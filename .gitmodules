@@ -1,0 +1,3 @@
+[submodule "TinyBFT"]
+	path = TinyBFT
+	url = https://github.com/CAMT-Web3-Club/TinyBFT.git
