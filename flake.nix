@@ -49,6 +49,7 @@
               esptool
               cmake
               ninja
+              mbedtls
             ];
             shellHook = ''
               export IDF_PATH=${pkgs.esp-idf-full}
