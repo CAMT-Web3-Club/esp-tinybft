@@ -1,0 +1,67 @@
+menu "TinyBFT Configuration"
+
+    config TBFT_MAX_MESSAGE_SIZE
+        int "Maximum message size (bytes)"
+        default 8192
+        help
+            Maximum UDP message size in bytes. Must be large enough to hold
+            view-change messages. Reduce for constrained environments.
+
+    config TBFT_MAX_REPLY_SIZE
+        int "Maximum reply payload size (bytes)"
+        default 1240
+        help
+            Maximum reply payload size. Must be less than TBFT_MAX_MESSAGE_SIZE.
+
+    config TBFT_BLOCK_SIZE
+        int "State block size (bytes)"
+        default 4096
+        help
+            State page/block size in bytes. Must be a power of 2. Smaller
+            values trade memory efficiency for more tree levels.
+
+    config TBFT_MAX_NUM_REPLICAS
+        int "Maximum number of replicas"
+        default 4
+        range 4 32
+        help
+            Maximum number of replicas supported. Determines size of
+            authenticators (HMAC array) and various static buffers.
+            For f=1 fault tolerance use 4 (n=3f+1).
+
+    config TBFT_WINDOW_SIZE
+        int "Sequence number window size"
+        default 256
+        help
+            Number of in-flight sequence numbers. Must be greater than
+            TBFT_CHECKPOINT_INTERVAL and a power of 2.
+
+    config TBFT_CHECKPOINT_INTERVAL
+        int "Checkpoint interval (sequence numbers)"
+        default 128
+        help
+            Number of sequence numbers between checkpoints. Must be
+            less than TBFT_WINDOW_SIZE.
+
+    config TBFT_MAX_NUM_CLIENTS
+        int "Maximum number of clients"
+        default 1
+        range 1 16
+        help
+            Maximum number of simultaneous clients. Affects static
+            region allocation in TinyBFT mode.
+
+    config TBFT_DISABLE_MULTICAST
+        bool "Disable multicast (use unicast)"
+        default n
+        help
+            When enabled, the library uses unicast UDP for all sends
+            instead of multicast. Useful when multicast is unavailable.
+
+    config TBFT_PRINT_STATS
+        bool "Enable performance statistics"
+        default n
+        help
+            Compile in statistics counters (throughput, latency).
+
+endmenu

@@ -1,0 +1,5 @@
+version: "0.1.0"
+description: TinyBFT — memory-optimised PBFT consensus for ESP-IDF
+url: https://github.com/CAMT-Web3-Club/esp-tinybft
+dependencies:
+  idf: ">=6.0"

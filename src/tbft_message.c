@@ -1,0 +1,29 @@
+#include "tbft_message.h"
+#include "esp_log.h"
+#include "psa/crypto.h"
+#include <string.h>
+
+static const char *TAG = "tbft_msg";
+
+void tbft_msg_digest(const void *data, size_t len, tbft_digest_t *out)
+{
+    size_t hash_len = 0;
+    psa_status_t st = psa_hash_compute(PSA_ALG_SHA_256,
+                                       (const uint8_t *)data, len,
+                                       out->bytes, TBFT_DIGEST_SIZE,
+                                       &hash_len);
+    if (st != PSA_SUCCESS) {
+        ESP_LOGE(TAG, "psa_hash_compute failed: %d", (int)st);
+        memset(out->bytes, 0, TBFT_DIGEST_SIZE);
+    }
+}
+
+bool tbft_digest_equal(const tbft_digest_t *a, const tbft_digest_t *b)
+{
+    /* Constant-time comparison to avoid timing side-channels */
+    uint8_t diff = 0;
+    for (int i = 0; i < TBFT_DIGEST_SIZE; i++) {
+        diff |= a->bytes[i] ^ b->bytes[i];
+    }
+    return diff == 0;
+}

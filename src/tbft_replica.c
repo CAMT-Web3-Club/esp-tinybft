@@ -1,0 +1,803 @@
+#include "tbft_replica.h"
+#include "esp_log.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include <string.h>
+
+static const char *TAG = "tbft_replica";
+
+/* --------------------------------------------------------------------------
+ * Request queue helpers
+ * -------------------------------------------------------------------------- */
+
+static void rqueue_init(tbft_rqueue_t *q) {
+    memset(q, 0, sizeof(*q));
+}
+
+static bool rqueue_push(tbft_rqueue_t *q, const void *buf, int len, bool ro) {
+    if (q->count >= TBFT_RQUEUE_MAX) return false;
+    tbft_rqueue_entry_t *e = &q->entries[q->tail];
+    if (len > TBFT_MAX_MESSAGE_SIZE) return false;
+    memcpy(e->buf, buf, (size_t)len);
+    e->len  = len;
+    e->ro   = ro;
+    e->used = true;
+    q->tail = (q->tail + 1) % TBFT_RQUEUE_MAX;
+    q->count++;
+    return true;
+}
+
+static tbft_rqueue_entry_t *rqueue_front(tbft_rqueue_t *q) {
+    if (q->count == 0) return NULL;
+    return &q->entries[q->head];
+}
+
+static void rqueue_pop(tbft_rqueue_t *q) {
+    if (q->count == 0) return;
+    q->entries[q->head].used = false;
+    q->head = (q->head + 1) % TBFT_RQUEUE_MAX;
+    q->count--;
+}
+
+/* --------------------------------------------------------------------------
+ * Timer callbacks
+ * -------------------------------------------------------------------------- */
+
+static void vtimer_cb(void *arg)
+{
+    tbft_replica_t *r = (tbft_replica_t *)arg;
+    ESP_LOGW(TAG, "view-change timeout in view %lld", (long long)r->node.view);
+    tbft_replica_send_view_change(r);
+}
+
+static void stimer_cb(void *arg)
+{
+    tbft_replica_t *r = (tbft_replica_t *)arg;
+    /* Broadcast a Status message */
+    tbft_status_rep_t *st = (tbft_status_rep_t *)r->out_buf;
+    st->hdr.tag           = TBFT_MSG_STATUS;
+    st->hdr.extra         = 0;
+    st->hdr.size          = tbft_msg_align((int32_t)sizeof(*st));
+    st->view              = r->node.view;
+    st->last_stable       = r->last_stable;
+    st->last_prepared     = r->last_prepared;
+    st->last_executed     = r->last_executed;
+    st->id                = r->node.node_id;
+    tbft_node_send(&r->node, r->out_buf, (size_t)st->hdr.size,
+                   TBFT_ALL_REPLICAS);
+
+    /* Restart status timer */
+    tbft_itimer_start(&r->stimer, r->stimer_period_us);
+}
+
+/* --------------------------------------------------------------------------
+ * Lifecycle
+ * -------------------------------------------------------------------------- */
+
+int tbft_replica_init(tbft_replica_t *r,
+                      tbft_node_id_t node_id, int f, int num_nodes,
+                      const char *mcast_ip, int64_t auth_timeout_us,
+                      uint16_t port,
+                      void *state_mem, size_t state_size,
+                      tbft_exec_cb_t exec_cb,
+                      tbft_comp_ndet_cb_t comp_ndet_cb,
+                      int ndet_max_len,
+                      tbft_recv_reply_cb_t recv_reply_cb)
+{
+    memset(r, 0, sizeof(*r));
+
+    /* Init base node */
+    if (tbft_node_init(&r->node, node_id, f, num_nodes,
+                       mcast_ip, auth_timeout_us, port) != 0) {
+        return -1;
+    }
+
+    int n = 3 * f + 1;
+    int prepare_threshold = 2 * f;   /* 2f prepares (primary's PP counts) */
+    int commit_threshold  = 2 * f + 1;
+
+    /* Init protocol logs */
+    tbft_plog_init(&r->plog, prepare_threshold);
+    tbft_clog_init(&r->clog, commit_threshold);
+    tbft_elog_init(&r->elog, commit_threshold);
+
+    /* Init static memory regions */
+    tbft_ar_init(&r->ar, prepare_threshold, commit_threshold);
+    tbft_cr_init(&r->cr, n, commit_threshold);
+    int num_clients = num_nodes - n;
+    if (num_clients < 1) num_clients = 1;
+    tbft_sr_init(&r->sr, n, num_clients);
+
+    /* Init state */
+    if (tbft_state_init(&r->state, state_mem, state_size) != 0) {
+        tbft_node_free(&r->node);
+        return -1;
+    }
+
+    /* Init view-change info */
+    tbft_vi_init(&r->vi, n, commit_threshold, &r->sr);
+
+    /* Init request queues */
+    rqueue_init(&r->rqueue);
+    rqueue_init(&r->ro_rqueue);
+
+    /* Set callbacks */
+    r->exec_cb        = exec_cb;
+    r->comp_ndet_cb   = comp_ndet_cb;
+    r->ndet_max_len   = ndet_max_len;
+    r->recv_reply_cb  = recv_reply_cb;
+
+    /* Sequence number initialisation */
+    r->seqno                    = 1;
+    r->last_stable              = 0;
+    r->last_prepared            = 0;
+    r->last_executed            = 0;
+    r->last_tentative_execute   = 0;
+
+    /* Timer periods (defaults) */
+    r->vtimer_period_us = 5000000LL;  /* 5 s */
+    r->stimer_period_us = 1000000LL;  /* 1 s */
+
+    /* Init timers */
+    tbft_itimer_init(&r->vtimer, vtimer_cb, r, "tbft_vtimer");
+    tbft_itimer_init(&r->stimer, stimer_cb, r, "tbft_stimer");
+    tbft_itimer_init(&r->rtimer, NULL,       r, "tbft_rtimer");
+    tbft_itimer_init(&r->ntimer, NULL,       r, "tbft_ntimer");
+
+    /* Start status timer immediately */
+    tbft_itimer_start(&r->stimer, r->stimer_period_us);
+
+    /* Start view-change timeout */
+    tbft_itimer_start(&r->vtimer, r->vtimer_period_us);
+
+    ESP_LOGI(TAG, "replica %d init: f=%d n=%d state=%zu bytes",
+             node_id, f, n, state_size);
+    return 0;
+}
+
+void tbft_replica_free(tbft_replica_t *r)
+{
+    r->running = false;
+    tbft_itimer_free(&r->vtimer);
+    tbft_itimer_free(&r->stimer);
+    tbft_itimer_free(&r->rtimer);
+    tbft_itimer_free(&r->ntimer);
+    tbft_state_free(&r->state);
+    tbft_node_free(&r->node);
+}
+
+/* --------------------------------------------------------------------------
+ * Message dispatch
+ * -------------------------------------------------------------------------- */
+
+void tbft_replica_run(tbft_replica_t *r)
+{
+    r->running = true;
+    ESP_LOGI(TAG, "replica %d starting event loop", r->node.node_id);
+
+    while (r->running) {
+        tbft_node_id_t src_id = -1;
+        int n = tbft_node_recv(&r->node, r->node.recv_buf, &src_id);
+        if (n < (int)sizeof(tbft_msg_hdr_t)) {
+            vTaskDelay(pdMS_TO_TICKS(1));
+            continue;
+        }
+
+        const tbft_msg_hdr_t *hdr = (const tbft_msg_hdr_t *)r->node.recv_buf;
+        if (n < hdr->size) {
+            ESP_LOGW(TAG, "truncated message: got %d, expected %d", n, hdr->size);
+            continue;
+        }
+
+        switch ((tbft_msg_tag_t)hdr->tag) {
+        case TBFT_MSG_REQUEST:
+            tbft_replica_handle_request(r, r->node.recv_buf, n);
+            break;
+        case TBFT_MSG_PRE_PREPARE:
+            tbft_replica_handle_pre_prepare(r, r->node.recv_buf, n);
+            break;
+        case TBFT_MSG_PREPARE:
+            tbft_replica_handle_prepare(r, r->node.recv_buf, n);
+            break;
+        case TBFT_MSG_COMMIT:
+            tbft_replica_handle_commit(r, r->node.recv_buf, n);
+            break;
+        case TBFT_MSG_CHECKPOINT:
+            tbft_replica_handle_checkpoint(r, r->node.recv_buf, n);
+            break;
+        case TBFT_MSG_VIEW_CHANGE:
+            tbft_replica_handle_view_change(r, r->node.recv_buf, n);
+            break;
+        case TBFT_MSG_NEW_VIEW:
+            tbft_replica_handle_new_view(r, r->node.recv_buf, n);
+            break;
+        case TBFT_MSG_FETCH:
+            tbft_replica_handle_fetch(r, r->node.recv_buf, n);
+            break;
+        case TBFT_MSG_META_DATA:
+            tbft_replica_handle_meta_data(r, r->node.recv_buf, n);
+            break;
+        case TBFT_MSG_DATA:
+            tbft_replica_handle_data(r, r->node.recv_buf, n);
+            break;
+        default:
+            ESP_LOGD(TAG, "unknown message tag %d", hdr->tag);
+            break;
+        }
+    }
+}
+
+/* --------------------------------------------------------------------------
+ * Request handler
+ * -------------------------------------------------------------------------- */
+
+void tbft_replica_handle_request(tbft_replica_t *r, const void *msg, int len)
+{
+    if (len < (int)sizeof(tbft_request_rep_t)) return;
+    const tbft_request_rep_t *req = (const tbft_request_rep_t *)msg;
+
+    /* If we are not the primary, forward to the primary */
+    if (!tbft_replica_is_primary(r)) {
+        int primary = tbft_node_primary(&r->node, r->node.view);
+        tbft_node_send(&r->node, msg, (size_t)len, primary);
+        /* Also restart view-change timer in case primary is faulty */
+        tbft_itimer_start(&r->vtimer, r->vtimer_period_us);
+        return;
+    }
+
+    /* Primary: enqueue and start ordering */
+    bool ro = (req->hdr.extra & 0x1) != 0;
+    tbft_rqueue_t *q = ro ? &r->ro_rqueue : &r->rqueue;
+    if (!rqueue_push(q, msg, len, ro)) {
+        ESP_LOGW(TAG, "request queue full, dropping request from client %d",
+                 req->cid);
+        return;
+    }
+
+    /* Try to send a pre-prepare if window allows */
+    tbft_replica_send_pre_prepare(r);
+}
+
+/* --------------------------------------------------------------------------
+ * Pre-prepare handler
+ * -------------------------------------------------------------------------- */
+
+void tbft_replica_handle_pre_prepare(tbft_replica_t *r, const void *msg, int len)
+{
+    if (len < (int)sizeof(tbft_pre_prepare_rep_t)) return;
+    const tbft_pre_prepare_rep_t *pp = (const tbft_pre_prepare_rep_t *)msg;
+
+    /* Reject if wrong view */
+    if (pp->view != r->node.view) return;
+
+    /* Must come from current primary */
+    int expected_primary = tbft_node_primary(&r->node, pp->view);
+    if (r->node.node_id == expected_primary) return; /* primary ignores own PP */
+
+    /* Check sequence number is in window */
+    if (!tbft_replica_in_window(r, pp->seqno)) {
+        ESP_LOGD(TAG, "pp seqno %lld out of window", (long long)pp->seqno);
+        return;
+    }
+
+    /* Store in agreement region */
+    if (!tbft_ar_store_pp(&r->ar, pp->seqno, msg, len)) {
+        return;
+    }
+
+    /* Update last_prepared if needed */
+    if (pp->seqno > r->last_prepared) {
+        r->last_prepared = pp->seqno;
+    }
+
+    /* Send prepare */
+    tbft_replica_send_prepare(r, pp->seqno);
+}
+
+/* --------------------------------------------------------------------------
+ * Prepare handler
+ * -------------------------------------------------------------------------- */
+
+void tbft_replica_handle_prepare(tbft_replica_t *r, const void *msg, int len)
+{
+    if (len < (int)sizeof(tbft_prepare_rep_t)) return;
+    const tbft_prepare_rep_t *prep = (const tbft_prepare_rep_t *)msg;
+
+    if (prep->view != r->node.view) return;
+    if (!tbft_replica_in_window(r, prep->seqno)) return;
+
+    tbft_node_id_t sender = prep->id;
+    if (sender == tbft_node_primary(&r->node, prep->view)) return; /* skip primary */
+
+    bool accepted;
+    if (sender == r->node.node_id) {
+        accepted = tbft_ar_add_my_prepare(&r->ar, prep->seqno,
+                                          msg, len, sender);
+    } else {
+        accepted = tbft_ar_add_prepare(&r->ar, prep->seqno,
+                                       msg, len, sender);
+    }
+
+    if (!accepted) return;
+
+    /* Check if prepared — if so, send commit */
+    if (tbft_ar_prepared(&r->ar, prep->seqno)) {
+        ESP_LOGD(TAG, "prepared seqno=%lld", (long long)prep->seqno);
+        tbft_replica_send_commit(r, prep->seqno);
+    }
+}
+
+/* --------------------------------------------------------------------------
+ * Commit handler
+ * -------------------------------------------------------------------------- */
+
+void tbft_replica_handle_commit(tbft_replica_t *r, const void *msg, int len)
+{
+    if (len < (int)sizeof(tbft_commit_rep_t)) return;
+    const tbft_commit_rep_t *cm = (const tbft_commit_rep_t *)msg;
+
+    if (cm->view != r->node.view) return;
+    if (!tbft_replica_in_window(r, cm->seqno)) return;
+
+    tbft_node_id_t sender = cm->id;
+    bool accepted;
+    if (sender == r->node.node_id) {
+        accepted = tbft_ar_add_my_commit(&r->ar, cm->seqno, msg, len, sender);
+    } else {
+        accepted = tbft_ar_add_commit(&r->ar, cm->seqno, msg, len, sender);
+    }
+
+    if (!accepted) return;
+
+    /* Check if committed-local */
+    if (tbft_ar_committed(&r->ar, cm->seqno)) {
+        ESP_LOGD(TAG, "committed seqno=%lld", (long long)cm->seqno);
+        tbft_replica_execute_committed(r);
+    }
+}
+
+/* --------------------------------------------------------------------------
+ * Checkpoint handler
+ * -------------------------------------------------------------------------- */
+
+void tbft_replica_handle_checkpoint(tbft_replica_t *r, const void *msg, int len)
+{
+    if (len < (int)sizeof(tbft_checkpoint_rep_t)) return;
+    const tbft_checkpoint_rep_t *ckpt = (const tbft_checkpoint_rep_t *)msg;
+
+    tbft_node_id_t sender = ckpt->id;
+    bool stable = tbft_cr_store(&r->cr, ckpt->seqno, sender, msg, len);
+
+    if (stable) {
+        ESP_LOGI(TAG, "stable checkpoint at seqno=%lld",
+                 (long long)ckpt->seqno);
+        tbft_replica_mark_stable(r, ckpt->seqno);
+    }
+}
+
+/* --------------------------------------------------------------------------
+ * View-change handler
+ * -------------------------------------------------------------------------- */
+
+void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len)
+{
+    if (len < (int)sizeof(tbft_view_change_rep_t)) return;
+    const tbft_view_change_rep_t *vc = (const tbft_view_change_rep_t *)msg;
+
+    if (!tbft_vi_collect_vc(&r->vi, vc->id, msg, len)) return;
+
+    /* If we are the new primary and have enough view-changes, send new-view */
+    int new_primary = tbft_node_primary(&r->node, vc->v);
+    if (new_primary == r->node.node_id && tbft_vi_has_quorum(&r->vi)) {
+        /* Build and send New_view */
+        tbft_seqno_t min_s, max_s;
+        tbft_vi_compute_min_max(&r->vi, &min_s, &max_s);
+
+        tbft_new_view_rep_t *nv = (tbft_new_view_rep_t *)r->out_buf;
+        nv->hdr.tag   = TBFT_MSG_NEW_VIEW;
+        nv->hdr.extra = 0;
+        nv->v         = vc->v;
+        nv->min       = min_s;
+        nv->max       = max_s;
+        nv->n_prep    = 0;
+        nv->hdr.size  = tbft_msg_align((int32_t)sizeof(*nv));
+
+        tbft_node_send(&r->node, r->out_buf, (size_t)nv->hdr.size,
+                       TBFT_ALL_REPLICAS);
+        ESP_LOGI(TAG, "sent new-view v=%lld min=%lld max=%lld",
+                 (long long)vc->v, (long long)min_s, (long long)max_s);
+    }
+}
+
+/* --------------------------------------------------------------------------
+ * New-view handler
+ * -------------------------------------------------------------------------- */
+
+void tbft_replica_handle_new_view(tbft_replica_t *r, const void *msg, int len)
+{
+    if (len < (int)sizeof(tbft_new_view_rep_t)) return;
+    const tbft_new_view_rep_t *nv = (const tbft_new_view_rep_t *)msg;
+
+    /* Verify it's for the view we expect */
+    if (nv->v <= r->node.view) return;
+
+    if (!tbft_vi_verify_nv(&r->vi, nv, len)) {
+        ESP_LOGW(TAG, "new-view verification failed for v=%lld",
+                 (long long)nv->v);
+        return;
+    }
+
+    /* Install new view */
+    r->node.view        = nv->v;
+    r->node.cur_primary = tbft_node_primary(&r->node, nv->v);
+
+    /* Stop view-change timer and restart it */
+    tbft_itimer_stop(&r->vtimer);
+    tbft_vi_reset(&r->vi, nv->v + 1);
+
+    tbft_itimer_start(&r->vtimer, r->vtimer_period_us);
+
+    ESP_LOGI(TAG, "installed new view %lld, primary=%d",
+             (long long)nv->v, r->node.cur_primary);
+}
+
+/* --------------------------------------------------------------------------
+ * Fetch handler
+ * -------------------------------------------------------------------------- */
+
+void tbft_replica_handle_fetch(tbft_replica_t *r, const void *msg, int len)
+{
+    if (len < (int)sizeof(tbft_fetch_rep_t)) return;
+    const tbft_fetch_rep_t *fetch = (const tbft_fetch_rep_t *)msg;
+
+    /* Respond with Meta_data for the requested level/index */
+    int level = fetch->level;
+    int index = fetch->index;
+
+    if (level >= r->state.ptree.dims.p_levels) return;
+
+    int pchildren = r->state.ptree.dims.p_children;
+    int n_children = tbft_ptree_nodes_at_level(level + 1, pchildren);
+    int first_child = index * pchildren;
+    int count = pchildren;
+    if (first_child + count > n_children) {
+        count = n_children - first_child;
+    }
+    if (count <= 0) return;
+
+    /* Build Meta_data response */
+    uint8_t *out = r->out_buf;
+    tbft_meta_data_rep_t *md = (tbft_meta_data_rep_t *)out;
+    md->hdr.tag  = TBFT_MSG_META_DATA;
+    md->hdr.extra = 0;
+    md->seqno    = fetch->c;
+    md->level    = level;
+    md->index    = index;
+    md->n_parts  = count;
+
+    tbft_part_info_t *parts =
+        (tbft_part_info_t *)(out + sizeof(tbft_meta_data_rep_t));
+    for (int c = 0; c < count; c++) {
+        int cidx = first_child + c;
+        if (level + 1 < r->state.ptree.dims.p_levels) {
+            parts[c].digest  = r->state.ptree.ptree[level + 1][cidx].digest;
+            parts[c].version = r->state.ptree.ptree[level + 1][cidx].version;
+        } else {
+            tbft_digest_zero(&parts[c].digest);
+            parts[c].version = 0;
+        }
+    }
+
+    int32_t total = (int32_t)(sizeof(*md) + (size_t)count * sizeof(tbft_part_info_t));
+    md->hdr.size = tbft_msg_align(total);
+
+    tbft_node_send(&r->node, out, (size_t)md->hdr.size, fetch->id);
+}
+
+/* --------------------------------------------------------------------------
+ * Meta_data / Data handlers (for fetching replica)
+ * -------------------------------------------------------------------------- */
+
+void tbft_replica_handle_meta_data(tbft_replica_t *r, const void *msg, int len)
+{
+    if (!tbft_state_in_fetch(&r->state)) return;
+    if (len < (int)sizeof(tbft_meta_data_rep_t)) return;
+
+    const tbft_meta_data_rep_t *md = (const tbft_meta_data_rep_t *)msg;
+    const tbft_part_info_t *parts =
+        (const tbft_part_info_t *)((const uint8_t *)msg + sizeof(*md));
+
+    tbft_state_handle_meta_data(&r->state, md, parts, md->n_parts);
+
+    /* Send next fetch requests */
+    int level, index;
+    while (tbft_state_next_fetch_req(&r->state, &level, &index)) {
+        tbft_fetch_rep_t *fr = (tbft_fetch_rep_t *)r->out_buf;
+        fr->hdr.tag   = TBFT_MSG_FETCH;
+        fr->hdr.extra = 0;
+        fr->last_stable = r->last_stable;
+        fr->c         = r->state.fetch_seqno;
+        fr->level     = level;
+        fr->index     = index;
+        fr->id        = r->node.node_id;
+        fr->hdr.size  = tbft_msg_align((int32_t)sizeof(*fr));
+        tbft_node_send(&r->node, r->out_buf, (size_t)fr->hdr.size,
+                       r->state.fetch_replier);
+    }
+}
+
+void tbft_replica_handle_data(tbft_replica_t *r, const void *msg, int len)
+{
+    if (!tbft_state_in_fetch(&r->state)) return;
+    if (len < (int)sizeof(tbft_data_rep_t) + TBFT_BLOCK_SIZE) return;
+
+    const tbft_data_rep_t *data_rep = (const tbft_data_rep_t *)msg;
+    const uint8_t *block_data =
+        (const uint8_t *)msg + sizeof(tbft_data_rep_t);
+
+    tbft_state_handle_data(&r->state, data_rep, block_data);
+}
+
+/* --------------------------------------------------------------------------
+ * Protocol actions
+ * -------------------------------------------------------------------------- */
+
+void tbft_replica_send_pre_prepare(tbft_replica_t *r)
+{
+    if (!tbft_replica_is_primary(r)) return;
+
+    tbft_rqueue_entry_t *req = rqueue_front(&r->rqueue);
+    if (!req) req = rqueue_front(&r->ro_rqueue);
+    if (!req) return;
+
+    /* Check window */
+    if (!tbft_replica_in_window(r, r->seqno)) {
+        ESP_LOGD(TAG, "seqno %lld out of window, waiting", (long long)r->seqno);
+        return;
+    }
+
+    /* Compute request set digest */
+    tbft_digest_t rset_digest;
+    tbft_msg_digest(req->buf, (size_t)req->len, &rset_digest);
+
+    /* Compute non-deterministic choices */
+    int ndet_len = 0;
+    if (r->comp_ndet_cb) {
+        r->comp_ndet_cb(r->seqno, r->ndet_buf, &ndet_len, r->ndet_max_len);
+    }
+
+    /* Build Pre_prepare message */
+    tbft_pre_prepare_rep_t *pp = (tbft_pre_prepare_rep_t *)r->out_buf;
+    pp->hdr.tag      = TBFT_MSG_PRE_PREPARE;
+    pp->hdr.extra    = 0;
+    pp->view         = r->node.view;
+    pp->seqno        = r->seqno;
+    pp->digest       = rset_digest;
+    pp->rset_size    = req->len;
+    pp->non_det_size = (int16_t)ndet_len;
+
+    /* Append request set, non-det choices, then authenticator */
+    uint8_t *ptr = r->out_buf + sizeof(*pp);
+    memcpy(ptr, req->buf, (size_t)req->len);
+    ptr += req->len;
+    memcpy(ptr, r->ndet_buf, (size_t)ndet_len);
+    ptr += ndet_len;
+
+    /* Authenticator */
+    tbft_auth_t *auth = (tbft_auth_t *)ptr;
+    int32_t msg_len_before_auth = (int32_t)(ptr - r->out_buf);
+    tbft_node_gen_auth(&r->node, r->out_buf, (size_t)msg_len_before_auth,
+                       auth);
+    ptr += sizeof(tbft_auth_t);
+
+    pp->hdr.size = tbft_msg_align((int32_t)(ptr - r->out_buf));
+
+    /* Store in agreement region */
+    tbft_ar_store_pp(&r->ar, r->seqno, r->out_buf, pp->hdr.size);
+
+    /* Broadcast */
+    tbft_node_send(&r->node, r->out_buf, (size_t)pp->hdr.size,
+                   TBFT_ALL_REPLICAS);
+
+    ESP_LOGD(TAG, "sent pre-prepare seqno=%lld view=%lld",
+             (long long)r->seqno, (long long)r->node.view);
+
+    rqueue_pop(&r->rqueue);
+    r->seqno++;
+
+    /* Reset view-change timer — primary is active */
+    tbft_itimer_start(&r->vtimer, r->vtimer_period_us);
+}
+
+void tbft_replica_send_prepare(tbft_replica_t *r, tbft_seqno_t n)
+{
+    /* Primary does not send Prepare */
+    if (tbft_replica_is_primary(r)) return;
+
+    /* Get the stored pre-prepare digest */
+    int pp_len = 0;
+    const uint8_t *pp_buf = tbft_ar_load_pp(&r->ar, n, &pp_len);
+    if (!pp_buf) return;
+    const tbft_pre_prepare_rep_t *pp = (const tbft_pre_prepare_rep_t *)pp_buf;
+
+    tbft_prepare_rep_t *prep = (tbft_prepare_rep_t *)r->out_buf;
+    prep->hdr.tag   = TBFT_MSG_PREPARE;
+    prep->hdr.extra = 0;
+    prep->view      = r->node.view;
+    prep->seqno     = n;
+    prep->digest    = pp->digest;
+    prep->id        = r->node.node_id;
+
+    tbft_auth_t *auth = (tbft_auth_t *)(r->out_buf + sizeof(*prep));
+    tbft_node_gen_auth(&r->node, r->out_buf, sizeof(*prep), auth);
+    prep->hdr.size = tbft_msg_align(
+        (int32_t)(sizeof(*prep) + sizeof(tbft_auth_t)));
+
+    /* Store own prepare */
+    tbft_ar_add_my_prepare(&r->ar, n, r->out_buf, prep->hdr.size,
+                           r->node.node_id);
+
+    tbft_node_send(&r->node, r->out_buf, (size_t)prep->hdr.size,
+                   TBFT_ALL_REPLICAS);
+    ESP_LOGD(TAG, "sent prepare seqno=%lld", (long long)n);
+}
+
+void tbft_replica_send_commit(tbft_replica_t *r, tbft_seqno_t n)
+{
+    tbft_commit_rep_t *cm = (tbft_commit_rep_t *)r->out_buf;
+    cm->hdr.tag   = TBFT_MSG_COMMIT;
+    cm->hdr.extra = 0;
+    cm->view      = r->node.view;
+    cm->seqno     = n;
+    cm->id        = r->node.node_id;
+
+    tbft_auth_t *auth = (tbft_auth_t *)(r->out_buf + sizeof(*cm));
+    tbft_node_gen_auth(&r->node, r->out_buf, sizeof(*cm), auth);
+    cm->hdr.size = tbft_msg_align(
+        (int32_t)(sizeof(*cm) + sizeof(tbft_auth_t)));
+
+    tbft_ar_add_my_commit(&r->ar, n, r->out_buf, cm->hdr.size,
+                          r->node.node_id);
+
+    tbft_node_send(&r->node, r->out_buf, (size_t)cm->hdr.size,
+                   TBFT_ALL_REPLICAS);
+    ESP_LOGD(TAG, "sent commit seqno=%lld", (long long)n);
+}
+
+void tbft_replica_execute_committed(tbft_replica_t *r)
+{
+    /* Execute in sequence-number order */
+    for (tbft_seqno_t n = r->last_executed + 1;
+         n <= r->last_prepared + 1;
+         n++) {
+        if (!tbft_ar_committed(&r->ar, n)) break;
+
+        int pp_len = 0;
+        const uint8_t *pp_buf = tbft_ar_load_pp(&r->ar, n, &pp_len);
+        if (!pp_buf) break;
+
+        const tbft_pre_prepare_rep_t *pp =
+            (const tbft_pre_prepare_rep_t *)pp_buf;
+        const uint8_t *req_bytes =
+            (const uint8_t *)pp_buf + sizeof(*pp);
+        int req_len   = pp->rset_size;
+        int ndet_len  = pp->non_det_size;
+        const uint8_t *ndet = req_bytes + req_len;
+
+        /* Notify application to CoW before execution */
+        /* (Application calls Byz_modify before writing state) */
+
+        /* Execute */
+        if (r->exec_cb && req_len >= (int)sizeof(tbft_request_rep_t)) {
+            const tbft_request_rep_t *req_rep =
+                (const tbft_request_rep_t *)req_bytes;
+
+            uint8_t rep_buf[TBFT_MAX_REPLY_SIZE];
+            int     rep_len = 0;
+            bool    ro = (req_rep->hdr.extra & 0x1) != 0;
+
+            int rc = r->exec_cb(req_bytes, req_len,
+                                rep_buf, &rep_len,
+                                (void *)ndet, ndet_len,
+                                req_rep->cid, ro);
+
+            if (rc == 0) {
+                /* Build and send Reply */
+                uint8_t out[sizeof(tbft_reply_rep_t) + TBFT_MAX_REPLY_SIZE
+                            + TBFT_SIG_SIZE];
+                tbft_reply_rep_t *reply = (tbft_reply_rep_t *)out;
+                reply->hdr.tag    = TBFT_MSG_REPLY;
+                reply->hdr.extra  = 0;
+                reply->view       = r->node.view;
+                reply->seqno      = n;
+                reply->cid        = req_rep->cid;
+                reply->rid        = req_rep->rid;
+                reply->reply_size = rep_len;
+                memcpy(out + sizeof(*reply), rep_buf, (size_t)rep_len);
+
+                int32_t total = (int32_t)(sizeof(*reply) + (size_t)rep_len);
+                reply->hdr.size = tbft_msg_align(total);
+
+                if (r->recv_reply_cb) {
+                    r->recv_reply_cb(out, reply->hdr.size, req_rep->cid);
+                }
+                tbft_node_send(&r->node, out, (size_t)reply->hdr.size,
+                               req_rep->cid);
+            }
+        }
+
+        r->last_executed = n;
+
+        /* Checkpoint at intervals */
+        if ((n % TBFT_CHECKPOINT_INTERVAL) == 0) {
+            tbft_state_checkpoint(&r->state, n);
+
+            /* Build and broadcast Checkpoint */
+            tbft_checkpoint_rep_t *ckpt =
+                (tbft_checkpoint_rep_t *)r->out_buf;
+            ckpt->hdr.tag  = TBFT_MSG_CHECKPOINT;
+            ckpt->hdr.extra = 0;
+            ckpt->seqno    = n;
+            ckpt->digest   = *tbft_state_root_digest(&r->state);
+            ckpt->id       = r->node.node_id;
+            tbft_auth_t *auth =
+                (tbft_auth_t *)(r->out_buf + sizeof(*ckpt));
+            tbft_node_gen_auth(&r->node, r->out_buf,
+                               sizeof(*ckpt), auth);
+            ckpt->hdr.size = tbft_msg_align(
+                (int32_t)(sizeof(*ckpt) + sizeof(tbft_auth_t)));
+            tbft_node_send(&r->node, r->out_buf,
+                           (size_t)ckpt->hdr.size, TBFT_ALL_REPLICAS);
+
+            ESP_LOGI(TAG, "broadcast checkpoint at seqno=%lld",
+                     (long long)n);
+        }
+    }
+}
+
+void tbft_replica_mark_stable(tbft_replica_t *r, tbft_seqno_t seqno)
+{
+    if (seqno <= r->last_stable) return;
+    r->last_stable = seqno;
+    r->state.last_stable = seqno;
+
+    /* Truncate logs */
+    tbft_plog_truncate(&r->plog, seqno + 1);
+    tbft_clog_truncate(&r->clog, seqno + 1);
+    tbft_elog_truncate(&r->elog, seqno + 1);
+    tbft_ar_truncate(&r->ar, seqno + 1);
+    tbft_cr_truncate(&r->cr, seqno);
+
+    /* Reset view-change timer — stable progress */
+    tbft_itimer_start(&r->vtimer, r->vtimer_period_us);
+
+    ESP_LOGI(TAG, "marked stable seqno=%lld", (long long)seqno);
+}
+
+void tbft_replica_send_view_change(tbft_replica_t *r)
+{
+    tbft_view_t new_view = r->node.view + 1;
+    tbft_vi_reset(&r->vi, new_view);
+
+    tbft_view_change_rep_t *vc = (tbft_view_change_rep_t *)r->out_buf;
+    vc->hdr.tag  = TBFT_MSG_VIEW_CHANGE;
+    vc->hdr.extra = 0;
+    vc->v        = new_view;
+    vc->ls       = r->last_stable;
+    vc->n_ckpts  = 0;
+    vc->n_reqs   = 0;
+    vc->id       = r->node.node_id;
+    vc->hdr.size = tbft_msg_align((int32_t)sizeof(*vc));
+
+    tbft_node_send(&r->node, r->out_buf, (size_t)vc->hdr.size,
+                   TBFT_ALL_REPLICAS);
+
+    ESP_LOGI(TAG, "sent view-change to view %lld", (long long)new_view);
+
+    /* Collect our own view-change */
+    tbft_vi_collect_vc(&r->vi, r->node.node_id, r->out_buf, vc->hdr.size);
+
+    /* Start view-change retransmit timer */
+    tbft_itimer_start(&r->vtimer, r->vtimer_period_us * 2);
+}
