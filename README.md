@@ -24,7 +24,7 @@ Add `esp-tinybft` to your host project's `idf_component.yml` (create it in your 
 
 ```yaml
 dependencies:
-  CAMT-Web3-Club/esp-tinybft: ">=0.1.0"
+  phukrit7171/esp-tinybft: ">=0.1.0"
 ```
 
 Then let the IDF Component Manager fetch it:
@@ -33,7 +33,7 @@ Then let the IDF Component Manager fetch it:
 idf.py update-dependencies
 ```
 
-The component is downloaded from the [Espressif Component Registry](https://components.espressif.com/components/CAMT-Web3-Club/esp-tinybft) and cached under `managed_components/`.
+The component is downloaded from the [Espressif Component Registry](https://components.espressif.com/components/phukrit7171/esp-tinybft) and cached under `managed_components/`.
 
 ### 2. Configure
 
