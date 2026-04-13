@@ -37,6 +37,26 @@
 #define TBFT_MAX_NUM_CLIENTS     CONFIG_TBFT_MAX_NUM_CLIENTS
 #endif
 
+#ifndef TBFT_MAX_STATE_BLOCKS
+#define TBFT_MAX_STATE_BLOCKS    CONFIG_TBFT_MAX_STATE_BLOCKS
+#endif
+
+#ifndef TBFT_RQUEUE_MAX
+#define TBFT_RQUEUE_MAX          CONFIG_TBFT_RQUEUE_MAX
+#endif
+
+#ifndef TBFT_NDET_BUF_SIZE
+#define TBFT_NDET_BUF_SIZE       CONFIG_TBFT_NDET_BUF_SIZE
+#endif
+
+#ifndef TBFT_P_LEVELS
+#define TBFT_P_LEVELS            CONFIG_TBFT_P_LEVELS
+#endif
+
+#ifndef TBFT_ANTI_REPLAY_WINDOW_US
+#define TBFT_ANTI_REPLAY_WINDOW_US  ((int64_t)CONFIG_TBFT_ANTI_REPLAY_WINDOW_MS * 1000LL)
+#endif
+
 /* --------------------------------------------------------------------------
  * Derived protocol constants
  * -------------------------------------------------------------------------- */
@@ -82,3 +102,6 @@ _Static_assert(TBFT_MAX_NUM_REPLICAS >= 4,
 
 _Static_assert(TBFT_MAX_REPLY_SIZE < TBFT_MAX_MESSAGE_SIZE,
                "TBFT_MAX_REPLY_SIZE must be less than TBFT_MAX_MESSAGE_SIZE");
+
+_Static_assert(TBFT_P_LEVELS >= 2,
+               "TBFT_P_LEVELS must be at least 2");

@@ -30,7 +30,7 @@ static inline void cow_zero(tbft_state_t *s)
 
 static tbft_ckpt_record_t *ckpt_slot_for(tbft_state_t *s, tbft_seqno_t seqno)
 {
-    int slot = (int)((seqno / TBFT_CHECKPOINT_INTERVAL) % TBFT_MAX_CKPT_RECORDS);
+    int slot = (int)((seqno / TBFT_CHECKPOINT_INTERVAL) % TBFT_NUM_CKPT_SLOTS);
     return &s->ckpt_records[slot];
 }
 
@@ -73,7 +73,7 @@ void tbft_state_free(tbft_state_t *state)
     tbft_ptree_free(&state->ptree);
 
     /* Free checkpoint record snapshots */
-    for (int i = 0; i < TBFT_MAX_CKPT_RECORDS; i++) {
+    for (int i = 0; i < TBFT_NUM_CKPT_SLOTS; i++) {
         if (state->ckpt_records[i].old_blocks) {
             free(state->ckpt_records[i].old_blocks);
             state->ckpt_records[i].old_blocks = NULL;

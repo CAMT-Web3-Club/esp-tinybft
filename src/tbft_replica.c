@@ -97,11 +97,6 @@ int tbft_replica_init(tbft_replica_t *r,
     int prepare_threshold = 2 * f;   /* 2f prepares (primary's PP counts) */
     int commit_threshold  = 2 * f + 1;
 
-    /* Init protocol logs */
-    tbft_plog_init(&r->plog, prepare_threshold);
-    tbft_clog_init(&r->clog, commit_threshold);
-    tbft_elog_init(&r->elog, commit_threshold);
-
     /* Init static memory regions */
     tbft_ar_init(&r->ar, prepare_threshold, commit_threshold);
     tbft_cr_init(&r->cr, n, commit_threshold);
@@ -125,7 +120,8 @@ int tbft_replica_init(tbft_replica_t *r,
     /* Set callbacks */
     r->exec_cb        = exec_cb;
     r->comp_ndet_cb   = comp_ndet_cb;
-    r->ndet_max_len   = ndet_max_len;
+    r->ndet_max_len   = (ndet_max_len > TBFT_NDET_BUF_SIZE)
+                      ? TBFT_NDET_BUF_SIZE : ndet_max_len;
     r->recv_reply_cb  = recv_reply_cb;
 
     /* Sequence number initialisation */
@@ -135,21 +131,15 @@ int tbft_replica_init(tbft_replica_t *r,
     r->last_executed            = 0;
     r->last_tentative_execute   = 0;
 
-    /* Timer periods (defaults) */
+    /* Timer periods (defaults — overridden by Byz_init_replica from config) */
     r->vtimer_period_us = 5000000LL;  /* 5 s */
     r->stimer_period_us = 1000000LL;  /* 1 s */
 
-    /* Init timers */
+    /* Init timers (not started — caller must set periods and start) */
     tbft_itimer_init(&r->vtimer, vtimer_cb, r, "tbft_vtimer");
     tbft_itimer_init(&r->stimer, stimer_cb, r, "tbft_stimer");
     tbft_itimer_init(&r->rtimer, NULL,       r, "tbft_rtimer");
     tbft_itimer_init(&r->ntimer, NULL,       r, "tbft_ntimer");
-
-    /* Start status timer immediately */
-    tbft_itimer_start(&r->stimer, r->stimer_period_us);
-
-    /* Start view-change timeout */
-    tbft_itimer_start(&r->vtimer, r->vtimer_period_us);
 
     ESP_LOGI(TAG, "replica %d init: f=%d n=%d state=%zu bytes",
              node_id, f, n, state_size);
@@ -851,10 +841,7 @@ void tbft_replica_mark_stable(tbft_replica_t *r, tbft_seqno_t seqno)
     r->last_stable = seqno;
     r->state.last_stable = seqno;
 
-    /* Truncate logs */
-    tbft_plog_truncate(&r->plog, seqno + 1);
-    tbft_clog_truncate(&r->clog, seqno + 1);
-    tbft_elog_truncate(&r->elog, seqno + 1);
+    /* Truncate static regions */
     tbft_ar_truncate(&r->ar, seqno + 1);
     tbft_cr_truncate(&r->cr, seqno);
 

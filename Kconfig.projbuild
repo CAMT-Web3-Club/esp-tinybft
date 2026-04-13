@@ -51,6 +51,46 @@ menu "TinyBFT Configuration"
             Maximum number of simultaneous clients. Affects static
             region allocation in TinyBFT mode.
 
+    config TBFT_MAX_STATE_BLOCKS
+        int "Maximum number of state blocks"
+        default 256
+        help
+            Maximum number of state blocks (state_size / BLOCK_SIZE).
+            Affects CoW bitmap, block_digests, and fetch queue sizing.
+
+    config TBFT_RQUEUE_MAX
+        int "Maximum pending requests in queue"
+        default 16
+        range 4 256
+        help
+            Maximum queued requests before the replica drops new ones.
+            Two queues are allocated (read-write and read-only). Each
+            entry is TBFT_MAX_MESSAGE_SIZE bytes, so total memory is
+            2 * RQUEUE_MAX * MAX_MESSAGE_SIZE.
+
+    config TBFT_NDET_BUF_SIZE
+        int "Non-deterministic choices buffer size (bytes)"
+        default 256
+        range 32 4096
+        help
+            Size of the per-replica buffer for non-deterministic choices.
+            Must be >= ndet_max_len passed to Byz_init_replica.
+
+    config TBFT_P_LEVELS
+        int "Partition tree levels"
+        default 4
+        range 2 8
+        help
+            Maximum depth of the Merkle partition tree over state blocks.
+            More levels allows more state blocks but increases memory.
+
+    config TBFT_ANTI_REPLAY_WINDOW_MS
+        int "Anti-replay window (milliseconds)"
+        default 30000
+        help
+            Messages with timestamps older than this window are rejected.
+            Set to 0 to disable anti-replay checking.
+
     config TBFT_DISABLE_MULTICAST
         bool "Disable multicast (use unicast)"
         default n

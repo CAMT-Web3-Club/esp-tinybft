@@ -369,33 +369,90 @@ int tbft_transport_send(tbft_transport_t *t, const void *buf, size_t len,
         int sent = 0;
         for (int i = 0; i < enow->num_nodes; i++) {
             if (!enow->peer_valid[i]) continue;
-            /* Send to each peer individually with unique msg_id */
             const uint8_t *peer_mac = enow->peers[i].u.mac.bytes;
-            frag_hdr_t fhdr;
-            fhdr.msg_id     = enow->next_msg_id;
+
+            uint16_t this_msg_id = enow->next_msg_id;
             enow->next_msg_id++;
-            fhdr.frag_total = 1;
-            fhdr.frag_idx   = 0;
 
-            uint8_t pkt[sizeof(frag_hdr_t) + TBFT_MAX_MESSAGE_SIZE];
-            memcpy(pkt, &fhdr, sizeof(fhdr));
-            memcpy(pkt + sizeof(fhdr), buf, len);
+            /* Check if fragmentation is needed */
+            if (len + sizeof(frag_hdr_t) <= ESPNOW_MAX_DATA_LEN) {
+                /* Single fragment */
+                frag_hdr_t fhdr;
+                fhdr.msg_id     = this_msg_id;
+                fhdr.frag_total = 1;
+                fhdr.frag_idx   = 0;
 
-            enow->send_done = false;
-            enow->send_ok = false;
+                uint8_t pkt[sizeof(frag_hdr_t) + ESPNOW_MAX_DATA_LEN];
+                memcpy(pkt, &fhdr, sizeof(fhdr));
+                memcpy(pkt + sizeof(fhdr), buf, len);
 
-            esp_err_t err = esp_now_send(peer_mac, pkt,
-                                         (size_t)len + sizeof(fhdr));
-            if (err == ESP_OK) {
-                /* Wait for send callback */
-                int retries = 0;
-                while (!enow->send_done && retries < 100) {
-                    vTaskDelay(pdMS_TO_TICKS(1));
-                    retries++;
+                enow->send_done = false;
+                enow->send_ok = false;
+
+                esp_err_t err = esp_now_send(peer_mac, pkt,
+                                             (size_t)len + sizeof(fhdr));
+                if (err == ESP_OK) {
+                    int retries = 0;
+                    while (!enow->send_done && retries < 100) {
+                        vTaskDelay(pdMS_TO_TICKS(1));
+                        retries++;
+                    }
+                    if (enow->send_ok) sent = (int)len;
+                } else {
+                    ESP_LOGE(TAG, "esp_now_send to peer %d failed: %d", i, err);
                 }
-                if (enow->send_ok) sent = (int)len;
             } else {
-                ESP_LOGE(TAG, "esp_now_send to peer %d failed: %d", i, err);
+                /* Multi-fragment send to this peer */
+                size_t remaining = len;
+                const uint8_t *src = (const uint8_t *)buf;
+                uint8_t frag_total = (uint8_t)((remaining + FRAG_MAX_PAYLOAD - 1)
+                                               / FRAG_MAX_PAYLOAD);
+                uint8_t frag_idx = 0;
+                bool peer_ok = true;
+
+                frag_hdr_t fhdr;
+                fhdr.msg_id = this_msg_id;
+                fhdr.frag_total = frag_total;
+
+                uint8_t pkt[sizeof(frag_hdr_t) + FRAG_MAX_PAYLOAD];
+
+                while (remaining > 0 && peer_ok) {
+                    fhdr.frag_idx = frag_idx;
+                    size_t chunk = remaining > FRAG_MAX_PAYLOAD
+                                 ? FRAG_MAX_PAYLOAD : remaining;
+
+                    memcpy(pkt, &fhdr, sizeof(fhdr));
+                    memcpy(pkt + sizeof(fhdr), src, chunk);
+
+                    enow->send_done = false;
+                    enow->send_ok = false;
+
+                    esp_err_t err = esp_now_send(peer_mac, pkt,
+                                                 chunk + sizeof(fhdr));
+                    if (err != ESP_OK) {
+                        ESP_LOGE(TAG, "esp_now_send bcast frag %d/%d to %d failed: %d",
+                                 frag_idx, frag_total, i, err);
+                        peer_ok = false;
+                        break;
+                    }
+
+                    int retries = 0;
+                    while (!enow->send_done && retries < 100) {
+                        vTaskDelay(pdMS_TO_TICKS(1));
+                        retries++;
+                    }
+                    if (!enow->send_ok) {
+                        ESP_LOGE(TAG, "esp_now_send bcast frag %d/%d to %d cb fail",
+                                 frag_idx, frag_total, i);
+                        peer_ok = false;
+                        break;
+                    }
+
+                    src += chunk;
+                    remaining -= chunk;
+                    frag_idx++;
+                }
+                if (peer_ok) sent = (int)len;
             }
         }
         return sent > 0 ? sent : -1;

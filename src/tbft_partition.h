@@ -20,10 +20,7 @@
  * individual state blocks.
  * -------------------------------------------------------------------------- */
 
-/* Maximum partition tree levels (can be tuned for state size) */
-#ifndef TBFT_P_LEVELS
-#define TBFT_P_LEVELS  4
-#endif
+/* TBFT_P_LEVELS is defined in tbft_config.h (sourced from Kconfig) */
 
 /** One partition node: state digest + checkpoint version */
 typedef struct {

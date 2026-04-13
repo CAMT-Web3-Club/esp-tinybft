@@ -13,15 +13,9 @@
  *  - Partition tree (ptree + stree) for incremental Merkle digest
  *  - Checkpoint log: CheckpointRecord per checkpoint interval
  *  - Fetch protocol: receives Meta_data / Data messages to recover state
+ *
+ * Note: TBFT_MAX_STATE_BLOCKS, TBFT_NUM_CKPT_SLOTS are defined in tbft_config.h
  * -------------------------------------------------------------------------- */
-
-/* Maximum number of state blocks (can be overridden via Kconfig) */
-#ifndef TBFT_MAX_STATE_BLOCKS
-#define TBFT_MAX_STATE_BLOCKS  256
-#endif
-
-/* Maximum number of checkpoint records kept simultaneously */
-#define TBFT_MAX_CKPT_RECORDS  (TBFT_WINDOW_SIZE / TBFT_CHECKPOINT_INTERVAL + 2)
 
 /* One snapshot of a block saved before modification (for CoW) */
 typedef struct {
@@ -61,7 +55,7 @@ typedef struct {
     tbft_digest_t block_digests[TBFT_MAX_STATE_BLOCKS];
 
     /* Checkpoint records */
-    tbft_ckpt_record_t ckpt_records[TBFT_MAX_CKPT_RECORDS];
+    tbft_ckpt_record_t ckpt_records[TBFT_NUM_CKPT_SLOTS];
     int                ckpt_head;   /* index of oldest valid record */
     int                ckpt_count;
 

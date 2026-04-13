@@ -7,7 +7,6 @@
 #include "tbft_special_region.h"
 #include "tbft_view_info.h"
 #include "tbft_prepared_cert.h"
-#include "tbft_log.h"
 
 /* --------------------------------------------------------------------------
  * Replica — the PBFT state machine (section 5 / Replica).
@@ -22,8 +21,7 @@
  *  - Timers
  * -------------------------------------------------------------------------- */
 
-/* Maximum pending requests in the queue */
-#define TBFT_RQUEUE_MAX  64
+/* TBFT_RQUEUE_MAX sourced from Kconfig (default 16) */
 
 /* Simple request queue entry */
 typedef struct {
@@ -70,11 +68,6 @@ typedef struct {
     tbft_rqueue_t rqueue;    /* read-write requests */
     tbft_rqueue_t ro_rqueue; /* read-only requests */
 
-    /* Protocol logs (use static regions in TinyBFT mode) */
-    tbft_plog_t  plog;  /* prepared certificates */
-    tbft_clog_t  clog;  /* commit certificates */
-    tbft_elog_t  elog;  /* checkpoint certificates */
-
     /* Static memory regions (TinyBFT) */
     tbft_agreement_region_t   ar;
     tbft_checkpoint_region_t  cr;
@@ -103,7 +96,7 @@ typedef struct {
     int                   ndet_max_len;
 
     /* Non-deterministic choices buffer */
-    uint8_t  ndet_buf[256];
+    uint8_t  ndet_buf[TBFT_NDET_BUF_SIZE];
 
     /* Outgoing message build buffer */
     uint8_t  out_buf[TBFT_MAX_MESSAGE_SIZE];

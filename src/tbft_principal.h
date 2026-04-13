@@ -38,10 +38,7 @@ typedef struct {
     int64_t         last_auth_time_us;
 } tbft_principal_t;
 
-/* Default anti-replay window in microseconds (30 seconds) */
-#ifndef TBFT_ANTI_REPLAY_WINDOW_US
-#define TBFT_ANTI_REPLAY_WINDOW_US  30000000LL
-#endif
+/* TBFT_ANTI_REPLAY_WINDOW_US is defined in tbft_config.h (sourced from Kconfig) */
 
 /* --------------------------------------------------------------------------
  * Lifecycle

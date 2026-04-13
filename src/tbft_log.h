@@ -18,9 +18,6 @@
  *   tbft_elog_t — CheckpointLog       (checkpoint log)
  * -------------------------------------------------------------------------- */
 
-/* Forward-declare the types to avoid circular includes */
-typedef struct tbft_prepared_cert tbft_prepared_cert_t;
-
 /* --------------------------------------------------------------------------
  * Commit log  (Log<tbft_commit_cert_t>)
  * -------------------------------------------------------------------------- */
