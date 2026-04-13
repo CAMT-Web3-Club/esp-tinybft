@@ -146,7 +146,7 @@ void tbft_state_checkpoint(tbft_state_t *state, tbft_seqno_t seqno)
         const uint8_t *block = state->mem + (size_t)i * TBFT_BLOCK_SIZE;
         tbft_msg_digest(block, TBFT_BLOCK_SIZE, &state->block_digests[i]);
         tbft_ptree_update_leaf(&state->ptree, i, &state->block_digests[i],
-                               (int32_t)seqno);
+                               seqno);
     }
 
     /* Store the checkpoint record */
@@ -183,7 +183,7 @@ tbft_seqno_t tbft_state_rollback(tbft_state_t *state)
                         TBFT_BLOCK_SIZE, &state->block_digests[bidx]);
         tbft_ptree_update_leaf(&state->ptree, bidx,
                                &state->block_digests[bidx],
-                               (int32_t)rec->seqno);
+                               rec->seqno);
     }
 
     cow_zero(state);

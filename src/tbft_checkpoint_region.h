@@ -1,5 +1,6 @@
 #pragma once
 
+#include "tbft_config.h"
 #include "tbft_types.h"
 #include "tbft_message.h"
 #include <stdbool.h>
@@ -23,7 +24,17 @@ typedef struct {
     uint8_t  msgs[TBFT_MAX_NUM_REPLICAS][TBFT_CKPT_MSG_SIZE];
     int      msg_lens[TBFT_MAX_NUM_REPLICAS];
     bool     present[TBFT_MAX_NUM_REPLICAS];
-    int      match_count;       /* how many share the same digest */
+
+    /* Multi-candidate digest tracking.
+     * Tracks up to TBFT_CERT_MAX_VALS distinct digest values independently,
+     * so a Byzantine replica arriving first cannot permanently poison the slot
+     * by setting an incorrect winning_digest. */
+    int           n_candidates;
+    tbft_digest_t cand_digests[TBFT_CERT_MAX_VALS];
+    int           cand_counts[TBFT_CERT_MAX_VALS];
+
+    /* Best-so-far: updated whenever a candidate surpasses the current leader */
+    int           match_count;
     tbft_digest_t winning_digest;
 } tbft_ckpt_slot_t;
 

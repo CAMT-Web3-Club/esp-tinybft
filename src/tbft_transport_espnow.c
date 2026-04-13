@@ -468,13 +468,13 @@ int tbft_transport_send(tbft_transport_t *t, const void *buf, size_t len,
 
     /* Check if fragmentation is needed */
     if (len + sizeof(frag_hdr_t) <= ESPNOW_MAX_DATA_LEN) {
-        /* Single fragment */
+        /* Single fragment — pkt only needs to hold one fragment */
+        uint8_t pkt[sizeof(frag_hdr_t) + ESPNOW_MAX_DATA_LEN];
         frag_hdr_t fhdr;
         fhdr.msg_id    = enow->next_msg_id;
         fhdr.frag_total = 1;
         fhdr.frag_idx  = 0;
 
-        uint8_t pkt[sizeof(frag_hdr_t) + TBFT_MAX_MESSAGE_SIZE];
         memcpy(pkt, &fhdr, sizeof(fhdr));
         memcpy(pkt + sizeof(fhdr), buf, len);
 
@@ -492,6 +492,8 @@ int tbft_transport_send(tbft_transport_t *t, const void *buf, size_t len,
             vTaskDelay(pdMS_TO_TICKS(1));
             retries++;
         }
+
+        enow->next_msg_id++; /* must increment even for single-fragment messages */
         return enow->send_ok ? (int)len : -1;
     }
 

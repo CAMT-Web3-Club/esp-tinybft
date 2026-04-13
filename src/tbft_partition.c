@@ -1,6 +1,7 @@
 #include "tbft_partition.h"
 #include "tbft_message.h"
 #include "esp_log.h"
+#include "psa/crypto.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -77,7 +78,7 @@ void tbft_ptree_free(tbft_ptree_t *tree)
 
 void tbft_ptree_update_leaf(tbft_ptree_t *tree, int block_idx,
                             const tbft_digest_t *block_digest,
-                            int32_t version)
+                            tbft_seqno_t version)
 {
     int levels    = tree->dims.p_levels;
     int pchildren = tree->dims.p_children;
@@ -88,31 +89,38 @@ void tbft_ptree_update_leaf(tbft_ptree_t *tree, int block_idx,
     leaf->digest  = *block_digest;
     leaf->version = version;
 
-    /* Propagate upward by XOR-summing children digests */
+    /* Propagate upward by hashing the concatenation of children's digests.
+     * Using concatenate-then-hash (not XOR-then-hash) is required for
+     * collision resistance: XOR(d1,d2) == XOR(d3,d4) is easily achievable
+     * even if all di are distinct valid digests. */
     int idx = block_idx;
     for (int l = leaf_level; l > 0; l--) {
         int parent_idx = tbft_ptree_parent(idx, pchildren);
 
-        /* Recompute stree[l-1][parent_idx] as XOR of children digests */
-        tbft_dsum_t *dsum = &tree->stree[l - 1][parent_idx];
-        memset(dsum->digest.bytes, 0, TBFT_DIGEST_SIZE);
-
-        int first_child = tbft_ptree_first_child(parent_idx, pchildren);
+        int first_child    = tbft_ptree_first_child(parent_idx, pchildren);
         int num_nodes_at_l = tbft_ptree_nodes_at_level(l, pchildren);
-        for (int c = first_child;
-             c < first_child + pchildren && c < num_nodes_at_l;
-             c++) {
-            const uint8_t *cd = tree->ptree[l][c].digest.bytes;
-            for (int b = 0; b < TBFT_DIGEST_SIZE; b++) {
-                dsum->digest.bytes[b] ^= cd[b];
-            }
-        }
 
-        /* Hash the XOR-sum to get the parent's partition digest */
-        tbft_part_t *parent = &tree->ptree[l - 1][parent_idx];
-        tbft_msg_digest(dsum->digest.bytes, TBFT_DIGEST_SIZE,
-                        &parent->digest);
-        parent->version = version;
+        /* Build parent digest with a multi-part SHA-256 over all child digests */
+        psa_hash_operation_t hash_op;
+        memset(&hash_op, 0, sizeof(hash_op));
+        psa_status_t pst = psa_hash_setup(&hash_op, PSA_ALG_SHA_256);
+        if (pst == PSA_SUCCESS) {
+            for (int c = first_child;
+                 c < first_child + pchildren && c < num_nodes_at_l;
+                 c++) {
+                psa_hash_update(&hash_op,
+                                tree->ptree[l][c].digest.bytes,
+                                TBFT_DIGEST_SIZE);
+            }
+            size_t hash_len = 0;
+            tbft_part_t *parent = &tree->ptree[l - 1][parent_idx];
+            psa_hash_finish(&hash_op, parent->digest.bytes,
+                            TBFT_DIGEST_SIZE, &hash_len);
+            parent->version = version;
+        } else {
+            ESP_LOGE(TAG, "psa_hash_setup failed: %d", (int)pst);
+            psa_hash_abort(&hash_op);
+        }
 
         idx = parent_idx;
     }

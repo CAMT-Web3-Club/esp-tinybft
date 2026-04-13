@@ -211,7 +211,17 @@ static int setup_principals(tbft_node_t *node, const tbft_config_t *cfg,
     for (int i = 0; i < cfg->num_nodes; i++) {
         tbft_principal_t *p =
             (tbft_principal_t *)calloc(1, sizeof(tbft_principal_t));
-        if (!p) return -1;
+        if (!p) {
+            /* Free already-allocated principals to avoid a leak */
+            for (int j = 0; j < i; j++) {
+                if (node->principals[j]) {
+                    tbft_principal_free(node->principals[j]);
+                    free(node->principals[j]);
+                    node->principals[j] = NULL;
+                }
+            }
+            return -1;
+        }
 
         tbft_addr_t addr;
         memset(&addr, 0, sizeof(addr));
@@ -352,8 +362,9 @@ int Byz_send_request(Byz_req *req, bool read_only)
     }
     memcpy(cmd_ptr, req->contents, (size_t)req->size);
 
-    /* Sign */
+    /* Sign (zero the signature field first to avoid sending uninitialized bytes) */
     tbft_sig_t *sig = (tbft_sig_t *)(cmd_ptr + req->size);
+    memset(sig->bytes, 0, sizeof(sig->bytes));
     if (s_client->local_principal && s_client->local_principal->has_priv_key) {
         tbft_node_gen_sig(s_client, out,
                           sizeof(*rep) + (size_t)req->size,
@@ -388,6 +399,37 @@ int Byz_recv_reply(Byz_rep *rep)
         const tbft_msg_hdr_t *hdr = (const tbft_msg_hdr_t *)buf;
         if (hdr->tag != TBFT_MSG_REPLY) continue;
 
+        const tbft_reply_rep_t *r0 = (const tbft_reply_rep_t *)buf;
+        int num_replicas = s_client->num_replicas;
+
+        /* Verify RSA signature on this reply.
+         * The replica appends the sig after hdr.size; total wire = hdr.size + SIG. */
+        {
+            int32_t body_sz = r0->hdr.size;
+            tbft_node_id_t rep_id = -1;
+            /* Infer sender: scan known replica slots (reply has no explicit id field) */
+            /* Try to identify from src_id — not available here, so verify all replicas */
+            bool sig_ok = false;
+            if (n >= (int)(body_sz + (int)sizeof(tbft_sig_t))) {
+                const tbft_sig_t *sig =
+                    (const tbft_sig_t *)((const uint8_t *)buf + body_sz);
+                for (int ri = 0; ri < num_replicas; ri++) {
+                    if (tbft_node_verify_sig(s_client, (tbft_node_id_t)ri,
+                                            buf, (size_t)body_sz, sig)) {
+                        rep_id  = (tbft_node_id_t)ri;
+                        sig_ok  = true;
+                        break;
+                    }
+                }
+            }
+            if (!sig_ok) {
+                ESP_LOGW(TAG, "recv_reply: no valid RSA signature");
+                vTaskDelay(pdMS_TO_TICKS(1));
+                continue;
+            }
+            (void)rep_id;
+        }
+
         /* Store reply */
         for (int i = 0; i < MAX_PENDING_REPLIES; i++) {
             if (!s_replies[i].valid) {
@@ -399,8 +441,9 @@ int Byz_recv_reply(Byz_rep *rep)
             }
         }
 
-        /* Count matching replies (same view, rid, payload digest) */
-        const tbft_reply_rep_t *r0 = (const tbft_reply_rep_t *)buf;
+        /* Count matching replies (same rid + payload digest).
+         * Do NOT filter on view: a replica may have moved to a later view but
+         * still produce a valid reply for our request id. */
         int match = 0;
         const uint8_t *winning_payload = NULL;
         int winning_payload_len = 0;
@@ -411,7 +454,7 @@ int Byz_recv_reply(Byz_rep *rep)
             if (!s_replies[i].valid) continue;
             const tbft_reply_rep_t *ri =
                 (const tbft_reply_rep_t *)s_replies[i].buf;
-            if (ri->view != r0->view || ri->rid != r0->rid) continue;
+            if (ri->rid != r0->rid) continue;
             if (ri->reply_size != r0->reply_size) continue;
 
             const uint8_t *payload = s_replies[i].buf + sizeof(*ri);
@@ -598,7 +641,12 @@ void Byz_modify1(void *mem)
 {
     if (s_replica) {
         uintptr_t base  = (uintptr_t)s_replica->state.mem;
+        uintptr_t end   = base + s_replica->state.mem_size;
         uintptr_t addr  = (uintptr_t)mem;
+        if (addr < base || addr >= end) {
+            ESP_LOGW(TAG, "Byz_modify1: address %p out of state bounds", mem);
+            return;
+        }
         int bindex = (int)((addr - base) / TBFT_BLOCK_SIZE);
         tbft_state_cow_single(&s_replica->state, bindex);
     }

@@ -111,6 +111,7 @@ bool tbft_node_verify_auth(tbft_node_t *node, tbft_node_id_t sender_id,
                            const void *msg, size_t msg_len,
                            const tbft_mac_t *mac, int64_t timestamp_us)
 {
+    if (sender_id < 0 || sender_id >= node->num_principals) return false;
     tbft_principal_t *p = node->principals[sender_id];
     if (!p) return false;
     return tbft_principal_verify_mac_in_with_replay_check(p, msg, msg_len, mac, timestamp_us);
@@ -131,6 +132,7 @@ bool tbft_node_verify_sig(tbft_node_t *node, tbft_node_id_t sender_id,
                           const void *msg, size_t msg_len,
                           const tbft_sig_t *sig)
 {
+    if (sender_id < 0 || sender_id >= node->num_principals) return false;
     tbft_principal_t *p = node->principals[sender_id];
     if (!p) return false;
     return tbft_principal_verify_sig(p, msg, msg_len, sig);

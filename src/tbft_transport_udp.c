@@ -177,7 +177,7 @@ int tbft_transport_send(tbft_transport_t *t, const void *buf, size_t len,
                 };
                 int r = sendto(udp->sock, buf, len, 0,
                                (struct sockaddr *)&addr, sizeof(addr));
-                if (r > 0) sent = r;
+                if (r > 0) sent += r;
             }
             return sent;
         }

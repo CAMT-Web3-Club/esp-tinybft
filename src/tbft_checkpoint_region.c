@@ -31,15 +31,38 @@ bool tbft_cr_store(tbft_checkpoint_region_t *cr,
     slot->msg_lens[replica_id] = msg_len;
     slot->present[replica_id]  = true;
 
-    /* Extract digest from message and check for matches */
+    /* Multi-candidate digest tracking.
+     * Find or register this message's digest among the tracked candidates.
+     * This prevents a Byzantine replica that arrives first from permanently
+     * blocking a legitimate quorum by establishing a wrong winning_digest. */
     const tbft_checkpoint_rep_t *rep = (const tbft_checkpoint_rep_t *)msg;
 
-    if (slot->match_count == 0) {
-        /* First message — set as candidate winning digest */
-        slot->winning_digest = rep->digest;
-        slot->match_count    = 1;
-    } else if (tbft_digest_equal(&slot->winning_digest, &rep->digest)) {
-        slot->match_count++;
+    int ci = -1;
+    for (int i = 0; i < slot->n_candidates; i++) {
+        if (tbft_digest_equal(&slot->cand_digests[i], &rep->digest)) {
+            ci = i;
+            break;
+        }
+    }
+    if (ci < 0) {
+        if (slot->n_candidates < TBFT_CERT_MAX_VALS) {
+            ci = slot->n_candidates++;
+            slot->cand_digests[ci] = rep->digest;
+            slot->cand_counts[ci]  = 0;
+        } else {
+            /* All candidate slots taken by distinct values: skip this one.
+             * With ≥ TBFT_CERT_MAX_VALS distinct digests, no single value
+             * can reach 2f+1 (pigeonhole), so the slot will never become
+             * stable regardless. */
+            return false;
+        }
+    }
+    slot->cand_counts[ci]++;
+
+    /* Keep winning_digest pointing to the candidate with the most votes */
+    if (slot->cand_counts[ci] > slot->match_count) {
+        slot->match_count    = slot->cand_counts[ci];
+        slot->winning_digest = slot->cand_digests[ci];
     }
 
     return slot->match_count >= cr->threshold;

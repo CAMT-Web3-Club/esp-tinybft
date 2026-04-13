@@ -24,8 +24,8 @@
 
 /** One partition node: state digest + checkpoint version */
 typedef struct {
-    tbft_digest_t digest;
-    int32_t       version; /* seqno of last checkpoint that changed this node */
+    tbft_digest_t  digest;
+    tbft_seqno_t   version; /* seqno of last checkpoint that changed this node */
 } tbft_part_t;
 
 /** One digest-sum node: XOR/sum of child digests (for incremental update) */
@@ -103,7 +103,7 @@ void tbft_ptree_free(tbft_ptree_t *tree);
  */
 void tbft_ptree_update_leaf(tbft_ptree_t *tree, int block_idx,
                             const tbft_digest_t *block_digest,
-                            int32_t version);
+                            tbft_seqno_t version);
 
 /**
  * Return the root digest (overall state digest).

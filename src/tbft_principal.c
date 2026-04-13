@@ -1,6 +1,7 @@
 #include "tbft_principal.h"
 #include "esp_log.h"
 #include "esp_random.h"
+#include "esp_timer.h"
 #include "psa/crypto.h"
 #include <string.h>
 
@@ -64,6 +65,8 @@ int tbft_principal_load_priv_key(tbft_principal_t *p,
 
 void tbft_principal_free(tbft_principal_t *p)
 {
+    if (p->psa_hmac_in_id  != 0) { psa_destroy_key(p->psa_hmac_in_id);  }
+    if (p->psa_hmac_out_id != 0) { psa_destroy_key(p->psa_hmac_out_id); }
     mbedtls_pk_free(&p->pub_pk);
     mbedtls_pk_free(&p->priv_pk);
     memset(p, 0, sizeof(*p));
@@ -71,34 +74,51 @@ void tbft_principal_free(tbft_principal_t *p)
 
 /* --------------------------------------------------------------------------
  * HMAC helpers (PSA Crypto — mbedtls/md.h HMAC API is private in 4.x)
+ *
+ * We cache persistent PSA key handles in the principal to avoid the cost of
+ * psa_import_key / psa_destroy_key on every MAC operation (hot path).
+ * Fallback to transient import if the persistent handle is not set.
  * -------------------------------------------------------------------------- */
 
-static psa_status_t hmac_sha256_psa(const tbft_hmac_key_t *key,
-                                     const void *msg, size_t msg_len,
-                                     tbft_mac_t *out)
+/* Import a raw key into PSA and return the key ID; 0 on failure. */
+static psa_key_id_t import_hmac_key(const tbft_hmac_key_t *key,
+                                    psa_key_usage_t usage)
 {
     psa_key_attributes_t attr = PSA_KEY_ATTRIBUTES_INIT;
     psa_set_key_type(&attr, PSA_KEY_TYPE_HMAC);
     psa_set_key_algorithm(&attr, PSA_ALG_HMAC(PSA_ALG_SHA_256));
-    psa_set_key_usage_flags(&attr, PSA_KEY_USAGE_SIGN_MESSAGE);
+    psa_set_key_usage_flags(&attr, usage);
 
-    psa_key_id_t key_id;
-    psa_status_t st = psa_import_key(&attr, key->bytes, sizeof(key->bytes), &key_id);
-    if (st != PSA_SUCCESS) return st;
-
-    size_t mac_len = 0;
-    st = psa_mac_compute(key_id, PSA_ALG_HMAC(PSA_ALG_SHA_256),
-                         (const uint8_t *)msg, msg_len,
-                         out->bytes, TBFT_HMAC_SIZE, &mac_len);
-    psa_destroy_key(key_id);
-    return st;
+    psa_key_id_t kid = 0;
+    psa_status_t st = psa_import_key(&attr, key->bytes, sizeof(key->bytes), &kid);
+    if (st != PSA_SUCCESS) {
+        return 0;
+    }
+    return kid;
 }
 
 int tbft_principal_gen_mac_out(const tbft_principal_t *p,
                                const void *msg, size_t msg_len,
                                tbft_mac_t *mac)
 {
-    psa_status_t st = hmac_sha256_psa(&p->hmac_out_key, msg, msg_len, mac);
+    size_t mac_len = 0;
+
+    if (p->psa_hmac_out_id != 0) {
+        /* Fast path: use cached PSA key */
+        psa_status_t st = psa_mac_compute(
+            p->psa_hmac_out_id, PSA_ALG_HMAC(PSA_ALG_SHA_256),
+            (const uint8_t *)msg, msg_len,
+            mac->bytes, TBFT_HMAC_SIZE, &mac_len);
+        return (st == PSA_SUCCESS) ? 0 : (int)st;
+    }
+
+    /* Slow fallback: import-per-op */
+    psa_key_id_t kid = import_hmac_key(&p->hmac_out_key, PSA_KEY_USAGE_SIGN_MESSAGE);
+    if (kid == 0) return -1;
+    psa_status_t st = psa_mac_compute(kid, PSA_ALG_HMAC(PSA_ALG_SHA_256),
+                                      (const uint8_t *)msg, msg_len,
+                                      mac->bytes, TBFT_HMAC_SIZE, &mac_len);
+    psa_destroy_key(kid);
     return (st == PSA_SUCCESS) ? 0 : (int)st;
 }
 
@@ -106,15 +126,21 @@ bool tbft_principal_verify_mac_in(const tbft_principal_t *p,
                                   const void *msg, size_t msg_len,
                                   const tbft_mac_t *mac)
 {
-    tbft_mac_t expected;
-    if (hmac_sha256_psa(&p->hmac_in_key, msg, msg_len, &expected) != PSA_SUCCESS) {
-        return false;
+    if (p->psa_hmac_in_id != 0) {
+        /* Fast path: psa_mac_verify handles timing-safe comparison internally */
+        return psa_mac_verify(p->psa_hmac_in_id, PSA_ALG_HMAC(PSA_ALG_SHA_256),
+                              (const uint8_t *)msg, msg_len,
+                              mac->bytes, TBFT_HMAC_SIZE) == PSA_SUCCESS;
     }
-    uint8_t diff = 0;
-    for (int i = 0; i < TBFT_HMAC_SIZE; i++) {
-        diff |= expected.bytes[i] ^ mac->bytes[i];
-    }
-    return diff == 0;
+
+    /* Slow fallback: import-per-op then constant-time compare */
+    psa_key_id_t kid = import_hmac_key(&p->hmac_in_key, PSA_KEY_USAGE_VERIFY_MESSAGE);
+    if (kid == 0) return false;
+    psa_status_t st = psa_mac_verify(kid, PSA_ALG_HMAC(PSA_ALG_SHA_256),
+                                     (const uint8_t *)msg, msg_len,
+                                     mac->bytes, TBFT_HMAC_SIZE);
+    psa_destroy_key(kid);
+    return st == PSA_SUCCESS;
 }
 
 bool tbft_principal_verify_mac_in_with_replay_check(tbft_principal_t *p,
@@ -126,10 +152,22 @@ bool tbft_principal_verify_mac_in_with_replay_check(tbft_principal_t *p,
         return false;
     }
     if (msg_time_us <= 0) {
-        return true;
+        return true; /* no timestamp — skip replay check */
     }
-    if (p->last_auth_time_us > 0 &&
-        msg_time_us <= p->last_auth_time_us) {
+
+    /* Reject messages outside the anti-replay window */
+    if (TBFT_ANTI_REPLAY_WINDOW_US > 0) {
+        int64_t now_us = esp_timer_get_time();
+        if (now_us - msg_time_us > TBFT_ANTI_REPLAY_WINDOW_US) {
+            ESP_LOGW(TAG, "anti-replay: message too old (age=%lld us, window=%lld us)",
+                     (long long)(now_us - msg_time_us),
+                     (long long)TBFT_ANTI_REPLAY_WINDOW_US);
+            return false;
+        }
+    }
+
+    /* Reject replays: timestamp must be strictly newer than the last accepted */
+    if (p->last_auth_time_us > 0 && msg_time_us <= p->last_auth_time_us) {
         return false;
     }
     p->last_auth_time_us = msg_time_us;
@@ -138,13 +176,24 @@ bool tbft_principal_verify_mac_in_with_replay_check(tbft_principal_t *p,
 
 void tbft_principal_set_in_key(tbft_principal_t *p, const tbft_hmac_key_t *key)
 {
+    /* Destroy old PSA key before replacing */
+    if (p->psa_hmac_in_id != 0) {
+        psa_destroy_key(p->psa_hmac_in_id);
+        p->psa_hmac_in_id = 0;
+    }
     p->hmac_in_key = *key;
+    p->psa_hmac_in_id = import_hmac_key(key, PSA_KEY_USAGE_VERIFY_MESSAGE);
     p->keys_fresh  = true;
 }
 
 void tbft_principal_set_out_key(tbft_principal_t *p, const tbft_hmac_key_t *key)
 {
+    if (p->psa_hmac_out_id != 0) {
+        psa_destroy_key(p->psa_hmac_out_id);
+        p->psa_hmac_out_id = 0;
+    }
     p->hmac_out_key = *key;
+    p->psa_hmac_out_id = import_hmac_key(key, PSA_KEY_USAGE_SIGN_MESSAGE);
 }
 
 /* --------------------------------------------------------------------------
@@ -204,8 +253,11 @@ bool tbft_principal_verify_sig(const tbft_principal_t *p,
 /* --------------------------------------------------------------------------
  * Session key rotation
  * mbedtls_pk_encrypt / mbedtls_pk_decrypt removed in MbedTLS 4.x.
- * We import the pk context into a transient PSA key for PKCS#1 v1.5.
+ * We import the pk context into a transient PSA key.
+ * OAEP with SHA-256 is used (PKCS#1 v1.5 encryption is not CCA-secure).
  * -------------------------------------------------------------------------- */
+
+#define TBFT_KEY_WRAP_ALG  PSA_ALG_RSA_OAEP(PSA_ALG_SHA_256)
 
 int tbft_principal_encrypt_new_key(tbft_principal_t *p,
                                    const tbft_hmac_key_t *new_out_key,
@@ -214,7 +266,7 @@ int tbft_principal_encrypt_new_key(tbft_principal_t *p,
 {
     psa_key_attributes_t attr = PSA_KEY_ATTRIBUTES_INIT;
     psa_set_key_type(&attr, PSA_KEY_TYPE_RSA_PUBLIC_KEY);
-    psa_set_key_algorithm(&attr, PSA_ALG_RSA_PKCS1V15_CRYPT);
+    psa_set_key_algorithm(&attr, TBFT_KEY_WRAP_ALG);
     psa_set_key_usage_flags(&attr, PSA_KEY_USAGE_ENCRYPT);
 
     mbedtls_svc_key_id_t key_id;
@@ -224,7 +276,7 @@ int tbft_principal_encrypt_new_key(tbft_principal_t *p,
         return rc;
     }
 
-    psa_status_t st = psa_asymmetric_encrypt(key_id, PSA_ALG_RSA_PKCS1V15_CRYPT,
+    psa_status_t st = psa_asymmetric_encrypt(key_id, TBFT_KEY_WRAP_ALG,
                                              new_out_key->bytes, sizeof(new_out_key->bytes),
                                              NULL, 0,
                                              enc_buf, enc_buf_len, out_enc_len);
@@ -245,7 +297,7 @@ int tbft_principal_decrypt_new_key(tbft_principal_t *p,
 
     psa_key_attributes_t attr = PSA_KEY_ATTRIBUTES_INIT;
     psa_set_key_type(&attr, PSA_KEY_TYPE_RSA_KEY_PAIR);
-    psa_set_key_algorithm(&attr, PSA_ALG_RSA_PKCS1V15_CRYPT);
+    psa_set_key_algorithm(&attr, TBFT_KEY_WRAP_ALG);
     psa_set_key_usage_flags(&attr, PSA_KEY_USAGE_DECRYPT);
 
     mbedtls_svc_key_id_t key_id;
@@ -256,7 +308,7 @@ int tbft_principal_decrypt_new_key(tbft_principal_t *p,
     }
 
     size_t out_len = 0;
-    psa_status_t st = psa_asymmetric_decrypt(key_id, PSA_ALG_RSA_PKCS1V15_CRYPT,
+    psa_status_t st = psa_asymmetric_decrypt(key_id, TBFT_KEY_WRAP_ALG,
                                              enc_buf, enc_len,
                                              NULL, 0,
                                              new_in_key->bytes, sizeof(new_in_key->bytes),

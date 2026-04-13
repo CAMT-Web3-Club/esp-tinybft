@@ -285,6 +285,27 @@ void tbft_replica_handle_pre_prepare(tbft_replica_t *r, const void *msg, int len
         return;
     }
 
+    /* Verify authenticator from the primary */
+    int auth_offset = (int)(sizeof(*pp) + pp->rset_size + pp->non_det_size);
+    if (len < auth_offset + (int)sizeof(tbft_auth_t)) {
+        ESP_LOGW(TAG, "pp: missing authenticator");
+        return;
+    }
+    {
+        int slot = tbft_node_auth_slot_index(&r->node, expected_primary);
+        if (slot < 0) return;
+        const tbft_auth_t *auth =
+            (const tbft_auth_t *)((const uint8_t *)msg + auth_offset);
+        if (!tbft_node_verify_auth(&r->node, expected_primary, msg,
+                                   (size_t)auth_offset,
+                                   &auth->slots[slot],
+                                   pp->hdr.timestamp_us)) {
+            ESP_LOGW(TAG, "pp: MAC verification failed from primary %d",
+                     expected_primary);
+            return;
+        }
+    }
+
     /* Verify request set digest */
     if (pp->rset_size > 0) {
         const uint8_t *req_set = (const uint8_t *)msg + sizeof(*pp);
@@ -392,16 +413,12 @@ void tbft_replica_handle_checkpoint(tbft_replica_t *r, const void *msg, int len)
     if (len < (int)sizeof(tbft_checkpoint_rep_t) + (int)sizeof(tbft_auth_t)) return;
     const tbft_checkpoint_rep_t *ckpt = (const tbft_checkpoint_rep_t *)msg;
 
+    /* Never trust ckpt->id from the wire as proof of identity.
+     * Our own checkpoint is stored directly in execute_committed at send time,
+     * so any network message claiming to be from us is ignored here. */
     tbft_node_id_t sender = ckpt->id;
-    if (sender == r->node.node_id) {
-        bool stable = tbft_cr_store(&r->cr, ckpt->seqno, sender, msg, len);
-        if (stable) {
-            ESP_LOGI(TAG, "stable checkpoint at seqno=%lld",
-                     (long long)ckpt->seqno);
-            tbft_replica_mark_stable(r, ckpt->seqno);
-        }
-        return;
-    }
+    if (sender < 0 || sender >= r->node.num_replicas) return;
+    if (sender == r->node.node_id) return; /* already stored at send time */
 
     int slot = tbft_node_auth_slot_index(&r->node, sender);
     if (slot < 0) return;
@@ -432,7 +449,26 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
     if (len < (int)sizeof(tbft_view_change_rep_t)) return;
     const tbft_view_change_rep_t *vc = (const tbft_view_change_rep_t *)msg;
 
-    if (!tbft_vi_collect_vc(&r->vi, vc->id, msg, len)) return;
+    /* Validate sender id before using it */
+    tbft_node_id_t sender_id = (tbft_node_id_t)vc->id;
+    if (sender_id < 0 || sender_id >= r->node.num_replicas) return;
+
+    /* Verify RSA signature.  hdr.size is the body length (without the sig).
+     * The sender appends the sig after the body but does not include it in
+     * hdr.size, so the total wire size is hdr.size + TBFT_SIG_SIZE. */
+    int32_t body_size = vc->hdr.size;
+    if (len < (int)(body_size + (int)sizeof(tbft_sig_t))) {
+        ESP_LOGW(TAG, "view-change: missing RSA signature from %d", sender_id);
+        return;
+    }
+    const tbft_sig_t *sig = (const tbft_sig_t *)((const uint8_t *)msg + body_size);
+    if (!tbft_node_verify_sig(&r->node, sender_id, msg, (size_t)body_size, sig)) {
+        ESP_LOGW(TAG, "view-change: RSA signature verification failed from %d",
+                 sender_id);
+        return;
+    }
+
+    if (!tbft_vi_collect_vc(&r->vi, sender_id, msg, len)) return;
 
     /* If we are the new primary and have enough view-changes, send new-view */
     int new_primary = tbft_node_primary(&r->node, vc->v);
@@ -557,7 +593,7 @@ void tbft_replica_handle_fetch(tbft_replica_t *r, const void *msg, int len)
         int cidx = first_child + c;
         if (level + 1 < r->state.ptree.dims.p_levels) {
             parts[c].digest  = r->state.ptree.ptree[level + 1][cidx].digest;
-            parts[c].version = r->state.ptree.ptree[level + 1][cidx].version;
+            parts[c].version = (int32_t)r->state.ptree.ptree[level + 1][cidx].version;
         } else {
             tbft_digest_zero(&parts[c].digest);
             parts[c].version = 0;
@@ -745,9 +781,11 @@ void tbft_replica_send_commit(tbft_replica_t *r, tbft_seqno_t n)
 
 void tbft_replica_execute_committed(tbft_replica_t *r)
 {
-    /* Execute in sequence-number order */
+    /* Execute in sequence-number order.
+     * Loop bound: <= last_prepared (not +1) to avoid executing a slot that
+     * has not yet been prepared. */
     for (tbft_seqno_t n = r->last_executed + 1;
-         n <= r->last_prepared + 1;
+         n <= r->last_prepared;
          n++) {
         if (!tbft_ar_committed(&r->ar, n)) break;
 
@@ -763,28 +801,30 @@ void tbft_replica_execute_committed(tbft_replica_t *r)
         int ndet_len  = pp->non_det_size;
         const uint8_t *ndet = req_bytes + req_len;
 
-        /* Notify application to CoW before execution */
-        /* (Application calls Byz_modify before writing state) */
-
         /* Execute */
         if (r->exec_cb && req_len >= (int)sizeof(tbft_request_rep_t)) {
             const tbft_request_rep_t *req_rep =
                 (const tbft_request_rep_t *)req_bytes;
 
-            uint8_t rep_buf[TBFT_MAX_REPLY_SIZE];
-            int     rep_len = 0;
-            bool    ro = (req_rep->hdr.extra & 0x1) != 0;
+            /* Use r->out_buf for reply; max reply payload fits inside */
+            tbft_reply_rep_t *reply = (tbft_reply_rep_t *)r->out_buf;
+            uint8_t *rep_payload    = r->out_buf + sizeof(*reply);
+            int      rep_len        = 0;
+            bool     ro = (req_rep->hdr.extra & 0x1) != 0;
+
+            /* Ensure enough room: hdr + payload + sig */
+            if (sizeof(*reply) + TBFT_MAX_REPLY_SIZE + TBFT_SIG_SIZE
+                    > sizeof(r->out_buf)) {
+                ESP_LOGE(TAG, "out_buf too small for reply");
+                break;
+            }
 
             int rc = r->exec_cb(req_bytes, req_len,
-                                rep_buf, &rep_len,
+                                rep_payload, &rep_len,
                                 (void *)ndet, ndet_len,
                                 req_rep->cid, ro);
 
             if (rc == 0) {
-                /* Build and send Reply */
-                uint8_t out[sizeof(tbft_reply_rep_t) + TBFT_MAX_REPLY_SIZE
-                            + TBFT_SIG_SIZE];
-                tbft_reply_rep_t *reply = (tbft_reply_rep_t *)out;
                 reply->hdr.tag    = TBFT_MSG_REPLY;
                 reply->hdr.extra  = 0;
                 reply->view       = r->node.view;
@@ -792,15 +832,25 @@ void tbft_replica_execute_committed(tbft_replica_t *r)
                 reply->cid        = req_rep->cid;
                 reply->rid        = req_rep->rid;
                 reply->reply_size = rep_len;
-                memcpy(out + sizeof(*reply), rep_buf, (size_t)rep_len);
 
-                int32_t total = (int32_t)(sizeof(*reply) + (size_t)rep_len);
-                reply->hdr.size = tbft_msg_align(total);
+                int32_t body_sz = (int32_t)(sizeof(*reply) + (size_t)rep_len);
+                reply->hdr.size = tbft_msg_align(body_sz);
+
+                /* Sign the reply so the client can verify authenticity */
+                tbft_sig_t *sig = (tbft_sig_t *)(r->out_buf + reply->hdr.size);
+                int32_t total = reply->hdr.size;
+                if (reply->hdr.size + (int32_t)sizeof(tbft_sig_t)
+                        <= (int32_t)sizeof(r->out_buf)) {
+                    if (tbft_node_gen_sig(&r->node, r->out_buf,
+                                          (size_t)reply->hdr.size, sig) == 0) {
+                        total = reply->hdr.size + (int32_t)sizeof(tbft_sig_t);
+                    }
+                }
 
                 if (r->recv_reply_cb) {
-                    r->recv_reply_cb(out, reply->hdr.size, req_rep->cid);
+                    r->recv_reply_cb(r->out_buf, total, req_rep->cid);
                 }
-                tbft_node_send(&r->node, out, (size_t)reply->hdr.size,
+                tbft_node_send(&r->node, r->out_buf, (size_t)total,
                                req_rep->cid);
             }
         }
@@ -826,8 +876,19 @@ void tbft_replica_execute_committed(tbft_replica_t *r)
                                sizeof(*ckpt), auth);
             ckpt->hdr.size = tbft_msg_align(
                 (int32_t)(sizeof(*ckpt) + sizeof(tbft_auth_t)));
+
+            /* Store our own checkpoint NOW, before broadcast.
+             * This prevents a spoofed message with id==node_id from
+             * bypassing auth in handle_checkpoint (which ignores self). */
+            bool self_stable = tbft_cr_store(&r->cr, n, r->node.node_id,
+                                             r->out_buf, ckpt->hdr.size);
+
             tbft_node_send(&r->node, r->out_buf,
                            (size_t)ckpt->hdr.size, TBFT_ALL_REPLICAS);
+
+            if (self_stable) {
+                tbft_replica_mark_stable(r, n);
+            }
 
             ESP_LOGI(TAG, "broadcast checkpoint at seqno=%lld",
                      (long long)n);
@@ -898,13 +959,28 @@ void tbft_replica_send_view_change(tbft_replica_t *r)
 
     vc->hdr.size = tbft_msg_align((int32_t)(ptr - r->out_buf));
 
-    tbft_node_send(&r->node, r->out_buf, (size_t)vc->hdr.size,
-                   TBFT_ALL_REPLICAS);
+    /* Append RSA signature over the body (hdr.size bytes).
+     * The body length is stored in hdr.size; the signature follows but is
+     * NOT included in hdr.size so receivers can locate it as msg + hdr.size. */
+    int32_t body_size  = vc->hdr.size;
+    int32_t total_size = body_size + (int32_t)sizeof(tbft_sig_t);
+    tbft_sig_t *sig = (tbft_sig_t *)(r->out_buf + body_size);
+    if (total_size <= (int32_t)sizeof(r->out_buf)) {
+        if (tbft_node_gen_sig(&r->node, r->out_buf, (size_t)body_size, sig) != 0) {
+            ESP_LOGW(TAG, "send_view_change: failed to sign message");
+            total_size = body_size; /* send unsigned if signing fails */
+        }
+    } else {
+        ESP_LOGW(TAG, "send_view_change: out_buf too small for signature");
+        total_size = body_size;
+    }
+
+    tbft_node_send(&r->node, r->out_buf, (size_t)total_size, TBFT_ALL_REPLICAS);
 
     ESP_LOGI(TAG, "sent view-change to view %lld", (long long)new_view);
 
-    /* Collect our own view-change */
-    tbft_vi_collect_vc(&r->vi, r->node.node_id, r->out_buf, vc->hdr.size);
+    /* Collect our own view-change (pass full wire length including sig) */
+    tbft_vi_collect_vc(&r->vi, r->node.node_id, r->out_buf, total_size);
 
     /* Start view-change retransmit timer */
     tbft_itimer_start(&r->vtimer, r->vtimer_period_us * 2);

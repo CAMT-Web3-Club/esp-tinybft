@@ -1,8 +1,10 @@
 #pragma once
 
 #include "tbft_types.h"
+#include "tbft_config.h"
 #include "tbft_message.h"
 #include "mbedtls/pk.h"
+#include "psa/crypto.h"
 #include <stdbool.h>
 
 /* --------------------------------------------------------------------------
@@ -29,10 +31,14 @@ typedef struct {
     mbedtls_pk_context  priv_pk;
     bool                has_priv_key;
 
-    /* HMAC session keys */
+    /* HMAC session keys (plaintext copy kept for re-import if needed) */
     tbft_hmac_key_t hmac_in_key;   /* verify MACs from this principal */
     tbft_hmac_key_t hmac_out_key;  /* generate MACs for this principal */
     bool            keys_fresh;    /* true if keys have been exchanged */
+
+    /* Persistent PSA key handles — avoid import/destroy on every MAC op */
+    psa_key_id_t    psa_hmac_in_id;  /* VERIFY_MESSAGE key; 0 = not loaded */
+    psa_key_id_t    psa_hmac_out_id; /* SIGN_MESSAGE key; 0 = not loaded */
 
     /* Monotonic timestamp of last successful MAC verification (anti-replay) */
     int64_t         last_auth_time_us;
