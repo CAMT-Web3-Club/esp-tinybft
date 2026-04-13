@@ -148,29 +148,39 @@ bool tbft_principal_verify_mac_in_with_replay_check(tbft_principal_t *p,
                                                      const tbft_mac_t *mac,
                                                      int64_t msg_time_us)
 {
+    (void)msg_time_us;  /* sender's clock is not trusted for replay detection */
+
     if (!tbft_principal_verify_mac_in(p, msg, msg_len, mac)) {
         return false;
     }
-    if (msg_time_us <= 0) {
-        return true; /* no timestamp — skip replay check */
-    }
 
-    /* Reject messages outside the anti-replay window */
     if (TBFT_ANTI_REPLAY_WINDOW_US > 0) {
         int64_t now_us = esp_timer_get_time();
-        if (now_us - msg_time_us > TBFT_ANTI_REPLAY_WINDOW_US) {
-            ESP_LOGW(TAG, "anti-replay: message too old (age=%lld us, window=%lld us)",
-                     (long long)(now_us - msg_time_us),
-                     (long long)TBFT_ANTI_REPLAY_WINDOW_US);
-            return false;
-        }
-    }
 
-    /* Reject replays: timestamp must be strictly newer than the last accepted */
-    if (p->last_auth_time_us > 0 && msg_time_us <= p->last_auth_time_us) {
-        return false;
+        /* Reject replays: time since last accepted auth must be strictly
+         * increasing.  Uses the RECEIVER's monotonic clock, not the sender's
+         * embedded timestamp, so it works correctly when boards boot at
+         * different times or have unsynchronised clocks. */
+        if (p->last_auth_time_us > 0) {
+            int64_t elapsed = now_us - p->last_auth_time_us;
+            if (elapsed <= 0) {
+                ESP_LOGW(TAG, "anti-replay: message arrived too soon "
+                         "(elapsed=%lld us, window=%lld us)",
+                         (long long)elapsed,
+                         (long long)TBFT_ANTI_REPLAY_WINDOW_US);
+                return false;
+            }
+            if (elapsed > TBFT_ANTI_REPLAY_WINDOW_US) {
+                ESP_LOGW(TAG, "anti-replay: gap too large — possible replay "
+                         "(elapsed=%lld us, window=%lld us)",
+                         (long long)elapsed,
+                         (long long)TBFT_ANTI_REPLAY_WINDOW_US);
+                return false;
+            }
+        }
+
+        p->last_auth_time_us = now_us;
     }
-    p->last_auth_time_us = msg_time_us;
     return true;
 }
 

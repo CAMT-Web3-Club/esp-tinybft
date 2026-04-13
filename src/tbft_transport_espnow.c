@@ -104,10 +104,6 @@ typedef struct tbft_espnow {
 
     /* Mutex for concurrent access */
     SemaphoreHandle_t lock;
-
-    /* Send status — updated by ESP-NOW send callback */
-    volatile bool send_done;
-    volatile bool send_ok;
 } tbft_espnow_t;
 
 /* Global pointer for ESP-NOW callbacks (single transport instance) */
@@ -242,16 +238,6 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info,
     xSemaphoreGive(enow->lock);
 }
 
-static void espnow_send_cb(const esp_now_send_info_t *tx_info,
-                            esp_now_send_status_t status)
-{
-    (void)tx_info;
-    if (g_espnow_ctx) {
-        g_espnow_ctx->send_done = true;
-        g_espnow_ctx->send_ok = (status == ESP_NOW_SEND_SUCCESS);
-    }
-}
-
 /* --------------------------------------------------------------------------
  * Find node index from MAC address
  * -------------------------------------------------------------------------- */
@@ -303,12 +289,8 @@ int tbft_transport_create(tbft_transport_t **out,
         return -1;
     }
 
-    /* Register global context (only one ESP-NOW transport at a time) */
-    g_espnow_ctx = enow;
-
-    /* Register ESP-NOW callbacks */
+    /* Register ESP-NOW receive callback */
     esp_now_register_recv_cb(espnow_recv_cb);
-    esp_now_register_send_cb(espnow_send_cb);
 
     *out = (tbft_transport_t *)enow;
     ESP_LOGI(TAG, "ESP-NOW transport init: max_frag=%d, max_parts=%d",
@@ -326,9 +308,6 @@ void tbft_transport_free(tbft_transport_t *t)
     }
     if (enow->lock) {
         vSemaphoreDelete(enow->lock);
-    }
-    if (g_espnow_ctx == enow) {
-        g_espnow_ctx = NULL;
     }
     free(enow);
 }
@@ -391,18 +370,11 @@ int tbft_transport_send(tbft_transport_t *t, const void *buf, size_t len,
                 memcpy(pkt, &fhdr, sizeof(fhdr));
                 memcpy(pkt + sizeof(fhdr), buf, len);
 
-                enow->send_done = false;
-                enow->send_ok = false;
-
                 esp_err_t err = esp_now_send(peer_mac, pkt,
                                              (size_t)len + sizeof(fhdr));
                 if (err == ESP_OK) {
-                    int retries = 0;
-                    while (!enow->send_done && retries < 100) {
-                        vTaskDelay(pdMS_TO_TICKS(1));
-                        retries++;
-                    }
-                    if (enow->send_ok) sent = (int)len;
+                    sent = (int)len;
+                    vTaskDelay(pdMS_TO_TICKS(5)); /* yield to WiFi/IDLE tasks */
                 } else {
                     ESP_LOGE(TAG, "esp_now_send to peer %d failed: %d", i, err);
                 }
@@ -429,9 +401,6 @@ int tbft_transport_send(tbft_transport_t *t, const void *buf, size_t len,
                     memcpy(pkt, &fhdr, sizeof(fhdr));
                     memcpy(pkt + sizeof(fhdr), src, chunk);
 
-                    enow->send_done = false;
-                    enow->send_ok = false;
-
                     esp_err_t err = esp_now_send(peer_mac, pkt,
                                                  chunk + sizeof(fhdr));
                     if (err != ESP_OK) {
@@ -441,17 +410,7 @@ int tbft_transport_send(tbft_transport_t *t, const void *buf, size_t len,
                         break;
                     }
 
-                    int retries = 0;
-                    while (!enow->send_done && retries < 100) {
-                        vTaskDelay(pdMS_TO_TICKS(1));
-                        retries++;
-                    }
-                    if (!enow->send_ok) {
-                        ESP_LOGE(TAG, "esp_now_send bcast frag %d/%d to %d cb fail",
-                                 frag_idx, frag_total, i);
-                        peer_ok = false;
-                        break;
-                    }
+                    vTaskDelay(pdMS_TO_TICKS(5)); /* yield to WiFi/IDLE tasks */
 
                     src += chunk;
                     remaining -= chunk;
@@ -483,23 +442,15 @@ int tbft_transport_send(tbft_transport_t *t, const void *buf, size_t len,
         memcpy(pkt, &fhdr, sizeof(fhdr));
         memcpy(pkt + sizeof(fhdr), buf, len);
 
-        enow->send_done = false;
-        enow->send_ok = false;
-
         esp_err_t err = esp_now_send(peer_mac, pkt, len + sizeof(fhdr));
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "esp_now_send failed: %d", err);
             return -1;
         }
 
-        int retries = 0;
-        while (!enow->send_done && retries < 100) {
-            vTaskDelay(pdMS_TO_TICKS(1));
-            retries++;
-        }
-
-        enow->next_msg_id++; /* must increment even for single-fragment messages */
-        return enow->send_ok ? (int)len : -1;
+        enow->next_msg_id++;
+        vTaskDelay(pdMS_TO_TICKS(5)); /* yield to WiFi/IDLE tasks */
+        return (int)len;
     }
 
     /* Multi-fragment send */
@@ -521,9 +472,6 @@ int tbft_transport_send(tbft_transport_t *t, const void *buf, size_t len,
         memcpy(pkt, &fhdr, sizeof(fhdr));
         memcpy(pkt + sizeof(fhdr), src, chunk);
 
-        enow->send_done = false;
-        enow->send_ok = false;
-
         esp_err_t err = esp_now_send(peer_mac, pkt, chunk + sizeof(fhdr));
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "esp_now_send frag %d/%d failed: %d",
@@ -531,16 +479,7 @@ int tbft_transport_send(tbft_transport_t *t, const void *buf, size_t len,
             return -1;
         }
 
-        int retries = 0;
-        while (!enow->send_done && retries < 100) {
-            vTaskDelay(pdMS_TO_TICKS(1));
-            retries++;
-        }
-        if (!enow->send_ok) {
-            ESP_LOGE(TAG, "esp_now_send frag %d/%d failed (callback)",
-                     frag_idx, frag_total);
-            return -1;
-        }
+        vTaskDelay(pdMS_TO_TICKS(5)); /* yield to WiFi/IDLE tasks */
 
         src += chunk;
         remaining -= chunk;
@@ -557,10 +496,12 @@ int tbft_transport_recv(tbft_transport_t *t, void *buf, size_t buf_len,
     tbft_espnow_t *enow = (tbft_espnow_t *)t;
     if (!enow) return -1;
 
-    /* Check queue for a fully reassembled message */
+    /* Block until a message arrives or timeout expires.
+     * Using a timeout (instead of polling) lets the WiFi task and IDLE task
+     * get CPU time, preventing task watchdog triggers. */
     uint8_t q_entry[6 + 4 + TBFT_MAX_MESSAGE_SIZE];
-    if (xQueueReceive(enow->msg_queue, q_entry, 0) != pdTRUE) {
-        return 0;  /* nothing available */
+    if (xQueueReceive(enow->msg_queue, q_entry, pdMS_TO_TICKS(50)) != pdTRUE) {
+        return 0;  /* timeout — nothing available */
     }
 
     const uint8_t *src_mac = q_entry;

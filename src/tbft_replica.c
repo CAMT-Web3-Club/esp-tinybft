@@ -2,6 +2,7 @@
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_timer.h"
+#include "esp_task_wdt.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <string.h>
@@ -172,17 +173,36 @@ void tbft_replica_run(tbft_replica_t *r)
      * messages which arrive during the normal event loop below. */
     tbft_replica_send_new_key(r);
 
+    /* Subscribe this task to the task watchdog so we can periodically feed it.
+     * The default timeout is CONFIG_ESP_TASK_WDT_TIMEOUT_S (typically 5s). */
+#if CONFIG_ESP_TASK_WDT_EN
+    esp_err_t err = esp_task_wdt_add(NULL);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "failed to subscribe to task WDT: %d", err);
+    }
+#endif
+
     while (r->running) {
+#if CONFIG_ESP_TASK_WDT_EN
+        esp_task_wdt_reset();
+#endif
+
         tbft_node_id_t src_id = -1;
         int n = tbft_node_recv(&r->node, r->node.recv_buf, &src_id);
         if (n < (int)sizeof(tbft_msg_hdr_t)) {
-            vTaskDelay(pdMS_TO_TICKS(1));
+            /* No message available — sleep long enough to guarantee
+             * the IDLE task gets CPU time (prevents task WDT on single-core). */
+            vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
 
         const tbft_msg_hdr_t *hdr = (const tbft_msg_hdr_t *)r->node.recv_buf;
         if (n < hdr->size) {
             ESP_LOGW(TAG, "truncated message: got %d, expected %d", n, hdr->size);
+            continue;
+        }
+        if (hdr->size > (int32_t)TBFT_MAX_MESSAGE_SIZE || hdr->size <= 0) {
+            ESP_LOGW(TAG, "invalid hdr->size=%d (n=%d)", (int)hdr->size, n);
             continue;
         }
 
@@ -224,6 +244,10 @@ void tbft_replica_run(tbft_replica_t *r)
             ESP_LOGD(TAG, "unknown message tag %d", hdr->tag);
             break;
         }
+
+        /* Yield after every message to let the WiFi task, lwIP, and
+         * the IDLE task get CPU time on single-core MCUs. */
+        vTaskDelay(pdMS_TO_TICKS(1));
     }
 }
 
@@ -291,6 +315,21 @@ void tbft_replica_handle_pre_prepare(tbft_replica_t *r, const void *msg, int len
     /* Check sequence number is in window */
     if (!tbft_replica_in_window(r, pp->seqno)) {
         ESP_LOGD(TAG, "pp seqno %lld out of window", (long long)pp->seqno);
+        return;
+    }
+
+    /* Validate embedded sizes to prevent integer overflow in auth_offset.
+     * rset_size and non_det_size must be non-negative and their sum must
+     * leave room for the struct header, authenticator, and fit within the
+     * received message length. */
+    if (pp->rset_size < 0 || pp->non_det_size < 0) {
+        ESP_LOGW(TAG, "pp: negative embedded size rset=%d ndet=%d",
+                 (int)pp->rset_size, (int)pp->non_det_size);
+        return;
+    }
+    if ((int64_t)sizeof(*pp) + pp->rset_size + pp->non_det_size +
+        (int64_t)sizeof(tbft_auth_t) > len) {
+        ESP_LOGW(TAG, "pp: embedded sizes exceed message length");
         return;
     }
 
