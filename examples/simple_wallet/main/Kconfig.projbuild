@@ -15,21 +15,25 @@ menu "Simple Wallet Example Configuration"
     config EXAMPLE_NODE_ID
         int "Node ID (replica only)"
         default 0
-        range 0 3
+        range 0 31
         depends on EXAMPLE_ROLE_REPLICA
         help
-            Which replica slot this node occupies (0–3 for a 4-node cluster).
-            Selects the matching private key file (privN.der).
+            Which replica slot this node occupies. Must be less than
+            TBFT_MAX_NUM_REPLICAS (TinyBFT Configuration menu).
+            Selects the matching private key file (privN.der) generated
+            by gen_configs.sh.
 
     config EXAMPLE_WIFI_SSID
-        string "WiFi SSID (UDP transport only)"
+        string "WiFi SSID"
         default "myssid"
+        depends on TBFT_TRANSPORT_UDP
         help
             SSID of the AP to connect to when using UDP transport.
 
     config EXAMPLE_WIFI_PASSWORD
-        string "WiFi Password (UDP transport only)"
+        string "WiFi Password"
         default "mypassword"
+        depends on TBFT_TRANSPORT_UDP
         help
             Password of the AP. Leave empty for open networks.
 
