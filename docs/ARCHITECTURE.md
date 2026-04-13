@@ -821,75 +821,74 @@ Inline accessors: `tbft_msg_tag(m)`, `tbft_msg_size(m)`, `tbft_msg_set_hdr(m, ta
 
 ### 11.1 Normal Case (no faults)
 
-```
-Client                Primary                 Replica B               Replica C
-  |                     |                        |                      |
-  |--- Request ------->|                        |                      |
-  |   (RSA-signed)      |                        |                      |
-  |                     |--- Pre-prepare ------>|                      |
-  |                     |   (view, seqno, digest)|                      |
-  |                     |--- Pre-prepare ------->|--------------------->|
-  |                     |                        |                      |
-  |                     |<-- Prepare ----------- |                      |
-  |                     |--- Prepare ----------->|<--- Prepare -------->|
-  |                     |<-- Prepare ---------- |<--- Prepare -------->|
-  |                     |                        |                      |
-  |                     |  [2f prepares match]   |                      |
-  |                     |                        |                      |
-  |                     |--- Commit ----------->|                      |
-  |                     |--- Commit ------------|--------------------->|
-  |                     |<-- Commit ----------- |                      |
-  |                     |<-- Commit ----------- |<--- Commit --------->|
-  |                     |                        |                      |
-  |                     |  [2f+1 commits match]  |                      |
-  |                     |  execute, send Reply   |                      |
-  |<-- Reply ----------|                        |                      |
-  |   (RSA-signed)      |                        |                      |
-  |<-- Reply -------------------------------  |                      |
-  |<-- Reply ----------------------------------------------        |
-  |                     |                        |                      |
-  |  [f+1 matching replies] --> accept           |                      |
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant P as Primary
+    participant B as Replica B
+    participant D as Replica C
+
+    C->>P: Request (RSA-signed)
+    P->>B: Pre-prepare (view, seqno, digest)
+    P->>D: Pre-prepare (view, seqno, digest)
+    B->>P: Prepare
+    B->>D: Prepare
+    D->>P: Prepare
+    D->>B: Prepare
+    Note over P,D: 2f prepares match
+    P->>B: Commit
+    P->>D: Commit
+    B->>P: Commit
+    B->>D: Commit
+    D->>P: Commit
+    D->>B: Commit
+    Note over P,D: 2f+1 commits match — execute
+    P->>C: Reply (RSA-signed)
+    B->>C: Reply (RSA-signed)
+    D->>C: Reply (RSA-signed)
+    Note over C: f+1 matching replies → accept
 ```
 
 ### 11.2 Checkpoint
 
 After executing every `TBFT_CHECKPOINT_INTERVAL` requests (default 128):
 
-```
-Replica A               Replica B               Replica C
-  |                       |                        |
-  |-- Checkpoint ------->|                        |
-  |-- Checkpoint --------|----------------------->|
-  |  (seqno, digest)      |                        |
-  |<-- Checkpoint ------- |                        |
-  |<-- Checkpoint ------- |<-- Checkpoint --------|
-  |                       |                        |
-  [2f+1 matching digests]  |                        |
-  --> stable checkpoint    |                        |
-  --> truncate logs        |                        |
+```mermaid
+sequenceDiagram
+    participant A as Replica A
+    participant B as Replica B
+    participant C as Replica C
+
+    A->>B: Checkpoint (seqno, digest)
+    A->>C: Checkpoint (seqno, digest)
+    B->>A: Checkpoint (seqno, digest)
+    B->>C: Checkpoint (seqno, digest)
+    C->>A: Checkpoint (seqno, digest)
+    C->>B: Checkpoint (seqno, digest)
+    Note over A,C: 2f+1 matching digests → stable checkpoint
+    Note over A,C: truncate logs
 ```
 
 ### 11.3 View-Change
 
-```
-Replica A               Replica B               New Primary (C)
-  |                       |                        |
-  |  [vtimer expires]     |                        |
-  |-- View-change ------>|                        |
-  |-- View-change -------|----------------------->|
-  |  (new_view, ls)       |                        |
-  |<-- View-change ------ |                        |
-  |<-- View-change ------ |<-- View-change ------->|
-  |                       |                        |
-  |                       |  [2f+1 view-changes]   |
-  |                       |  compute min, max      |
-  |                       |                        |
-  |<-- New-view --------- |<-- New-view ---------- |
-  |  (v, min, max)        |                        |
-  |                       |                        |
-  |  [verify nv]          |  [verify nv]           |
-  |  install view v       |  install view v        |
-  |                       |                        |
+```mermaid
+sequenceDiagram
+    participant A as Replica A
+    participant B as Replica B
+    participant NP as New Primary (C)
+
+    Note over A: vtimer expires
+    A->>B: View-change (new_view, ls)
+    A->>NP: View-change (new_view, ls)
+    B->>A: View-change (new_view, ls)
+    B->>NP: View-change (new_view, ls)
+    NP->>A: View-change (new_view, ls)
+    NP->>B: View-change (new_view, ls)
+    Note over NP: 2f+1 view-changes — compute min, max
+    NP->>A: New-view (v, min, max)
+    NP->>B: New-view (v, min, max)
+    Note over A: verify nv — install view v
+    Note over B: verify nv — install view v
 ```
 
 ## 12. State Management
