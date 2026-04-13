@@ -237,6 +237,20 @@ void tbft_replica_handle_request(tbft_replica_t *r, const void *msg, int len)
     if (len < (int)sizeof(tbft_request_rep_t)) return;
     const tbft_request_rep_t *req = (const tbft_request_rep_t *)msg;
 
+    /* Verify request signature */
+    int sig_offset = (int)(sizeof(*req) + req->command_size);
+    if (len < sig_offset + (int)sizeof(tbft_sig_t)) {
+        ESP_LOGW(TAG, "request: missing signature");
+        return;
+    }
+    const tbft_sig_t *sig = (const tbft_sig_t *)((const uint8_t *)msg + sig_offset);
+    if (!tbft_node_verify_sig(&r->node, (tbft_node_id_t)req->cid,
+                              req, sig_offset, sig)) {
+        ESP_LOGW(TAG, "request: signature verification failed from client %d",
+                 req->cid);
+        return;
+    }
+
     /* If we are not the primary, forward to the primary */
     if (!tbft_replica_is_primary(r)) {
         int primary = tbft_node_primary(&r->node, r->node.view);
@@ -279,6 +293,17 @@ void tbft_replica_handle_pre_prepare(tbft_replica_t *r, const void *msg, int len
     if (!tbft_replica_in_window(r, pp->seqno)) {
         ESP_LOGD(TAG, "pp seqno %lld out of window", (long long)pp->seqno);
         return;
+    }
+
+    /* Verify request set digest */
+    if (pp->rset_size > 0) {
+        const uint8_t *req_set = (const uint8_t *)msg + sizeof(*pp);
+        tbft_digest_t computed;
+        tbft_msg_digest(req_set, (size_t)pp->rset_size, &computed);
+        if (!tbft_digest_equal(&pp->digest, &computed)) {
+            ESP_LOGW(TAG, "pp: request set digest mismatch");
+            return;
+        }
     }
 
     /* Store in agreement region */
@@ -401,7 +426,17 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
         nv->min       = min_s;
         nv->max       = max_s;
         nv->n_prep    = 0;
-        nv->hdr.size  = tbft_msg_align((int32_t)sizeof(*nv));
+        nv->has_sig   = 1;
+
+        /* Sign the New_view */
+        tbft_sig_t *sig = (tbft_sig_t *)(r->out_buf + sizeof(*nv));
+        if (tbft_node_gen_sig(&r->node, nv, sizeof(*nv), sig) == 0) {
+            nv->hdr.size = tbft_msg_align(
+                (int32_t)(sizeof(*nv) + sizeof(tbft_sig_t)));
+        } else {
+            nv->has_sig = 0;
+            nv->hdr.size = tbft_msg_align((int32_t)sizeof(*nv));
+        }
 
         tbft_node_send(&r->node, r->out_buf, (size_t)nv->hdr.size,
                        TBFT_ALL_REPLICAS);
@@ -426,6 +461,24 @@ void tbft_replica_handle_new_view(tbft_replica_t *r, const void *msg, int len)
         ESP_LOGW(TAG, "new-view verification failed for v=%lld",
                  (long long)nv->v);
         return;
+    }
+
+    /* Verify signature from the new primary */
+    if (nv->has_sig) {
+        int sig_offset = (int)((const uint8_t *)nv - (const uint8_t *)msg)
+                       + sizeof(*nv);
+        if (len < sig_offset + (int)sizeof(tbft_sig_t)) {
+            ESP_LOGW(TAG, "new-view: missing signature");
+            return;
+        }
+        const tbft_sig_t *sig = (const tbft_sig_t *)((const uint8_t *)msg + sig_offset);
+        int new_primary = tbft_node_primary(&r->node, nv->v);
+        if (!tbft_node_verify_sig(&r->node, new_primary,
+                                  nv, sizeof(*nv), sig)) {
+            ESP_LOGW(TAG, "new-view signature verification failed for v=%lld",
+                     (long long)nv->v);
+            return;
+        }
     }
 
     /* Install new view */
@@ -780,15 +833,47 @@ void tbft_replica_send_view_change(tbft_replica_t *r)
     tbft_view_t new_view = r->node.view + 1;
     tbft_vi_reset(&r->vi, new_view);
 
-    tbft_view_change_rep_t *vc = (tbft_view_change_rep_t *)r->out_buf;
-    vc->hdr.tag  = TBFT_MSG_VIEW_CHANGE;
+    uint8_t *ptr = r->out_buf;
+    tbft_view_change_rep_t *vc = (tbft_view_change_rep_t *)ptr;
+    vc->hdr.tag   = TBFT_MSG_VIEW_CHANGE;
     vc->hdr.extra = 0;
-    vc->v        = new_view;
-    vc->ls       = r->last_stable;
-    vc->n_ckpts  = 0;
-    vc->n_reqs   = 0;
-    vc->id       = r->node.node_id;
-    vc->hdr.size = tbft_msg_align((int32_t)sizeof(*vc));
+    vc->v         = new_view;
+    vc->ls        = r->last_stable;
+    vc->id        = r->node.node_id;
+
+    ptr += sizeof(*vc);
+
+    vc->n_ckpts = 0;
+    vc->n_reqs  = 0;
+
+    if (r->last_stable > 0) {
+        const tbft_digest_t *root = tbft_state_root_digest(&r->state);
+        tbft_vc_ckpt_t *ckpt = (tbft_vc_ckpt_t *)ptr;
+        ckpt->seqno  = r->last_stable;
+        ckpt->digest = *root;
+        ptr += sizeof(*ckpt);
+        vc->n_ckpts = 1;
+    }
+
+    for (tbft_seqno_t s = r->last_stable + 1; s <= r->last_prepared; s++) {
+        if (tbft_ar_in_range(&r->ar, s) && tbft_ar_prepared(&r->ar, s)) {
+            if (vc->n_reqs >= TBFT_WINDOW_SIZE) break;
+            int pp_len = 0;
+            const uint8_t *pp_buf = tbft_ar_load_pp(&r->ar, s, &pp_len);
+            if (pp_buf) {
+                const tbft_pre_prepare_rep_t *pp =
+                    (const tbft_pre_prepare_rep_t *)pp_buf;
+                tbft_vc_req_info_t *req = (tbft_vc_req_info_t *)ptr;
+                req->seqno     = s;
+                req->last_view = r->node.view;
+                req->digest    = pp->digest;
+                ptr += sizeof(*req);
+                vc->n_reqs++;
+            }
+        }
+    }
+
+    vc->hdr.size = tbft_msg_align((int32_t)(ptr - r->out_buf));
 
     tbft_node_send(&r->node, r->out_buf, (size_t)vc->hdr.size,
                    TBFT_ALL_REPLICAS);

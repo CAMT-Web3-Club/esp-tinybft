@@ -110,12 +110,29 @@ bool tbft_principal_verify_mac_in(const tbft_principal_t *p,
     if (hmac_sha256_psa(&p->hmac_in_key, msg, msg_len, &expected) != PSA_SUCCESS) {
         return false;
     }
-    /* Constant-time compare */
     uint8_t diff = 0;
     for (int i = 0; i < TBFT_HMAC_SIZE; i++) {
         diff |= expected.bytes[i] ^ mac->bytes[i];
     }
     return diff == 0;
+}
+
+bool tbft_principal_verify_mac_in_with_replay_check(const tbft_principal_t *p,
+                                                     const void *msg, size_t msg_len,
+                                                     const tbft_mac_t *mac,
+                                                     int64_t msg_time_us)
+{
+    if (!tbft_principal_verify_mac_in(p, msg, msg_len, mac)) {
+        return false;
+    }
+    if (msg_time_us <= 0) {
+        return true;
+    }
+    if (p->last_auth_time_us > 0 &&
+        msg_time_us <= p->last_auth_time_us) {
+        return false;
+    }
+    return true;
 }
 
 void tbft_principal_set_in_key(tbft_principal_t *p, const tbft_hmac_key_t *key)

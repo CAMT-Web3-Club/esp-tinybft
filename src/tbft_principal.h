@@ -38,6 +38,11 @@ typedef struct {
     int64_t         last_auth_time_us;
 } tbft_principal_t;
 
+/* Default anti-replay window in microseconds (30 seconds) */
+#ifndef TBFT_ANTI_REPLAY_WINDOW_US
+#define TBFT_ANTI_REPLAY_WINDOW_US  30000000LL
+#endif
+
 /* --------------------------------------------------------------------------
  * Lifecycle
  * -------------------------------------------------------------------------- */
@@ -89,6 +94,15 @@ int tbft_principal_gen_mac_out(const tbft_principal_t *p,
 bool tbft_principal_verify_mac_in(const tbft_principal_t *p,
                                   const void *msg, size_t msg_len,
                                   const tbft_mac_t *mac);
+
+/**
+ * Verify MAC and update anti-replay timestamp.
+ * Returns true if MAC is valid AND message is not a replay.
+ */
+bool tbft_principal_verify_mac_in_with_replay_check(const tbft_principal_t *p,
+                                                    const void *msg, size_t msg_len,
+                                                    const tbft_mac_t *mac,
+                                                    int64_t msg_time_us);
 
 /**
  * Set the in-key (key for verifying messages received from this principal).

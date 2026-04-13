@@ -333,8 +333,8 @@ int Byz_send_request(Byz_req *req, bool read_only)
 {
     if (!s_client) return -1;
 
-    /* Build Request message */
-    static uint8_t out[TBFT_MAX_MESSAGE_SIZE];
+    /* Build Request message on stack */
+    uint8_t out[TBFT_MAX_MESSAGE_SIZE];
     tbft_request_rep_t *rep = (tbft_request_rep_t *)out;
     rep->hdr.tag      = TBFT_MSG_REQUEST;
     rep->hdr.extra    = (int16_t)(read_only ? 1 : 0);
@@ -404,17 +404,28 @@ int Byz_recv_reply(Byz_rep *rep)
         int match = 0;
         const uint8_t *winning_payload = NULL;
         int winning_payload_len = 0;
+        tbft_digest_t winning_digest;
+        bool first = true;
 
         for (int i = 0; i < MAX_PENDING_REPLIES; i++) {
             if (!s_replies[i].valid) continue;
             const tbft_reply_rep_t *ri =
                 (const tbft_reply_rep_t *)s_replies[i].buf;
-            if (ri->view == r0->view && ri->rid == r0->rid
-                    && ri->reply_size == r0->reply_size) {
-                match++;
-                winning_payload =
-                    s_replies[i].buf + sizeof(tbft_reply_rep_t);
+            if (ri->view != r0->view || ri->rid != r0->rid) continue;
+            if (ri->reply_size != r0->reply_size) continue;
+
+            const uint8_t *payload = s_replies[i].buf + sizeof(*ri);
+            tbft_digest_t digest;
+            tbft_msg_digest(payload, (size_t)ri->reply_size, &digest);
+
+            if (first) {
+                winning_payload = payload;
                 winning_payload_len = ri->reply_size;
+                winning_digest = digest;
+                match++;
+                first = false;
+            } else if (memcmp(&digest, &winning_digest, sizeof(digest)) == 0) {
+                match++;
             }
         }
 

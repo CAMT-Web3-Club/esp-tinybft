@@ -168,6 +168,7 @@ typedef struct __attribute__((packed)) {
 /* --------------------------------------------------------------------------
  * New_view  (tag = 9)  New Primary → All
  * Wire: [hdr][New_view_rep][prepared array][Pre_prepare set][authenticator]
+ *       [RSA signature of New_view_rep]
  * -------------------------------------------------------------------------- */
 
 typedef struct __attribute__((packed)) {
@@ -176,7 +177,7 @@ typedef struct __attribute__((packed)) {
     tbft_seqno_t    min;      /* max of all last_stable values in view-changes */
     tbft_seqno_t    max;      /* min of (last_stable + window) across view-changes */
     int32_t         n_prep;   /* number of prepared entries */
-    int32_t         _pad;
+    int32_t         has_sig;  /* 1 if signature follows */
 } tbft_new_view_rep_t;
 
 /* --------------------------------------------------------------------------

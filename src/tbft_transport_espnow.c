@@ -369,12 +369,13 @@ int tbft_transport_send(tbft_transport_t *t, const void *buf, size_t len,
         int sent = 0;
         for (int i = 0; i < enow->num_nodes; i++) {
             if (!enow->peer_valid[i]) continue;
-            /* Send to each peer individually */
+            /* Send to each peer individually with unique msg_id */
             const uint8_t *peer_mac = enow->peers[i].u.mac.bytes;
             frag_hdr_t fhdr;
-            fhdr.msg_id    = enow->next_msg_id;
+            fhdr.msg_id     = enow->next_msg_id;
+            enow->next_msg_id++;
             fhdr.frag_total = 1;
-            fhdr.frag_idx  = 0;
+            fhdr.frag_idx   = 0;
 
             uint8_t pkt[sizeof(frag_hdr_t) + TBFT_MAX_MESSAGE_SIZE];
             memcpy(pkt, &fhdr, sizeof(fhdr));
@@ -397,7 +398,6 @@ int tbft_transport_send(tbft_transport_t *t, const void *buf, size_t len,
                 ESP_LOGE(TAG, "esp_now_send to peer %d failed: %d", i, err);
             }
         }
-        enow->next_msg_id++;
         return sent > 0 ? sent : -1;
     }
 
