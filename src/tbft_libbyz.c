@@ -586,7 +586,10 @@ int Byz_init_replica(const char *config_file, const char *priv_config,
         free(s_replica);
     }
     s_replica = (tbft_replica_t *)calloc(1, sizeof(tbft_replica_t));
-    if (!s_replica) return -1;
+    if (!s_replica) {
+        ESP_LOGE(TAG, "failed to allocate tbft_replica_t (size=%zu). device out of memory. reduce TBFT_WINDOW_SIZE or max nodes.", sizeof(tbft_replica_t));
+        return -1;
+    }
 
     uint16_t bind_port = (port != 0) ? port : cfg.nodes[local_id].port;
 
