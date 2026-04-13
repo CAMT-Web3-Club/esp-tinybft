@@ -1,68 +1,8 @@
 #include "tbft_node.h"
 #include "esp_log.h"
-#include "lwip/inet.h"
-#include "lwip/netdb.h"
 #include <string.h>
-#include <errno.h>
 
 static const char *TAG = "tbft_node";
-
-/* --------------------------------------------------------------------------
- * Socket setup
- * -------------------------------------------------------------------------- */
-
-static int socket_open(uint16_t port, bool use_multicast,
-                       const char *mcast_ip, struct sockaddr_in *mcast_addr_out)
-{
-    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (sock < 0) {
-        ESP_LOGE(TAG, "socket() failed: %d", errno);
-        return -1;
-    }
-
-    /* Enable address reuse */
-    int one = 1;
-    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-
-    /* Set non-blocking */
-    int flags = fcntl(sock, F_GETFL, 0);
-    fcntl(sock, F_SETFL, flags | O_NONBLOCK);
-
-    /* Bind to port */
-    struct sockaddr_in bind_addr = {
-        .sin_family      = AF_INET,
-        .sin_addr.s_addr = htonl(INADDR_ANY),
-        .sin_port        = htons(port),
-    };
-    if (bind(sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
-        ESP_LOGE(TAG, "bind(%d) failed: %d", port, errno);
-        close(sock);
-        return -1;
-    }
-
-    if (use_multicast && mcast_ip) {
-        /* Join multicast group */
-        struct ip_mreq mreq;
-        mreq.imr_multiaddr.s_addr = inet_addr(mcast_ip);
-        mreq.imr_interface.s_addr = htonl(INADDR_ANY);
-        if (setsockopt(sock, IPPROTO_IP, IP_ADD_MEMBERSHIP,
-                       &mreq, sizeof(mreq)) < 0) {
-            ESP_LOGW(TAG, "IP_ADD_MEMBERSHIP failed: %d (continuing)", errno);
-        }
-
-        /* Set multicast TTL */
-        uint8_t ttl = 32;
-        setsockopt(sock, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl));
-
-        /* Store multicast destination address */
-        memset(mcast_addr_out, 0, sizeof(*mcast_addr_out));
-        mcast_addr_out->sin_family      = AF_INET;
-        mcast_addr_out->sin_addr.s_addr = inet_addr(mcast_ip);
-        mcast_addr_out->sin_port        = htons(port);
-    }
-
-    return sock;
-}
 
 /* --------------------------------------------------------------------------
  * Lifecycle
@@ -84,37 +24,39 @@ int tbft_node_init(tbft_node_t *node, tbft_node_id_t node_id,
     node->cur_primary    = 0;
     node->auth_timeout_us = auth_timeout_us;
 
-#ifdef CONFIG_TBFT_DISABLE_MULTICAST
-    node->use_multicast = false;
+    /* Create transport (type selected by Kconfig) */
+#if CONFIG_TBFT_TRANSPORT_ESPNOW
+    tbft_transport_type_t ttype = TBFT_TRANSPORT_ESPNOW;
+    ESP_LOGI(TAG, "transport: ESP-NOW");
 #else
-    node->use_multicast = (mcast_ip != NULL);
+    tbft_transport_type_t ttype = TBFT_TRANSPORT_UDP;
+    ESP_LOGI(TAG, "transport: UDP (mcast=%s)", mcast_ip ? mcast_ip : "off");
 #endif
 
-    node->sock = socket_open(port, node->use_multicast, mcast_ip,
-                             &node->mcast_addr);
-    if (node->sock < 0) {
+    if (tbft_transport_create(&node->transport, ttype, num_nodes,
+                              mcast_ip, port) != 0) {
+        ESP_LOGE(TAG, "failed to create transport");
         return -1;
     }
 
     /* Initialise authentication freshness timer */
     esp_err_t err = tbft_itimer_init(&node->atimer, NULL, node, "tbft_auth");
     if (err != ESP_OK) {
-        close(node->sock);
+        tbft_transport_free(node->transport);
+        node->transport = NULL;
         return -1;
     }
 
-    ESP_LOGI(TAG, "node %d init: f=%d n=%d quorum=%d port=%d",
-             node_id, f, node->num_replicas, node->threshold, port);
+    ESP_LOGI(TAG, "node %d init: f=%d n=%d quorum=%d",
+             node_id, f, node->num_replicas, node->threshold);
     return 0;
 }
 
 void tbft_node_free(tbft_node_t *node)
 {
     tbft_itimer_free(&node->atimer);
-    if (node->sock >= 0) {
-        close(node->sock);
-        node->sock = -1;
-    }
+    tbft_transport_free(node->transport);
+    node->transport = NULL;
     for (int i = 0; i < node->num_principals; i++) {
         if (node->principals[i]) {
             tbft_principal_free(node->principals[i]);
@@ -124,91 +66,24 @@ void tbft_node_free(tbft_node_t *node)
 }
 
 /* --------------------------------------------------------------------------
- * Network I/O
+ * Network I/O — delegated to transport layer
  * -------------------------------------------------------------------------- */
 
 int tbft_node_send(tbft_node_t *node, const void *buf, size_t len,
                    tbft_node_id_t dest)
 {
-    if (dest == TBFT_ALL_REPLICAS) {
-        if (node->use_multicast) {
-            int ret = sendto(node->sock, buf, len, 0,
-                             (struct sockaddr *)&node->mcast_addr,
-                             sizeof(node->mcast_addr));
-            if (ret < 0) {
-                ESP_LOGE(TAG, "sendto(multicast) failed: %d", errno);
-            }
-            return ret;
-        } else {
-            /* Unicast to each replica */
-            int sent = 0;
-            for (int i = 0; i < node->num_replicas; i++) {
-                if (i == node->node_id) continue;
-                tbft_principal_t *p = node->principals[i];
-                if (!p) continue;
-                struct sockaddr_in addr = {
-                    .sin_family      = AF_INET,
-                    .sin_addr.s_addr = p->addr.ip,
-                    .sin_port        = p->addr.port,
-                };
-                int r = sendto(node->sock, buf, len, 0,
-                               (struct sockaddr *)&addr, sizeof(addr));
-                if (r > 0) sent = r;
-            }
-            return sent;
-        }
-    }
-
-    /* Unicast to single destination */
-    tbft_principal_t *p = node->principals[dest];
-    if (!p) {
-        ESP_LOGE(TAG, "send: unknown principal %d", dest);
-        return -1;
-    }
-    struct sockaddr_in addr = {
-        .sin_family      = AF_INET,
-        .sin_addr.s_addr = p->addr.ip,
-        .sin_port        = p->addr.port,
-    };
-    int ret = sendto(node->sock, buf, len, 0,
-                     (struct sockaddr *)&addr, sizeof(addr));
-    if (ret < 0) {
-        ESP_LOGE(TAG, "sendto(%d) failed: %d", dest, errno);
-    }
-    return ret;
+    if (!node->transport) return -1;
+    return tbft_transport_send(node->transport, buf, len, dest);
 }
 
 int tbft_node_recv(tbft_node_t *node, void *buf, tbft_node_id_t *src_id)
 {
-    struct sockaddr_in from;
-    socklen_t from_len = sizeof(from);
-
-    int n = recvfrom(node->sock, buf, TBFT_MAX_MESSAGE_SIZE, 0,
-                     (struct sockaddr *)&from, &from_len);
-    if (n < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            return 0; /* nothing available */
-        }
-        ESP_LOGE(TAG, "recvfrom failed: %d", errno);
-        return -1;
-    }
+    if (!node->transport) return -1;
+    int n = tbft_transport_recv(node->transport, buf,
+                                TBFT_MAX_MESSAGE_SIZE, src_id);
     if (n < (int)sizeof(tbft_msg_hdr_t)) {
-        return 0; /* truncated */
+        return 0; /* truncated or nothing available */
     }
-
-    /* Try to identify sender by matching IP:port */
-    if (src_id) {
-        *src_id = -1;
-        for (int i = 0; i < node->num_principals; i++) {
-            tbft_principal_t *p = node->principals[i];
-            if (p && p->addr.ip   == from.sin_addr.s_addr
-                  && p->addr.port == from.sin_port) {
-                *src_id = p->id;
-                break;
-            }
-        }
-    }
-
     return n;
 }
 

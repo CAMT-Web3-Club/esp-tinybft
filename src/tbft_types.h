@@ -63,11 +63,29 @@ typedef struct {
  * Network address
  * -------------------------------------------------------------------------- */
 
-/** IPv4 address + UDP port for a replica/client */
+/** ESP-NOW MAC address (6 bytes) */
 typedef struct {
-    uint32_t ip;    /* network byte order */
-    uint16_t port;  /* network byte order */
+    uint8_t bytes[6];
+} tbft_mac_addr_t;
+
+/**
+ * Unified peer address — either an IPv4 + port pair, or an ESP-NOW MAC.
+ * The active field depends on the configured transport type.
+ */
+typedef struct {
+    union {
+        struct {
+            uint32_t ip;    /* network byte order */
+            uint16_t port;  /* network byte order */
+        } udp;
+        tbft_mac_addr_t mac;
+    } u;
 } tbft_addr_t;
+
+/* Convenience accessors */
+#define tbft_addr_udp_ip(a)   ((a).u.udp.ip)
+#define tbft_addr_udp_port(a) ((a).u.udp.port)
+#define tbft_addr_mac_bytes(a) ((a).u.mac.bytes)
 
 /* --------------------------------------------------------------------------
  * State block

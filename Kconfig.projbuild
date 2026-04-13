@@ -58,6 +58,31 @@ menu "TinyBFT Configuration"
             When enabled, the library uses unicast UDP for all sends
             instead of multicast. Useful when multicast is unavailable.
 
+    choice TBFT_TRANSPORT_TYPE
+        prompt "Transport backend"
+        default TBFT_TRANSPORT_UDP
+        help
+            Select the transport layer for inter-node communication.
+
+        config TBFT_TRANSPORT_UDP
+            bool "UDP (lwIP sockets)"
+            help
+                Standard UDP over IP. Requires WiFi/Ethernet network stack.
+                Supports multicast (unless TBFT_DISABLE_MULTICAST is set).
+                Config file format per node line:
+                  <hostname> <ip> <port> <pubkey_path>
+
+        config TBFT_TRANSPORT_ESPNOW
+            bool "ESP-NOW"
+            help
+                ESP-NOW (v2.0, up to 1470 bytes per packet).
+                Automatic fragmentation for larger messages.
+                Requires WiFi init (host app must call esp_wifi_init).
+                Config file format per node line:
+                  <hostname> <mac_address> <pubkey_path>
+                MAC format: xx:xx:xx:xx:xx:xx
+    endchoice
+
     config TBFT_PRINT_STATS
         bool "Enable performance statistics"
         default n

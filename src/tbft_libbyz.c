@@ -13,7 +13,9 @@
 #include "esp_log.h"
 #include "esp_spiffs.h"
 #include "esp_timer.h"
+#if CONFIG_TBFT_TRANSPORT_UDP
 #include "lwip/inet.h"
+#endif
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <stdio.h>
@@ -64,8 +66,9 @@ typedef struct {
 
     struct {
         char   hostname[64];
-        char   ip[32];
-        uint16_t port;
+        char   ip[32];       /* UDP: IP address */
+        uint16_t port;       /* UDP: port number */
+        char   mac_str[32];  /* ESP-NOW: MAC address string */
         char   pubkey_path[128];
     } nodes[TBFT_MAX_NUM_REPLICAS + TBFT_MAX_NUM_CLIENTS];
 
@@ -73,7 +76,7 @@ typedef struct {
     int    status_timeout_ms;
     int    recovery_timeout_ms;
 
-    /* Filled by parser: which node index matches local IP */
+    /* Filled by parser: which node index matches local */
     int    local_node_id;
 } tbft_config_t;
 
@@ -100,16 +103,41 @@ static int parse_config(const char *path, tbft_config_t *cfg)
     }
 
     for (int i = 0; i < cfg->num_nodes; i++) {
-        int port_int = 0;
-        if (fscanf(f, "%63s %31s %d %127s",
-                   cfg->nodes[i].hostname,
-                   cfg->nodes[i].ip,
-                   &port_int,
-                   cfg->nodes[i].pubkey_path) != 4) {
+        /* Detect format: try reading 4 fields (UDP) or 3 fields (ESP-NOW) */
+        char field2[128];
+        char field3[128];
+        char field4[128];
+
+        if (fscanf(f, "%63s %127s", cfg->nodes[i].hostname, field2) != 2) {
             ESP_LOGE(TAG, "failed to parse node %d", i);
             goto fail;
         }
-        cfg->nodes[i].port = (uint16_t)port_int;
+
+        /* Check if field2 looks like a MAC address (contains ':') */
+        if (strchr(field2, ':') != NULL) {
+            /* ESP-NOW format: <hostname> <mac> <pubkey_path> */
+            strncpy(cfg->nodes[i].mac_str, field2,
+                    sizeof(cfg->nodes[i].mac_str) - 1);
+            if (fscanf(f, "%127s", cfg->nodes[i].pubkey_path) != 1) {
+                ESP_LOGE(TAG, "failed to parse node %d pubkey_path", i);
+                goto fail;
+            }
+            cfg->nodes[i].port = 0;
+            cfg->nodes[i].ip[0] = '\0';
+        } else {
+            /* UDP format: <hostname> <ip> <port> <pubkey_path> */
+            strncpy(cfg->nodes[i].ip, field2, sizeof(cfg->nodes[i].ip) - 1);
+            int port_int = 0;
+            if (fscanf(f, "%127s %d", field3, &port_int) != 2) {
+                ESP_LOGE(TAG, "failed to parse node %d port", i);
+                goto fail;
+            }
+            cfg->nodes[i].port = (uint16_t)port_int;
+            if (fscanf(f, "%127s", cfg->nodes[i].pubkey_path) != 1) {
+                ESP_LOGE(TAG, "failed to parse node %d pubkey_path", i);
+                goto fail;
+            }
+        }
     }
 
     if (fscanf(f, "%d", &cfg->vc_timeout_ms)       != 1) goto fail;
@@ -160,10 +188,29 @@ static int setup_principals(tbft_node_t *node, const tbft_config_t *cfg,
             (tbft_principal_t *)calloc(1, sizeof(tbft_principal_t));
         if (!p) return -1;
 
-        tbft_addr_t addr = {
-            .ip   = inet_addr(cfg->nodes[i].ip),
-            .port = htons(cfg->nodes[i].port),
-        };
+        tbft_addr_t addr;
+        memset(&addr, 0, sizeof(addr));
+
+#if CONFIG_TBFT_TRANSPORT_ESPNOW
+        /* ESP-NOW: parse MAC address */
+        if (cfg->nodes[i].mac_str[0] != '\0') {
+            unsigned int m[6];
+            if (sscanf(cfg->nodes[i].mac_str, "%x:%x:%x:%x:%x:%x",
+                       &m[0], &m[1], &m[2], &m[3], &m[4], &m[5]) == 6) {
+                for (int b = 0; b < 6; b++) {
+                    tbft_addr_mac_bytes(addr)[b] = (uint8_t)m[b];
+                }
+            } else {
+                ESP_LOGW(TAG, "invalid MAC for node %d: %s",
+                         i, cfg->nodes[i].mac_str);
+            }
+        }
+#else
+        /* UDP: use IP + port */
+        tbft_addr_udp_ip(addr)   = inet_addr(cfg->nodes[i].ip);
+        tbft_addr_udp_port(addr) = htons(cfg->nodes[i].port);
+#endif
+
         tbft_principal_init(p, (tbft_node_id_t)i, &addr);
 
         /* Load public key */
@@ -177,6 +224,9 @@ static int setup_principals(tbft_node_t *node, const tbft_config_t *cfg,
         }
 
         node->principals[i] = p;
+
+        /* Register peer address with transport */
+        tbft_transport_set_peer(node->transport, (tbft_node_id_t)i, &addr);
 
         /* Load private key for the local node */
         if (i == local_id && priv_config_path) {

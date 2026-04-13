@@ -26,14 +26,17 @@ There is no dedicated test target or test suite yet. Runtime logging uses `ESP_L
 ### Layer overview
 
 ```
-include/esp-tinybft.h     ← public API (Byz_* functions, libbyz-compatible)
-src/tbft_libbyz.c         ← API implementation + config file parser
-src/tbft_replica.c/h      ← PBFT state machine (message dispatch + all handlers)
-src/tbft_node.c/h         ← UDP socket, send/recv, authenticator generation
-src/tbft_principal.c/h    ← per-peer crypto: HMAC-SHA256 (hot path) + RSA-2048
-src/tbft_state.c/h        ← application state: CoW, partition tree, fetch
-src/tbft_config.h         ← all compile-time constants (sourced from Kconfig)
-src/tbft_types.h          ← typedefs: scalars, crypto structs, bitmap, network, state block
+include/esp-tinybft.h       ← public API (Byz_* functions, libbyz-compatible)
+src/tbft_libbyz.c           ← API implementation + config file parser
+src/tbft_replica.c/h        ← PBFT state machine (message dispatch + all handlers)
+src/tbft_node.c/h           ← Transport delegation (send/recv → transport layer)
+src/tbft_transport.h        ← Transport abstraction interface
+src/tbft_transport_udp.c    ← UDP backend (lwIP sockets)
+src/tbft_transport_espnow.c ← ESP-NOW backend (auto fragmentation/reassembly)
+src/tbft_principal.c/h      ← per-peer crypto: HMAC-SHA256 (hot path) + RSA-2048
+src/tbft_state.c/h          ← application state: CoW, partition tree, fetch
+src/tbft_config.h           ← all compile-time constants (sourced from Kconfig)
+src/tbft_types.h            ← typedefs: scalars, crypto structs, bitmap, network, state block
 ```
 
 ### Crypto migration (ESP-IDF v6.0 / MbedTLS 4.x)
@@ -50,6 +53,41 @@ MbedTLS 4.x removed several classic APIs. The component uses the **PSA Crypto AP
 | RSA verify | `mbedtls_pk_verify()` | unchanged |
 
 Removed headers: `mbedtls/sha256.h`, `mbedtls/entropy.h`, `mbedtls/ctr_drbg.h` — all moved to private/.
+
+### Transport layer
+
+The component supports two interchangeable transport backends, selected at compile time via `CONFIG_TBFT_TRANSPORT_TYPE` in `menuconfig`:
+
+| Backend | Config value | Protocol | Max payload | Notes |
+|---------|-------------|----------|-------------|-------|
+| **UDP** | `TBFT_TRANSPORT_UDP` | lwIP sockets | Unbounded | Supports multicast |
+| **ESP-NOW** | `TBFT_TRANSPORT_ESPNOW` | esp_now API | 1470 bytes (v2.0) | Auto fragmentation + reassembly |
+
+The transport interface (`tbft_transport.h`) abstracts send/recv/peer-registration behind a uniform API. Both backends handle the same message formats and authentication — switching transports requires no changes to the BFT protocol logic.
+
+#### ESP-NOW fragmentation
+
+ESP-NOW v2.0 limits each packet to 1470 bytes. Messages exceeding this are automatically fragmented with a 4-byte header (`msg_id`, `frag_idx`, `frag_total`) and reassembled on the receiving side. The reassembly system uses 4 concurrent slots with 5-second timeout per message.
+
+#### Config file formats
+
+**UDP mode** (per node line):
+```
+<hostname> <ip> <port> <pubkey_path>
+```
+
+**ESP-NOW mode** (per node line):
+```
+<hostname> <mac_address> <pubkey_path>
+```
+MAC format: `xx:xx:xx:xx:xx:xx` (e.g. `aa:bb:cc:dd:ee:ff`). The parser auto-detects the format by checking for `:` in the second field.
+
+#### Host app responsibilities (ESP-NOW)
+
+When using ESP-NOW, the host application must:
+1. Initialize WiFi (`esp_wifi_init`, `esp_wifi_set_mode`, `esp_wifi_start`)
+2. The ESP-NOW transport registers its own `esp_now_recv_cb` and `esp_now_send_cb`
+3. Peer MAC addresses are registered via `esp_now_add_peer` automatically
 
 ### TinyBFT static memory model
 

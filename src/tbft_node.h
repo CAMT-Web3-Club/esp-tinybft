@@ -3,8 +3,8 @@
 #include "tbft_types.h"
 #include "tbft_message.h"
 #include "tbft_principal.h"
+#include "tbft_transport.h"
 #include "tbft_itimer.h"
-#include "lwip/sockets.h"
 #include <stdbool.h>
 
 /* --------------------------------------------------------------------------
@@ -13,7 +13,7 @@
  * Owns:
  *  - The local node's crypto identity (node_id, private key)
  *  - Array of all known principals (replicas first, then clients)
- *  - UDP socket
+ *  - Transport layer (UDP or ESP-NOW)
  *  - Authentication freshness timer
  * -------------------------------------------------------------------------- */
 
@@ -35,13 +35,11 @@ struct tbft_node {
     /* Local principal (shortcut into principals[node_id]) */
     tbft_principal_t  *local_principal;
 
-    /* UDP socket */
-    int       sock;
-    uint8_t   recv_buf[TBFT_MAX_MESSAGE_SIZE];
+    /* Transport layer (UDP or ESP-NOW) */
+    tbft_transport_t   *transport;
 
-    /* Multicast group address (for All_replicas sends) */
-    struct sockaddr_in mcast_addr;
-    bool               use_multicast;
+    /* Receive buffer */
+    uint8_t   recv_buf[TBFT_MAX_MESSAGE_SIZE];
 
     /* Authentication freshness timer */
     tbft_itimer_t  atimer;
@@ -62,9 +60,9 @@ struct tbft_node {
  * @param node_id        This node's id
  * @param f              Max Byzantine faults
  * @param num_nodes      Total node count (replicas + clients)
- * @param mcast_ip       Multicast group IP string (e.g. "234.5.6.8")
+ * @param mcast_ip       Multicast group IP string (UDP only, e.g. "234.5.6.8")
  * @param auth_timeout_us  Authentication timer period in microseconds
- * @param port           UDP port to bind
+ * @param port           UDP port to bind (UDP only; ignored for ESP-NOW)
  * @return 0 on success, -1 on error
  */
 int tbft_node_init(tbft_node_t *node, tbft_node_id_t node_id,
@@ -78,7 +76,7 @@ int tbft_node_init(tbft_node_t *node, tbft_node_id_t node_id,
 void tbft_node_free(tbft_node_t *node);
 
 /* --------------------------------------------------------------------------
- * Network I/O
+ * Network I/O (delegated to transport layer)
  * -------------------------------------------------------------------------- */
 
 /**
@@ -86,7 +84,7 @@ void tbft_node_free(tbft_node_t *node);
  * @param node  This node
  * @param buf   Message bytes
  * @param len   Message length
- * @param dest  Destination node id, or TBFT_ALL_REPLICAS (-1) for multicast
+ * @param dest  Destination node id, or TBFT_ALL_REPLICAS (-1) for broadcast
  * @return bytes sent, or -1 on error
  */
 int tbft_node_send(tbft_node_t *node, const void *buf, size_t len,

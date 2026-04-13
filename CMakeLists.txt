@@ -4,6 +4,8 @@ idf_component_register(
         "src/tbft_principal.c"
         "src/tbft_itimer.c"
         "src/tbft_node.c"
+        "src/tbft_transport_udp.c"
+        "src/tbft_transport_espnow.c"
         "src/tbft_certificate.c"
         "src/tbft_prepared_cert.c"
         "src/tbft_partition.c"
@@ -24,4 +26,5 @@ idf_component_register(
         freertos
         vfs
         spiffs
+        esp_wifi
 )
