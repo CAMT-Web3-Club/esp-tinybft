@@ -190,9 +190,6 @@ void tbft_replica_run(tbft_replica_t *r)
         tbft_node_id_t src_id = -1;
         int n = tbft_node_recv(&r->node, r->node.recv_buf, &src_id);
         if (n < (int)sizeof(tbft_msg_hdr_t)) {
-            /* No message available — sleep long enough to guarantee
-             * the IDLE task gets CPU time (prevents task WDT on single-core). */
-            vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
 
@@ -244,10 +241,6 @@ void tbft_replica_run(tbft_replica_t *r)
             ESP_LOGD(TAG, "unknown message tag %d", hdr->tag);
             break;
         }
-
-        /* Yield after every message to let the WiFi task, lwIP, and
-         * the IDLE task get CPU time on single-core MCUs. */
-        vTaskDelay(pdMS_TO_TICKS(1));
     }
 }
 

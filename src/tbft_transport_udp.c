@@ -7,6 +7,8 @@
 
 #include "tbft_transport.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "lwip/inet.h"
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
@@ -214,6 +216,7 @@ int tbft_transport_recv(tbft_transport_t *t, void *buf, size_t buf_len,
                      (struct sockaddr *)&from, &from_len);
     if (n < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            vTaskDelay(pdMS_TO_TICKS(10));
             return 0; /* nothing available */
         }
         ESP_LOGE(TAG, "recvfrom failed: %d", errno);
