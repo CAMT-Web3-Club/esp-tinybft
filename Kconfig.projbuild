@@ -2,7 +2,7 @@ menu "TinyBFT Configuration"
 
     config TBFT_MAX_MESSAGE_SIZE
         int "Maximum message size (bytes)"
-        default 8192
+        default 1440
         help
             Maximum UDP message size in bytes. Must be large enough to hold
             view-change messages. Reduce for constrained environments.
@@ -15,7 +15,7 @@ menu "TinyBFT Configuration"
 
     config TBFT_BLOCK_SIZE
         int "State block size (bytes)"
-        default 4096
+        default 1024
         help
             State page/block size in bytes. Must be a power of 2. Smaller
             values trade memory efficiency for more tree levels.
@@ -31,14 +31,14 @@ menu "TinyBFT Configuration"
 
     config TBFT_WINDOW_SIZE
         int "Sequence number window size"
-        default 256
+        default 16
         help
             Number of in-flight sequence numbers. Must be greater than
             TBFT_CHECKPOINT_INTERVAL and a power of 2.
 
     config TBFT_CHECKPOINT_INTERVAL
         int "Checkpoint interval (sequence numbers)"
-        default 128
+        default 8
         help
             Number of sequence numbers between checkpoints. Must be
             less than TBFT_WINDOW_SIZE.
@@ -60,7 +60,7 @@ menu "TinyBFT Configuration"
 
     config TBFT_RQUEUE_MAX
         int "Maximum pending requests in queue"
-        default 16
+        default 8
         range 4 256
         help
             Maximum queued requests before the replica drops new ones.
