@@ -103,12 +103,10 @@ static int parse_config(const char *path, tbft_config_t *cfg)
     }
 
     for (int i = 0; i < cfg->num_nodes; i++) {
-        /* Detect format: try reading 4 fields (UDP) or 3 fields (ESP-NOW) */
-        char field2[128];
-        char field3[128];
-        char field4[128];
+        /* field2 holds a MAC (17 chars) or IP (15 chars) — 32 bytes matches the struct fields */
+        char field2[32];
 
-        if (fscanf(f, "%63s %127s", cfg->nodes[i].hostname, field2) != 2) {
+        if (fscanf(f, "%63s %31s", cfg->nodes[i].hostname, field2) != 2) {
             ESP_LOGE(TAG, "failed to parse node %d", i);
             goto fail;
         }
@@ -116,8 +114,7 @@ static int parse_config(const char *path, tbft_config_t *cfg)
         /* Check if field2 looks like a MAC address (contains ':') */
         if (strchr(field2, ':') != NULL) {
             /* ESP-NOW format: <hostname> <mac> <pubkey_path> */
-            strncpy(cfg->nodes[i].mac_str, field2,
-                    sizeof(cfg->nodes[i].mac_str) - 1);
+            memcpy(cfg->nodes[i].mac_str, field2, sizeof(cfg->nodes[i].mac_str));
             if (fscanf(f, "%127s", cfg->nodes[i].pubkey_path) != 1) {
                 ESP_LOGE(TAG, "failed to parse node %d pubkey_path", i);
                 goto fail;
@@ -126,17 +123,13 @@ static int parse_config(const char *path, tbft_config_t *cfg)
             cfg->nodes[i].ip[0] = '\0';
         } else {
             /* UDP format: <hostname> <ip> <port> <pubkey_path> */
-            strncpy(cfg->nodes[i].ip, field2, sizeof(cfg->nodes[i].ip) - 1);
+            memcpy(cfg->nodes[i].ip, field2, sizeof(cfg->nodes[i].ip));
             int port_int = 0;
-            if (fscanf(f, "%127s %d", field3, &port_int) != 2) {
-                ESP_LOGE(TAG, "failed to parse node %d port", i);
+            if (fscanf(f, "%d %127s", &port_int, cfg->nodes[i].pubkey_path) != 2) {
+                ESP_LOGE(TAG, "failed to parse node %d port/pubkey", i);
                 goto fail;
             }
             cfg->nodes[i].port = (uint16_t)port_int;
-            if (fscanf(f, "%127s", cfg->nodes[i].pubkey_path) != 1) {
-                ESP_LOGE(TAG, "failed to parse node %d pubkey_path", i);
-                goto fail;
-            }
         }
     }
 

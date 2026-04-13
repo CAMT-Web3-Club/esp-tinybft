@@ -1,0 +1,36 @@
+menu "Simple Wallet Example Configuration"
+
+    choice EXAMPLE_NODE_ROLE
+        prompt "Node role"
+        default EXAMPLE_ROLE_REPLICA
+        help
+            Select whether this node runs as a BFT replica or a client.
+
+        config EXAMPLE_ROLE_REPLICA
+            bool "Replica"
+        config EXAMPLE_ROLE_CLIENT
+            bool "Client"
+    endchoice
+
+    config EXAMPLE_NODE_ID
+        int "Node ID (replica only)"
+        default 0
+        range 0 3
+        depends on EXAMPLE_ROLE_REPLICA
+        help
+            Which replica slot this node occupies (0–3 for a 4-node cluster).
+            Selects the matching private key file (privN.der).
+
+    config EXAMPLE_WIFI_SSID
+        string "WiFi SSID (UDP transport only)"
+        default "myssid"
+        help
+            SSID of the AP to connect to when using UDP transport.
+
+    config EXAMPLE_WIFI_PASSWORD
+        string "WiFi Password (UDP transport only)"
+        default "mypassword"
+        help
+            Password of the AP. Leave empty for open networks.
+
+endmenu

@@ -1,0 +1,13 @@
+wallet
+1
+3000
+5
+239.0.0.1
+node0 127.0.0.1 5000 /spiffs/pub0.der
+node1 127.0.0.1 5001 /spiffs/pub1.der
+node2 127.0.0.1 5002 /spiffs/pub2.der
+node3 127.0.0.1 5003 /spiffs/pub3.der
+client4 127.0.0.1 5004 /spiffs/pub4.der
+2000
+5000
+10000
