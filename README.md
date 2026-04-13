@@ -14,19 +14,26 @@ A pure-C implementation of [PBFT](https://pmg.csail.mit.edu/papers/osdi99.pdf) (
 ## Requirements
 
 - ESP-IDF v6.0 or later (MbedTLS 4.x / PSA Crypto)
-- Target: ESP32 family (tested on ESP32-S3)
+- Supported targets: ESP32, ESP32-S2, ESP32-S3, ESP32-C3, ESP32-C6, ESP32-H2
 
 ## Quick Start
 
 ### 1. Add the component
 
-Copy or symlink this directory into your host project's `components/` folder, or use the IDF Component Manager:
+Add `esp-tinybft` to your host project's `idf_component.yml` (create it in your project root or `main/` if it does not exist):
+
+```yaml
+dependencies:
+  CAMT-Web3-Club/esp-tinybft: ">=0.1.0"
+```
+
+Then let the IDF Component Manager fetch it:
 
 ```bash
-# From your host project root
-mkdir -p components
-ln -s /path/to/esp-tinybft components/esp-tinybft
+idf.py update-dependencies
 ```
+
+The component is downloaded from the [Espressif Component Registry](https://components.espressif.com/components/CAMT-Web3-Club/esp-tinybft) and cached under `managed_components/`.
 
 ### 2. Configure
 

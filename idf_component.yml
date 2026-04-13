@@ -1,5 +1,14 @@
 version: "0.1.0"
 description: TinyBFT — memory-optimised PBFT consensus for ESP-IDF
 url: https://github.com/CAMT-Web3-Club/esp-tinybft
+license: "BSD-3-Clause AND MIT"
+targets:
+  - esp32
+  - esp32s2
+  - esp32s3
+  - esp32c3
+  - esp32c6
+  - esp32c61
+  - esp32h2
 dependencies:
   idf: ">=6.0"
