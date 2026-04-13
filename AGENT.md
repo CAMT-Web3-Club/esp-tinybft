@@ -67,7 +67,7 @@ The transport interface (`tbft_transport.h`) abstracts send/recv/peer-registrati
 
 #### ESP-NOW fragmentation
 
-ESP-NOW v2.0 limits each packet to 1470 bytes. Messages exceeding this are automatically fragmented with a 4-byte header (`msg_id`, `frag_idx`, `frag_total`) and reassembled on the receiving side. The reassembly system uses 4 concurrent slots with 5-second timeout per message.
+ESP-NOW v2.0 limits each packet to 1470 bytes. Messages exceeding this are automatically fragmented with a 4-byte header (`msg_id`, `frag_idx`, `frag_total`) and reassembled on the receiving side. Fragmentation works for both unicast and broadcast sends. The reassembly system uses 4 concurrent slots with 5-second timeout per message.
 
 #### Config file formats
 
@@ -107,14 +107,15 @@ All three regions live directly inside `tbft_replica_t`. Indexing into `agreemen
 
 ### Replica struct layout
 
-`tbft_replica_t` (in `tbft_replica.h`) begins with `tbft_node_t node` as its first member, enabling safe pointer-aliasing between `tbft_replica_t *` and `tbft_node_t *`. All protocol logs (`plog`, `clog`, `elog`) and static regions (`ar`, `cr`, `sr`) are embedded by value — there is no heap allocation in the steady-state protocol path.
+`tbft_replica_t` (in `tbft_replica.h`) begins with `tbft_node_t node` as its first member, enabling safe pointer-aliasing between `tbft_replica_t *` and `tbft_node_t *`. The three static regions (`ar`, `cr`, `sr`) are embedded by value — there is no heap allocation in the steady-state protocol path.
 
 Additional important fields:
 - `tbft_view_info_t vi` — view-change protocol state
 - Four timers: `vtimer`, `stimer`, `rtimer`, `ntimer` (all `tbft_itimer_t` wrapping `esp_timer_handle_t`)
-- Request queues: `rqueue`, `ro_rqueue` (circular FIFOs, `TBFT_RQUEUE_MAX` entries)
-- Buffers: `ndet_buf[256]`, `out_buf[TBFT_MAX_MESSAGE_SIZE]`
+- Request queues: `rqueue`, `ro_rqueue` (circular FIFOs, `TBFT_RQUEUE_MAX` entries, default 16 via Kconfig)
+- Buffers: `ndet_buf[TBFT_NDET_BUF_SIZE]`, `out_buf[TBFT_MAX_MESSAGE_SIZE]`
 - `running` flag, `vtimer_period_us`, `stimer_period_us`
+- Timers are initialised in `tbft_replica_init()` but **not started** — `Byz_init_replica()` sets the correct periods from the config file and starts them
 
 ### Message flow
 
@@ -123,7 +124,7 @@ Additional important fields:
 3. Backups receive Pre_prepare → store in `ar` → broadcast Prepare.
 4. All receive Prepare → `tbft_ar_add_prepare` → when complete, broadcast Commit.
 5. All receive Commit → `tbft_ar_add_commit` → when complete, `tbft_replica_execute_committed` calls `exec_cb`, sends Reply, and checkpoints every `CHECKPOINT_INTERVAL` seqnos.
-6. On checkpoint: `tbft_state_checkpoint` + broadcast Checkpoint → `tbft_cr_store` → when stable (`2f+1` matches), `tbft_replica_mark_stable` truncates all logs.
+6. On checkpoint: `tbft_state_checkpoint` + broadcast Checkpoint → `tbft_cr_store` → when stable (`2f+1` matches), `tbft_replica_mark_stable` truncates static regions (`ar`, `cr`).
 
 ### Crypto paths
 
@@ -157,8 +158,16 @@ Public keys are DER files on SPIFFS. Private key path is passed separately as `p
 - `TBFT_WINDOW_SIZE` must be a power of 2 **and** > `TBFT_CHECKPOINT_INTERVAL`.
 - `TBFT_MAX_NUM_REPLICAS >= 4`.
 - `TBFT_MAX_REPLY_SIZE < TBFT_MAX_MESSAGE_SIZE`.
+- `TBFT_P_LEVELS >= 2`.
 
 Derived constants: `TBFT_DIGEST_SIZE` (32), `TBFT_HMAC_SIZE` (32), `TBFT_SIG_SIZE` (256), `TBFT_AUTH_SIZE`, `TBFT_NUM_CKPT_SLOTS`, `TBFT_MAX_FAULTY`, `TBFT_CERT_MAX_VALS` (f+1), `TBFT_P_CHILDREN`.
+
+Additional Kconfig-sourced constants (with `#ifndef` guards for override):
+- `TBFT_MAX_STATE_BLOCKS` (default 256) — max state blocks
+- `TBFT_RQUEUE_MAX` (default 16) — request queue depth
+- `TBFT_NDET_BUF_SIZE` (default 256) — non-det choices buffer
+- `TBFT_P_LEVELS` (default 4) — Merkle partition tree depth
+- `TBFT_ANTI_REPLAY_WINDOW_US` (default 30s, from `TBFT_ANTI_REPLAY_WINDOW_MS * 1000`)
 
 - `MAX_NUM_REPLICAS` drives static buffer sizing across all three regions — keep it as small as the deployment allows.
 - Default `MAX_NUM_REPLICAS=4` targets a single-fault-tolerant cluster (f=1, n=4).
@@ -167,4 +176,4 @@ Derived constants: `TBFT_DIGEST_SIZE` (32), `TBFT_HMAC_SIZE` (32), `TBFT_SIG_SIZ
 
 When a replica detects it has fallen behind, `tbft_state_start_fetch` sets `in_fetch=true` and enqueues a root-level Fetch. The fetching replica walks the Merkle partition tree (`tbft_ptree_t`) top-down, comparing local digests (`block_digests[]`) to received `Meta_data` messages and requesting only mismatched subtrees, until it reaches leaf-level `Data` messages that overwrite individual `tbft_block_t` entries.
 
-State uses a CoW bitmap (`cowb[]` — array of uint64_t, not a single bitmap) to track dirty blocks. `block_digests[]` holds per-block SHA-256 digests. Checkpoint records are stored in `ckpt_records[]` (max `TBFT_MAX_CKPT_RECORDS`). `last_stable` tracks the highest stable checkpoint seqno.
+State uses a CoW bitmap (`cowb[]` — array of uint64_t, not a single bitmap) to track dirty blocks. `block_digests[]` holds per-block SHA-256 digests. Checkpoint records are stored in `ckpt_records[]` (max `TBFT_NUM_CKPT_SLOTS`). `last_stable` tracks the highest stable checkpoint seqno.

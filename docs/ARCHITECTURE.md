@@ -56,11 +56,6 @@ graph TB
         PTree[tbft_ptree_t\nMerkle digest tree]
     end
 
-    subgraph "Protocol Logs"
-        PLog[tbft_plog_t\nLog<Prepared_cert>]
-        CLog[tbft_clog_t\nLog<Commit_cert>]
-        ELog[tbft_elog_t\nLog<Checkpoint_cert>]
-    end
 
     subgraph "View-Change"
         VI[tbft_view_info_t]
@@ -93,9 +88,7 @@ graph TB
     Replica --> CR
     Replica --> SR
     Replica --> State
-    Replica --> PLog
-    Replica --> CLog
-    Replica --> ELog
+
     Replica --> VI
     Replica --> ITimer
     Node --> Principal
@@ -363,7 +356,7 @@ This approach is necessary because MbedTLS 4.x does not expose a standalone HMAC
 ### Struct Layout (src/tbft_replica.h)
 
 ```c
-#define TBFT_RQUEUE_MAX  64
+/* TBFT_RQUEUE_MAX sourced from Kconfig (default 16) */
 
 typedef struct {
     uint8_t  buf[TBFT_MAX_MESSAGE_SIZE];
@@ -399,11 +392,6 @@ typedef struct {
     tbft_rqueue_t rqueue;     /* read-write */
     tbft_rqueue_t ro_rqueue;  /* read-only */
 
-    /* Protocol logs */
-    tbft_plog_t  plog;   /* Log<Prepared_cert> */
-    tbft_clog_t  clog;   /* Log<Commit_cert> */
-    tbft_elog_t  elog;   /* Log<Checkpoint_cert> */
-
     /* Static memory regions */
     tbft_agreement_region_t   ar;
     tbft_checkpoint_region_t  cr;
@@ -428,7 +416,7 @@ typedef struct {
     tbft_comp_ndet_cb_t   comp_ndet_cb;
     tbft_recv_reply_cb_t  recv_reply_cb;
     int                   ndet_max_len;
-    uint8_t  ndet_buf[256];
+    uint8_t  ndet_buf[TBFT_NDET_BUF_SIZE];
 
     /* Message build buffer */
     uint8_t  out_buf[TBFT_MAX_MESSAGE_SIZE];
@@ -466,7 +454,7 @@ Messages received but not in this list (Reply, Status, View-change-ack, New-key,
 | `rtimer` | NULL | Placeholder (not used) |
 | `ntimer` | NULL | Placeholder (not used) |
 
-Default periods: `vtimer = 5000000 us` (5 s), `stimer = 1000000 us` (1 s). Overridden by config file values.
+Default periods: `vtimer = 5000000 us` (5 s), `stimer = 1000000 us` (1 s). Overridden by config file values. Timers are initialised in `tbft_replica_init()` but **not started** — `Byz_init_replica()` sets the correct periods from the config file and then starts them.
 
 ### Handler Summary
 
@@ -498,7 +486,7 @@ For each `n` from `last_executed + 1` upward while committed in AR:
 ### mark_stable Flow
 
 1. Update `last_stable` and `state.last_stable`
-2. Truncate all logs: `plog`, `clog`, `elog`, `ar`, `cr`
+2. Truncate static regions: `ar`, `cr`
 3. Restart vtimer
 
 ### send_view_change Flow
@@ -681,40 +669,9 @@ Complete when ALL of:
 2. `tbft_prepare_cert_is_complete(&pc)` (2f matching prepares)
 3. Digest in PP matches digest in winning prepare value
 
-### Prepare Log (tbft_plog_t)
+### Standalone Logs (tbft_plog_t, tbft_clog_t, tbft_elog_t)
 
-```c
-typedef struct {
-    tbft_prepared_cert_t  slots[TBFT_WINDOW_SIZE];
-    tbft_seqno_t          head;
-    int                   head_idx;
-    int                   mask;
-    int                   prepare_threshold;  /* 2f */
-} tbft_plog_t;
-```
-
-This is an independent circular buffer of Prepared_cert objects, separate from the agreement region.
-
-### Commit Log (tbft_clog_t) and Checkpoint Log (tbft_elog_t)
-
-Defined inline in `src/tbft_log.h`:
-
-```c
-typedef struct {
-    tbft_commit_cert_t  slots[TBFT_WINDOW_SIZE];
-    tbft_seqno_t        head;
-    int                 head_idx;
-    int                 mask;       /* WINDOW_SIZE - 1 */
-    int                 threshold;  /* 2f+1 */
-} tbft_clog_t;
-
-typedef struct {
-    tbft_checkpoint_cert_t  slots[TBFT_NUM_CKPT_SLOTS];
-    tbft_seqno_t            head;
-    int                     threshold;
-    int                     num_slots;  /* TBFT_NUM_CKPT_SLOTS */
-} tbft_elog_t;
-```
+> **Note:** These types are defined in `src/tbft_prepared_cert.h` and `src/tbft_log.h` but are **not used by the replica**. All prepare/commit handling goes through the agreement region (`ar`) and checkpoint handling through the checkpoint region (`cr`). The standalone log types remain available for custom integrations but are not embedded in `tbft_replica_t`.
 
 ## 10. Message Types
 
@@ -896,8 +853,8 @@ sequenceDiagram
 ### tbft_state_t Layout
 
 ```c
-#define TBFT_MAX_STATE_BLOCKS  256
-#define TBFT_MAX_CKPT_RECORDS  (TBFT_WINDOW_SIZE / TBFT_CHECKPOINT_INTERVAL + 2)
+/* TBFT_MAX_STATE_BLOCKS — sourced from Kconfig (default 256) */
+/* TBFT_NUM_CKPT_SLOTS = (TBFT_WINDOW_SIZE / TBFT_CHECKPOINT_INTERVAL + 2) — defined in tbft_config.h */
 
 typedef struct {
     int       block_idx;
@@ -925,7 +882,7 @@ typedef struct {
     tbft_bitmap_t cowb[TBFT_MAX_STATE_BLOCKS / 64 + 1];  /* CoW bitmap */
     tbft_ptree_t  ptree;
     tbft_digest_t block_digests[TBFT_MAX_STATE_BLOCKS];
-    tbft_ckpt_record_t ckpt_records[TBFT_MAX_CKPT_RECORDS];
+    tbft_ckpt_record_t ckpt_records[TBFT_NUM_CKPT_SLOTS];
     int                ckpt_head;
     int                ckpt_count;
     bool              in_fetch;
@@ -1338,14 +1295,14 @@ Bitmap helpers: `tbft_bitmap_set`, `tbft_bitmap_clear`, `tbft_bitmap_test`, `tbf
 | `src/tbft_node.h/c` | Node base class (send/recv/auth) |
 | `src/tbft_itimer.h/c` | esp_timer wrapper |
 | `src/tbft_certificate.h/c` | Generic certificate via CERT_IMPL macro |
-| `src/tbft_prepared_cert.h/c` | Prepared_cert + plog |
+| `src/tbft_prepared_cert.h/c` | Prepared_cert (+ standalone plog type, unused by replica) |
 | `src/tbft_agreement_region.h/c` | Static AR (slices of prepared_cert + commit_cert) |
 | `src/tbft_checkpoint_region.h/c` | Static CR (checkpoint messages) |
 | `src/tbft_special_region.h/c` | Static SR (VC, NV, requests, replies) |
 | `src/tbft_partition.h/c` | Merkle partition tree |
 | `src/tbft_state.h/c` | Application state: CoW, checkpoints, fetch |
 | `src/tbft_view_info.h/c` | View-change protocol state |
-| `src/tbft_log.h` | Circular log types (clog, elog inline) |
+| `src/tbft_log.h` | Standalone circular log types (not used by replica) |
 | `src/tbft_replica.h/c` | Full replica state machine |
 | `src/tbft_libbyz.c` | Public API bridge, config parser |
 | `Kconfig.projbuild` | All Kconfig options |

@@ -51,6 +51,11 @@ Key options:
 | `TBFT_MAX_MESSAGE_SIZE` | 8192 | Maximum protocol message size |
 | `TBFT_WINDOW_SIZE` | 256 | Sequence number window |
 | `TBFT_CHECKPOINT_INTERVAL` | 128 | Checkpoint every N requests |
+| `TBFT_RQUEUE_MAX` | 16 | Max queued requests (memory: 2 × N × msg_size) |
+| `TBFT_NDET_BUF_SIZE` | 256 | Non-deterministic choices buffer |
+| `TBFT_MAX_STATE_BLOCKS` | 256 | Max state blocks for CoW / partition tree |
+| `TBFT_P_LEVELS` | 4 | Merkle partition tree depth |
+| `TBFT_ANTI_REPLAY_WINDOW_MS` | 30000 | Anti-replay window (ms, 0 = disabled) |
 
 ### 3. Build and flash
 
