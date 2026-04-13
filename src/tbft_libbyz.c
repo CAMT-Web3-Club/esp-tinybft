@@ -97,8 +97,24 @@ static int parse_config(const char *path, tbft_config_t *cfg)
     if (fscanf(f, "%d", &cfg->num_nodes) != 1) goto fail;
     if (fscanf(f, "%31s", cfg->mcast_ip) != 1) goto fail;
 
+    /* Validate: f must fit the static cert buffers sized at compile time */
+    if (cfg->f < 1 || cfg->f > TBFT_MAX_FAULTY) {
+        ESP_LOGE(TAG, "f=%d out of range [1, %d] — increase TBFT_MAX_NUM_REPLICAS",
+                 cfg->f, TBFT_MAX_FAULTY);
+        goto fail;
+    }
+
+    /* Validate: BFT requires n >= 3f+1 replicas; extra entries are clients */
+    int min_replicas = 3 * cfg->f + 1;
+    if (cfg->num_nodes < min_replicas) {
+        ESP_LOGE(TAG, "num_nodes=%d < 3f+1=%d", cfg->num_nodes, min_replicas);
+        goto fail;
+    }
     if (cfg->num_nodes > TBFT_MAX_NUM_REPLICAS + TBFT_MAX_NUM_CLIENTS) {
-        ESP_LOGE(TAG, "too many nodes: %d", cfg->num_nodes);
+        ESP_LOGE(TAG, "num_nodes=%d exceeds compile-time cap %d (MAX_NUM_REPLICAS=%d + MAX_NUM_CLIENTS=%d)",
+                 cfg->num_nodes,
+                 TBFT_MAX_NUM_REPLICAS + TBFT_MAX_NUM_CLIENTS,
+                 TBFT_MAX_NUM_REPLICAS, TBFT_MAX_NUM_CLIENTS);
         goto fail;
     }
 
@@ -111,8 +127,24 @@ static int parse_config(const char *path, tbft_config_t *cfg)
             goto fail;
         }
 
-        /* Check if field2 looks like a MAC address (contains ':') */
-        if (strchr(field2, ':') != NULL) {
+        bool is_mac = (strchr(field2, ':') != NULL);
+
+        /* Validate: file format must match the compiled-in transport */
+#if CONFIG_TBFT_TRANSPORT_UDP
+        if (is_mac) {
+            ESP_LOGE(TAG, "node %d has MAC address but transport is UDP — "
+                          "use a UDP config file (<hostname> <ip> <port> <pubkey>)", i);
+            goto fail;
+        }
+#elif CONFIG_TBFT_TRANSPORT_ESPNOW
+        if (!is_mac) {
+            ESP_LOGE(TAG, "node %d has IP address but transport is ESP-NOW — "
+                          "use an ESP-NOW config file (<hostname> <mac> <pubkey>)", i);
+            goto fail;
+        }
+#endif
+
+        if (is_mac) {
             /* ESP-NOW format: <hostname> <mac> <pubkey_path> */
             memcpy(cfg->nodes[i].mac_str, field2, sizeof(cfg->nodes[i].mac_str));
             if (fscanf(f, "%127s", cfg->nodes[i].pubkey_path) != 1) {
@@ -240,14 +272,22 @@ static int setup_principals(tbft_node_t *node, const tbft_config_t *cfg,
  * -------------------------------------------------------------------------- */
 
 int Byz_init_client(const char *config_file, const char *priv_config,
-                    uint16_t port)
+                    int local_id, uint16_t port)
 {
     tbft_config_t cfg;
     if (parse_config(config_file, &cfg) != 0) return -1;
 
-    int n = 3 * cfg.f + 1;
-    /* Local node id = first client index */
-    tbft_node_id_t local_id = (tbft_node_id_t)n;
+    int num_replicas = 3 * cfg.f + 1;
+
+    /* local_id == -1: auto-select first client slot (3f+1) */
+    if (local_id == -1) local_id = num_replicas;
+
+    /* Validate: local_id must be a client slot (beyond the replicas) */
+    if (local_id < num_replicas || local_id >= cfg.num_nodes) {
+        ESP_LOGE(TAG, "client local_id=%d out of client range [%d, %d)",
+                 local_id, num_replicas, cfg.num_nodes);
+        return -1;
+    }
 
     if (s_client) {
         tbft_node_free(s_client);
@@ -465,6 +505,7 @@ static void recv_reply_adapter(const void *rep, int rep_len, int cid)
 }
 
 int Byz_init_replica(const char *config_file, const char *priv_config,
+                     int local_id,
                      void *mem, size_t mem_size,
                      Byz_exec_cb exec_cb,
                      Byz_comp_ndet_cb comp_ndet_cb, int ndet_max_len,
@@ -474,12 +515,13 @@ int Byz_init_replica(const char *config_file, const char *priv_config,
     tbft_config_t cfg;
     if (parse_config(config_file, &cfg) != 0) return -1;
 
-    /* Find our node id by matching IP */
-    tbft_node_id_t local_id = -1;
-    /* In embedded context, we default to node 0 if we cannot determine IP.
-     * A production implementation would use esp_netif to get the local IP. */
-    local_id = 0;
-    ESP_LOGW(TAG, "using node_id=0 (set TBFT_NODE_ID env or config to override)");
+    /* Validate local_id: must be a replica slot (0..3f) in range */
+    int num_replicas = 3 * cfg.f + 1;
+    if (local_id < 0 || local_id >= num_replicas) {
+        ESP_LOGE(TAG, "local_id=%d out of replica range [0, %d)",
+                 local_id, num_replicas);
+        return -1;
+    }
 
     s_exec_cb       = exec_cb;
     s_comp_ndet_cb  = comp_ndet_cb;

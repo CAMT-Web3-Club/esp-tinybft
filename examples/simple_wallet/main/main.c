@@ -141,6 +141,7 @@ static void replica_task(void *arg) {
     app_state[3] = 1000;
 
     int ret = Byz_init_replica(config_file, priv_config,
+                               CONFIG_EXAMPLE_NODE_ID,
                                app_state, sizeof(app_state),
                                exec_cb, NULL, 0, NULL, 0);
     if (ret != 0) {
@@ -163,7 +164,7 @@ static void client_task(void *arg) {
 
     vTaskDelay(pdMS_TO_TICKS(5000)); // Wait for replicas to start
 
-    int ret = Byz_init_client(config_file, priv_config, 0);
+    int ret = Byz_init_client(config_file, priv_config, -1 /* auto = 3f+1 */, 0);
     if (ret != 0) {
         ESP_LOGE(TAG, "Failed to init client");
         vTaskDelete(NULL);

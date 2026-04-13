@@ -12,7 +12,8 @@
  * @code
  *   Byz_req req;
  *   Byz_rep rep;
- *   Byz_init_client("config.txt", "priv.txt", 0);
+ *   // local_id 4 = first client slot in a 4-replica config (3f+1 with f=1)
+ *   Byz_init_client("config.txt", "priv.txt", 4, 0);
  *   Byz_alloc_request(&req, 64);
  *   memcpy(req.contents, my_cmd, 64);
  *   req.size = 64;
@@ -25,7 +26,8 @@
  * Typical replica usage:
  * @code
  *   static uint8_t app_state[4096];
- *   Byz_init_replica("config.txt", "priv.txt",
+ *   // local_id identifies which replica slot (0..num_nodes-1) this board is
+ *   Byz_init_replica("config.txt", "priv.txt", 0,
  *                    app_state, sizeof(app_state),
  *                    exec_cb, NULL, 0, NULL, 0);
  *   Byz_replica_run();  // blocks — run in a FreeRTOS task
@@ -105,11 +107,14 @@ typedef void (*Byz_recv_reply_cb)(Byz_rep *reply, int cid);
  *
  * @param config_file   Path to the cluster configuration file
  * @param priv_config   Path to the private key / identity file
+ * @param local_id      Node slot this client occupies in the config
+ *                      (must be in [num_replicas, num_nodes-1]);
+ *                      pass -1 to auto-select the first client slot (3f+1)
  * @param port          UDP port to bind (0 = OS-assigned)
  * @return 0 on success, -1 on error
  */
 int Byz_init_client(const char *config_file, const char *priv_config,
-                    uint16_t port);
+                    int local_id, uint16_t port);
 
 /**
  * Allocate a request buffer of @p size bytes.
@@ -162,6 +167,10 @@ void Byz_reset_client(void);
  *
  * @param config_file   Cluster configuration file path
  * @param priv_config   Private key / identity file path
+ * @param local_id      Replica slot this board occupies (0..3f). Must match
+ *                      the node entry in @p config_file whose @p priv_config
+ *                      corresponds to; otherwise peers will reject this
+ *                      replica's authenticators.
  * @param mem           Application state buffer (must remain valid)
  * @param mem_size      State buffer size (multiple of BLOCK_SIZE)
  * @param exec_cb       Execution callback (must not be NULL)
@@ -172,6 +181,7 @@ void Byz_reset_client(void);
  * @return 0 on success, -1 on error
  */
 int Byz_init_replica(const char *config_file, const char *priv_config,
+                     int local_id,
                      void *mem, size_t mem_size,
                      Byz_exec_cb exec_cb,
                      Byz_comp_ndet_cb comp_ndet_cb, int ndet_max_len,
