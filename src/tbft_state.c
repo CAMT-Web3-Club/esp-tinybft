@@ -99,8 +99,8 @@ void tbft_state_cow_single(tbft_state_t *state, int bindex)
     tbft_cow_entry_t *new_arr = (tbft_cow_entry_t *)realloc(
         rec->old_blocks, (size_t)(n + 1) * sizeof(tbft_cow_entry_t));
     if (!new_arr) {
-        ESP_LOGE(TAG, "cow_single: out of memory");
-        return;
+        ESP_LOGE(TAG, "cow_single: out of memory! ABORTING to prevent consensus corruption.");
+        abort();
     }
     rec->old_blocks = new_arr;
 
@@ -151,6 +151,11 @@ void tbft_state_checkpoint(tbft_state_t *state, tbft_seqno_t seqno)
 
     /* Store the checkpoint record */
     tbft_ckpt_record_t *rec = ckpt_slot_for(state, seqno);
+    if (rec->old_blocks) {
+        free(rec->old_blocks);
+        rec->old_blocks = NULL;
+    }
+    rec->num_old_blocks = 0;
     rec->seqno       = seqno;
     rec->root_digest = *tbft_ptree_root_digest(&state->ptree);
     rec->valid       = true;
@@ -188,6 +193,21 @@ tbft_seqno_t tbft_state_rollback(tbft_state_t *state)
 
     cow_zero(state);
     return rec->seqno;
+}
+
+void tbft_state_mark_stable(tbft_state_t *state, tbft_seqno_t stable_seqno)
+{
+    if (stable_seqno <= state->last_stable) return;
+
+    /* Free old_blocks from the previous stable checkpoint since we can't rollback prior back. */
+    tbft_ckpt_record_t *old_rec = ckpt_slot_for(state, state->last_stable);
+    if (old_rec->old_blocks) {
+        free(old_rec->old_blocks);
+        old_rec->old_blocks = NULL;
+    }
+    old_rec->num_old_blocks = 0;
+
+    state->last_stable = stable_seqno;
 }
 
 /* --------------------------------------------------------------------------

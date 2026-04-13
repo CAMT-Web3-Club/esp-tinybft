@@ -131,6 +131,12 @@ const tbft_digest_t *tbft_state_root_digest(const tbft_state_t *state);
  */
 tbft_seqno_t tbft_state_rollback(tbft_state_t *state);
 
+/**
+ * Mark a checkpoint as stable across the network.
+ * Discards CoW history for checkpoints prior to this seqno.
+ */
+void tbft_state_mark_stable(tbft_state_t *state, tbft_seqno_t stable_seqno);
+
 /* --------------------------------------------------------------------------
  * State transfer (fetch protocol)
  * -------------------------------------------------------------------------- */

@@ -577,6 +577,27 @@ void tbft_replica_handle_fetch(tbft_replica_t *r, const void *msg, int len)
 
     if (level >= r->state.ptree.dims.p_levels) return;
 
+    if (level == r->state.ptree.dims.p_levels - 1) {
+        /* Send TBFT_MSG_DATA containing the requested block */
+        if (index >= r->state.num_blocks) return;
+
+        tbft_data_rep_t *data_rep = (tbft_data_rep_t *)r->out_buf;
+        data_rep->hdr.tag     = TBFT_MSG_DATA;
+        data_rep->hdr.extra   = 0;
+        data_rep->seqno       = fetch->c;
+        data_rep->block_index = index;
+        data_rep->digest      = r->state.ptree.ptree[level][index].digest;
+
+        uint8_t *payload = r->out_buf + sizeof(*data_rep);
+        memcpy(payload, r->state.mem + (size_t)index * TBFT_BLOCK_SIZE, TBFT_BLOCK_SIZE);
+
+        int32_t body_size = (int32_t)(sizeof(*data_rep) + TBFT_BLOCK_SIZE);
+        data_rep->hdr.size = tbft_msg_align(body_size);
+
+        tbft_node_send(&r->node, r->out_buf, (size_t)data_rep->hdr.size, fetch->id);
+        return;
+    }
+
     int pchildren = r->state.ptree.dims.p_children;
     int n_children = tbft_ptree_nodes_at_level(level + 1, pchildren);
     int first_child = index * pchildren;
@@ -600,13 +621,8 @@ void tbft_replica_handle_fetch(tbft_replica_t *r, const void *msg, int len)
         (tbft_part_info_t *)(out + sizeof(tbft_meta_data_rep_t));
     for (int c = 0; c < count; c++) {
         int cidx = first_child + c;
-        if (level + 1 < r->state.ptree.dims.p_levels) {
-            parts[c].digest  = r->state.ptree.ptree[level + 1][cidx].digest;
-            parts[c].version = (int32_t)r->state.ptree.ptree[level + 1][cidx].version;
-        } else {
-            tbft_digest_zero(&parts[c].digest);
-            parts[c].version = 0;
-        }
+        parts[c].digest  = r->state.ptree.ptree[level + 1][cidx].digest;
+        parts[c].version = (int32_t)r->state.ptree.ptree[level + 1][cidx].version;
     }
 
     int32_t total = (int32_t)(sizeof(*md) + (size_t)count * sizeof(tbft_part_info_t));
@@ -908,8 +924,8 @@ void tbft_replica_execute_committed(tbft_replica_t *r)
 void tbft_replica_mark_stable(tbft_replica_t *r, tbft_seqno_t seqno)
 {
     if (seqno <= r->last_stable) return;
+    tbft_state_mark_stable(&r->state, seqno);
     r->last_stable = seqno;
-    r->state.last_stable = seqno;
 
     /* Truncate static regions */
     tbft_ar_truncate(&r->ar, seqno + 1);
@@ -948,9 +964,10 @@ void tbft_replica_send_view_change(tbft_replica_t *r)
         vc->n_ckpts = 1;
     }
 
+    int max_reqs = (int)((sizeof(r->out_buf) - (size_t)(ptr - r->out_buf) - sizeof(tbft_sig_t)) / sizeof(tbft_vc_req_info_t));
     for (tbft_seqno_t s = r->last_stable + 1; s <= r->last_prepared; s++) {
         if (tbft_ar_in_range(&r->ar, s) && tbft_ar_prepared(&r->ar, s)) {
-            if (vc->n_reqs >= TBFT_WINDOW_SIZE) break;
+            if (vc->n_reqs >= TBFT_WINDOW_SIZE || vc->n_reqs >= max_reqs) break;
             int pp_len = 0;
             const uint8_t *pp_buf = tbft_ar_load_pp(&r->ar, s, &pp_len);
             if (pp_buf) {
