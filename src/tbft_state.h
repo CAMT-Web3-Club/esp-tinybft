@@ -64,6 +64,7 @@ typedef struct {
     tbft_seqno_t      fetch_seqno;
     tbft_fetch_req_t  fetch_queue[TBFT_MAX_STATE_BLOCKS];
     int               fetch_queue_len;
+    int               n_data_pending; /* number of leaf requests dispatched but not fulfilled */
     int64_t           fetch_timeout_us;
     int               fetch_replier;  /* replica id we're fetching from */
 

@@ -201,6 +201,7 @@ void tbft_state_start_fetch(tbft_state_t *state, tbft_seqno_t seqno,
     state->fetch_seqno      = seqno;
     state->fetch_replier    = replier;
     state->fetch_queue_len  = 0;
+    state->n_data_pending   = 0;
     state->fetch_timeout_us = 100000; /* 100 ms */
 
     /* Enqueue a root-level fetch request */
@@ -270,12 +271,16 @@ void tbft_state_handle_data(tbft_state_t *state,
     state->block_digests[bidx] = computed;
     tbft_ptree_update_leaf(&state->ptree, bidx, &computed, rep->seqno);
 
+    state->n_data_pending--;
+
     /* Check if all pending fetches are resolved */
-    bool all_done = true;
-    for (int i = 0; i < state->fetch_queue_len; i++) {
-        if (!state->fetch_queue[i].done) {
-            all_done = false;
-            break;
+    bool all_done = (state->n_data_pending == 0);
+    if (all_done) {
+        for (int i = 0; i < state->fetch_queue_len; i++) {
+            if (!state->fetch_queue[i].done) {
+                all_done = false;
+                break;
+            }
         }
     }
     if (all_done) {
@@ -290,6 +295,9 @@ bool tbft_state_next_fetch_req(tbft_state_t *state, int *level, int *index)
             *level = state->fetch_queue[i].level;
             *index = state->fetch_queue[i].index;
             state->fetch_queue[i].done = true;
+            if (*level == state->ptree.dims.p_levels - 1) {
+                state->n_data_pending++;
+            }
             return true;
         }
     }
@@ -301,4 +309,5 @@ void tbft_state_fetch_complete(tbft_state_t *state)
     ESP_LOGI(TAG, "fetch complete seqno=%lld", (long long)state->fetch_seqno);
     state->in_fetch        = false;
     state->fetch_queue_len = 0;
+    state->n_data_pending  = 0;
 }
