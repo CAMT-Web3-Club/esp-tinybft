@@ -268,8 +268,7 @@ void tbft_state_handle_data(tbft_state_t *state,
     memcpy(state->mem + (size_t)bidx * TBFT_BLOCK_SIZE,
            block_data, TBFT_BLOCK_SIZE);
     state->block_digests[bidx] = computed;
-    tbft_ptree_update_leaf(&state->ptree, bidx, &computed,
-                           (int32_t)rep->seqno);
+    tbft_ptree_update_leaf(&state->ptree, bidx, &computed, rep->seqno);
 
     /* Check if all pending fetches are resolved */
     bool all_done = true;

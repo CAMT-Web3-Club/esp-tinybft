@@ -66,6 +66,11 @@ typedef struct {
 
 _Static_assert(sizeof(frag_hdr_t) == FRAG_HDR_SIZE, "frag_hdr_t size mismatch");
 
+/* frag_mask is uint32_t so we can only track up to 32 fragments per message */
+_Static_assert(FRAG_MAX_PARTS <= 32,
+    "TBFT_MAX_MESSAGE_SIZE too large: would need >32 ESP-NOW fragments; "
+    "reduce TBFT_MAX_MESSAGE_SIZE or increase ESPNOW_MAX_DATA_LEN");
+
 /* --------------------------------------------------------------------------
  * Internal state
  * -------------------------------------------------------------------------- */
@@ -76,7 +81,7 @@ typedef struct {
     int       buf_len;
     uint16_t  msg_id;
     uint8_t   frag_total;
-    uint8_t   frag_received;  /* bitmap — up to 32 fragments via uint32_t */
+    uint8_t   frag_received;  /* count of fragments received so far */
     uint32_t  frag_mask;      /* bitmask of received fragment indices */
     uint8_t   src_mac[6];
     bool      valid;

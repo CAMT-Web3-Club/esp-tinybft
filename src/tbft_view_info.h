@@ -25,7 +25,6 @@ typedef struct {
     /* Per-replica tracking */
     bool         received[TBFT_MAX_NUM_REPLICAS];
     tbft_seqno_t last_stable[TBFT_MAX_NUM_REPLICAS]; /* ls from each vc msg */
-    bool         valid[TBFT_MAX_NUM_REPLICAS];
 
     int          n_received;      /* count of received view-change messages */
 } tbft_view_info_t;

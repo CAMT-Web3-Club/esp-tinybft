@@ -19,7 +19,6 @@ void tbft_vi_reset(tbft_view_info_t *vi, tbft_view_t new_target_view)
     vi->n_received  = 0;
     memset(vi->received,    0, sizeof(vi->received));
     memset(vi->last_stable, 0, sizeof(vi->last_stable));
-    memset(vi->valid,       0, sizeof(vi->valid));
     if (vi->sr) {
         tbft_sr_clear_vc(vi->sr);
     }
@@ -49,7 +48,6 @@ bool tbft_vi_collect_vc(tbft_view_info_t *vi,
 
     vi->received[sender_id]    = true;
     vi->last_stable[sender_id] = rep->ls;
-    vi->valid[sender_id]       = true;
     vi->n_received++;
 
     ESP_LOGD(TAG, "collected vc from %d, view=%lld, ls=%lld, total=%d",
@@ -71,7 +69,7 @@ void tbft_vi_compute_min_max(const tbft_view_info_t *vi,
     bool         first   = true;
 
     for (int i = 0; i < vi->num_replicas; i++) {
-        if (!vi->valid[i]) continue;
+        if (!vi->received[i]) continue;
 
         tbft_seqno_t ls = vi->last_stable[i];
         if (first) {
