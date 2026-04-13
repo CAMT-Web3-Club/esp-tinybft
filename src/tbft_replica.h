@@ -174,10 +174,15 @@ void tbft_replica_handle_meta_data(tbft_replica_t *r,
                                    const void *msg, int len);
 void tbft_replica_handle_data(tbft_replica_t *r,
                               const void *msg, int len);
+void tbft_replica_handle_new_key(tbft_replica_t *r,
+                                 const void *msg, int len);
 
 /* --------------------------------------------------------------------------
  * Protocol actions
  * -------------------------------------------------------------------------- */
+
+/** Generate fresh HMAC session keys and broadcast a New_key message */
+void tbft_replica_send_new_key(tbft_replica_t *r);
 
 /** Primary: assign seqno and broadcast Pre_prepare for queued requests */
 void tbft_replica_send_pre_prepare(tbft_replica_t *r);

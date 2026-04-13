@@ -1,5 +1,6 @@
 #include "tbft_replica.h"
 #include "esp_log.h"
+#include "esp_random.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -166,6 +167,11 @@ void tbft_replica_run(tbft_replica_t *r)
     r->running = true;
     ESP_LOGI(TAG, "replica %d starting event loop", r->node.node_id);
 
+    /* Broadcast fresh HMAC session keys to all peers before processing
+     * any protocol messages.  Peers will also send their own New_key
+     * messages which arrive during the normal event loop below. */
+    tbft_replica_send_new_key(r);
+
     while (r->running) {
         tbft_node_id_t src_id = -1;
         int n = tbft_node_recv(&r->node, r->node.recv_buf, &src_id);
@@ -210,6 +216,9 @@ void tbft_replica_run(tbft_replica_t *r)
             break;
         case TBFT_MSG_DATA:
             tbft_replica_handle_data(r, r->node.recv_buf, n);
+            break;
+        case TBFT_MSG_NEW_KEY:
+            tbft_replica_handle_new_key(r, r->node.recv_buf, n);
             break;
         default:
             ESP_LOGD(TAG, "unknown message tag %d", hdr->tag);
@@ -984,4 +993,125 @@ void tbft_replica_send_view_change(tbft_replica_t *r)
 
     /* Start view-change retransmit timer */
     tbft_itimer_start(&r->vtimer, r->vtimer_period_us * 2);
+}
+
+/* --------------------------------------------------------------------------
+ * Session key exchange (New_key)
+ * -------------------------------------------------------------------------- */
+
+void tbft_replica_send_new_key(tbft_replica_t *r)
+{
+    int n        = r->node.num_replicas;
+    int local_id = r->node.node_id;
+
+    /* Max message size check: header + (n-1) slots */
+    size_t max_needed = sizeof(tbft_new_key_rep_t)
+                      + (size_t)(n - 1) * sizeof(tbft_new_key_slot_t);
+    if (max_needed > sizeof(r->out_buf)) {
+        ESP_LOGE(TAG, "send_new_key: out_buf too small (%zu needed, %zu available)",
+                 max_needed, sizeof(r->out_buf));
+        return;
+    }
+
+    tbft_new_key_rep_t *nk = (tbft_new_key_rep_t *)r->out_buf;
+    nk->hdr.tag   = TBFT_MSG_NEW_KEY;
+    nk->hdr.extra = 0;
+    nk->id        = local_id;
+    nk->n_keys    = 0;
+
+    tbft_new_key_slot_t *slots =
+        (tbft_new_key_slot_t *)(r->out_buf + sizeof(*nk));
+    int slot_idx = 0;
+
+    for (int i = 0; i < n; i++) {
+        if (i == local_id) continue;
+
+        tbft_principal_t *p = r->node.principals[i];
+        if (!p) continue;
+
+        /* Generate a cryptographically random session key */
+        tbft_hmac_key_t new_key;
+        esp_fill_random(new_key.bytes, sizeof(new_key.bytes));
+
+        /* Store locally as the out-key for messages we send TO replica i */
+        tbft_principal_set_out_key(p, &new_key);
+
+        /* Encrypt the key under replica i's RSA public key */
+        size_t enc_len = 0;
+        int rc = tbft_principal_encrypt_new_key(p, &new_key,
+                                                 slots[slot_idx].ciphertext,
+                                                 sizeof(slots[slot_idx].ciphertext),
+                                                 &enc_len);
+        if (rc != 0 || enc_len != TBFT_SIG_SIZE) {
+            ESP_LOGW(TAG, "send_new_key: encrypt for replica %d failed", i);
+            /* Zero the ciphertext to avoid leaking key material */
+            memset(slots[slot_idx].ciphertext, 0,
+                   sizeof(slots[slot_idx].ciphertext));
+        }
+
+        slots[slot_idx].recipient_id = i;
+        slot_idx++;
+    }
+
+    if (slot_idx == 0) return;
+
+    nk->n_keys = slot_idx;
+    int32_t total = (int32_t)(sizeof(*nk)
+                               + (size_t)slot_idx * sizeof(tbft_new_key_slot_t));
+    nk->hdr.size = tbft_msg_align(total);
+
+    tbft_node_send(&r->node, r->out_buf, (size_t)nk->hdr.size,
+                   TBFT_ALL_REPLICAS);
+    ESP_LOGI(TAG, "sent New_key with %d slots", slot_idx);
+}
+
+void tbft_replica_handle_new_key(tbft_replica_t *r, const void *msg, int len)
+{
+    if (len < (int)sizeof(tbft_new_key_rep_t)) return;
+    const tbft_new_key_rep_t *nk = (const tbft_new_key_rep_t *)msg;
+
+    tbft_node_id_t sender_id = (tbft_node_id_t)nk->id;
+    if (sender_id < 0 || sender_id >= r->node.num_replicas) return;
+    if (sender_id == r->node.node_id) return; /* ignore own broadcasts */
+
+    if (nk->n_keys <= 0 || nk->n_keys > r->node.num_replicas) return;
+
+    int expected_len = (int)(sizeof(*nk)
+                             + (size_t)nk->n_keys * sizeof(tbft_new_key_slot_t));
+    if (len < expected_len) {
+        ESP_LOGW(TAG, "new_key from %d: message too short", sender_id);
+        return;
+    }
+
+    const tbft_new_key_slot_t *slots =
+        (const tbft_new_key_slot_t *)((const uint8_t *)msg + sizeof(*nk));
+
+    for (int i = 0; i < nk->n_keys; i++) {
+        if (slots[i].recipient_id != r->node.node_id) continue;
+
+        /* This slot is addressed to us — decrypt with our RSA private key */
+        tbft_principal_t *local = r->node.local_principal;
+        if (!local) return;
+
+        tbft_hmac_key_t new_key;
+        int rc = tbft_principal_decrypt_new_key(local,
+                                                 slots[i].ciphertext,
+                                                 TBFT_SIG_SIZE,
+                                                 &new_key);
+        if (rc != 0) {
+            ESP_LOGW(TAG, "new_key: decrypt from replica %d failed", sender_id);
+            return;
+        }
+
+        /* Install as the in-key for verifying messages FROM sender_id */
+        tbft_principal_t *p = r->node.principals[sender_id];
+        if (p) {
+            tbft_principal_set_in_key(p, &new_key);
+            ESP_LOGI(TAG, "installed HMAC in-key from replica %d", sender_id);
+        }
+
+        /* Explicit wipe of plaintext key after installation */
+        memset(&new_key, 0, sizeof(new_key));
+        return; /* only one slot per sender per message */
+    }
 }
