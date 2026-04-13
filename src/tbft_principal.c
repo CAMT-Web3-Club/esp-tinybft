@@ -117,7 +117,7 @@ bool tbft_principal_verify_mac_in(const tbft_principal_t *p,
     return diff == 0;
 }
 
-bool tbft_principal_verify_mac_in_with_replay_check(const tbft_principal_t *p,
+bool tbft_principal_verify_mac_in_with_replay_check(tbft_principal_t *p,
                                                      const void *msg, size_t msg_len,
                                                      const tbft_mac_t *mac,
                                                      int64_t msg_time_us)
@@ -132,6 +132,7 @@ bool tbft_principal_verify_mac_in_with_replay_check(const tbft_principal_t *p,
         msg_time_us <= p->last_auth_time_us) {
         return false;
     }
+    p->last_auth_time_us = msg_time_us;
     return true;
 }
 

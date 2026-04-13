@@ -98,11 +98,21 @@ bool tbft_principal_verify_mac_in(const tbft_principal_t *p,
 /**
  * Verify MAC and update anti-replay timestamp.
  * Returns true if MAC is valid AND message is not a replay.
+ * On success, updates p->last_auth_time_us to msg_time_us.
  */
-bool tbft_principal_verify_mac_in_with_replay_check(const tbft_principal_t *p,
+bool tbft_principal_verify_mac_in_with_replay_check(tbft_principal_t *p,
                                                     const void *msg, size_t msg_len,
                                                     const tbft_mac_t *mac,
                                                     int64_t msg_time_us);
+
+/**
+ * Update the last authenticated timestamp for this principal.
+ * Called after successful verification.
+ */
+static inline void tbft_principal_update_auth_time(tbft_principal_t *p, int64_t time_us)
+{
+    p->last_auth_time_us = time_us;
+}
 
 /**
  * Set the in-key (key for verifying messages received from this principal).

@@ -109,11 +109,11 @@ void tbft_node_gen_auth(tbft_node_t *node, const void *msg, size_t msg_len,
 
 bool tbft_node_verify_auth(tbft_node_t *node, tbft_node_id_t sender_id,
                            const void *msg, size_t msg_len,
-                           const tbft_mac_t *mac)
+                           const tbft_mac_t *mac, int64_t timestamp_us)
 {
     tbft_principal_t *p = node->principals[sender_id];
     if (!p) return false;
-    return tbft_principal_verify_mac_in(p, msg, msg_len, mac);
+    return tbft_principal_verify_mac_in_with_replay_check(p, msg, msg_len, mac, timestamp_us);
 }
 
 /* --------------------------------------------------------------------------
@@ -139,6 +139,15 @@ bool tbft_node_verify_sig(tbft_node_t *node, tbft_node_id_t sender_id,
 /* --------------------------------------------------------------------------
  * Helpers
  * -------------------------------------------------------------------------- */
+
+int tbft_node_auth_slot_index(const tbft_node_t *node, tbft_node_id_t sender_id)
+{
+    if (sender_id == node->node_id) return -1;
+    if (sender_id > node->node_id) {
+        return (int)sender_id - 1;
+    }
+    return (int)sender_id;
+}
 
 tbft_req_id_t tbft_node_new_rid(tbft_node_t *node)
 {

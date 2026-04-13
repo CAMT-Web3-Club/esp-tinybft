@@ -326,24 +326,28 @@ void tbft_replica_handle_pre_prepare(tbft_replica_t *r, const void *msg, int len
 
 void tbft_replica_handle_prepare(tbft_replica_t *r, const void *msg, int len)
 {
-    if (len < (int)sizeof(tbft_prepare_rep_t)) return;
+    if (len < (int)sizeof(tbft_prepare_rep_t) + (int)sizeof(tbft_auth_t)) return;
     const tbft_prepare_rep_t *prep = (const tbft_prepare_rep_t *)msg;
 
     if (prep->view != r->node.view) return;
     if (!tbft_replica_in_window(r, prep->seqno)) return;
 
     tbft_node_id_t sender = prep->id;
-    if (sender == tbft_node_primary(&r->node, prep->view)) return; /* skip primary */
+    if (sender == tbft_node_primary(&r->node, prep->view)) return;
+    if (sender == r->node.node_id) return;
 
-    bool accepted;
-    if (sender == r->node.node_id) {
-        accepted = tbft_ar_add_my_prepare(&r->ar, prep->seqno,
-                                          msg, len, sender);
-    } else {
-        accepted = tbft_ar_add_prepare(&r->ar, prep->seqno,
-                                       msg, len, sender);
+    int slot = tbft_node_auth_slot_index(&r->node, sender);
+    if (slot < 0) return;
+
+    const tbft_msg_hdr_t *hdr = (const tbft_msg_hdr_t *)msg;
+    const tbft_auth_t *auth = (const tbft_auth_t *)((const uint8_t *)msg + sizeof(*prep));
+    if (!tbft_node_verify_auth(&r->node, sender, msg, sizeof(*prep),
+                               &auth->slots[slot], hdr->timestamp_us)) {
+        ESP_LOGW(TAG, "prepare: MAC verification failed from %d", sender);
+        return;
     }
 
+    bool accepted = tbft_ar_add_prepare(&r->ar, prep->seqno, msg, len, sender);
     if (!accepted) return;
 
     /* Check if prepared — if so, send commit */
@@ -359,20 +363,27 @@ void tbft_replica_handle_prepare(tbft_replica_t *r, const void *msg, int len)
 
 void tbft_replica_handle_commit(tbft_replica_t *r, const void *msg, int len)
 {
-    if (len < (int)sizeof(tbft_commit_rep_t)) return;
+    if (len < (int)sizeof(tbft_commit_rep_t) + (int)sizeof(tbft_auth_t)) return;
     const tbft_commit_rep_t *cm = (const tbft_commit_rep_t *)msg;
 
     if (cm->view != r->node.view) return;
     if (!tbft_replica_in_window(r, cm->seqno)) return;
 
     tbft_node_id_t sender = cm->id;
-    bool accepted;
-    if (sender == r->node.node_id) {
-        accepted = tbft_ar_add_my_commit(&r->ar, cm->seqno, msg, len, sender);
-    } else {
-        accepted = tbft_ar_add_commit(&r->ar, cm->seqno, msg, len, sender);
+    if (sender == r->node.node_id) return;
+
+    int slot = tbft_node_auth_slot_index(&r->node, sender);
+    if (slot < 0) return;
+
+    const tbft_msg_hdr_t *hdr = (const tbft_msg_hdr_t *)msg;
+    const tbft_auth_t *auth = (const tbft_auth_t *)((const uint8_t *)msg + sizeof(*cm));
+    if (!tbft_node_verify_auth(&r->node, sender, msg, sizeof(*cm),
+                               &auth->slots[slot], hdr->timestamp_us)) {
+        ESP_LOGW(TAG, "commit: MAC verification failed from %d", sender);
+        return;
     }
 
+    bool accepted = tbft_ar_add_commit(&r->ar, cm->seqno, msg, len, sender);
     if (!accepted) return;
 
     /* Check if committed-local */
@@ -388,10 +399,31 @@ void tbft_replica_handle_commit(tbft_replica_t *r, const void *msg, int len)
 
 void tbft_replica_handle_checkpoint(tbft_replica_t *r, const void *msg, int len)
 {
-    if (len < (int)sizeof(tbft_checkpoint_rep_t)) return;
+    if (len < (int)sizeof(tbft_checkpoint_rep_t) + (int)sizeof(tbft_auth_t)) return;
     const tbft_checkpoint_rep_t *ckpt = (const tbft_checkpoint_rep_t *)msg;
 
     tbft_node_id_t sender = ckpt->id;
+    if (sender == r->node.node_id) {
+        bool stable = tbft_cr_store(&r->cr, ckpt->seqno, sender, msg, len);
+        if (stable) {
+            ESP_LOGI(TAG, "stable checkpoint at seqno=%lld",
+                     (long long)ckpt->seqno);
+            tbft_replica_mark_stable(r, ckpt->seqno);
+        }
+        return;
+    }
+
+    int slot = tbft_node_auth_slot_index(&r->node, sender);
+    if (slot < 0) return;
+
+    const tbft_msg_hdr_t *hdr = (const tbft_msg_hdr_t *)msg;
+    const tbft_auth_t *auth = (const tbft_auth_t *)((const uint8_t *)msg + sizeof(*ckpt));
+    if (!tbft_node_verify_auth(&r->node, sender, msg, sizeof(*ckpt),
+                               &auth->slots[slot], hdr->timestamp_us)) {
+        ESP_LOGW(TAG, "checkpoint: MAC verification failed from %d", sender);
+        return;
+    }
+
     bool stable = tbft_cr_store(&r->cr, ckpt->seqno, sender, msg, len);
 
     if (stable) {
@@ -622,8 +654,9 @@ void tbft_replica_send_pre_prepare(tbft_replica_t *r)
 
     /* Build Pre_prepare message */
     tbft_pre_prepare_rep_t *pp = (tbft_pre_prepare_rep_t *)r->out_buf;
-    pp->hdr.tag      = TBFT_MSG_PRE_PREPARE;
-    pp->hdr.extra    = 0;
+    pp->hdr.tag        = TBFT_MSG_PRE_PREPARE;
+    pp->hdr.extra      = 0;
+    pp->hdr.timestamp_us = esp_timer_get_time();
     pp->view         = r->node.view;
     pp->seqno        = r->seqno;
     pp->digest       = rset_digest;
@@ -677,6 +710,7 @@ void tbft_replica_send_prepare(tbft_replica_t *r, tbft_seqno_t n)
     tbft_prepare_rep_t *prep = (tbft_prepare_rep_t *)r->out_buf;
     prep->hdr.tag   = TBFT_MSG_PREPARE;
     prep->hdr.extra = 0;
+    prep->hdr.timestamp_us = esp_timer_get_time();
     prep->view      = r->node.view;
     prep->seqno     = n;
     prep->digest    = pp->digest;
@@ -701,6 +735,7 @@ void tbft_replica_send_commit(tbft_replica_t *r, tbft_seqno_t n)
     tbft_commit_rep_t *cm = (tbft_commit_rep_t *)r->out_buf;
     cm->hdr.tag   = TBFT_MSG_COMMIT;
     cm->hdr.extra = 0;
+    cm->hdr.timestamp_us = esp_timer_get_time();
     cm->view      = r->node.view;
     cm->seqno     = n;
     cm->id        = r->node.node_id;
@@ -791,6 +826,7 @@ void tbft_replica_execute_committed(tbft_replica_t *r)
                 (tbft_checkpoint_rep_t *)r->out_buf;
             ckpt->hdr.tag  = TBFT_MSG_CHECKPOINT;
             ckpt->hdr.extra = 0;
+            ckpt->hdr.timestamp_us = esp_timer_get_time();
             ckpt->seqno    = n;
             ckpt->digest   = *tbft_state_root_digest(&r->state);
             ckpt->id       = r->node.node_id;

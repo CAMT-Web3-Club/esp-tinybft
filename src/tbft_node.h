@@ -121,17 +121,19 @@ void tbft_node_gen_auth(tbft_node_t *node, const void *msg, size_t msg_len,
 
 /**
  * Verify one slot of a received authenticator from principal @p sender_id.
+ * Includes anti-replay protection using the message timestamp.
  *
  * @param node       This node
  * @param sender_id  Principal that sent the message
  * @param msg        Message bytes (header + body, excluding authenticator)
  * @param msg_len    Length
  * @param mac        The MAC slot from the received authenticator
- * @return true if valid
+ * @param timestamp_us  Message timestamp for anti-replay
+ * @return true if valid and not a replay
  */
 bool tbft_node_verify_auth(tbft_node_t *node, tbft_node_id_t sender_id,
                            const void *msg, size_t msg_len,
-                           const tbft_mac_t *mac);
+                           const tbft_mac_t *mac, int64_t timestamp_us);
 
 /* --------------------------------------------------------------------------
  * RSA signature path
@@ -149,6 +151,12 @@ int tbft_node_gen_sig(tbft_node_t *node, const void *msg, size_t msg_len,
 bool tbft_node_verify_sig(tbft_node_t *node, tbft_node_id_t sender_id,
                           const void *msg, size_t msg_len,
                           const tbft_sig_t *sig);
+
+/**
+ * Get the authenticator slot index for a given sender.
+ * Used to extract the correct MAC from received authenticators.
+ */
+int tbft_node_auth_slot_index(const tbft_node_t *node, tbft_node_id_t sender_id);
 
 /* --------------------------------------------------------------------------
  * Helpers

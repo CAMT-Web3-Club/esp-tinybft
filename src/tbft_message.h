@@ -29,13 +29,14 @@ typedef enum {
 
 /* --------------------------------------------------------------------------
  * Common message header
- * All messages on the wire begin with this header (8 bytes).
+ * All messages on the wire begin with this header (16 bytes).
  * -------------------------------------------------------------------------- */
 
 typedef struct __attribute__((packed)) {
     int16_t  tag;   /* tbft_msg_tag_t */
     int16_t  extra; /* tag-specific flags */
     int32_t  size;  /* total message byte length (8-byte aligned) */
+    int64_t  timestamp_us; /* sender timestamp for anti-replay protection */
 } tbft_msg_hdr_t;
 
 /* --------------------------------------------------------------------------
