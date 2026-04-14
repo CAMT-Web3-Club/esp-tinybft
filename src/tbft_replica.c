@@ -139,6 +139,8 @@ int tbft_replica_init(tbft_replica_t *r,
         tbft_itimer_free(&r->stimer);
         tbft_itimer_free(&r->rtimer);
         tbft_itimer_free(&r->ntimer);
+        tbft_state_free(&r->state);
+        tbft_node_free(&r->node);
         return -1;
     }
 
@@ -560,6 +562,10 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
      * The sender appends the sig after the body but does not include it in
      * hdr.size, so the total wire size is hdr.size + TBFT_SIG_SIZE. */
     int32_t body_size = vc->hdr.size;
+    if (body_size < (int32_t)sizeof(tbft_view_change_rep_t) || body_size > len) {
+        ESP_LOGW(TAG, "view-change: invalid body_size %d", (int)body_size);
+        return;
+    }
     if (len < (int)(body_size + (int)sizeof(tbft_sig_t))) {
         ESP_LOGW(TAG, "view-change: missing RSA signature from %d", sender_id);
         return;
@@ -1061,6 +1067,14 @@ void tbft_replica_send_view_change(tbft_replica_t *r)
     tbft_vi_reset(&r->vi, new_view);
 
     uint8_t *ptr = r->out_buf;
+
+    /* Ensure the fixed-size header + optional ckpt fits before writing */
+    size_t min_size = sizeof(tbft_view_change_rep_t) + sizeof(tbft_vc_ckpt_t) + sizeof(tbft_sig_t);
+    if (min_size > sizeof(r->out_buf)) {
+        ESP_LOGE(TAG, "send_view_change: buffer too small");
+        return;
+    }
+
     tbft_view_change_rep_t *vc = (tbft_view_change_rep_t *)ptr;
     vc->hdr.tag   = TBFT_MSG_VIEW_CHANGE;
     vc->hdr.extra = 0;
