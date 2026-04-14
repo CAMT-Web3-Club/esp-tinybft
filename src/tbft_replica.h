@@ -102,7 +102,7 @@ typedef struct {
     uint8_t  out_buf[TBFT_MAX_MESSAGE_SIZE];
 
     /* Running flag */
-    bool  running;
+    volatile bool  running;
 } tbft_replica_t;
 
 /* --------------------------------------------------------------------------

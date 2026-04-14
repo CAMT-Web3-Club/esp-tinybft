@@ -187,9 +187,22 @@ void tbft_replica_run(tbft_replica_t *r)
         esp_task_wdt_reset();
 #endif
 
+        /* Periodic yield counter: after processing a burst of messages,
+         * yield to let lower-priority tasks (send_task at priority 3)
+         * get CPU time.  Without this, the replica (priority 5) can
+         * starve the send_task indefinitely under continuous message load. */
+        static int msg_count = 0;
+        if (++msg_count >= 16) {
+            msg_count = 0;
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
+
         tbft_node_id_t src_id = -1;
         int n = tbft_node_recv(&r->node, r->node.recv_buf, &src_id);
         if (n < (int)sizeof(tbft_msg_hdr_t)) {
+            /* No message available — yield to let the WiFi task, lwIP,
+             * and the IDLE task get CPU time on single-core MCUs. */
+            vTaskDelay(0);
             continue;
         }
 
