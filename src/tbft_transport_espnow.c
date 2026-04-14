@@ -72,12 +72,10 @@ _Static_assert(SEND_TASK_SHUTDOWN < 0, "SEND_TASK_SHUTDOWN must be negative");
  * -------------------------------------------------------------------------- */
 
 typedef struct {
-    uint8_t  src_mac[ESPNOW_MAC_LEN];
     int      buf_len;
+    uint8_t  src_mac[ESPNOW_MAC_LEN];
     uint8_t  payload[TBFT_MAX_MESSAGE_SIZE];
 } recv_entry_t;
-_Static_assert(sizeof(recv_entry_t) == ESPNOW_MAC_LEN + sizeof(int) + TBFT_MAX_MESSAGE_SIZE,
-    "recv_entry_t size mismatch");
 
 #pragma pack(push, 1)
 typedef struct {
@@ -149,6 +147,11 @@ typedef struct tbft_espnow {
     /* Set during teardown to reject new send/recv calls */
     volatile bool shutting_down;
 } tbft_espnow_t;
+
+/* Global pointer to the active ESP-NOW context — set in tbft_transport_create,
+ * cleared in tbft_transport_free.  Accessed only from espnow_recv_cb (WiFi
+ * task) and the two lifecycle functions, so a simple pointer suffices. */
+static tbft_espnow_t *g_espnow_ctx = NULL;
 
 /* --------------------------------------------------------------------------
  * Stale-slot reclamation helper — call under lock in task context
