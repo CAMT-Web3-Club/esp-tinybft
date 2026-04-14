@@ -548,7 +548,16 @@ int tbft_transport_create(tbft_transport_t **out,
     }
 
     g_espnow_ctx = enow;
-    esp_now_register_recv_cb(espnow_recv_cb);
+    esp_err_t err = esp_now_register_recv_cb(espnow_recv_cb);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_now_register_recv_cb failed: %d", err);
+        g_espnow_ctx = NULL;
+        vQueueDelete(enow->send_queue);
+        vQueueDelete(enow->msg_queue);
+        vSemaphoreDelete(enow->lock);
+        free(enow);
+        return -1;
+    }
 
     /* Start the dedicated send task */
     BaseType_t ret = xTaskCreate(

@@ -8,6 +8,7 @@
 #include "nvs_flash.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
+#include "esp_now.h"
 #include "esp-tinybft.h"
 
 #if CONFIG_TBFT_TRANSPORT_UDP
@@ -59,7 +60,7 @@ int exec_cb(Byz_req *in, Byz_rep *out, Byz_buffer *ndet, int cid, bool ro) {
     wallet_req_t *req = (wallet_req_t *)in->contents;
     wallet_rep_t *rep = (wallet_rep_t *)out->contents;
     out->size = sizeof(wallet_rep_t);
-    
+
     if (req->op == 0) {
         if (req->from >= NUM_ACCOUNTS) return -1;
         rep->balance_from = app_state[req->from];
@@ -67,10 +68,10 @@ int exec_cb(Byz_req *in, Byz_rep *out, Byz_buffer *ndet, int cid, bool ro) {
         rep->status = 0;
     } else if (req->op == 1) {
         if (req->from >= NUM_ACCOUNTS || req->to >= NUM_ACCOUNTS) return -1;
-        
+
         Byz_modify(&app_state[req->from], sizeof(int32_t));
         Byz_modify(&app_state[req->to], sizeof(int32_t));
-        
+
         if (app_state[req->from] >= req->amount && req->amount > 0) {
             app_state[req->from] -= req->amount;
             app_state[req->to] += req->amount;
@@ -122,6 +123,7 @@ static void wifi_init(void) {
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_ERROR_CHECK(esp_now_init());
 #endif
 }
 
@@ -172,7 +174,7 @@ static void client_task(void *arg) {
     }
 
     ESP_LOGI(TAG, "Client running...");
-    
+
     while(1) {
         Byz_req req;
         Byz_rep rep;
@@ -181,7 +183,7 @@ static void client_task(void *arg) {
             vTaskDelay(pdMS_TO_TICKS(1000));
             continue;
         }
-        
+
         wallet_req_t *cmd = (wallet_req_t *)req.contents;
         cmd->op = 1; // transfer
         cmd->from = 0;
@@ -198,7 +200,7 @@ static void client_task(void *arg) {
         } else {
             ESP_LOGW(TAG, "Request failed or timed out.");
         }
-        
+
         Byz_free_request(&req);
         vTaskDelay(pdMS_TO_TICKS(5000));
     }

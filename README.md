@@ -158,16 +158,17 @@ The replica enforces the following bounds checks before touching any protocol st
 
 ### ESP-NOW host app requirements
 
-When using the ESP-NOW backend, the host application must initialise WiFi before calling `Byz_init_replica`:
+When using the ESP-NOW backend, the host application must initialise WiFi **and ESP-NOW** before calling `Byz_init_replica`:
 
 ```c
 esp_wifi_init(&cfg);
 esp_wifi_set_mode(WIFI_MODE_STA);
 esp_wifi_start();
+esp_now_init();
 // then call Byz_init_replica(...)
 ```
 
-The transport layer handles peer registration (`esp_now_add_peer`) automatically.
+ESP-NOW data must be transmitted only after Wi-Fi is started, so the recommended order is: start Wi-Fi, call `esp_now_init()`, then initialise TinyBFT. The transport layer handles peer registration (`esp_now_add_peer`) automatically.
 
 ## Architecture
 
