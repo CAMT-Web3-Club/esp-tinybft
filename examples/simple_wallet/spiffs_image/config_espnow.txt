@@ -3,7 +3,7 @@ wallet
 3000
 5
 0.0.0.0
-node0 02:00:00:00:00:00 /spiffs/pub0.der
+node0 88:56:a6:5b:f2:f0 /spiffs/pub0.der
 node1 02:00:00:00:00:01 /spiffs/pub1.der
 node2 02:00:00:00:00:02 /spiffs/pub2.der
 node3 02:00:00:00:00:03 /spiffs/pub3.der
