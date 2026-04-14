@@ -3,8 +3,8 @@
  * @brief ESP-NOW transport backend with automatic fragmentation/reassembly.
  *
  * Event-driven design:
- *  - Receive: ISR callback feeds reassembly under lock, pushes to msg_queue.
- *    xQueueSendFromISR wakes the blocked replica task automatically.
+ *  - Receive: WiFi-task callback feeds reassembly under lock, pushes to msg_queue.
+ *    Standard xQueueSend wakes the blocked replica task automatically.
  *  - Send: Replica task posts to send_queue (non-blocking).  A dedicated
  *    low-priority send_task drains the queue and handles ESP-NOW I/O with
  *    proper yields between sends.
@@ -116,6 +116,7 @@ typedef struct {
     bool      valid;
     bool      stale;  /* marked for deferred clear by task */
     TickType_t last_tick;
+    uint16_t  last_frag_len;   /* payload size of fragment (frag_total-1) */
 } reasm_slot_t;
 
 typedef struct tbft_espnow {
@@ -212,7 +213,8 @@ static reasm_slot_t *reasm_find_or_alloc(tbft_espnow_t *enow,
     return &enow->reasm[oldest];
 }
 
-static bool reasm_feed(reasm_slot_t *s, const uint8_t *data, int data_len,
+static bool reasm_feed(tbft_espnow_t *enow, reasm_slot_t *s,
+                       const uint8_t *data, int data_len,
                        uint16_t msg_id, uint8_t frag_idx, uint8_t frag_total,
                        const uint8_t *src_mac)
 {
@@ -228,6 +230,7 @@ static bool reasm_feed(reasm_slot_t *s, const uint8_t *data, int data_len,
         s->frag_received = 0;
         s->frag_mask = 0;
         s->buf_len = 0;
+        s->last_frag_len = 0;
         memcpy(s->src_mac, src_mac, 6);
         s->last_tick = now_ticks();
     } else if (s->stale) {
@@ -237,7 +240,17 @@ static bool reasm_feed(reasm_slot_t *s, const uint8_t *data, int data_len,
          * msg_id didn't match earlier — but reasm_find_or_alloc returned
          * it via timeout/LRU eviction).  Reset the slot fully to avoid
          * corrupting the new reassembly with leftover state. */
-        s->stale = false;
+        if (frag_total == 0 || frag_total > 32) return false;
+        s->valid         = true;
+        s->stale         = false;
+        s->msg_id        = msg_id;
+        s->frag_total    = frag_total;
+        s->frag_received = 0;
+        s->frag_mask     = 0;
+        s->buf_len       = 0;
+        s->last_frag_len = 0;
+        memcpy(s->src_mac, src_mac, 6);
+        s->last_tick     = now_ticks();
         enow->reasm_stale_flag = false;
     }
 
@@ -253,15 +266,21 @@ static bool reasm_feed(reasm_slot_t *s, const uint8_t *data, int data_len,
     s->frag_received++;
     s->last_tick = now_ticks();
 
+    if (frag_idx == frag_total - 1) {
+        s->last_frag_len = (uint16_t)data_len;
+    }
+
     if (s->frag_received == frag_total) {
-        s->buf_len = offset + data_len;
+        s->buf_len = (int)(frag_total - 1) * FRAG_MAX_PAYLOAD + (int)s->last_frag_len;
         return true;
     }
     return false;
 }
 
 /* --------------------------------------------------------------------------
- * ESP-NOW receive callback (ISR context)
+ * ESP-NOW receive callback (WiFi task context)
+ * Note: espnow_recv_cb runs in the WiFi task context, NOT an ISR.
+ * Standard FreeRTOS task-context APIs are used throughout.
  * -------------------------------------------------------------------------- */
 
 static void espnow_recv_cb(const esp_now_recv_info_t *recv_info,
@@ -292,7 +311,7 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info,
     int payload_len = data_len - (int)sizeof(frag_hdr_t);
     if (payload_len < 0) return;  /* malformed packet */
 
-    bool complete = reasm_feed(s, payload, payload_len,
+    bool complete = reasm_feed(enow, s, payload, payload_len,
                                fhdr->msg_id, fhdr->frag_idx,
                                fhdr->frag_total, src_mac);
 
@@ -341,7 +360,7 @@ static int espnow_do_send(tbft_espnow_t *enow,
             ESP_LOGE(TAG, "esp_now_send failed: %d", err);
             return -1;
         }
-        vTaskDelay(pdMS_TO_TICKICS(FRAG_INTER_DELAY_MS));
+        vTaskDelay(pdMS_TO_TICKS(FRAG_INTER_DELAY_MS));
         return (int)len;
     }
 
@@ -371,7 +390,7 @@ static int espnow_do_send(tbft_espnow_t *enow,
             return -1;
         }
 
-        vTaskDelay(pdMS_TO_TICKICS(FRAG_INTER_DELAY_MS));
+        vTaskDelay(pdMS_TO_TICKS(FRAG_INTER_DELAY_MS));
 
         src += chunk;
         remaining -= chunk;
@@ -392,7 +411,7 @@ static void espnow_send_task(void *pvParameters)
     while (1) {
         /* Block until a send entry is available */
         BaseType_t ret = xQueueReceive(enow->send_queue, &entry,
-                                       pdMS_TO_TICKICS(SEND_TASK_RECV_TIMEOUT_MS));
+                                       pdMS_TO_TICKS(SEND_TASK_RECV_TIMEOUT_MS));
         if (ret != pdTRUE) {
             /* Timeout — clear any stale reassembly slots under lock.
              * This prevents a race where the ISR is mid-write to a slot
@@ -647,7 +666,7 @@ int tbft_transport_send(tbft_transport_t *t, const void *buf, size_t len,
     entry.dest = dest;
 
     /* Non-blocking post to send queue — returns immediately */
-    if (xQueueSend(enow->send_queue, &entry, pdMS_TO_TICKICS(SEND_QUEUE_TIMEOUT_MS)) != pdTRUE) {
+    if (xQueueSend(enow->send_queue, &entry, pdMS_TO_TICKS(SEND_QUEUE_TIMEOUT_MS)) != pdTRUE) {
         ESP_LOGW(TAG, "send_queue full");
         return -1;
     }

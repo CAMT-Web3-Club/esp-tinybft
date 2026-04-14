@@ -49,28 +49,17 @@ static void rqueue_pop(tbft_rqueue_t *q) {
 static void vtimer_cb(void *arg)
 {
     tbft_replica_t *r = (tbft_replica_t *)arg;
-    ESP_LOGW(TAG, "view-change timeout in view %lld", (long long)r->node.view);
-    tbft_replica_send_view_change(r);
+    if (r->evt_group) {
+        xEventGroupSetBits(r->evt_group, TBFT_EVT_VTIMER);
+    }
 }
 
 static void stimer_cb(void *arg)
 {
     tbft_replica_t *r = (tbft_replica_t *)arg;
-    /* Broadcast a Status message */
-    tbft_status_rep_t *st = (tbft_status_rep_t *)r->out_buf;
-    st->hdr.tag           = TBFT_MSG_STATUS;
-    st->hdr.extra         = 0;
-    st->hdr.size          = tbft_msg_align((int32_t)sizeof(*st));
-    st->view              = r->node.view;
-    st->last_stable       = r->last_stable;
-    st->last_prepared     = r->last_prepared;
-    st->last_executed     = r->last_executed;
-    st->id                = r->node.node_id;
-    tbft_node_send(&r->node, r->out_buf, (size_t)st->hdr.size,
-                   TBFT_ALL_REPLICAS);
-
-    /* Restart status timer */
-    tbft_itimer_start(&r->stimer, r->stimer_period_us);
+    if (r->evt_group) {
+        xEventGroupSetBits(r->evt_group, TBFT_EVT_STIMER);
+    }
 }
 
 /* --------------------------------------------------------------------------
@@ -143,6 +132,16 @@ int tbft_replica_init(tbft_replica_t *r,
     tbft_itimer_init(&r->rtimer, NULL,       r, "tbft_rtimer");
     tbft_itimer_init(&r->ntimer, NULL,       r, "tbft_ntimer");
 
+    r->evt_group = xEventGroupCreate();
+    if (!r->evt_group) {
+        ESP_LOGE(TAG, "replica: failed to create event group");
+        tbft_itimer_free(&r->vtimer);
+        tbft_itimer_free(&r->stimer);
+        tbft_itimer_free(&r->rtimer);
+        tbft_itimer_free(&r->ntimer);
+        return -1;
+    }
+
     ESP_LOGI(TAG, "replica %d init: f=%d n=%d state=%zu bytes",
              node_id, f, n, state_size);
     return 0;
@@ -151,13 +150,14 @@ int tbft_replica_init(tbft_replica_t *r,
 void tbft_replica_free(tbft_replica_t *r)
 {
     r->running = false;
-    if (r->evt_group) {
-        vEventGroupDelete(r->evt_group);
-    }
     tbft_itimer_free(&r->vtimer);
     tbft_itimer_free(&r->stimer);
     tbft_itimer_free(&r->rtimer);
     tbft_itimer_free(&r->ntimer);
+    if (r->evt_group) {
+        vEventGroupDelete(r->evt_group);
+        r->evt_group = NULL;
+    }
     tbft_state_free(&r->state);
     tbft_node_free(&r->node);
 }
@@ -217,6 +217,8 @@ void tbft_replica_run(tbft_replica_t *r)
                 st->last_prepared     = r->last_prepared;
                 st->last_executed     = r->last_executed;
                 st->id                = r->node.node_id;
+                st->_pad              = 0;
+                st->hdr.timestamp_us  = esp_timer_get_time();
                 tbft_node_send(&r->node, r->out_buf, (size_t)st->hdr.size,
                                TBFT_ALL_REPLICAS);
 
@@ -293,6 +295,17 @@ void tbft_replica_handle_request(tbft_replica_t *r, const void *msg, int len)
 {
     if (len < (int)sizeof(tbft_request_rep_t)) return;
     const tbft_request_rep_t *req = (const tbft_request_rep_t *)msg;
+
+    if (req->command_size < 0 ||
+        (size_t)req->command_size > TBFT_MAX_MESSAGE_SIZE - sizeof(*req) - sizeof(tbft_sig_t)) {
+        ESP_LOGW(TAG, "request: invalid command_size %d", req->command_size);
+        return;
+    }
+
+    if (req->cid < 0 || req->cid >= r->node.num_nodes) {
+        ESP_LOGW(TAG, "request: invalid client id %d", req->cid);
+        return;
+    }
 
     /* Verify request signature */
     int sig_offset = (int)(sizeof(*req) + req->command_size);
@@ -426,6 +439,10 @@ void tbft_replica_handle_prepare(tbft_replica_t *r, const void *msg, int len)
     if (!tbft_replica_in_window(r, prep->seqno)) return;
 
     tbft_node_id_t sender = prep->id;
+    if (sender < 0 || sender >= r->node.num_replicas) {
+        ESP_LOGW(TAG, "prepare: invalid sender id %d", sender);
+        return;
+    }
     if (sender == tbft_node_primary(&r->node, prep->view)) return;
     if (sender == r->node.node_id) return;
 
@@ -463,6 +480,10 @@ void tbft_replica_handle_commit(tbft_replica_t *r, const void *msg, int len)
     if (!tbft_replica_in_window(r, cm->seqno)) return;
 
     tbft_node_id_t sender = cm->id;
+    if (sender < 0 || sender >= r->node.num_replicas) {
+        ESP_LOGW(TAG, "commit: invalid sender id %d", sender);
+        return;
+    }
     if (sender == r->node.node_id) return;
 
     int slot = tbft_node_auth_slot_index(&r->node, sender);
@@ -644,6 +665,11 @@ void tbft_replica_handle_fetch(tbft_replica_t *r, const void *msg, int len)
     if (len < (int)sizeof(tbft_fetch_rep_t)) return;
     const tbft_fetch_rep_t *fetch = (const tbft_fetch_rep_t *)msg;
 
+    if (fetch->id < 0 || fetch->id >= r->node.num_replicas) {
+        ESP_LOGW(TAG, "fetch: invalid sender id %d", fetch->id);
+        return;
+    }
+
     /* Respond with Meta_data for the requested level/index */
     int level = fetch->level;
     int index = fetch->index;
@@ -714,6 +740,16 @@ void tbft_replica_handle_meta_data(tbft_replica_t *r, const void *msg, int len)
     if (len < (int)sizeof(tbft_meta_data_rep_t)) return;
 
     const tbft_meta_data_rep_t *md = (const tbft_meta_data_rep_t *)msg;
+
+    if (md->n_parts < 0 || md->n_parts > TBFT_P_CHILDREN) {
+        ESP_LOGW(TAG, "meta_data: invalid n_parts=%d", md->n_parts);
+        return;
+    }
+    if (len < (int)(sizeof(tbft_meta_data_rep_t) + (size_t)md->n_parts * sizeof(tbft_part_info_t))) {
+        ESP_LOGW(TAG, "meta_data: truncated parts array (n_parts=%d, len=%d)", md->n_parts, len);
+        return;
+    }
+
     const tbft_part_info_t *parts =
         (const tbft_part_info_t *)((const uint8_t *)msg + sizeof(*md));
 
@@ -774,6 +810,15 @@ void tbft_replica_send_pre_prepare(tbft_replica_t *r)
     int ndet_len = 0;
     if (r->comp_ndet_cb) {
         r->comp_ndet_cb(r->seqno, r->ndet_buf, &ndet_len, r->ndet_max_len);
+    }
+
+    /* Guard against buffer overflow before building the message */
+    size_t needed = sizeof(tbft_pre_prepare_rep_t) + (size_t)req->len
+                  + (size_t)ndet_len + sizeof(tbft_auth_t);
+    size_t aligned_needed = (needed + 7u) & ~7u;
+    if (aligned_needed > sizeof(r->out_buf)) {
+        ESP_LOGE(TAG, "pre-prepare: message too large (%zu > %zu)", aligned_needed, sizeof(r->out_buf));
+        return;
     }
 
     /* Build Pre_prepare message */
