@@ -302,7 +302,7 @@ void tbft_replica_handle_request(tbft_replica_t *r, const void *msg, int len)
         return;
     }
 
-    if (req->cid < 0 || req->cid >= r->node.num_nodes) {
+    if (req->cid < 0 || req->cid >= r->node.num_principals) {
         ESP_LOGW(TAG, "request: invalid client id %d", req->cid);
         return;
     }
