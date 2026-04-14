@@ -1,5 +1,7 @@
 #pragma once
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/event_groups.h"
 #include "tbft_node.h"
 #include "tbft_state.h"
 #include "tbft_agreement_region.h"
@@ -103,7 +105,13 @@ typedef struct {
 
     /* Running flag */
     volatile bool  running;
+
+    /* Event group for decoupling timer callbacks from heavy processing */
+    EventGroupHandle_t evt_group;
 } tbft_replica_t;
+
+#define TBFT_EVT_VTIMER (1 << 0)
+#define TBFT_EVT_STIMER (1 << 1)
 
 /* --------------------------------------------------------------------------
  * Lifecycle

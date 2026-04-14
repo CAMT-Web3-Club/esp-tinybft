@@ -15,7 +15,7 @@ idf.py flash monitor           # flash and open serial console
 idf.py -p /dev/ttyUSB0 flash monitor  # with explicit port
 
 # Component-only sanity check (requires IDF env active):
-idf.py --preview set-target esp32s3
+idf.py set-target esp32c3
 idf.py build
 ```
 
@@ -111,7 +111,8 @@ All three regions live directly inside `tbft_replica_t`. Indexing into `agreemen
 
 Additional important fields:
 - `tbft_view_info_t vi` — view-change protocol state
-- Four timers: `vtimer`, `stimer`, `rtimer`, `ntimer` (all `tbft_itimer_t` wrapping `esp_timer_handle_t`)
+- `EventGroupHandle_t evt_group` — Event group used to decouple timer callbacks (which execute in the system timer task) from heavy operations like RSA cryptography.
+- Four timers: `vtimer`, `stimer`, `rtimer`, `ntimer` (all `tbft_itimer_t` wrapping `esp_timer_handle_t`). Timers signal the event group rather than executing directly.
 - Request queues: `rqueue`, `ro_rqueue` (circular FIFOs, `TBFT_RQUEUE_MAX` entries, default 16 via Kconfig)
 - Buffers: `ndet_buf[TBFT_NDET_BUF_SIZE]`, `out_buf[TBFT_MAX_MESSAGE_SIZE]`
 - `running` flag, `vtimer_period_us`, `stimer_period_us`

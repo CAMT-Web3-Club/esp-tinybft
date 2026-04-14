@@ -151,6 +151,9 @@ int tbft_replica_init(tbft_replica_t *r,
 void tbft_replica_free(tbft_replica_t *r)
 {
     r->running = false;
+    if (r->evt_group) {
+        vEventGroupDelete(r->evt_group);
+    }
     tbft_itimer_free(&r->vtimer);
     tbft_itimer_free(&r->stimer);
     tbft_itimer_free(&r->rtimer);
@@ -197,12 +200,37 @@ void tbft_replica_run(tbft_replica_t *r)
             vTaskDelay(pdMS_TO_TICKS(1));
         }
 
+        if (r->evt_group) {
+            EventBits_t bits = xEventGroupClearBits(r->evt_group, TBFT_EVT_VTIMER | TBFT_EVT_STIMER);
+            if (bits & TBFT_EVT_VTIMER) {
+                ESP_LOGW(TAG, "view-change timeout in view %lld", (long long)r->node.view);
+                tbft_replica_send_view_change(r);
+            }
+            if (bits & TBFT_EVT_STIMER) {
+                /* Broadcast a Status message */
+                tbft_status_rep_t *st = (tbft_status_rep_t *)r->out_buf;
+                st->hdr.tag           = TBFT_MSG_STATUS;
+                st->hdr.extra         = 0;
+                st->hdr.size          = tbft_msg_align((int32_t)sizeof(*st));
+                st->view              = r->node.view;
+                st->last_stable       = r->last_stable;
+                st->last_prepared     = r->last_prepared;
+                st->last_executed     = r->last_executed;
+                st->id                = r->node.node_id;
+                tbft_node_send(&r->node, r->out_buf, (size_t)st->hdr.size,
+                               TBFT_ALL_REPLICAS);
+
+                /* Restart status timer */
+                tbft_itimer_start(&r->stimer, r->stimer_period_us);
+            }
+        }
+
         tbft_node_id_t src_id = -1;
         int n = tbft_node_recv(&r->node, r->node.recv_buf, &src_id);
         if (n < (int)sizeof(tbft_msg_hdr_t)) {
             /* No message available — yield to let the WiFi task, lwIP,
              * and the IDLE task get CPU time on single-core MCUs. */
-            vTaskDelay(0);
+            vTaskDelay(pdMS_TO_TICKS(1));
             continue;
         }
 

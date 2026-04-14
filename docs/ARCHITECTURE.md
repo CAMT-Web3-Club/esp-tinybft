@@ -403,6 +403,9 @@ typedef struct {
     /* View-change */
     tbft_view_info_t vi;
 
+    /* Event Group for decoupled timer callbacks */
+    EventGroupHandle_t evt_group;
+
     /* Timers */
     tbft_itimer_t vtimer;   /* view-change timeout */
     tbft_itimer_t stimer;   /* status broadcast */

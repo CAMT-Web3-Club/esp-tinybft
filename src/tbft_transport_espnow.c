@@ -170,11 +170,8 @@ static void reasm_clear_stale(tbft_espnow_t *enow)
 
 static TickType_t now_ticks(void)
 {
-    /* Use the ISR-safe variant — safe for both task and ISR context */
-    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-    TickType_t ticks = xTaskGetTickCountFromISR(&xHigherPriorityTaskWoken);
-    (void)xHigherPriorityTaskWoken;  /* caller handles yield */
-    return ticks;
+    /* Use the standard variant — safe for task context */
+    return xTaskGetTickCount();
 }
 
 static reasm_slot_t *reasm_find_or_alloc(tbft_espnow_t *enow,
@@ -278,19 +275,16 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info,
 
     tbft_espnow_t *enow = g_espnow_ctx;
 
-    /* Aggregate woken state across all FromISR calls */
-    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-
-    if (xSemaphoreTakeFromISR(enow->lock, &xHigherPriorityTaskWoken) != pdTRUE) {
-        /* Lock unavailable — another ISR or task holds it.
+    /* Lock is held by task context now */
+    if (xSemaphoreTake(enow->lock, 0) != pdTRUE) {
+        /* Lock unavailable — another task holds it.
          * Drop this fragment; the sender will retransmit at protocol level. */
         return;
     }
 
     reasm_slot_t *s = reasm_find_or_alloc(enow, fhdr->msg_id, src_mac);
     if (!s) {
-        xSemaphoreGiveFromISR(enow->lock, &xHigherPriorityTaskWoken);
-        portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+        xSemaphoreGive(enow->lock);
         return;
     }
 
@@ -308,8 +302,7 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info,
         q_entry.buf_len = s->buf_len;
         memcpy(q_entry.payload, s->buf, (size_t)s->buf_len);
 
-        if (xQueueSendFromISR(enow->msg_queue, &q_entry,
-                              &xHigherPriorityTaskWoken) != pdTRUE) {
+        if (xQueueSend(enow->msg_queue, &q_entry, 0) != pdTRUE) {
             /* Queue full — this is a protocol-level concern.
              * Dropped commits/checkpoints stall the replica until retransmit.
              * The 8-entry depth should suffice under normal load. */
@@ -319,13 +312,9 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info,
         /* Mark slot stale — memset deferred to task context under lock */
         s->stale = true;
         enow->reasm_stale_flag = true;
-
-        /* xQueueSendFromISR already wakes the waiting replica task.
-         * No task notification needed — the queue mechanism handles wakeup. */
     }
 
-    xSemaphoreGiveFromISR(enow->lock, &xHigherPriorityTaskWoken);
-    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+    xSemaphoreGive(enow->lock);
 }
 
 /* --------------------------------------------------------------------------
