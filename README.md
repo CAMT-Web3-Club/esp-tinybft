@@ -9,7 +9,7 @@ A pure-C implementation of [PBFT](https://pmg.csail.mit.edu/papers/osdi99.pdf) (
 - **Dual transport** — UDP over lwIP sockets or ESP-NOW with automatic fragmentation/reassembly; switchable via `menuconfig`
 - **PSA Crypto / MbedTLS 4.x** — HMAC-SHA256 (hot path) via PSA; RSA-2048 sign/verify via `mbedtls/pk.h`
 - **libbyz-compatible API** — drop-in for projects that already use the original libbyz interface
-- **FreeRTOS-native** — runs in a dedicated task; timers use `esp_timer`
+- **FreeRTOS-native** — runs in a dedicated task; timer callbacks are signal-only (event group); heavy protocol work dispatched in the run loop
 
 ## Requirements
 
@@ -145,6 +145,16 @@ Public keys are DER files (RSA-2048) stored on SPIFFS. Pass the private key path
 |---|---|---|---|---|
 | UDP | `TBFT_TRANSPORT_UDP` | lwIP sockets | Unbounded | Supports multicast |
 | ESP-NOW | `TBFT_TRANSPORT_ESPNOW` | esp_now API | 1470 bytes | Auto fragmentation/reassembly |
+
+### Input Validation
+
+The replica enforces the following bounds checks before touching any protocol state:
+
+- **Request handler**: `command_size` is validated non-negative and within message bounds; `cid` must be `>= 0 && < num_principals`
+- **Prepare / Commit / Checkpoint / Fetch / View-change handlers**: sender id must be `>= 0 && < num_replicas`
+- **Meta-data handler**: `n_parts` validated non-negative and `<= TBFT_P_CHILDREN` before performing the size arithmetic that walks the parts array
+- **View-change handler**: `body_size` validated `>= sizeof(tbft_view_change_rep_t)` and `<= len` before reading the appended RSA signature
+- **send_pre_prepare**: `aligned_needed` overflow guard ensures the assembled Pre-prepare fits in `out_buf` before any writes
 
 ### ESP-NOW host app requirements
 

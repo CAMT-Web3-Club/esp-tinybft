@@ -69,6 +69,8 @@ The transport interface (`tbft_transport.h`) abstracts send/recv/peer-registrati
 
 ESP-NOW v2.0 limits each packet to 1470 bytes. Messages exceeding this are automatically fragmented with a 4-byte header (`msg_id`, `frag_idx`, `frag_total`) and reassembled on the receiving side. Fragmentation works for both unicast and broadcast sends. The reassembly system uses 4 concurrent slots with 5-second timeout per message.
 
+`espnow_recv_cb` runs in the **WiFi task context** (not an ISR); standard task-context FreeRTOS APIs (`xSemaphoreTake`, `xQueueSend`) are used throughout.
+
 #### Config file formats
 
 **UDP mode** (per node line):
@@ -111,7 +113,7 @@ All three regions live directly inside `tbft_replica_t`. Indexing into `agreemen
 
 Additional important fields:
 - `tbft_view_info_t vi` — view-change protocol state
-- `EventGroupHandle_t evt_group` — Event group used to decouple timer callbacks (which execute in the system timer task) from heavy operations like RSA cryptography.
+- `EventGroupHandle_t evt_group` — Event group used to decouple timer callbacks (which execute in the system timer task) from heavy operations like RSA cryptography. Callbacks are signal-only — `vtimer_cb` and `stimer_cb` call `xEventGroupSetBits` and return immediately; heavy work runs in the `tbft_replica_run()` loop.
 - Four timers: `vtimer`, `stimer`, `rtimer`, `ntimer` (all `tbft_itimer_t` wrapping `esp_timer_handle_t`). Timers signal the event group rather than executing directly.
 - Request queues: `rqueue`, `ro_rqueue` (circular FIFOs, `TBFT_RQUEUE_MAX` entries, default 16 via Kconfig)
 - Buffers: `ndet_buf[TBFT_NDET_BUF_SIZE]`, `out_buf[TBFT_MAX_MESSAGE_SIZE]`
@@ -172,6 +174,16 @@ Additional Kconfig-sourced constants (with `#ifndef` guards for override):
 
 - `MAX_NUM_REPLICAS` drives static buffer sizing across all three regions — keep it as small as the deployment allows.
 - Default `MAX_NUM_REPLICAS=4` targets a single-fault-tolerant cluster (f=1, n=4).
+
+### Input validation
+
+Every message handler performs bounds and identity checks before touching protocol state:
+
+- `handle_request`: `command_size` validated non-negative and no integer overflow (`command_size <= TBFT_MAX_MESSAGE_SIZE - sizeof(rep) - sizeof(sig)`); `cid >= 0 && cid < num_principals`
+- `handle_prepare`, `handle_commit`, `handle_checkpoint`, `handle_view_change`, `handle_fetch`: sender id validated `>= 0 && < num_replicas`
+- `handle_meta_data`: `n_parts` validated non-negative and `<= TBFT_P_CHILDREN` before the size arithmetic `sizeof(rep) + n_parts * sizeof(tbft_part_info_t) <= len`
+- `handle_view_change`: `body_size >= sizeof(tbft_view_change_rep_t)` and `body_size <= len` before reading the RSA signature
+- `send_pre_prepare`: `aligned_needed <= sizeof(r->out_buf)` overflow guard before writing the Pre-prepare message to `out_buf`
 
 ### State transfer (fetch protocol)
 

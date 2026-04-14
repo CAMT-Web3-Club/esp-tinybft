@@ -173,19 +173,39 @@ typedef struct {
     uint32_t  frag_mask;       // bitmask, supports up to 32 fragments
     uint8_t   src_mac[6];
     bool      valid;
+    bool      stale;           // marked for deferred clear by task
     TickType_t last_tick;
+    uint16_t  last_frag_len;   // payload size of fragment (frag_total-1)
 } reasm_slot_t;
 
 typedef struct tbft_espnow {
     tbft_addr_t  peers[TBFT_MAX_NUM_REPLICAS + TBFT_MAX_NUM_CLIENTS];
     bool         peer_valid[TBFT_MAX_NUM_REPLICAS + TBFT_MAX_NUM_CLIENTS];
     int          num_nodes;
-    QueueHandle_t msg_queue;            // fully reassembled messages
-    reasm_slot_t  reasm[REASM_MAX_SLOTS]; // 4 concurrent reassembly slots
+
+    /* Queue of fully reassembled messages ready for delivery */
+    QueueHandle_t msg_queue;
+
+    /* Send queue: entries posted by replica task, consumed by send_task */
+    QueueHandle_t send_queue;
+    TaskHandle_t  send_task_handle;
+    TaskHandle_t  replica_task_handle;  // for waking from recv callback
+
+    /* Reassembly slots */
+    reasm_slot_t  reasm[REASM_MAX_SLOTS];
+
+    /* Monotonic message ID counter (protected by lock) */
     uint16_t next_msg_id;
+
+    /* Mutex — provides priority inheritance, preventing priority inversion
+     * between the lower-priority send_task (3) and higher-priority callers (5+) */
     SemaphoreHandle_t lock;
-    volatile bool send_done;
-    volatile bool send_ok;
+
+    /* Flag to signal task context has stale slots to clear */
+    volatile bool reasm_stale_flag;
+
+    /* Set during teardown to reject new send/recv calls */
+    volatile bool shutting_down;
 } tbft_espnow_t;
 ```
 
@@ -194,9 +214,10 @@ Key properties:
 - Fragment header: 4 bytes (`msg_id`, `frag_idx`, `frag_total`)
 - Max payload per fragment: 1466 bytes
 - Max fragments for a `TBFT_MAX_MESSAGE_SIZE` (8192) message: 6
-- Reassembly uses a FreeRTOS `QueueHandle_t` with entries of size `6 + 4 + TBFT_MAX_MESSAGE_SIZE`
+- Reassembly uses a FreeRTOS `QueueHandle_t` (`msg_queue`, depth 8) with entries of size `6 + 4 + TBFT_MAX_MESSAGE_SIZE`
 - Reassembly timeout: 5000 ms
-- Send waits synchronously for the ESP-NOW send callback (up to 100 retries, 1 ms each)
+- Send is event-driven: the replica task posts a `send_entry_t` to `send_queue` (non-blocking, depth 8) and returns immediately; a dedicated low-priority `send_task` (priority 3) drains the queue and handles all ESP-NOW I/O with `vTaskDelay` yields between fragments
+- `espnow_recv_cb` runs in the **WiFi task context** (not an ISR) — standard FreeRTOS task-context APIs (`xSemaphoreTake`, `xQueueSend`) are used throughout
 - Peers registered via `esp_now_add_peer` with `WIFI_IF_STA`
 
 ### Network Address Type
@@ -448,12 +469,28 @@ default: /* ignored */
 
 Messages received but not in this list (Reply, Status, View-change-ack, New-key, Query-stable, Reply-stable) are silently ignored in the current implementation.
 
+### Event Group and Timer Dispatch
+
+`tbft_replica_t` contains an `EventGroupHandle_t evt_group` that decouples `esp_timer` callbacks from heavy protocol work. The two timer callbacks are signal-only:
+
+```c
+#define TBFT_EVT_VTIMER (1 << 0)
+#define TBFT_EVT_STIMER (1 << 1)
+```
+
+- `vtimer_cb` — calls `xEventGroupSetBits(r->evt_group, TBFT_EVT_VTIMER)` and returns immediately
+- `stimer_cb` — calls `xEventGroupSetBits(r->evt_group, TBFT_EVT_STIMER)` and returns immediately
+
+The `tbft_replica_run()` loop calls `xEventGroupClearBits` each iteration and handles any set bits before processing the next network message. This avoids calling RSA or other heavy operations from the `esp_timer` task context.
+
+**Lifecycle:** In `tbft_replica_free()`, all four timers are freed with `tbft_itimer_free` before `vEventGroupDelete(r->evt_group)` is called, ensuring no timer callback fires after the event group is destroyed.
+
 ### Timer Callbacks
 
 | Timer | Callback | Action |
 |---|---|---|
-| `vtimer` | `vtimer_cb` | Calls `tbft_replica_send_view_change(r)` -- triggers view change |
-| `stimer` | `stimer_cb` | Builds and broadcasts `tbft_status_rep_t`, restarts itself |
+| `vtimer` | `vtimer_cb` | Sets `TBFT_EVT_VTIMER` bit — run loop calls `tbft_replica_send_view_change(r)` |
+| `stimer` | `stimer_cb` | Sets `TBFT_EVT_STIMER` bit — run loop builds and broadcasts `tbft_status_rep_t`, restarts stimer |
 | `rtimer` | NULL | Placeholder (not used) |
 | `ntimer` | NULL | Placeholder (not used) |
 
@@ -473,6 +510,21 @@ Default periods: `vtimer = 5000000 us` (5 s), `stimer = 1000000 us` (1 s). Overr
 | `handle_fetch` | Min size, level valid | Build Meta-data response with child digests |
 | `handle_meta_data` | In fetch, min size | Forward to state; dequeue and send fetch requests |
 | `handle_data` | In fetch, min size | Forward to state; verifies digest, writes block |
+
+### Input Validation
+
+Every message handler performs bounds and identity checks before touching protocol state. The following table summarises what is validated and where:
+
+| Handler / Function | Checks performed |
+|---|---|
+| `handle_request` | `command_size >= 0` and `command_size <= TBFT_MAX_MESSAGE_SIZE - sizeof(rep) - sizeof(sig)`; `cid >= 0 && cid < num_principals` |
+| `handle_prepare` | `sender >= 0 && sender < num_replicas` |
+| `handle_commit` | `sender >= 0 && sender < num_replicas` |
+| `handle_checkpoint` | `sender >= 0 && sender < num_replicas` |
+| `handle_view_change` | `sender_id >= 0 && sender_id < num_replicas`; `body_size >= sizeof(tbft_view_change_rep_t)` and `body_size <= len` |
+| `handle_fetch` | `fetch->id >= 0 && fetch->id < num_replicas` |
+| `handle_meta_data` | `n_parts >= 0 && n_parts <= TBFT_P_CHILDREN`; then size arithmetic `sizeof(rep) + n_parts * sizeof(tbft_part_info_t) <= len` |
+| `send_pre_prepare` | `aligned_needed <= sizeof(r->out_buf)` guard before writing Pre-prepare to `out_buf` |
 
 ### execute_committed Flow
 
