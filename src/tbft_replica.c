@@ -19,8 +19,8 @@ static void rqueue_init(tbft_rqueue_t *q) {
 
 static bool rqueue_push(tbft_rqueue_t *q, const void *buf, int len, bool ro) {
     if (q->count >= TBFT_RQUEUE_MAX) return false;
+    if (len < 0 || len > TBFT_MAX_MESSAGE_SIZE) return false;
     tbft_rqueue_entry_t *e = &q->entries[q->tail];
-    if (len > TBFT_MAX_MESSAGE_SIZE) return false;
     memcpy(e->buf, buf, (size_t)len);
     e->len  = len;
     e->ro   = ro;
@@ -577,7 +577,12 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
         return;
     }
 
-    if (!tbft_vi_collect_vc(&r->vi, sender_id, msg, len)) return;
+    if (!tbft_vi_collect_vc(&r->vi, sender_id, msg, len)) {
+        if (vc->v > r->node.view && !r->vi.received[r->node.node_id]) {
+            tbft_replica_send_view_change(r);
+        }
+        return;
+    }
 
     /* If we are the new primary and have enough view-changes, send new-view */
     int new_primary = tbft_node_primary(&r->node, vc->v);
@@ -587,25 +592,33 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
         tbft_vi_compute_min_max(&r->vi, &min_s, &max_s);
 
         tbft_new_view_rep_t *nv = (tbft_new_view_rep_t *)r->out_buf;
-        nv->hdr.tag   = TBFT_MSG_NEW_VIEW;
-        nv->hdr.extra = 0;
-        nv->v         = vc->v;
-        nv->min       = min_s;
-        nv->max       = max_s;
-        nv->n_prep    = 0;
-        nv->has_sig   = 1;
+        nv->hdr.tag          = TBFT_MSG_NEW_VIEW;
+        nv->hdr.extra        = 0;
+        nv->hdr.timestamp_us = esp_timer_get_time();
+        nv->v       = vc->v;
+        nv->min     = min_s;
+        nv->max     = max_s;
+        nv->n_prep  = 0;
+        nv->has_sig = 1;
 
-        /* Sign the New_view */
-        tbft_sig_t *sig = (tbft_sig_t *)(r->out_buf + sizeof(*nv));
-        if (tbft_node_gen_sig(&r->node, nv, sizeof(*nv), sig) == 0) {
-            nv->hdr.size = tbft_msg_align(
-                (int32_t)(sizeof(*nv) + sizeof(tbft_sig_t)));
-        } else {
-            nv->has_sig = 0;
-            nv->hdr.size = tbft_msg_align((int32_t)sizeof(*nv));
+        /* hdr.size covers the signed body (header + any prepared-entries).
+         * The RSA signature follows but is NOT included in hdr.size, so
+         * receivers locate it at msg + hdr.size. */
+        int32_t body_size = tbft_msg_align((int32_t)sizeof(*nv));
+        nv->hdr.size = body_size;
+
+        if ((size_t)body_size + sizeof(tbft_sig_t) > sizeof(r->out_buf)) {
+            ESP_LOGE(TAG, "new-view: out_buf too small for signature");
+            return;
+        }
+        tbft_sig_t *sig = (tbft_sig_t *)(r->out_buf + body_size);
+        if (tbft_node_gen_sig(&r->node, r->out_buf, (size_t)body_size, sig) != 0) {
+            ESP_LOGE(TAG, "new-view: failed to sign; refusing to send");
+            return;
         }
 
-        tbft_node_send(&r->node, r->out_buf, (size_t)nv->hdr.size,
+        int32_t total_size = body_size + (int32_t)sizeof(tbft_sig_t);
+        tbft_node_send(&r->node, r->out_buf, (size_t)total_size,
                        TBFT_ALL_REPLICAS);
         ESP_LOGI(TAG, "sent new-view v=%lld min=%lld max=%lld",
                  (long long)vc->v, (long long)min_s, (long long)max_s);
@@ -630,22 +643,37 @@ void tbft_replica_handle_new_view(tbft_replica_t *r, const void *msg, int len)
         return;
     }
 
-    /* Verify signature from the new primary */
-    if (nv->has_sig) {
-        int sig_offset = (int)((const uint8_t *)nv - (const uint8_t *)msg)
-                       + sizeof(*nv);
-        if (len < sig_offset + (int)sizeof(tbft_sig_t)) {
-            ESP_LOGW(TAG, "new-view: missing signature");
-            return;
-        }
-        const tbft_sig_t *sig = (const tbft_sig_t *)((const uint8_t *)msg + sig_offset);
-        int new_primary = tbft_node_primary(&r->node, nv->v);
-        if (!tbft_node_verify_sig(&r->node, new_primary,
-                                  nv, sizeof(*nv), sig)) {
-            ESP_LOGW(TAG, "new-view signature verification failed for v=%lld",
-                     (long long)nv->v);
-            return;
-        }
+    /* Signature is mandatory — an unsigned or malformed New_view would let
+     * any attacker drive our view and primary.  The signature covers the
+     * full body (hdr.size bytes, including any prepared-entries) so an
+     * attacker cannot mutate the trailing payload without invalidating it.
+     * hdr.size is the body length; the sig is appended but NOT included in
+     * hdr.size, so total wire = hdr.size + TBFT_SIG_SIZE. */
+    if (!nv->has_sig) {
+        ESP_LOGW(TAG, "new-view: unsigned message rejected (v=%lld)",
+                 (long long)nv->v);
+        return;
+    }
+
+    int32_t body_size = nv->hdr.size;
+    if (body_size < (int32_t)sizeof(tbft_new_view_rep_t) || body_size > len) {
+        ESP_LOGW(TAG, "new-view: invalid body_size=%d len=%d",
+                 (int)body_size, len);
+        return;
+    }
+    if (len < body_size + (int)sizeof(tbft_sig_t)) {
+        ESP_LOGW(TAG, "new-view: missing signature (body=%d len=%d)",
+                 (int)body_size, len);
+        return;
+    }
+    const tbft_sig_t *sig =
+        (const tbft_sig_t *)((const uint8_t *)msg + body_size);
+    int new_primary = tbft_node_primary(&r->node, nv->v);
+    if (!tbft_node_verify_sig(&r->node, new_primary,
+                              msg, (size_t)body_size, sig)) {
+        ESP_LOGW(TAG, "new-view: signature verification failed (v=%lld primary=%d)",
+                 (long long)nv->v, new_primary);
+        return;
     }
 
     /* Install new view */
@@ -798,8 +826,14 @@ void tbft_replica_send_pre_prepare(tbft_replica_t *r)
 {
     if (!tbft_replica_is_primary(r)) return;
 
-    tbft_rqueue_entry_t *req = rqueue_front(&r->rqueue);
-    if (!req) req = rqueue_front(&r->ro_rqueue);
+    /* Track which queue the request came from so we pop from the right one
+     * after successfully building and broadcasting the Pre_prepare. */
+    tbft_rqueue_t *src_queue = &r->rqueue;
+    tbft_rqueue_entry_t *req = rqueue_front(src_queue);
+    if (!req) {
+        src_queue = &r->ro_rqueue;
+        req = rqueue_front(src_queue);
+    }
     if (!req) return;
 
     /* Check window */
@@ -864,7 +898,7 @@ void tbft_replica_send_pre_prepare(tbft_replica_t *r)
     ESP_LOGD(TAG, "sent pre-prepare seqno=%lld view=%lld",
              (long long)r->seqno, (long long)r->node.view);
 
-    rqueue_pop(&r->rqueue);
+    rqueue_pop(src_queue);
     r->seqno++;
 
     /* Reset view-change timer — primary is active */
@@ -1048,6 +1082,19 @@ void tbft_replica_execute_committed(tbft_replica_t *r)
 void tbft_replica_mark_stable(tbft_replica_t *r, tbft_seqno_t seqno)
 {
     if (seqno <= r->last_stable) return;
+
+    const tbft_digest_t *winning = tbft_cr_winning_digest(&r->cr, seqno);
+    if (winning) {
+        const tbft_digest_t *local = tbft_state_root_digest(&r->state);
+        if (!tbft_digest_equal(winning, local)) {
+            ESP_LOGW(TAG, "stable ckpt digest mismatch at seqno=%lld — starting fetch",
+                     (long long)seqno);
+            tbft_state_start_fetch(&r->state, seqno,
+                                   tbft_node_primary(&r->node, r->node.view));
+            return;
+        }
+    }
+
     tbft_state_mark_stable(&r->state, seqno);
     r->last_stable = seqno;
 
@@ -1063,8 +1110,14 @@ void tbft_replica_mark_stable(tbft_replica_t *r, tbft_seqno_t seqno)
 
 void tbft_replica_send_view_change(tbft_replica_t *r)
 {
-    tbft_view_t new_view = r->node.view + 1;
-    tbft_vi_reset(&r->vi, new_view);
+    tbft_view_t target = r->node.view + 1;
+    if (r->vi.target_view > target) {
+        target = r->vi.target_view;
+    }
+
+    if (r->vi.target_view != target) {
+        tbft_vi_reset(&r->vi, target);
+    }
 
     uint8_t *ptr = r->out_buf;
 
@@ -1078,7 +1131,7 @@ void tbft_replica_send_view_change(tbft_replica_t *r)
     tbft_view_change_rep_t *vc = (tbft_view_change_rep_t *)ptr;
     vc->hdr.tag   = TBFT_MSG_VIEW_CHANGE;
     vc->hdr.extra = 0;
-    vc->v         = new_view;
+    vc->v         = target;
     vc->ls        = r->last_stable;
     vc->id        = r->node.node_id;
 
@@ -1135,10 +1188,11 @@ void tbft_replica_send_view_change(tbft_replica_t *r)
 
     tbft_node_send(&r->node, r->out_buf, (size_t)total_size, TBFT_ALL_REPLICAS);
 
-    ESP_LOGI(TAG, "sent view-change to view %lld", (long long)new_view);
+    ESP_LOGI(TAG, "sent view-change to view %lld", (long long)target);
 
-    /* Collect our own view-change (pass full wire length including sig) */
-    tbft_vi_collect_vc(&r->vi, r->node.node_id, r->out_buf, total_size);
+    if (!r->vi.received[r->node.node_id]) {
+        tbft_vi_collect_vc(&r->vi, r->node.node_id, r->out_buf, total_size);
+    }
 
     /* Start view-change retransmit timer */
     tbft_itimer_start(&r->vtimer, r->vtimer_period_us * 2);

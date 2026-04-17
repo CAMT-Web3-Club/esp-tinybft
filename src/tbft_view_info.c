@@ -29,18 +29,24 @@ bool tbft_vi_collect_vc(tbft_view_info_t *vi,
                         const void *msg, int msg_len)
 {
     if (sender_id < 0 || sender_id >= TBFT_MAX_NUM_REPLICAS) return false;
-    if (vi->received[sender_id]) return false;
 
-    /* Basic sanity check */
     if (msg_len < (int)sizeof(tbft_view_change_rep_t)) return false;
     const tbft_view_change_rep_t *rep = (const tbft_view_change_rep_t *)msg;
+
     if (rep->v != vi->target_view) {
-        ESP_LOGD(TAG, "vc from %d for view %lld, expected %lld",
-                 sender_id, (long long)rep->v, (long long)vi->target_view);
-        return false;
+        if (rep->v > vi->target_view) {
+            tbft_vi_reset(vi, rep->v);
+            ESP_LOGI(TAG, "advanced target_view to %lld (with reset) from vc of %d",
+                     (long long)vi->target_view, sender_id);
+        } else {
+            ESP_LOGD(TAG, "vc from %d for view %lld, expected %lld",
+                     sender_id, (long long)rep->v, (long long)vi->target_view);
+            return false;
+        }
     }
 
-    /* Store in special region */
+    if (vi->received[sender_id]) return false;
+
     if (!tbft_sr_store_vc(vi->sr, sender_id, msg, msg_len)) {
         ESP_LOGW(TAG, "failed to store vc from %d", sender_id);
         return false;

@@ -21,6 +21,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
+#include "esp_mac.h"
+#if CONFIG_TBFT_TRANSPORT_ESPNOW
+#include "esp_efuse.h"
+#endif
 
 static const char *TAG = "tbft_libbyz";
 
@@ -32,13 +37,15 @@ static tbft_replica_t *s_replica  = NULL;  /* allocated on Byz_init_replica */
 static tbft_node_t    *s_client   = NULL;  /* allocated on Byz_init_client  */
 static bool            s_is_replica = false;
 
-/* Reply collection state for clients */
-#define MAX_PENDING_REPLIES  (TBFT_MAX_NUM_REPLICAS * 2)
+/* Reply collection state for clients.
+ * Indexed by replica id — exactly one slot per replica.  This makes any
+ * "match" count necessarily a count of DISTINCT senders, which is required
+ * for BFT reply agreement (f+1 matching replies from different replicas). */
 static struct {
-    uint8_t  buf[TBFT_MAX_MESSAGE_SIZE];
-    int      len;
-    bool     valid;
-} s_replies[MAX_PENDING_REPLIES];
+    uint8_t          buf[TBFT_MAX_MESSAGE_SIZE];
+    int              len;
+    bool             valid;
+} s_replies[TBFT_MAX_NUM_REPLICAS];
 static int s_reply_count = 0;
 
 /* --------------------------------------------------------------------------
@@ -172,6 +179,45 @@ static int parse_config(const char *path, tbft_config_t *cfg)
     fclose(f);
     ESP_LOGI(TAG, "parsed config: service=%s f=%d nodes=%d mcast=%s",
              cfg->service_name, cfg->f, cfg->num_nodes, cfg->mcast_ip);
+
+#if CONFIG_TBFT_TRANSPORT_ESPNOW
+    /* Auto-detect local_node_id by matching the eFuse base MAC against
+     * the config entries.  Config files MUST contain base (eFuse) MACs,
+     * NOT AP MACs — the ESP-NOW transport applies get_ap_mac() internally. */
+    uint8_t local_mac[6];
+    if (esp_efuse_mac_get_default(local_mac) == ESP_OK) {
+        char local_mac_str[18];
+        snprintf(local_mac_str, sizeof(local_mac_str),
+                 "%02x:%02x:%02x:%02x:%02x:%02x",
+                 local_mac[0], local_mac[1], local_mac[2],
+                 local_mac[3], local_mac[4], local_mac[5]);
+        for (int i = 0; i < cfg->num_nodes; i++) {
+            if (cfg->nodes[i].mac_str[0] != '\0') {
+                /* Case-insensitive compare (config may use upper or lower hex) */
+                bool match = true;
+                for (int c = 0; c < 17; c++) {
+                    if (tolower((unsigned char)cfg->nodes[i].mac_str[c]) !=
+                        tolower((unsigned char)local_mac_str[c])) {
+                        match = false;
+                        break;
+                    }
+                }
+                if (match) {
+                    cfg->local_node_id = i;
+                    ESP_LOGI(TAG, "auto-detected local_node_id=%d (MAC=%s)",
+                             i, local_mac_str);
+                    break;
+                }
+            }
+        }
+        if (cfg->local_node_id < 0) {
+            ESP_LOGW(TAG, "local MAC %s not found in config — "
+                     "ensure config contains base (eFuse) MACs, not AP MACs",
+                     local_mac_str);
+        }
+    }
+#endif
+
     return 0;
 
 fail:
@@ -248,14 +294,37 @@ static int setup_principals(tbft_node_t *node, const tbft_config_t *cfg,
 
         tbft_principal_init(p, (tbft_node_id_t)i, &addr);
 
-        /* Load public key */
+        /* Load public key — failure is fatal */
         size_t pub_len = 0;
         uint8_t *pub = load_key_file(cfg->nodes[i].pubkey_path, &pub_len);
-        if (pub) {
-            tbft_principal_load_pub_key(p, pub, pub_len);
-            free(pub);
-        } else {
-            ESP_LOGW(TAG, "no public key file for node %d", i);
+        if (!pub) {
+            ESP_LOGE(TAG, "no public key file for node %d: %s", i, cfg->nodes[i].pubkey_path);
+            tbft_principal_free(p);
+            free(p);
+            for (int j = 0; j < i; j++) {
+                if (node->principals[j]) {
+                    tbft_principal_free(node->principals[j]);
+                    free(node->principals[j]);
+                    node->principals[j] = NULL;
+                }
+            }
+            return -1;
+        }
+        int pub_ret = tbft_principal_load_pub_key(p, pub, pub_len);
+        free(pub);
+        if (pub_ret != 0) {
+            ESP_LOGE(TAG, "failed to parse public key for node %d from %s",
+                     i, cfg->nodes[i].pubkey_path);
+            tbft_principal_free(p);
+            free(p);
+            for (int j = 0; j < i; j++) {
+                if (node->principals[j]) {
+                    tbft_principal_free(node->principals[j]);
+                    free(node->principals[j]);
+                    node->principals[j] = NULL;
+                }
+            }
+            return -1;
         }
 
         node->principals[i] = p;
@@ -272,6 +341,24 @@ static int setup_principals(tbft_node_t *node, const tbft_config_t *cfg,
                 free(priv);
             }
             node->local_principal = p;
+
+            /* Verify public/private key pair consistency */
+            if (p->has_priv_key) {
+                int rc = mbedtls_pk_check_pair(&p->pub_pk, &p->priv_pk);
+                if (rc != 0) {
+                    ESP_LOGE(TAG, "key pair mismatch for node %d: "
+                             "public and private keys do not correspond "
+                             "(mbedtls err=%d)", i, rc);
+                    for (int j = 0; j <= i; j++) {
+                        if (node->principals[j]) {
+                            tbft_principal_free(node->principals[j]);
+                            free(node->principals[j]);
+                            node->principals[j] = NULL;
+                        }
+                    }
+                    return -1;
+                }
+            }
         }
     }
     return 0;
@@ -385,7 +472,8 @@ int Byz_recv_reply(Byz_rep *rep)
     if (!s_client) return -1;
 
     int f = s_client->max_faulty;
-    int needed = f + 1; /* f+1 matching replies */
+    int needed = f + 1; /* f+1 matching replies from DISTINCT replicas */
+    int num_replicas = s_client->num_replicas;
     int64_t deadline_us = esp_timer_get_time() + 10000000LL; /* 10 s timeout */
 
     while (esp_timer_get_time() < deadline_us) {
@@ -400,57 +488,62 @@ int Byz_recv_reply(Byz_rep *rep)
         if (hdr->tag != TBFT_MSG_REPLY) continue;
 
         const tbft_reply_rep_t *r0 = (const tbft_reply_rep_t *)buf;
-        int num_replicas = s_client->num_replicas;
 
-        /* Verify RSA signature on this reply.
-         * The replica appends the sig after hdr.size; total wire = hdr.size + SIG. */
-        {
-            int32_t body_sz = r0->hdr.size;
-            tbft_node_id_t rep_id = -1;
-            /* Infer sender: scan known replica slots (reply has no explicit id field) */
-            /* Try to identify from src_id — not available here, so verify all replicas */
-            bool sig_ok = false;
-            if (n >= (int)(body_sz + (int)sizeof(tbft_sig_t))) {
-                const tbft_sig_t *sig =
-                    (const tbft_sig_t *)((const uint8_t *)buf + body_sz);
-                for (int ri = 0; ri < num_replicas; ri++) {
-                    if (tbft_node_verify_sig(s_client, (tbft_node_id_t)ri,
-                                            buf, (size_t)body_sz, sig)) {
-                        rep_id  = (tbft_node_id_t)ri;
-                        sig_ok  = true;
-                        break;
-                    }
-                }
-            }
-            if (!sig_ok) {
-                ESP_LOGW(TAG, "recv_reply: no valid RSA signature");
-                vTaskDelay(pdMS_TO_TICKS(1));
-                continue;
-            }
-            (void)rep_id;
-        }
+        /* Verify RSA signature and identify sender.
+         * The replica appends the sig after hdr.size; total wire = hdr.size + SIG.
+         * We try each replica's public key; only the true sender's key will
+         * validate the signature, giving us a reliable sender id. */
+        int32_t body_sz = r0->hdr.size;
+        tbft_node_id_t rep_id = -1;
+        if (body_sz < (int32_t)sizeof(tbft_reply_rep_t) || body_sz > n) continue;
+        if (n < body_sz + (int)sizeof(tbft_sig_t)) continue;
 
-        /* Store reply */
-        for (int i = 0; i < MAX_PENDING_REPLIES; i++) {
-            if (!s_replies[i].valid) {
-                memcpy(s_replies[i].buf, buf, (size_t)n);
-                s_replies[i].len   = n;
-                s_replies[i].valid = true;
-                s_reply_count++;
+        const tbft_sig_t *sig =
+            (const tbft_sig_t *)((const uint8_t *)buf + body_sz);
+        for (int ri = 0; ri < num_replicas; ri++) {
+            if (tbft_node_verify_sig(s_client, (tbft_node_id_t)ri,
+                                     buf, (size_t)body_sz, sig)) {
+                rep_id = (tbft_node_id_t)ri;
                 break;
             }
         }
+        if (rep_id < 0) {
+            ESP_LOGW(TAG, "recv_reply: no valid RSA signature");
+            vTaskDelay(pdMS_TO_TICKS(1));
+            continue;
+        }
+
+        /* Drop replies for old rids that were not cleared. */
+        if (s_replies[rep_id].valid) {
+            const tbft_reply_rep_t *old =
+                (const tbft_reply_rep_t *)s_replies[rep_id].buf;
+            if (old->rid != r0->rid) {
+                /* Stale cached reply from a previous request — replace. */
+                s_replies[rep_id].valid = false;
+                s_reply_count--;
+            } else {
+                /* Duplicate reply for same rid from this replica — ignore. */
+                continue;
+            }
+        }
+
+        /* Store — one slot per replica id guarantees distinct senders. */
+        if ((size_t)n > sizeof(s_replies[rep_id].buf)) continue;
+        memcpy(s_replies[rep_id].buf, buf, (size_t)n);
+        s_replies[rep_id].len   = n;
+        s_replies[rep_id].valid = true;
+        s_reply_count++;
 
         /* Count matching replies (same rid + payload digest).
-         * Do NOT filter on view: a replica may have moved to a later view but
-         * still produce a valid reply for our request id. */
+         * Do NOT filter on view: a replica may have moved to a later view
+         * but still produce a valid reply for our request id. */
         int match = 0;
         const uint8_t *winning_payload = NULL;
         int winning_payload_len = 0;
         tbft_digest_t winning_digest;
         bool first = true;
 
-        for (int i = 0; i < MAX_PENDING_REPLIES; i++) {
+        for (int i = 0; i < num_replicas; i++) {
             if (!s_replies[i].valid) continue;
             const tbft_reply_rep_t *ri =
                 (const tbft_reply_rep_t *)s_replies[i].buf;
@@ -569,6 +662,18 @@ int Byz_init_replica(const char *config_file, const char *priv_config,
     tbft_config_t cfg;
     if (parse_config(config_file, &cfg) != 0) return -1;
 
+    /* Auto-detect local_id if caller passes -1 */
+    if (local_id < 0) {
+        if (cfg.local_node_id >= 0) {
+            local_id = cfg.local_node_id;
+            ESP_LOGI(TAG, "using auto-detected local_id=%d", local_id);
+        } else {
+            ESP_LOGE(TAG, "local_id auto-detection failed: "
+                     "local MAC not found in config. Supply local_id explicitly.");
+            return -1;
+        }
+    }
+
     /* Validate local_id: must be a replica slot (0..3f) in range */
     int num_replicas = 3 * cfg.f + 1;
     if (local_id < 0 || local_id >= num_replicas) {
@@ -610,14 +715,16 @@ int Byz_init_replica(const char *config_file, const char *priv_config,
         return -1;
     }
 
-    /* Set timer periods from config */
+    /* Set timer periods from config.
+     * Use a 3x grace period for the initial view-change timer to allow
+     * the cluster to complete HMAC key exchange before triggering view-change. */
     s_replica->vtimer_period_us = (int64_t)cfg.vc_timeout_ms * 1000LL;
     s_replica->stimer_period_us = (int64_t)cfg.status_timeout_ms * 1000LL;
 
     /* Restart timers with correct periods */
     tbft_itimer_stop(&s_replica->vtimer);
     tbft_itimer_stop(&s_replica->stimer);
-    tbft_itimer_start(&s_replica->vtimer, s_replica->vtimer_period_us);
+    tbft_itimer_start(&s_replica->vtimer, s_replica->vtimer_period_us * 3);
     tbft_itimer_start(&s_replica->stimer, s_replica->stimer_period_us);
 
     /* Setup principals */
@@ -680,4 +787,11 @@ void Byz_print_stats(void)
              (long long)s_replica->last_stable,
              (long long)s_replica->last_executed,
              (long long)s_replica->last_prepared);
+}
+
+int Byz_detect_local_id(const char *config_file)
+{
+    tbft_config_t cfg;
+    if (parse_config(config_file, &cfg) != 0) return -1;
+    return cfg.local_node_id;
 }

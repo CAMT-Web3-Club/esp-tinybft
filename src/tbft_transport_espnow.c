@@ -1,23 +1,12 @@
 /**
  * @file tbft_transport_espnow.c
- * @brief ESP-NOW transport backend with automatic fragmentation/reassembly.
- *
- * Event-driven design:
- *  - Receive: WiFi-task callback feeds reassembly under lock, pushes to msg_queue.
- *    Standard xQueueSend wakes the blocked replica task automatically.
- *  - Send: Replica task posts to send_queue (non-blocking).  A dedicated
- *    low-priority send_task drains the queue and handles ESP-NOW I/O with
- *    proper yields between sends.
- *
- * Fragment header (4 bytes, prepended to each fragment):
- *   uint16_t msg_id    — unique message identifier
- *   uint8_t  frag_idx  — fragment index (0-based)
- *   uint8_t  frag_total — total number of fragments
+ * @brief แบ็กเอนด์การส่งข้อมูลผ่าน ESP-NOW พร้อมระบบแบ่งส่วน/ประกอบกลับข้อมูลอัตโนมัติ (fragmentation/reassembly)
  */
 
 #include "tbft_transport.h"
 #include "esp_log.h"
 #include "esp_wifi.h"
+#include "esp_mac.h"
 #include "esp_now.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -36,7 +25,7 @@ static const char *TAG = "tbft_espnow";
 #endif
 
 /* --------------------------------------------------------------------------
- * Fragmentation constants
+ * ค่าคงที่สำหรับการแบ่งส่วนข้อมูล (Fragmentation constants)
  * -------------------------------------------------------------------------- */
 
 #ifndef ESPNOW_MAX_DATA_LEN
@@ -48,27 +37,24 @@ static const char *TAG = "tbft_espnow";
 #define FRAG_MAX_PARTS      ((TBFT_MAX_MESSAGE_SIZE + FRAG_MAX_PAYLOAD - 1) / FRAG_MAX_PAYLOAD + 1)
 #define REASM_MAX_SLOTS     4
 #define REASM_TIMEOUT_MS    5000
-#define FRAG_INTER_DELAY_MS 5   /* pause between ESP-NOW fragment sends */
+#define FRAG_INTER_DELAY_MS 5
 
-#define MSG_QUEUE_DEPTH     8
-#define SEND_QUEUE_DEPTH    8
-#define SEND_TASK_PRIORITY  3   /* below replica task (typically 5) */
+#define MSG_QUEUE_DEPTH     16
+#define SEND_QUEUE_DEPTH    16
+#define SEND_TASK_PRIORITY  3
 #define SEND_TASK_STACK_SIZE 4096
 #define SEND_TASK_RECV_TIMEOUT_MS  100
 #define RECV_TASK_TIMEOUT_MS  100
 #define SEND_QUEUE_TIMEOUT_MS 10
 #define SHUTDOWN_DRAIN_MS     200
 
-/* Sentinel value to signal send_task shutdown via send_queue */
 #define SEND_TASK_SHUTDOWN  -999
 _Static_assert(SEND_TASK_SHUTDOWN < 0, "SEND_TASK_SHUTDOWN must be negative");
 
-/* MAC address length — used in queue entry format */
 #define ESPNOW_MAC_LEN  6
 
 /* --------------------------------------------------------------------------
- * Reassembled message queue entry
- * Format: { src_mac[6], buf_len (int), payload[] }
+ * โครงสร้างข้อมูลคิวและการแบ่งส่วน (Structures)
  * -------------------------------------------------------------------------- */
 
 typedef struct {
@@ -86,22 +72,13 @@ typedef struct {
 #pragma pack(pop)
 
 _Static_assert(sizeof(frag_hdr_t) == FRAG_HDR_SIZE, "frag_hdr_t size mismatch");
-_Static_assert(FRAG_MAX_PARTS <= 32,
-    "TBFT_MAX_MESSAGE_SIZE too large: would need >32 ESP-NOW fragments");
-
-/* --------------------------------------------------------------------------
- * Send queue entry
- * -------------------------------------------------------------------------- */
+_Static_assert(FRAG_MAX_PARTS <= 32, "TBFT_MAX_MESSAGE_SIZE too large");
 
 typedef struct {
     uint8_t  buf[TBFT_MAX_MESSAGE_SIZE];
     int      len;
-    int      dest;   /* tbft_node_id_t (or TBFT_ALL_REPLICAS = -1) */
+    int      dest;
 } send_entry_t;
-
-/* --------------------------------------------------------------------------
- * Internal state
- * -------------------------------------------------------------------------- */
 
 typedef struct {
     uint8_t   buf[TBFT_MAX_MESSAGE_SIZE];
@@ -112,53 +89,57 @@ typedef struct {
     uint32_t  frag_mask;
     uint8_t   src_mac[6];
     bool      valid;
-    bool      stale;  /* marked for deferred clear by task */
+    bool      stale;
     TickType_t last_tick;
-    uint16_t  last_frag_len;   /* payload size of fragment (frag_total-1) */
+    uint16_t  last_frag_len;
 } reasm_slot_t;
 
 typedef struct tbft_espnow {
     tbft_addr_t  peers[TBFT_MAX_NUM_REPLICAS + TBFT_MAX_NUM_CLIENTS];
     bool         peer_valid[TBFT_MAX_NUM_REPLICAS + TBFT_MAX_NUM_CLIENTS];
     int          num_nodes;
+    int          local_id;
 
-    /* Queue of fully reassembled messages ready for delivery */
     QueueHandle_t msg_queue;
-
-    /* Send queue: entries posted by replica task, consumed by send_task */
     QueueHandle_t send_queue;
     TaskHandle_t  send_task_handle;
-    TaskHandle_t  replica_task_handle;  /* for waking from recv ISR */
+    SemaphoreHandle_t task_exit_sem; /* ซิงก์รอให้ task ออกอย่างปลอดภัยตอน shutdown */
 
-    /* Reassembly slots */
     reasm_slot_t  reasm[REASM_MAX_SLOTS];
-
-    /* Monotonic message ID counter (protected by lock) */
     uint16_t next_msg_id;
-
-    /* Mutex for reassembly access — mutex (not binary semaphore) provides
-     * priority inheritance, preventing priority inversion between the
-     * lower-priority send_task (3) and higher-priority callers (5+). */
     SemaphoreHandle_t lock;
-
-    /* Flag to signal task context has stale slots to clear */
     volatile bool reasm_stale_flag;
-
-    /* Set during teardown to reject new send/recv calls */
     volatile bool shutting_down;
 } tbft_espnow_t;
 
-/* Global pointer to the active ESP-NOW context — set in tbft_transport_create,
- * cleared in tbft_transport_free.  Accessed only from espnow_recv_cb (WiFi
- * task) and the two lifecycle functions, so a simple pointer suffices. */
 static tbft_espnow_t *g_espnow_ctx = NULL;
 
 /* --------------------------------------------------------------------------
- * Stale-slot reclamation helper — call under lock in task context
+ * ฟังก์ชันคำนวณ MAC Address อย่างปลอดภัย (รองรับ Overflow/Underflow)
  * -------------------------------------------------------------------------- */
 
-static void reasm_clear_stale(tbft_espnow_t *enow)
-{
+static void get_ap_mac(const uint8_t *base_mac, uint8_t *ap_mac) {
+    memcpy(ap_mac, base_mac, 6);
+    for (int i = 5; i >= 0; i--) {
+        ap_mac[i]++;
+        if (ap_mac[i] != 0) break; /* หากไม่เกิด Overflow (255 -> 0) ให้หยุดคำนวณทดบิต */
+    }
+}
+
+static void get_base_mac(const uint8_t *ap_mac, uint8_t *base_mac) {
+    memcpy(base_mac, ap_mac, 6);
+    for (int i = 5; i >= 0; i--) {
+        uint8_t val = base_mac[i];
+        base_mac[i]--;
+        if (val != 0) break; /* หากไม่เกิด Underflow (0 -> 255) ให้หยุดคำนวณทดบิต */
+    }
+}
+
+/* --------------------------------------------------------------------------
+ * ฟังก์ชันจัดการ Reassembly (Stale-slot / Find / Feed)
+ * -------------------------------------------------------------------------- */
+
+static void reasm_clear_stale(tbft_espnow_t *enow) {
     for (int i = 0; i < REASM_MAX_SLOTS; i++) {
         reasm_slot_t *s = &enow->reasm[i];
         if (s->stale) {
@@ -168,24 +149,14 @@ static void reasm_clear_stale(tbft_espnow_t *enow)
     }
 }
 
-/* --------------------------------------------------------------------------
- * Reassembly helpers
- * -------------------------------------------------------------------------- */
-
-static TickType_t now_ticks(void)
-{
-    /* Use the standard variant — safe for task context */
+static TickType_t now_ticks(void) {
     return xTaskGetTickCount();
 }
 
-static reasm_slot_t *reasm_find_or_alloc(tbft_espnow_t *enow,
-                                          uint16_t msg_id,
-                                          const uint8_t *src_mac)
-{
+static reasm_slot_t *reasm_find_or_alloc(tbft_espnow_t *enow, uint16_t msg_id, const uint8_t *src_mac) {
     for (int i = 0; i < REASM_MAX_SLOTS; i++) {
         reasm_slot_t *s = &enow->reasm[i];
-        if (s->valid && s->msg_id == msg_id
-                && memcmp(s->src_mac, src_mac, 6) == 0) {
+        if (s->valid && s->msg_id == msg_id && memcmp(s->src_mac, src_mac, 6) == 0) {
             return s;
         }
     }
@@ -196,7 +167,6 @@ static reasm_slot_t *reasm_find_or_alloc(tbft_espnow_t *enow,
         if (!s->valid) return s;
         TickType_t elapsed = now - s->last_tick;
         if (elapsed > pdMS_TO_TICKS(REASM_TIMEOUT_MS)) {
-            /* Mark stale — actual memset deferred to task context */
             s->stale = true;
             enow->reasm_stale_flag = true;
             return s;
@@ -216,16 +186,9 @@ static reasm_slot_t *reasm_find_or_alloc(tbft_espnow_t *enow,
     return &enow->reasm[oldest];
 }
 
-static bool reasm_feed(tbft_espnow_t *enow, reasm_slot_t *s,
-                       const uint8_t *data, int data_len,
-                       uint16_t msg_id, uint8_t frag_idx, uint8_t frag_total,
-                       const uint8_t *src_mac)
-{
-    if (!s->valid) {
-        /* Reject fragments claiming more than 32 parts — our frag_mask
-         * is only 32 bits.  Also reject zero frag_total (invalid). */
+static bool reasm_feed(tbft_espnow_t *enow, reasm_slot_t *s, const uint8_t *data, int data_len, uint16_t msg_id, uint8_t frag_idx, uint8_t frag_total, const uint8_t *src_mac) {
+    if (!s->valid || s->stale) {
         if (frag_total == 0 || frag_total > 32) return false;
-
         s->valid = true;
         s->stale = false;
         s->msg_id = msg_id;
@@ -236,25 +199,6 @@ static bool reasm_feed(tbft_espnow_t *enow, reasm_slot_t *s,
         s->last_frag_len = 0;
         memcpy(s->src_mac, src_mac, 6);
         s->last_tick = now_ticks();
-    } else if (s->stale) {
-        /* Slot was marked stale by a previous completed message but the
-         * task hasn't cleared it yet.  A new fragment for a DIFFERENT
-         * message arrived and matched this slot (same src_mac, different
-         * msg_id didn't match earlier — but reasm_find_or_alloc returned
-         * it via timeout/LRU eviction).  Reset the slot fully to avoid
-         * corrupting the new reassembly with leftover state. */
-        if (frag_total == 0 || frag_total > 32) return false;
-        s->valid         = true;
-        s->stale         = false;
-        s->msg_id        = msg_id;
-        s->frag_total    = frag_total;
-        s->frag_received = 0;
-        s->frag_mask     = 0;
-        s->buf_len       = 0;
-        s->last_frag_len = 0;
-        memcpy(s->src_mac, src_mac, 6);
-        s->last_tick     = now_ticks();
-        enow->reasm_stale_flag = false;
     }
 
     if (msg_id != s->msg_id || frag_total != s->frag_total) return false;
@@ -281,26 +225,26 @@ static bool reasm_feed(tbft_espnow_t *enow, reasm_slot_t *s,
 }
 
 /* --------------------------------------------------------------------------
- * ESP-NOW receive callback (WiFi task context)
- * Note: espnow_recv_cb runs in the WiFi task context, NOT an ISR.
- * Standard FreeRTOS task-context APIs are used throughout.
+ * Callback ฝั่ง รับ-ส่ง (WiFi Context)
  * -------------------------------------------------------------------------- */
 
-static void espnow_recv_cb(const esp_now_recv_info_t *recv_info,
-                            const uint8_t *data, int data_len)
-{
+static void espnow_send_cb(const esp_now_send_info_t *tx_info, esp_now_send_status_t status) {
+    if (status != ESP_NOW_SEND_SUCCESS) {
+        ESP_LOGW(TAG, "esp_now_send to " MACSTR " failed: %d", MAC2STR(tx_info->des_addr), (int)status);
+    }
+}
+
+static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *data, int data_len) {
     if (!g_espnow_ctx || !recv_info || !data) return;
     if (data_len < (int)sizeof(frag_hdr_t)) return;
 
+    tbft_espnow_t *enow = g_espnow_ctx;
     const uint8_t *src_mac = recv_info->src_addr;
     const frag_hdr_t *fhdr = (const frag_hdr_t *)data;
 
-    tbft_espnow_t *enow = g_espnow_ctx;
-
-    /* Lock is held by task context now */
-    if (xSemaphoreTake(enow->lock, 0) != pdTRUE) {
-        /* Lock unavailable — another task holds it.
-         * Drop this fragment; the sender will retransmit at protocol level. */
+    /* รอ 10ms ป้องกันการ Drop Packet หาก Lock ถูก Task อื่นใช้งานอยู่แวบเดียว */
+    if (xSemaphoreTake(enow->lock, pdMS_TO_TICKS(10)) != pdTRUE) {
+        ESP_LOGW(TAG, "recv: Lock timeout, packet dropped");
         return;
     }
 
@@ -312,11 +256,8 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info,
 
     const uint8_t *payload = data + sizeof(frag_hdr_t);
     int payload_len = data_len - (int)sizeof(frag_hdr_t);
-    if (payload_len < 0) return;  /* malformed packet */
 
-    bool complete = reasm_feed(enow, s, payload, payload_len,
-                               fhdr->msg_id, fhdr->frag_idx,
-                               fhdr->frag_total, src_mac);
+    bool complete = reasm_feed(enow, s, payload, payload_len, fhdr->msg_id, fhdr->frag_idx, fhdr->frag_total, src_mac);
 
     if (complete) {
         recv_entry_t q_entry;
@@ -325,13 +266,9 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info,
         memcpy(q_entry.payload, s->buf, (size_t)s->buf_len);
 
         if (xQueueSend(enow->msg_queue, &q_entry, 0) != pdTRUE) {
-            /* Queue full — this is a protocol-level concern.
-             * Dropped commits/checkpoints stall the replica until retransmit.
-             * The 8-entry depth should suffice under normal load. */
             ESP_LOGW(TAG, "msg_queue full, dropping reassembled msg");
         }
 
-        /* Mark slot stale — memset deferred to task context under lock */
         s->stale = true;
         enow->reasm_stale_flag = true;
     }
@@ -340,43 +277,30 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info,
 }
 
 /* --------------------------------------------------------------------------
- * Internal send function (called from send_task context)
+ * ฟังก์ชันส่งข้อมูลและ Send Task
  * -------------------------------------------------------------------------- */
 
-static int espnow_do_send(tbft_espnow_t *enow,
-                          const uint8_t *peer_mac, uint16_t msg_id,
-                          const uint8_t *buf, size_t len)
-{
-    if (len + sizeof(frag_hdr_t) <= ESPNOW_MAX_DATA_LEN) {
-        /* Single fragment */
-        frag_hdr_t fhdr;
-        fhdr.msg_id     = msg_id;
-        fhdr.frag_total = 1;
-        fhdr.frag_idx   = 0;
+static int espnow_do_send(tbft_espnow_t *enow, const uint8_t *peer_mac, uint16_t msg_id, const uint8_t *buf, size_t len) {
+    uint8_t ap_mac[6];
+    get_ap_mac(peer_mac, ap_mac); /* คำนวณแบบป้องกัน Overflow */
 
+    if (len + sizeof(frag_hdr_t) <= ESPNOW_MAX_DATA_LEN) {
+        frag_hdr_t fhdr = { .msg_id = msg_id, .frag_total = 1, .frag_idx = 0 };
         uint8_t pkt[sizeof(frag_hdr_t) + ESPNOW_MAX_DATA_LEN];
         memcpy(pkt, &fhdr, sizeof(fhdr));
         memcpy(pkt + sizeof(fhdr), buf, len);
 
-        esp_err_t err = esp_now_send(peer_mac, pkt, len + sizeof(fhdr));
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "esp_now_send failed: %d", err);
-            return -1;
-        }
+        if (esp_now_send(ap_mac, pkt, len + sizeof(fhdr)) != ESP_OK) return -1;
         vTaskDelay(pdMS_TO_TICKS(FRAG_INTER_DELAY_MS));
         return (int)len;
     }
 
-    /* Multi-fragment */
     size_t remaining = len;
     const uint8_t *src = buf;
     uint8_t frag_total = (uint8_t)((remaining + FRAG_MAX_PAYLOAD - 1) / FRAG_MAX_PAYLOAD);
     uint8_t frag_idx = 0;
 
-    frag_hdr_t fhdr;
-    fhdr.msg_id = msg_id;
-    fhdr.frag_total = frag_total;
-
+    frag_hdr_t fhdr = { .msg_id = msg_id, .frag_total = frag_total };
     uint8_t pkt[sizeof(frag_hdr_t) + FRAG_MAX_PAYLOAD];
 
     while (remaining > 0) {
@@ -386,13 +310,7 @@ static int espnow_do_send(tbft_espnow_t *enow,
         memcpy(pkt, &fhdr, sizeof(fhdr));
         memcpy(pkt + sizeof(fhdr), src, chunk);
 
-        esp_err_t err = esp_now_send(peer_mac, pkt, chunk + sizeof(fhdr));
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "esp_now_send frag %d/%d failed: %d",
-                     frag_idx, frag_total, err);
-            return -1;
-        }
-
+        if (esp_now_send(ap_mac, pkt, chunk + sizeof(fhdr)) != ESP_OK) return -1;
         vTaskDelay(pdMS_TO_TICKS(FRAG_INTER_DELAY_MS));
 
         src += chunk;
@@ -402,23 +320,12 @@ static int espnow_do_send(tbft_espnow_t *enow,
     return (int)len;
 }
 
-/* --------------------------------------------------------------------------
- * Send task — drains send_queue and handles ESP-NOW I/O
- * -------------------------------------------------------------------------- */
-
-static void espnow_send_task(void *pvParameters)
-{
+static void espnow_send_task(void *pvParameters) {
     tbft_espnow_t *enow = (tbft_espnow_t *)pvParameters;
     send_entry_t entry;
 
     while (1) {
-        /* Block until a send entry is available */
-        BaseType_t ret = xQueueReceive(enow->send_queue, &entry,
-                                       pdMS_TO_TICKS(SEND_TASK_RECV_TIMEOUT_MS));
-        if (ret != pdTRUE) {
-            /* Timeout — clear any stale reassembly slots under lock.
-             * This prevents a race where the ISR is mid-write to a slot
-             * while we memset it to zero. */
+        if (xQueueReceive(enow->send_queue, &entry, pdMS_TO_TICKS(SEND_TASK_RECV_TIMEOUT_MS)) != pdTRUE) {
             if (enow->reasm_stale_flag) {
                 enow->reasm_stale_flag = false;
                 xSemaphoreTake(enow->lock, portMAX_DELAY);
@@ -428,71 +335,50 @@ static void espnow_send_task(void *pvParameters)
             continue;
         }
 
-        /* Check for shutdown sentinel */
         if (entry.dest == SEND_TASK_SHUTDOWN) {
-            /* Drain remaining stale slots and exit cleanly */
             xSemaphoreTake(enow->lock, portMAX_DELAY);
             reasm_clear_stale(enow);
             xSemaphoreGive(enow->lock);
             ESP_LOGI(TAG, "send_task exiting cleanly");
+
+            /* ส่งสัญญาณให้กระบวนการ Free ถัดไปรับทราบว่า Task ปิดตัวเองเสร็จแล้ว */
+            xSemaphoreGive(enow->task_exit_sem);
             vTaskDelete(NULL);
         }
 
         if (entry.dest == TBFT_ALL_REPLICAS) {
-            /* Broadcast: send to all registered peers */
             for (int i = 0; i < enow->num_nodes; i++) {
-                bool valid;
-                tbft_addr_t peer_addr;
+                if (i == enow->local_id) continue;
 
                 xSemaphoreTake(enow->lock, portMAX_DELAY);
-                valid = enow->peer_valid[i];
-                if (valid) peer_addr = enow->peers[i];
+                bool valid = enow->peer_valid[i];
+                tbft_addr_t peer_addr = enow->peers[i];
                 uint16_t this_msg_id = enow->next_msg_id++;
                 xSemaphoreGive(enow->lock);
 
-                if (!valid) continue;
-
-                if (espnow_do_send(enow, peer_addr.u.mac.bytes,
-                                   this_msg_id, entry.buf, (size_t)entry.len) < 0) {
-                    ESP_LOGW(TAG, "broadcast send to peer %d failed", i);
-                }
+                if (valid) espnow_do_send(enow, peer_addr.u.mac.bytes, this_msg_id, entry.buf, (size_t)entry.len);
             }
         } else if (entry.dest >= 0 && entry.dest < enow->num_nodes) {
-            bool valid;
-            tbft_addr_t peer_addr;
-
             xSemaphoreTake(enow->lock, portMAX_DELAY);
-            valid = enow->peer_valid[entry.dest];
-            if (valid) peer_addr = enow->peers[entry.dest];
+            bool valid = enow->peer_valid[entry.dest];
+            tbft_addr_t peer_addr = enow->peers[entry.dest];
             uint16_t this_msg_id = enow->next_msg_id++;
             xSemaphoreGive(enow->lock);
 
-            if (!valid) {
-                ESP_LOGE(TAG, "send_task: invalid dest %d", entry.dest);
-                continue;
-            }
-
-            if (espnow_do_send(enow, peer_addr.u.mac.bytes,
-                               this_msg_id, entry.buf, (size_t)entry.len) < 0) {
-                ESP_LOGW(TAG, "unicast send to peer %d failed", entry.dest);
-            }
-        } else {
-            ESP_LOGE(TAG, "send_task: invalid dest %d", entry.dest);
+            if (valid) espnow_do_send(enow, peer_addr.u.mac.bytes, this_msg_id, entry.buf, (size_t)entry.len);
         }
     }
 }
 
-/* --------------------------------------------------------------------------
- * Find node index from MAC address
- * -------------------------------------------------------------------------- */
-
-static tbft_node_id_t find_node_by_mac(tbft_espnow_t *enow, const uint8_t *mac)
-{
+static tbft_node_id_t find_node_by_mac(tbft_espnow_t *enow, const uint8_t *mac) {
     tbft_node_id_t result = -1;
+    uint8_t base[6];
+    get_base_mac(mac, base);
     xSemaphoreTake(enow->lock, portMAX_DELAY);
     for (int i = 0; i < enow->num_nodes; i++) {
         if (!enow->peer_valid[i]) continue;
-        if (memcmp(enow->peers[i].u.mac.bytes, mac, 6) == 0) {
+
+        if (memcmp(enow->peers[i].u.mac.bytes, base, 6) == 0) {
             result = (tbft_node_id_t)i;
             break;
         }
@@ -505,21 +391,13 @@ static tbft_node_id_t find_node_by_mac(tbft_espnow_t *enow, const uint8_t *mac)
  * Public API
  * -------------------------------------------------------------------------- */
 
-int tbft_transport_create(tbft_transport_t **out,
-                          tbft_transport_type_t type,
-                          int num_nodes,
-                          const char *mcast_ip,
-                          uint16_t port)
-{
-    (void)type;
-    (void)mcast_ip;
-    (void)port;
-
-    if (num_nodes > TBFT_MAX_NUM_REPLICAS + TBFT_MAX_NUM_CLIENTS) {
-        ESP_LOGE(TAG, "num_nodes %d exceeds max %d", num_nodes,
-                 TBFT_MAX_NUM_REPLICAS + TBFT_MAX_NUM_CLIENTS);
+int tbft_transport_create(tbft_transport_t **out, tbft_transport_type_t type, int num_nodes, const char *mcast_ip, uint16_t port) {
+    if (g_espnow_ctx != NULL) {
+        ESP_LOGE(TAG, "ESP-NOW transport is already initialized (Singleton Guard)");
         return -1;
     }
+
+    if (num_nodes > TBFT_MAX_NUM_REPLICAS + TBFT_MAX_NUM_CLIENTS) return -1;
 
     tbft_espnow_t *enow = (tbft_espnow_t *)calloc(1, sizeof(*enow));
     if (!enow) return -1;
@@ -528,182 +406,126 @@ int tbft_transport_create(tbft_transport_t **out,
     enow->next_msg_id = 1;
 
     enow->lock = xSemaphoreCreateMutex();
-    if (!enow->lock) { free(enow); return -1; }
-    /* Mutex starts unavailable — give it so the first taker succeeds */
-    xSemaphoreGive(enow->lock);
-
+    enow->task_exit_sem = xSemaphoreCreateBinary();
     enow->msg_queue = xQueueCreate(MSG_QUEUE_DEPTH, sizeof(recv_entry_t));
-    if (!enow->msg_queue) {
-        vSemaphoreDelete(enow->lock);
-        free(enow);
-        return -1;
-    }
-
     enow->send_queue = xQueueCreate(SEND_QUEUE_DEPTH, sizeof(send_entry_t));
-    if (!enow->send_queue) {
-        vQueueDelete(enow->msg_queue);
-        vSemaphoreDelete(enow->lock);
+
+    if (!enow->lock || !enow->task_exit_sem || !enow->msg_queue || !enow->send_queue) {
+        if (enow->send_queue) vQueueDelete(enow->send_queue);
+        if (enow->msg_queue) vQueueDelete(enow->msg_queue);
+        if (enow->task_exit_sem) vSemaphoreDelete(enow->task_exit_sem);
+        if (enow->lock) vSemaphoreDelete(enow->lock);
         free(enow);
         return -1;
     }
 
+    xSemaphoreGive(enow->lock);
     g_espnow_ctx = enow;
-    esp_err_t err = esp_now_register_recv_cb(espnow_recv_cb);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "esp_now_register_recv_cb failed: %d", err);
-        g_espnow_ctx = NULL;
-        vQueueDelete(enow->send_queue);
-        vQueueDelete(enow->msg_queue);
-        vSemaphoreDelete(enow->lock);
-        free(enow);
-        return -1;
-    }
 
-    /* Start the dedicated send task */
-    BaseType_t ret = xTaskCreate(
-        espnow_send_task, "tbft_send",
-        4096, enow,
-        SEND_TASK_PRIORITY,
-        &enow->send_task_handle);
-    if (ret != pdPASS) {
-        enow->send_task_handle = NULL;
-        ESP_LOGE(TAG, "failed to create send task");
-        vQueueDelete(enow->send_queue);
-        vQueueDelete(enow->msg_queue);
-        vSemaphoreDelete(enow->lock);
-        free(enow);
-        return -1;
-    }
+    if (esp_now_register_recv_cb(espnow_recv_cb) != ESP_OK) goto init_error;
+    esp_now_register_send_cb(espnow_send_cb);
 
-    /* Clear any stale reassembly slots at startup */
-    enow->reasm_stale_flag = false;
-    for (int i = 0; i < REASM_MAX_SLOTS; i++) {
-        memset(&enow->reasm[i], 0, sizeof(reasm_slot_t));
+    if (xTaskCreate(espnow_send_task, "tbft_send", SEND_TASK_STACK_SIZE, enow, SEND_TASK_PRIORITY, &enow->send_task_handle) != pdPASS) {
+        goto init_error;
     }
 
     *out = (tbft_transport_t *)enow;
-    ESP_LOGI(TAG, "ESP-NOW transport init: max_frag=%d, max_parts=%d, send_task=0x%p",
-             FRAG_MAX_PAYLOAD, FRAG_MAX_PARTS, enow->send_task_handle);
     return 0;
+
+init_error:
+    g_espnow_ctx = NULL;
+    vQueueDelete(enow->send_queue);
+    vQueueDelete(enow->msg_queue);
+    vSemaphoreDelete(enow->task_exit_sem);
+    vSemaphoreDelete(enow->lock);
+    free(enow);
+    return -1;
 }
 
-void tbft_transport_free(tbft_transport_t *t)
-{
+void tbft_transport_free(tbft_transport_t *t) {
     if (!t) return;
     tbft_espnow_t *enow = (tbft_espnow_t *)t;
 
-    /* Set shutting_down FIRST — rejects new send/recv calls immediately */
     enow->shutting_down = true;
-
-    /* Unregister the recv callback first to prevent new ISR invocations.
-     * ESP-IDF's unregister is synchronous — it waits for any in-flight
-     * callback to complete before returning. */
     esp_now_unregister_recv_cb();
-
-    /* Clear global pointer — prevents use-after-free in any late callback */
     g_espnow_ctx = NULL;
 
-    /* Allow a brief window for any in-flight callbacks to drain */
     vTaskDelay(pdMS_TO_TICKS(50));
 
-    /* Signal send_task to exit cleanly via sentinel */
     if (enow->send_queue && enow->send_task_handle) {
-        send_entry_t sentinel;
-        memset(&sentinel, 0, sizeof(sentinel));
-        sentinel.dest = SEND_TASK_SHUTDOWN;
-        if (xQueueSend(enow->send_queue, &sentinel,
-                       pdMS_TO_TICKS(SHUTDOWN_DRAIN_MS)) != pdTRUE) {
-            ESP_LOGW(TAG, "free: shutdown sentinel not delivered");
-        } else {
-            vTaskDelay(pdMS_TO_TICKS(SHUTDOWN_DRAIN_MS));
+        send_entry_t sentinel = { .dest = SEND_TASK_SHUTDOWN };
+        if (xQueueSend(enow->send_queue, &sentinel, pdMS_TO_TICKS(SHUTDOWN_DRAIN_MS)) == pdTRUE) {
+            /* รอจนกว่า send_task จะสั่งปิดตัวเองเสร็จสิ้นอย่างปลอดภัย */
+            xSemaphoreTake(enow->task_exit_sem, pdMS_TO_TICKS(1000));
         }
     }
 
-    if (enow->send_queue) {
-        vQueueDelete(enow->send_queue);
-    }
-    if (enow->msg_queue) {
-        vQueueDelete(enow->msg_queue);
-    }
-    if (enow->lock) {
-        vSemaphoreDelete(enow->lock);
-    }
+    if (enow->send_queue) vQueueDelete(enow->send_queue);
+    if (enow->msg_queue) vQueueDelete(enow->msg_queue);
+    if (enow->task_exit_sem) vSemaphoreDelete(enow->task_exit_sem);
+    if (enow->lock) vSemaphoreDelete(enow->lock);
     free(enow);
 }
 
-void tbft_transport_set_peer(tbft_transport_t *t,
-                             tbft_node_id_t node_id,
-                             const tbft_addr_t *addr)
-{
-    if (!t || node_id < 0
-            || node_id >= TBFT_MAX_NUM_REPLICAS + TBFT_MAX_NUM_CLIENTS)
-        return;
-
+void tbft_transport_set_peer(tbft_transport_t *t, tbft_node_id_t node_id, const tbft_addr_t *addr) {
+    if (!t || node_id < 0 || node_id >= TBFT_MAX_NUM_REPLICAS + TBFT_MAX_NUM_CLIENTS) return;
     tbft_espnow_t *enow = (tbft_espnow_t *)t;
 
-    /* Protect peer data writes from concurrent send_task reads */
     xSemaphoreTake(enow->lock, portMAX_DELAY);
     enow->peers[node_id] = *addr;
     enow->peer_valid[node_id] = true;
+
+    uint8_t self_mac[6];
+    if (esp_efuse_mac_get_default(self_mac) == ESP_OK && memcmp(self_mac, addr->u.mac.bytes, 6) == 0) {
+        enow->local_id = node_id;
+    }
     xSemaphoreGive(enow->lock);
 
-    esp_now_peer_info_t peer = {0};
-    memcpy(peer.peer_addr, addr->u.mac.bytes, 6);
-    peer.channel = 0;
-    peer.ifidx = WIFI_IF_STA;
-    peer.encrypt = false;
+    uint8_t ap_mac[6];
+    get_ap_mac(addr->u.mac.bytes, ap_mac);
 
-    esp_now_del_peer(addr->u.mac.bytes);
-    esp_err_t err = esp_now_add_peer(&peer);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "esp_now_add_peer for node %d failed: %d", node_id, err);
-    } else {
-        ESP_LOGI(TAG, "ESP-NOW peer %d: " MACSTR, node_id, MAC2STR(addr->u.mac.bytes));
+    ESP_LOGI(TAG, "set_peer node=%d base=" MACSTR " ap=" MACSTR,
+             node_id, MAC2STR(addr->u.mac.bytes), MAC2STR(ap_mac));
+
+    uint8_t self_base[6];
+    uint8_t self_ap[6];
+    if (esp_efuse_mac_get_default(self_base) == ESP_OK) {
+        get_ap_mac(self_base, self_ap);
+        if (memcmp(ap_mac, self_ap, 6) == 0) {
+            ESP_LOGW(TAG, "set_peer: node %d AP MAC matches local AP MAC — "
+                     "config may contain AP MAC instead of base (eFuse) MAC",
+                     node_id);
+        }
+    }
+
+    esp_now_peer_info_t peer = { .channel = 1, .ifidx = WIFI_IF_AP, .encrypt = false };
+    memcpy(peer.peer_addr, ap_mac, 6);
+
+    esp_now_del_peer(ap_mac);
+    esp_err_t add_ret = esp_now_add_peer(&peer);
+    if (add_ret != ESP_OK) {
+        ESP_LOGW(TAG, "esp_now_add_peer for node %d failed: 0x%x", node_id, add_ret);
     }
 }
 
-int tbft_transport_send(tbft_transport_t *t, const void *buf, size_t len,
-                        tbft_node_id_t dest)
-{
+int tbft_transport_send(tbft_transport_t *t, const void *buf, size_t len, tbft_node_id_t dest) {
     tbft_espnow_t *enow = (tbft_espnow_t *)t;
-    if (!enow || !enow->send_queue) return -1;
-    if (enow->shutting_down) return -1;
-    /* Guard against truncation when casting to int in send_entry_t */
-    if (len > (size_t)INT_MAX) return -1;
-    if (len > TBFT_MAX_MESSAGE_SIZE) return -1;
+    if (!enow || !enow->send_queue || enow->shutting_down) return -1;
+    if (len > (size_t)INT_MAX || len > TBFT_MAX_MESSAGE_SIZE) return -1;
 
     send_entry_t entry;
     memcpy(entry.buf, buf, len);
     entry.len  = (int)len;
     entry.dest = dest;
 
-    /* Non-blocking post to send queue — returns immediately */
-    if (xQueueSend(enow->send_queue, &entry, pdMS_TO_TICKS(SEND_QUEUE_TIMEOUT_MS)) != pdTRUE) {
-        ESP_LOGW(TAG, "send_queue full");
-        return -1;
-    }
+    if (xQueueSend(enow->send_queue, &entry, pdMS_TO_TICKS(SEND_QUEUE_TIMEOUT_MS)) != pdTRUE) return -1;
     return (int)len;
 }
 
-int tbft_transport_recv(tbft_transport_t *t, void *buf, size_t buf_len,
-                        tbft_node_id_t *src_id)
-{
+int tbft_transport_recv(tbft_transport_t *t, void *buf, size_t buf_len, tbft_node_id_t *src_id) {
     tbft_espnow_t *enow = (tbft_espnow_t *)t;
-    if (!enow) return -1;
-    if (enow->shutting_down) return -1;
+    if (!enow || enow->shutting_down) return -1;
 
-    /* Register this task handle so the ISR can wake us on receive.
-     * Only set once — if a different task calls recv, that's a usage error.
-     * We detect this and refuse to overwrite the handle. */
-    TaskHandle_t current = xTaskGetCurrentTaskHandle();
-    if (enow->replica_task_handle == NULL) {
-        enow->replica_task_handle = current;
-    } else if (enow->replica_task_handle != current) {
-        ESP_LOGW(TAG, "recv called from different task — ignoring");
-    }
-
-    /* Clear any stale reassembly slots opportistically — under lock to
-     * prevent ISR data race. */
     if (enow->reasm_stale_flag) {
         enow->reasm_stale_flag = false;
         xSemaphoreTake(enow->lock, portMAX_DELAY);
@@ -712,24 +534,12 @@ int tbft_transport_recv(tbft_transport_t *t, void *buf, size_t buf_len,
     }
 
     recv_entry_t entry;
+    if (xQueueReceive(enow->msg_queue, &entry, pdMS_TO_TICKS(SEND_TASK_RECV_TIMEOUT_MS)) != pdTRUE) return 0;
 
-    /* Block until a message arrives or the WDT timeout expires */
-    if (xQueueReceive(enow->msg_queue, &entry,
-                      pdMS_TO_TICKS(SEND_TASK_RECV_TIMEOUT_MS)) != pdTRUE) {
-        return 0;  /* timeout — nothing available */
-    }
-
-    if (entry.buf_len < 0 || (size_t)entry.buf_len > buf_len
-            || (size_t)entry.buf_len > TBFT_MAX_MESSAGE_SIZE) {
-        ESP_LOGE(TAG, "recv: message too large: %d", entry.buf_len);
-        return -1;
-    }
+    if (entry.buf_len < 0 || (size_t)entry.buf_len > buf_len || (size_t)entry.buf_len > TBFT_MAX_MESSAGE_SIZE) return -1;
 
     memcpy(buf, entry.payload, (size_t)entry.buf_len);
-
-    if (src_id) {
-        *src_id = find_node_by_mac(enow, entry.src_mac);
-    }
+    if (src_id) *src_id = find_node_by_mac(enow, entry.src_mac);
 
     return entry.buf_len;
 }
