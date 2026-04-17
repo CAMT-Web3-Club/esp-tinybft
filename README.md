@@ -48,14 +48,16 @@ Key options:
 |---|---|---|
 | `TBFT_TRANSPORT_TYPE` | UDP | Transport backend: UDP or ESP-NOW |
 | `TBFT_MAX_NUM_REPLICAS` | 4 | Cluster size (n = 3f+1, default f=1) |
-| `TBFT_MAX_MESSAGE_SIZE` | 8192 | Maximum protocol message size |
-| `TBFT_WINDOW_SIZE` | 256 | Sequence number window |
-| `TBFT_CHECKPOINT_INTERVAL` | 128 | Checkpoint every N requests |
-| `TBFT_RQUEUE_MAX` | 16 | Max queued requests (memory: 2 × N × msg_size) |
+| `TBFT_MAX_MESSAGE_SIZE` | 1440 | Maximum protocol message size (bytes) |
+| `TBFT_WINDOW_SIZE` | 16 | Sequence number window |
+| `TBFT_CHECKPOINT_INTERVAL` | 8 | Checkpoint every N requests |
+| `TBFT_RQUEUE_MAX` | 8 | Max queued requests (memory: 2 × N × msg_size) |
 | `TBFT_NDET_BUF_SIZE` | 256 | Non-deterministic choices buffer |
 | `TBFT_MAX_STATE_BLOCKS` | 256 | Max state blocks for CoW / partition tree |
 | `TBFT_P_LEVELS` | 4 | Merkle partition tree depth |
 | `TBFT_ANTI_REPLAY_WINDOW_MS` | 30000 | Anti-replay window (ms, 0 = disabled) |
+
+> **For ESP32-C3 constrained deployments**, `TBFT_MAX_MESSAGE_SIZE=1024`, `TBFT_WINDOW_SIZE=8`, `TBFT_CHECKPOINT_INTERVAL=4`, `TBFT_RQUEUE_MAX=4` are recommended (saves ~60KB RAM). See `examples/simple_wallet/sdkconfig.defaults`.
 
 ### 3. Build and flash
 

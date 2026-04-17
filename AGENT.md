@@ -115,7 +115,7 @@ Additional important fields:
 - `tbft_view_info_t vi` — view-change protocol state
 - `EventGroupHandle_t evt_group` — Event group used to decouple timer callbacks (which execute in the system timer task) from heavy operations like RSA cryptography. Callbacks are signal-only — `vtimer_cb` and `stimer_cb` call `xEventGroupSetBits` and return immediately; heavy work runs in the `tbft_replica_run()` loop.
 - Four timers: `vtimer`, `stimer`, `rtimer`, `ntimer` (all `tbft_itimer_t` wrapping `esp_timer_handle_t`). Timers signal the event group rather than executing directly.
-- Request queues: `rqueue`, `ro_rqueue` (circular FIFOs, `TBFT_RQUEUE_MAX` entries, default 16 via Kconfig)
+- Request queues: `rqueue`, `ro_rqueue` (circular FIFOs, `TBFT_RQUEUE_MAX` entries, default 8 via Kconfig)
 - Buffers: `ndet_buf[TBFT_NDET_BUF_SIZE]`, `out_buf[TBFT_MAX_MESSAGE_SIZE]`
 - `running` flag, `vtimer_period_us`, `stimer_period_us`
 - Timers are initialised in `tbft_replica_init()` but **not started** — `Byz_init_replica()` sets the correct periods from the config file and starts them
@@ -167,7 +167,7 @@ Derived constants: `TBFT_DIGEST_SIZE` (32), `TBFT_HMAC_SIZE` (32), `TBFT_SIG_SIZ
 
 Additional Kconfig-sourced constants (with `#ifndef` guards for override):
 - `TBFT_MAX_STATE_BLOCKS` (default 256) — max state blocks
-- `TBFT_RQUEUE_MAX` (default 16) — request queue depth
+- `TBFT_RQUEUE_MAX` (default 8) — request queue depth
 - `TBFT_NDET_BUF_SIZE` (default 256) — non-det choices buffer
 - `TBFT_P_LEVELS` (default 4) — Merkle partition tree depth
 - `TBFT_ANTI_REPLAY_WINDOW_US` (default 30s, from `TBFT_ANTI_REPLAY_WINDOW_MS * 1000`)

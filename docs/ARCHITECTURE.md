@@ -213,7 +213,7 @@ Key properties:
 - ESP-NOW v2.0 max data length: 1470 bytes (`ESP_NOW_MAX_DATA_LEN_V2`)
 - Fragment header: 4 bytes (`msg_id`, `frag_idx`, `frag_total`)
 - Max payload per fragment: 1466 bytes
-- Max fragments for a `TBFT_MAX_MESSAGE_SIZE` (8192) message: 6
+- Max fragments for a `TBFT_MAX_MESSAGE_SIZE` (1440) message: 2
 - Reassembly uses a FreeRTOS `QueueHandle_t` (`msg_queue`, depth 8) with entries of size `6 + 4 + TBFT_MAX_MESSAGE_SIZE`
 - Reassembly timeout: 5000 ms
 - Send is event-driven: the replica task posts a `send_entry_t` to `send_queue` (non-blocking, depth 8) and returns immediately; a dedicated low-priority `send_task` (priority 3) drains the queue and handles all ESP-NOW I/O with `vTaskDelay` yields between fragments
@@ -1076,13 +1076,17 @@ Each replica:
 
 | Option | Type | Default | Range | Description |
 |---|---|---|---|---|
-| `TBFT_MAX_MESSAGE_SIZE` | int | 8192 | -- | Max UDP/message size |
+| `TBFT_MAX_MESSAGE_SIZE` | int | 1440 | -- | Max UDP/message size (bytes) |
 | `TBFT_MAX_REPLY_SIZE` | int | 1240 | -- | Max reply payload (must be < MAX_MESSAGE_SIZE) |
-| `TBFT_BLOCK_SIZE` | int | 4096 | power of 2 | State block/page size |
+| `TBFT_BLOCK_SIZE` | int | 1024 | power of 2 | State block/page size |
 | `TBFT_MAX_NUM_REPLICAS` | int | 4 | 4-32 | Replica count (n = 3f+1) |
-| `TBFT_WINDOW_SIZE` | int | 256 | power of 2 | Sequence number window |
-| `TBFT_CHECKPOINT_INTERVAL` | int | 128 | -- | Checkpoints per N seqnos (< WINDOW_SIZE) |
+| `TBFT_WINDOW_SIZE` | int | 16 | power of 2 | Sequence number window |
+| `TBFT_CHECKPOINT_INTERVAL` | int | 8 | -- | Checkpoints per N seqnos (< WINDOW_SIZE) |
 | `TBFT_MAX_NUM_CLIENTS` | int | 1 | 1-16 | Simultaneous clients |
+| `TBFT_MAX_STATE_BLOCKS` | int | 256 | -- | State blocks (state_size / BLOCK_SIZE) |
+| `TBFT_RQUEUE_MAX` | int | 8 | 4-256 | Pending requests per queue |
+| `TBFT_NDET_BUF_SIZE` | int | 256 | 32-4096 | Non-det choices buffer |
+| `TBFT_P_LEVELS` | int | 4 | 2-8 | Merkle partition tree depth |
 | `TBFT_DISABLE_MULTICAST` | bool | n | -- | Use unicast instead of multicast |
 | `TBFT_TRANSPORT_TYPE` | choice | UDP | UDP/ESP-NOW | Transport backend |
 | `TBFT_TRANSPORT_UDP` | bool | -- | -- | UDP over lwIP |
@@ -1100,7 +1104,7 @@ TBFT_AUTH_SIZE          = 32 * (TBFT_MAX_NUM_REPLICAS - 1)
 TBFT_NUM_CKPT_SLOTS     = TBFT_WINDOW_SIZE / TBFT_CHECKPOINT_INTERVAL + 2
 TBFT_MAX_FAULTY         = (TBFT_MAX_NUM_REPLICAS - 1) / 3
 TBFT_CERT_MAX_VALS      = TBFT_MAX_FAULTY + 1
-TBFT_P_CHILDREN         = (TBFT_MAX_MESSAGE_SIZE - 32) / 36  (= 226 for defaults)
+TBFT_P_CHILDREN         = (TBFT_MAX_MESSAGE_SIZE - 32) / 36  (= 39 for defaults)
 ```
 
 ### Compile-Time Assertions
