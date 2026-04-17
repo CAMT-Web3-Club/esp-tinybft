@@ -8,6 +8,9 @@
 #include "esp_wifi.h"
 #include "esp_mac.h"
 #include "esp_now.h"
+#include "esp_heap_caps.h"
+#include "esp_system.h"
+#include "esp_err.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -39,11 +42,11 @@ static const char *TAG = "tbft_espnow";
 #define REASM_TIMEOUT_MS    5000
 #define FRAG_INTER_DELAY_MS 5
 
-#define MSG_QUEUE_DEPTH     16
-#define SEND_QUEUE_DEPTH    16
+#define MSG_QUEUE_DEPTH     8
+#define SEND_QUEUE_DEPTH    4
 #define SEND_TASK_PRIORITY  3
 #define SEND_TASK_STACK_SIZE 4096
-#define SEND_TASK_RECV_TIMEOUT_MS  100
+#define SEND_TASK_RECV_TIMEOUT_MS  50
 #define RECV_TASK_TIMEOUT_MS  100
 #define SEND_QUEUE_TIMEOUT_MS 10
 #define SHUTDOWN_DRAIN_MS     200
@@ -98,6 +101,7 @@ typedef struct tbft_espnow {
     tbft_addr_t  peers[TBFT_MAX_NUM_REPLICAS + TBFT_MAX_NUM_CLIENTS];
     bool         peer_valid[TBFT_MAX_NUM_REPLICAS + TBFT_MAX_NUM_CLIENTS];
     int          num_nodes;
+    int          num_replicas;
     int          local_id;
 
     QueueHandle_t msg_queue;
@@ -347,7 +351,8 @@ static void espnow_send_task(void *pvParameters) {
         }
 
         if (entry.dest == TBFT_ALL_REPLICAS) {
-            for (int i = 0; i < enow->num_nodes; i++) {
+            int limit = enow->num_replicas > 0 ? enow->num_replicas : enow->num_nodes;
+            for (int i = 0; i < limit; i++) {
                 if (i == enow->local_id) continue;
 
                 xSemaphoreTake(enow->lock, portMAX_DELAY);
@@ -391,19 +396,30 @@ static tbft_node_id_t find_node_by_mac(tbft_espnow_t *enow, const uint8_t *mac) 
  * Public API
  * -------------------------------------------------------------------------- */
 
-int tbft_transport_create(tbft_transport_t **out, tbft_transport_type_t type, int num_nodes, const char *mcast_ip, uint16_t port) {
+int tbft_transport_create(tbft_transport_t **out, tbft_transport_type_t type, int num_nodes, int num_replicas, const char *mcast_ip, uint16_t port) {
     if (g_espnow_ctx != NULL) {
         ESP_LOGE(TAG, "ESP-NOW transport is already initialized (Singleton Guard)");
         return -1;
     }
 
-    if (num_nodes > TBFT_MAX_NUM_REPLICAS + TBFT_MAX_NUM_CLIENTS) return -1;
+    if (num_nodes > TBFT_MAX_NUM_REPLICAS + TBFT_MAX_NUM_CLIENTS) {
+        ESP_LOGE(TAG, "num_nodes %d exceeds cap", num_nodes);
+        return -1;
+    }
+
+    ESP_LOGI(TAG, "transport_create: free_heap=%u struct_size=%zu",
+             (unsigned)esp_get_free_heap_size(), sizeof(tbft_espnow_t));
 
     tbft_espnow_t *enow = (tbft_espnow_t *)calloc(1, sizeof(*enow));
-    if (!enow) return -1;
+    if (!enow) {
+        ESP_LOGE(TAG, "calloc(%zu) failed, free_heap=%u",
+                 sizeof(tbft_espnow_t), (unsigned)esp_get_free_heap_size());
+        return -1;
+    }
 
-    enow->num_nodes = num_nodes;
-    enow->next_msg_id = 1;
+    enow->num_nodes    = num_nodes;
+    enow->num_replicas = num_replicas;
+    enow->next_msg_id  = 1;
 
     enow->lock = xSemaphoreCreateMutex();
     enow->task_exit_sem = xSemaphoreCreateBinary();
@@ -411,6 +427,9 @@ int tbft_transport_create(tbft_transport_t **out, tbft_transport_type_t type, in
     enow->send_queue = xQueueCreate(SEND_QUEUE_DEPTH, sizeof(send_entry_t));
 
     if (!enow->lock || !enow->task_exit_sem || !enow->msg_queue || !enow->send_queue) {
+        ESP_LOGE(TAG, "queue/sem alloc failed: lock=%p sem=%p msg_q=%p send_q=%p free_heap=%u",
+                 enow->lock, enow->task_exit_sem, enow->msg_queue, enow->send_queue,
+                 (unsigned)esp_get_free_heap_size());
         if (enow->send_queue) vQueueDelete(enow->send_queue);
         if (enow->msg_queue) vQueueDelete(enow->msg_queue);
         if (enow->task_exit_sem) vSemaphoreDelete(enow->task_exit_sem);
@@ -422,10 +441,17 @@ int tbft_transport_create(tbft_transport_t **out, tbft_transport_type_t type, in
     xSemaphoreGive(enow->lock);
     g_espnow_ctx = enow;
 
-    if (esp_now_register_recv_cb(espnow_recv_cb) != ESP_OK) goto init_error;
+    esp_err_t rcb_err = esp_now_register_recv_cb(espnow_recv_cb);
+    if (rcb_err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_now_register_recv_cb failed: 0x%x (%s) — "
+                 "ensure esp_now_init() was called before Byz_init_replica",
+                 rcb_err, esp_err_to_name(rcb_err));
+        goto init_error;
+    }
     esp_now_register_send_cb(espnow_send_cb);
 
     if (xTaskCreate(espnow_send_task, "tbft_send", SEND_TASK_STACK_SIZE, enow, SEND_TASK_PRIORITY, &enow->send_task_handle) != pdPASS) {
+        ESP_LOGE(TAG, "xTaskCreate for send_task failed");
         goto init_error;
     }
 

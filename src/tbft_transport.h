@@ -34,15 +34,18 @@ typedef struct tbft_transport tbft_transport_t;
  * @param out         Output pointer
  * @param type        UDP or ESP-NOW
  * @param num_nodes   Total node count (for peer table sizing)
+ * @param num_replicas  Replica count (3f+1); TBFT_ALL_REPLICAS broadcast
+ *                      targets only nodes 0..num_replicas-1
  * @param mcast_ip    Multicast IP string (UDP only; NULL for ESP-NOW)
  * @param port        UDP bind port (UDP only; ignored for ESP-NOW)
  * @return 0 on success, -1 on error
  */
 int tbft_transport_create(tbft_transport_t **out,
-                          tbft_transport_type_t type,
-                          int num_nodes,
-                          const char *mcast_ip,
-                          uint16_t port);
+                           tbft_transport_type_t type,
+                           int num_nodes,
+                           int num_replicas,
+                           const char *mcast_ip,
+                           uint16_t port);
 
 /** Release all resources held by the transport. */
 void tbft_transport_free(tbft_transport_t *t);

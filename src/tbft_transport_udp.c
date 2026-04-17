@@ -30,6 +30,7 @@ typedef struct {
     tbft_addr_t  peers[TBFT_MAX_NUM_REPLICAS + TBFT_MAX_NUM_CLIENTS];
     bool         peer_valid[TBFT_MAX_NUM_REPLICAS + TBFT_MAX_NUM_CLIENTS];
     int          num_nodes;
+    int          num_replicas;
 } tbft_udp_t;
 
 /* --------------------------------------------------------------------------
@@ -94,10 +95,11 @@ static int socket_open(uint16_t port, bool use_multicast,
  * -------------------------------------------------------------------------- */
 
 int tbft_transport_create(tbft_transport_t **out,
-                          tbft_transport_type_t type,
-                          int num_nodes,
-                          const char *mcast_ip,
-                          uint16_t port)
+                           tbft_transport_type_t type,
+                           int num_nodes,
+                           int num_replicas,
+                           const char *mcast_ip,
+                           uint16_t port)
 {
     (void)type;  /* only called with TBFT_TRANSPORT_UDP */
 
@@ -110,7 +112,8 @@ int tbft_transport_create(tbft_transport_t **out,
     tbft_udp_t *udp = (tbft_udp_t *)calloc(1, sizeof(*udp));
     if (!udp) return -1;
 
-    udp->num_nodes = num_nodes;
+    udp->num_nodes    = num_nodes;
+    udp->num_replicas = num_replicas;
 
 #ifdef CONFIG_TBFT_DISABLE_MULTICAST
     udp->use_multicast = false;
@@ -170,7 +173,8 @@ int tbft_transport_send(tbft_transport_t *t, const void *buf, size_t len,
         } else {
             /* Unicast to each replica */
             int sent = 0;
-            for (int i = 0; i < udp->num_nodes; i++) {
+            int limit = udp->num_replicas > 0 ? udp->num_replicas : udp->num_nodes;
+            for (int i = 0; i < limit; i++) {
                 if (!udp->peer_valid[i]) continue;
                 struct sockaddr_in addr = {
                     .sin_family      = AF_INET,

@@ -442,6 +442,12 @@ int Byz_send_request(Byz_req *req, bool read_only)
 
     tbft_msg_digest(req->contents, (size_t)req->size, &rep->od);
 
+    /* Set header size and timestamp BEFORE signing — the signature covers
+     * the full header (including hdr.size) so it must have its final value. */
+    int32_t total = (int32_t)(sizeof(*rep) + (size_t)req->size + TBFT_SIG_SIZE);
+    rep->hdr.size = tbft_msg_align(total);
+    rep->hdr.timestamp_us = esp_timer_get_time();
+
     /* Append command */
     uint8_t *cmd_ptr = out + sizeof(*rep);
     if (sizeof(*rep) + (size_t)req->size + TBFT_SIG_SIZE > TBFT_MAX_MESSAGE_SIZE) {
@@ -449,7 +455,7 @@ int Byz_send_request(Byz_req *req, bool read_only)
     }
     memcpy(cmd_ptr, req->contents, (size_t)req->size);
 
-    /* Sign (zero the signature field first to avoid sending uninitialized bytes) */
+    /* Sign */
     tbft_sig_t *sig = (tbft_sig_t *)(cmd_ptr + req->size);
     memset(sig->bytes, 0, sizeof(sig->bytes));
     if (s_client->local_principal && s_client->local_principal->has_priv_key) {
@@ -458,13 +464,13 @@ int Byz_send_request(Byz_req *req, bool read_only)
                           sig);
     }
 
-    int32_t total = (int32_t)(sizeof(*rep) + (size_t)req->size + TBFT_SIG_SIZE);
-    rep->hdr.size = tbft_msg_align(total);
-
-    /* Send to primary */
-    int primary = tbft_node_primary(s_client, s_client->view);
-    return tbft_node_send(s_client, out, (size_t)rep->hdr.size, primary) > 0
-           ? 0 : -1;
+    /* Broadcast to all replicas — any replica that receives the request
+     * will forward it to the current primary.  Sending only to the
+     * primary (based on the client's stale view) is fragile: if the
+     * cluster has advanced to a different view, the client's primary
+     * may no longer be the real primary. */
+    return tbft_node_send(s_client, out, (size_t)rep->hdr.size,
+                          TBFT_ALL_REPLICAS) > 0 ? 0 : -1;
 }
 
 int Byz_recv_reply(Byz_rep *rep)

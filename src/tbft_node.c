@@ -1,5 +1,7 @@
 #include "tbft_node.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include <string.h>
 
 static const char *TAG = "tbft_node";
@@ -33,9 +35,25 @@ int tbft_node_init(tbft_node_t *node, tbft_node_id_t node_id,
     ESP_LOGI(TAG, "transport: UDP (mcast=%s)", mcast_ip ? mcast_ip : "off");
 #endif
 
-    if (tbft_transport_create(&node->transport, ttype, num_nodes,
-                              mcast_ip, port) != 0) {
-        ESP_LOGE(TAG, "failed to create transport");
+    /* For ESP-NOW, the underlying network must be ready.  If the first
+     * attempt fails (e.g. ESP-NOW not yet fully initialized), retry a few
+     * times with a short delay before giving up. */
+    esp_err_t transport_err = ESP_OK;
+    for (int attempt = 0; attempt < 5; attempt++) {
+        if (attempt > 0) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            ESP_LOGI(TAG, "transport retry attempt %d", attempt + 1);
+        }
+        if (tbft_transport_create(&node->transport, ttype, num_nodes,
+                                  node->num_replicas,
+                                  mcast_ip, port) == 0) {
+            transport_err = ESP_OK;
+            break;
+        }
+        transport_err = ESP_FAIL;
+    }
+    if (transport_err != ESP_OK) {
+        ESP_LOGE(TAG, "failed to create transport after 5 attempts");
         return -1;
     }
 

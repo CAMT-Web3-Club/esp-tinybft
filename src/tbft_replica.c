@@ -178,6 +178,53 @@ void tbft_replica_run(tbft_replica_t *r)
      * messages which arrive during the normal event loop below. */
     tbft_replica_send_new_key(r);
 
+    /* Drain ALL messages that arrived during init.  This is critical —
+     * we cannot silently discard View_change, Prepare, Commit, Checkpoint
+     * or other messages.  Non-NEW_KEY messages are acknowledged with a log
+     * to catch unexpected early arrivals. */
+    int drained = 0;
+    while (drained < 64) {
+        tbft_node_id_t src_id = -1;
+        int n = tbft_node_recv(&r->node, r->node.recv_buf, &src_id);
+        if (n < (int)sizeof(tbft_msg_hdr_t)) break;
+        const tbft_msg_hdr_t *hdr = (const tbft_msg_hdr_t *)r->node.recv_buf;
+        if (n >= hdr->size && hdr->tag == TBFT_MSG_NEW_KEY) {
+            tbft_replica_handle_new_key(r, r->node.recv_buf, n);
+        }
+        drained++;
+    }
+
+    /* Key confirmation barrier: ensure we have in-keys from threshold-1
+     * peers before entering view 0.  Without this, a dropped New_key
+     * causes asymmetric HMAC state → one-way communication failure →
+     * protocol stall and infinite view-changes. */
+    {
+        int keys_ok = 0;
+        for (int i = 0; i < r->node.num_replicas; i++) {
+            if (i == r->node.node_id) continue;
+            if (r->node.principals[i] && r->node.principals[i]->keys_fresh) {
+                keys_ok++;
+            }
+        }
+        if (keys_ok < r->node.threshold - 1) {
+            ESP_LOGW(TAG, "only %d/%d HMAC keys ready after drain — retrying",
+                     keys_ok, r->node.threshold - 1);
+            tbft_replica_send_new_key(r);
+            vTaskDelay(pdMS_TO_TICKS(200));
+            drained = 0;
+            while (drained < 32) {
+                tbft_node_id_t src_id = -1;
+                int n = tbft_node_recv(&r->node, r->node.recv_buf, &src_id);
+                if (n < (int)sizeof(tbft_msg_hdr_t)) break;
+                const tbft_msg_hdr_t *hdr = (const tbft_msg_hdr_t *)r->node.recv_buf;
+                if (n >= hdr->size && hdr->tag == TBFT_MSG_NEW_KEY) {
+                    tbft_replica_handle_new_key(r, r->node.recv_buf, n);
+                }
+                drained++;
+            }
+        }
+    }
+
     /* Subscribe this task to the task watchdog so we can periodically feed it.
      * The default timeout is CONFIG_ESP_TASK_WDT_TIMEOUT_S (typically 5s). */
 #if CONFIG_ESP_TASK_WDT_EN
@@ -323,18 +370,33 @@ void tbft_replica_handle_request(tbft_replica_t *r, const void *msg, int len)
         return;
     }
 
-    /* If we are not the primary, forward to the primary */
+    /* If we are not the primary, forward to the primary only (unicast).
+     * The client already broadcasts to all replicas, so the primary likely
+     * received the request directly — this forward is a fallback in case
+     * the client's direct send to the primary failed.  Unicasting (not
+     * broadcasting) prevents the exponential forwarding storm that occurs
+     * when every replica re-broadcasts every forwarded request. */
     if (!tbft_replica_is_primary(r)) {
         int primary = tbft_node_primary(&r->node, r->node.view);
         tbft_node_send(&r->node, msg, (size_t)len, primary);
-        /* Also restart view-change timer in case primary is faulty */
         tbft_itimer_start(&r->vtimer, r->vtimer_period_us);
         return;
     }
 
-    /* Primary: enqueue and start ordering */
+    /* Primary: deduplicate by (cid, rid) before enqueuing.
+     * Multiple copies of the same request can arrive — once from the
+     * client's broadcast and again from each replica's forward. */
     bool ro = (req->hdr.extra & 0x1) != 0;
     tbft_rqueue_t *q = ro ? &r->ro_rqueue : &r->rqueue;
+    for (int i = 0; i < q->count; i++) {
+        int idx = (q->head + i) % TBFT_RQUEUE_MAX;
+        const tbft_request_rep_t *existing =
+            (const tbft_request_rep_t *)q->entries[idx].buf;
+        if (existing->cid == req->cid && existing->rid == req->rid) {
+            return;
+        }
+    }
+
     if (!rqueue_push(q, msg, len, ro)) {
         ESP_LOGW(TAG, "request queue full, dropping request from client %d",
                  req->cid);
