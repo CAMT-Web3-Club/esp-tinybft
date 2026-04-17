@@ -171,6 +171,8 @@ void Byz_reset_client(void);
  *                      the node entry in @p config_file whose @p priv_config
  *                      corresponds to; otherwise peers will reject this
  *                      replica's authenticators.
+ *                      Pass -1 to auto-detect from the local WiFi MAC
+ *                      (ESP-NOW only; WiFi must be started first).
  * @param mem           Application state buffer (must remain valid)
  * @param mem_size      State buffer size (multiple of BLOCK_SIZE)
  * @param exec_cb       Execution callback (must not be NULL)
@@ -208,6 +210,21 @@ void Byz_modify1(void *mem);
  * from a dedicated FreeRTOS task.
  */
 void Byz_replica_run(void);
+
+/**
+ * Auto-detect the local node ID from the cluster config file.
+ *
+ * For ESP-NOW transport, reads the WiFi STA MAC and matches it against
+ * the MAC addresses in the config.  For UDP transport, returns -1
+ * (IP-based auto-detection is not supported in the embedded context).
+ *
+ * WiFi must be initialised and started before calling this function
+ * when using ESP-NOW transport.
+ *
+ * @param config_file   Path to the cluster configuration file
+ * @return node index (0-based) if found, -1 if not detected
+ */
+int Byz_detect_local_id(const char *config_file);
 
 /** Reset all performance counters. */
 void Byz_reset_stats(void);

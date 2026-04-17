@@ -64,7 +64,33 @@ int tbft_state_init(tbft_state_t *state, void *mem, size_t size)
         return -1;
     }
 
-    ESP_LOGI(TAG, "state init: %d blocks (%zu bytes)", state->num_blocks, size);
+    /* Pre-allocate each checkpoint record's snapshot array to num_blocks
+     * entries.  Every block can change at most once per checkpoint interval,
+     * so num_blocks is a hard upper bound.  This avoids realloc() in the
+     * CoW hot path and the OOM-induced abort it would otherwise require. */
+    for (int i = 0; i < TBFT_NUM_CKPT_SLOTS; i++) {
+        state->ckpt_records[i].old_blocks =
+            (tbft_cow_entry_t *)calloc((size_t)state->num_blocks,
+                                       sizeof(tbft_cow_entry_t));
+        if (!state->ckpt_records[i].old_blocks) {
+            ESP_LOGE(TAG, "state init: OOM allocating CoW snapshot array "
+                          "(%d blocks * %zu bytes)",
+                     state->num_blocks, sizeof(tbft_cow_entry_t));
+            for (int j = 0; j < i; j++) {
+                free(state->ckpt_records[j].old_blocks);
+                state->ckpt_records[j].old_blocks = NULL;
+            }
+            tbft_ptree_free(&state->ptree);
+            return -1;
+        }
+        state->ckpt_records[i].num_old_blocks = 0;
+    }
+
+    ESP_LOGI(TAG, "state init: %d blocks (%zu bytes), CoW reserve "
+                  "%d slots * %d blocks * %zu bytes",
+             state->num_blocks, size,
+             TBFT_NUM_CKPT_SLOTS, state->num_blocks,
+             sizeof(tbft_cow_entry_t));
     return 0;
 }
 
@@ -94,17 +120,26 @@ void tbft_state_cow_single(tbft_state_t *state, int bindex)
     /* Find the active (most recent) checkpoint record */
     tbft_ckpt_record_t *rec = ckpt_slot_for(state, state->last_stable);
 
-    /* Grow old_blocks array */
-    int n = rec->num_old_blocks;
-    tbft_cow_entry_t *new_arr = (tbft_cow_entry_t *)realloc(
-        rec->old_blocks, (size_t)(n + 1) * sizeof(tbft_cow_entry_t));
-    if (!new_arr) {
-        ESP_LOGE(TAG, "cow_single: out of memory! ABORTING to prevent consensus corruption.");
-        abort();
+    if (!rec->old_blocks) {
+        /* Should not happen: old_blocks is pre-allocated in tbft_state_init
+         * and freed only on shutdown.  Log and bail out non-fatally — the
+         * missing snapshot merely means we cannot roll back THIS checkpoint
+         * on view change; consensus can still advance via state transfer. */
+        ESP_LOGW(TAG, "cow_single: snapshot buffer missing, skipping block %d",
+                 bindex);
+        return;
     }
-    rec->old_blocks = new_arr;
+    if (rec->num_old_blocks >= state->num_blocks) {
+        /* Every block already snapshotted — indicates a rapid write pattern
+         * on all blocks without an intervening checkpoint.  The CoW bitmap
+         * prevents duplicates, so hitting this branch should be impossible. */
+        ESP_LOGW(TAG, "cow_single: snapshot array full, skipping block %d",
+                 bindex);
+        return;
+    }
 
-    /* Save the current block */
+    /* Save the current block into the pre-allocated slot */
+    int n = rec->num_old_blocks;
     rec->old_blocks[n].block_idx = bindex;
     memcpy(rec->old_blocks[n].data,
            state->mem + (size_t)bindex * TBFT_BLOCK_SIZE,

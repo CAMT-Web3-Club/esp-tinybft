@@ -33,4 +33,5 @@ idf_component_register(
         vfs
         spiffs
         esp_wifi
+        efuse
 )

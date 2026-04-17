@@ -21,6 +21,7 @@
 
 /** One slot: Checkpoint messages from each replica at one seqno */
 typedef struct {
+    tbft_seqno_t seqno;    /* explicit seqno for truncate (avoids heuristic) */
     uint8_t  msgs[TBFT_MAX_NUM_REPLICAS][TBFT_CKPT_MSG_SIZE];
     int      msg_lens[TBFT_MAX_NUM_REPLICAS];
     bool     present[TBFT_MAX_NUM_REPLICAS];

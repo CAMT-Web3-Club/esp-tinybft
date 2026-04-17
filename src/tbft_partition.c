@@ -114,9 +114,14 @@ void tbft_ptree_update_leaf(tbft_ptree_t *tree, int block_idx,
             }
             size_t hash_len = 0;
             tbft_part_t *parent = &tree->ptree[l - 1][parent_idx];
-            psa_hash_finish(&hash_op, parent->digest.bytes,
-                            TBFT_DIGEST_SIZE, &hash_len);
-            parent->version = version;
+            psa_status_t fin = psa_hash_finish(&hash_op, parent->digest.bytes,
+                                                TBFT_DIGEST_SIZE, &hash_len);
+            if (fin == PSA_SUCCESS) {
+                parent->version = version;
+            } else {
+                ESP_LOGE(TAG, "psa_hash_finish failed: %d", (int)fin);
+                psa_hash_abort(&hash_op);
+            }
         } else {
             ESP_LOGE(TAG, "psa_hash_setup failed: %d", (int)pst);
             psa_hash_abort(&hash_op);

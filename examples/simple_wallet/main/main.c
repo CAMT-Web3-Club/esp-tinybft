@@ -117,11 +117,21 @@ static void wifi_init(void) {
         ESP_LOGE(TAG, "WiFi connection failed");
     }
 #else
-    ESP_LOGI(TAG, "Starting WiFi in STA mode for ESP-NOW...");
-    esp_netif_create_default_wifi_sta();
+    ESP_LOGI(TAG, "Starting WiFi AP for ESP-NOW...");
+    esp_netif_create_default_wifi_ap();
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+    wifi_config_t ap_cfg = {
+        .ap = {
+            .ssid = "tinybft",
+            .ssid_len = 7,
+            .channel = 1,
+            .authmode = WIFI_AUTH_OPEN,
+            .max_connection = 0,
+        },
+    };
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_cfg));
     ESP_ERROR_CHECK(esp_wifi_start());
     ESP_ERROR_CHECK(esp_now_init());
 #endif
@@ -133,8 +143,27 @@ static void replica_task(void *arg) {
 #if CONFIG_TBFT_TRANSPORT_ESPNOW
     config_file = "/spiffs/config_espnow.txt";
 #endif
+
+    /* Auto-detect local_id from MAC address (ESP-NOW) or use Kconfig default.
+     * For ESP-NOW, the config file contains MAC addresses and parse_config()
+     * matches the local WiFi STA MAC to determine local_id automatically. */
+    int local_id = Byz_detect_local_id(config_file);
+    if (local_id < 0) {
+#if CONFIG_TBFT_TRANSPORT_ESPNOW
+        ESP_LOGE(TAG, "Failed to auto-detect local ID — "
+                 "check that this board's MAC is in the config file");
+        vTaskDelete(NULL);
+        return;
+#else
+        local_id = CONFIG_EXAMPLE_NODE_ID;
+        ESP_LOGW(TAG, "MAC auto-detect not available for UDP; "
+                 "using CONFIG_EXAMPLE_NODE_ID=%d", local_id);
+#endif
+    }
+    ESP_LOGI(TAG, "Using local_id=%d", local_id);
+
     char priv_config[32];
-    snprintf(priv_config, sizeof(priv_config), "/spiffs/priv%d.der", CONFIG_EXAMPLE_NODE_ID);
+    snprintf(priv_config, sizeof(priv_config), "/spiffs/priv%d.der", local_id);
 
     // Initial balances
     app_state[0] = 1000;
@@ -143,7 +172,7 @@ static void replica_task(void *arg) {
     app_state[3] = 1000;
 
     int ret = Byz_init_replica(config_file, priv_config,
-                               CONFIG_EXAMPLE_NODE_ID,
+                               local_id,
                                app_state, sizeof(app_state),
                                exec_cb, NULL, 0, NULL, 0);
     if (ret != 0) {
@@ -161,12 +190,10 @@ static void client_task(void *arg) {
 #if CONFIG_TBFT_TRANSPORT_ESPNOW
     config_file = "/spiffs/config_espnow.txt";
 #endif
-    // Node 4 is the client as defined in gen_configs.sh
-    const char *priv_config = "/spiffs/priv4.der";
 
     vTaskDelay(pdMS_TO_TICKS(5000)); // Wait for replicas to start
 
-    int ret = Byz_init_client(config_file, priv_config, -1 /* auto = 3f+1 */, 0);
+    int ret = Byz_init_client(config_file, "/spiffs/priv4.der", -1, 0);
     if (ret != 0) {
         ESP_LOGE(TAG, "Failed to init client");
         vTaskDelete(NULL);

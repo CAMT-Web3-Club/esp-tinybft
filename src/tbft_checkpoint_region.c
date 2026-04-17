@@ -25,6 +25,8 @@ bool tbft_cr_store(tbft_checkpoint_region_t *cr,
     int sidx = slot_index(seqno);
     tbft_ckpt_slot_t *slot = &cr->slots[sidx];
 
+    slot->seqno = seqno;
+
     if (slot->present[replica_id]) return false; /* duplicate */
 
     memcpy(slot->msgs[replica_id], msg, (size_t)msg_len);
@@ -134,17 +136,9 @@ const uint8_t *tbft_cr_load_above_window(const tbft_checkpoint_region_t *cr,
 void tbft_cr_truncate(tbft_checkpoint_region_t *cr, tbft_seqno_t stable_seqno)
 {
     for (int i = 0; i < TBFT_NUM_CKPT_SLOTS; i++) {
-        /* Reconstruct the seqno for this slot (heuristic: check first present) */
         tbft_ckpt_slot_t *slot = &cr->slots[i];
-        for (int r = 0; r < TBFT_MAX_NUM_REPLICAS; r++) {
-            if (slot->present[r] && slot->msg_lens[r] >= (int)sizeof(tbft_checkpoint_rep_t)) {
-                const tbft_checkpoint_rep_t *rep =
-                    (const tbft_checkpoint_rep_t *)slot->msgs[r];
-                if (rep->seqno < stable_seqno) {
-                    memset(slot, 0, sizeof(*slot));
-                }
-                break;
-            }
+        if (slot->seqno > 0 && slot->seqno <= stable_seqno) {
+            memset(slot, 0, sizeof(*slot));
         }
     }
 }

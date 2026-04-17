@@ -7,8 +7,6 @@ echo "Generating RSA keys for 4 replicas and 1 client..."
 for i in 0 1 2 3 4; do
     openssl genrsa -out spiffs_image/priv$i.pem 2048 2>/dev/null
     openssl rsa -in spiffs_image/priv$i.pem -pubout -out spiffs_image/pub$i.pem 2>/dev/null
-    # TinyBFT expects DER format by default for mbedtls or we can use PEM. Let's provide PEM if it supports it, or DER if required.
-    # The README says: Byz_init_replica("config.txt", "priv.der", ...). Wait, I will use DER to be safe.
     openssl rsa -in spiffs_image/priv$i.pem -outform DER -out spiffs_image/priv$i.der 2>/dev/null
     openssl rsa -in spiffs_image/priv$i.pem -pubout -outform DER -out spiffs_image/pub$i.der 2>/dev/null
     rm spiffs_image/priv$i.pem spiffs_image/pub$i.pem
@@ -32,22 +30,25 @@ client4 127.0.0.1 5004 /spiffs/pub4.der
 EOF
 
 echo "Generating ESP-NOW config..."
-# We will use dummy MACs, but in reality ESP-NOW nodes must know each other's MAC. 
-# We'll put generic local admin MACs.
+echo "NOTE: Replace MAC addresses below with your boards' real MACs."
+echo "      Run 'esptool -p /dev/ttyACMx flash_id' on each board to find its MAC."
+echo "      The config has 4 nodes (all replicas, no client entry)."
 cat <<EOF > spiffs_image/config_espnow.txt
 wallet
 1
 3000
-5
-239.0.0.1
-node0 02:00:00:00:00:00 /spiffs/pub0.der
-node1 02:00:00:00:00:01 /spiffs/pub1.der
-node2 02:00:00:00:00:02 /spiffs/pub2.der
-node3 02:00:00:00:00:03 /spiffs/pub3.der
-client4 02:00:00:00:00:04 /spiffs/pub4.der
+4
+0.0.0.0
+node0 88:56:a6:5b:f2:f0 /spiffs/pub0.der
+node1 1c:db:d4:c6:41:14 /spiffs/pub1.der
+node2 1c:db:d4:c5:7f:20 /spiffs/pub2.der
+node3 88:56:a6:5b:76:84 /spiffs/pub3.der
 2000
 5000
 10000
 EOF
 
 echo "Done."
+echo ""
+echo "!!! IMPORTANT: Edit spiffs_image/config_espnow.txt to replace MAC addresses"
+echo "    with your boards' real WiFi STA MACs before building. !!!"
