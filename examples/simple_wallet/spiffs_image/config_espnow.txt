@@ -7,6 +7,6 @@ node0 88:56:a6:5b:76:ac /spiffs/pub0.der
 node1 1c:db:d4:c6:41:14 /spiffs/pub1.der
 node2 88:56:a6:5b:7c:ac /spiffs/pub2.der
 node3 1c:db:d4:c6:40:40 /spiffs/pub3.der
-2000
+30000
 5000
 10000

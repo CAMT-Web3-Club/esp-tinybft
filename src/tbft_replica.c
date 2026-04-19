@@ -173,57 +173,12 @@ void tbft_replica_run(tbft_replica_t *r)
     r->running = true;
     ESP_LOGI(TAG, "replica %d starting event loop", r->node.node_id);
 
-    /* Broadcast fresh HMAC session keys to all peers before processing
-     * any protocol messages.  Peers will also send their own New_key
-     * messages which arrive during the normal event loop below. */
+    /* Broadcast fresh HMAC session keys to all peers.  Peers will also
+     * send their own New_key messages which we handle in the main loop.
+     * We do NOT block waiting for keys — boards may start at different
+     * times (e.g. sequential flashing), so we enter the main loop
+     * immediately and handle New_key asynchronously. */
     tbft_replica_send_new_key(r);
-
-    /* Drain ALL messages that arrived during init.  This is critical —
-     * we cannot silently discard View_change, Prepare, Commit, Checkpoint
-     * or other messages.  Non-NEW_KEY messages are acknowledged with a log
-     * to catch unexpected early arrivals. */
-    int drained = 0;
-    while (drained < 64) {
-        tbft_node_id_t src_id = -1;
-        int n = tbft_node_recv(&r->node, r->node.recv_buf, &src_id);
-        if (n < (int)sizeof(tbft_msg_hdr_t)) break;
-        const tbft_msg_hdr_t *hdr = (const tbft_msg_hdr_t *)r->node.recv_buf;
-        if (n >= hdr->size && hdr->tag == TBFT_MSG_NEW_KEY) {
-            tbft_replica_handle_new_key(r, r->node.recv_buf, n);
-        }
-        drained++;
-    }
-
-    /* Key confirmation barrier: ensure we have in-keys from threshold-1
-     * peers before entering view 0.  Without this, a dropped New_key
-     * causes asymmetric HMAC state → one-way communication failure →
-     * protocol stall and infinite view-changes. */
-    {
-        int keys_ok = 0;
-        for (int i = 0; i < r->node.num_replicas; i++) {
-            if (i == r->node.node_id) continue;
-            if (r->node.principals[i] && r->node.principals[i]->keys_fresh) {
-                keys_ok++;
-            }
-        }
-        if (keys_ok < r->node.threshold - 1) {
-            ESP_LOGW(TAG, "only %d/%d HMAC keys ready after drain — retrying",
-                     keys_ok, r->node.threshold - 1);
-            tbft_replica_send_new_key(r);
-            vTaskDelay(pdMS_TO_TICKS(200));
-            drained = 0;
-            while (drained < 32) {
-                tbft_node_id_t src_id = -1;
-                int n = tbft_node_recv(&r->node, r->node.recv_buf, &src_id);
-                if (n < (int)sizeof(tbft_msg_hdr_t)) break;
-                const tbft_msg_hdr_t *hdr = (const tbft_msg_hdr_t *)r->node.recv_buf;
-                if (n >= hdr->size && hdr->tag == TBFT_MSG_NEW_KEY) {
-                    tbft_replica_handle_new_key(r, r->node.recv_buf, n);
-                }
-                drained++;
-            }
-        }
-    }
 
     /* Subscribe this task to the task watchdog so we can periodically feed it.
      * The default timeout is CONFIG_ESP_TASK_WDT_TIMEOUT_S (typically 5s). */
@@ -236,6 +191,7 @@ void tbft_replica_run(tbft_replica_t *r)
 
     /* HIGH FIX M4: Move msg_count into replica task scope (was static, shared across instances) */
     int msg_count = 0;
+    TickType_t last_nk_send = xTaskGetTickCount();
 
     while (r->running) {
 #if CONFIG_ESP_TASK_WDT_EN
@@ -251,11 +207,45 @@ void tbft_replica_run(tbft_replica_t *r)
             vTaskDelay(pdMS_TO_TICKS(1));
         }
 
+        /* Periodically re-broadcast New_key to help late-joining nodes.
+         * Send every 2s if we're missing keys, every 10s once ready. */
+        {
+            int keys_ok = 0;
+            for (int i = 0; i < r->node.num_replicas; i++) {
+                if (i == r->node.node_id) continue;
+                if (r->node.principals[i] && r->node.principals[i]->keys_fresh) {
+                    keys_ok++;
+                }
+            }
+            TickType_t interval = (keys_ok >= r->node.threshold - 1)
+                ? pdMS_TO_TICKS(10000) : pdMS_TO_TICKS(2000);
+            TickType_t now = xTaskGetTickCount();
+            if (now - last_nk_send >= interval) {
+                tbft_replica_send_new_key(r);
+                last_nk_send = now;
+            }
+        }
+
         if (r->evt_group) {
             EventBits_t bits = xEventGroupClearBits(r->evt_group, TBFT_EVT_VTIMER | TBFT_EVT_STIMER);
-            if (bits & TBFT_EVT_VTIMER) {
-                ESP_LOGW(TAG, "view-change timeout in view %lld", (long long)r->node.view);
-                tbft_replica_send_view_change(r);
+            /* Suppress view-change timeouts until we have enough HMAC keys.
+             * Without keys, Prepare/Commit messages fail verification, so
+             * view-changes would be triggered spuriously. */
+            {
+                int keys_ok = 0;
+                for (int i = 0; i < r->node.num_replicas; i++) {
+                    if (i == r->node.node_id) continue;
+                    if (r->node.principals[i] && r->node.principals[i]->keys_fresh) {
+                        keys_ok++;
+                    }
+                }
+                if (keys_ok >= r->node.threshold - 1 && (bits & TBFT_EVT_VTIMER)) {
+                    ESP_LOGW(TAG, "view-change timeout in view %lld (keys=%d/%d)",
+                             (long long)r->node.view, keys_ok, r->node.threshold - 1);
+                    tbft_replica_send_view_change(r);
+                } else if (bits & TBFT_EVT_VTIMER) {
+                    ESP_LOGD(TAG, "view-change suppressed: keys=%d/%d", keys_ok, r->node.threshold - 1);
+                }
             }
             if (bits & TBFT_EVT_STIMER) {
                 /* Broadcast a Status message */
@@ -295,6 +285,25 @@ void tbft_replica_run(tbft_replica_t *r)
         if (hdr->size > (int32_t)TBFT_MAX_MESSAGE_SIZE || hdr->size <= 0) {
             ESP_LOGW(TAG, "invalid hdr->size=%d (n=%d)", (int)hdr->size, n);
             continue;
+        }
+
+        /* CRITICAL FIX: Until we have enough HMAC in-keys, only process
+         * New_key messages.  All other protocol messages (View_change,
+         * New_view, Prepare, Commit, etc.) require HMAC verification and
+         * would either fail silently or corrupt state.  This prevents the
+         * view-change cascade that occurs when nodes without keys exchange
+         * view-change messages (which use RSA, not HMAC). */
+        if (hdr->tag != TBFT_MSG_NEW_KEY) {
+            int keys_ok = 0;
+            for (int i = 0; i < r->node.num_replicas; i++) {
+                if (i == r->node.node_id) continue;
+                if (r->node.principals[i] && r->node.principals[i]->keys_fresh) {
+                    keys_ok++;
+                }
+            }
+            if (keys_ok < r->node.threshold - 1) {
+                continue; /* drop until keys ready */
+            }
         }
 
         switch ((tbft_msg_tag_t)hdr->tag) {
@@ -656,7 +665,17 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
 
     if (!tbft_vi_collect_vc(&r->vi, sender_id, msg, len)) {
         if (vc->v > r->node.view && !r->vi.received[r->node.node_id]) {
-            tbft_replica_send_view_change(r);
+            /* Suppress catch-up view-change until we have enough HMAC keys */
+            int keys_ok = 0;
+            for (int i = 0; i < r->node.num_replicas; i++) {
+                if (i == r->node.node_id) continue;
+                if (r->node.principals[i] && r->node.principals[i]->keys_fresh) {
+                    keys_ok++;
+                }
+            }
+            if (keys_ok >= r->node.threshold - 1) {
+                tbft_replica_send_view_change(r);
+            }
         }
         return;
     }

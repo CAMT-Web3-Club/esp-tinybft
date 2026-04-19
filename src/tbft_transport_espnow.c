@@ -42,7 +42,7 @@ static const char *TAG = "tbft_espnow";
 #define REASM_TIMEOUT_MS    5000
 #define FRAG_INTER_DELAY_MS 5
 
-#define MSG_QUEUE_DEPTH     8
+#define MSG_QUEUE_DEPTH     24
 #define SEND_QUEUE_DEPTH    4
 #define SEND_TASK_PRIORITY  3
 #define SEND_TASK_STACK_SIZE 4096
