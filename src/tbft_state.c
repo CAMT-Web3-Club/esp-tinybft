@@ -151,6 +151,10 @@ void tbft_state_cow_single(tbft_state_t *state, int bindex)
 
 void tbft_state_cow(tbft_state_t *state, void *mem, size_t size)
 {
+    /* CRITICAL FIX: Prevent unsigned underflow when size == 0.
+     * Without this, end - base - 1 wraps to SIZE_MAX, corrupting the bitmap. */
+    if (size == 0) return;
+
     uintptr_t base  = (uintptr_t)state->mem;
     uintptr_t start = (uintptr_t)mem;
     uintptr_t end   = start + size;
@@ -184,18 +188,20 @@ void tbft_state_checkpoint(tbft_state_t *state, tbft_seqno_t seqno)
                                seqno);
     }
 
-    /* Store the checkpoint record */
+    /* CRITICAL FIX: Do NOT free old_blocks here. The CoW-saved blocks
+     * represent the state at last_stable and are needed for rollback during
+     * view-change. Freeing them here makes rollback a silent no-op.
+     *
+     * Instead, we reset the CoW bitmap and keep the old_blocks intact.
+     * The old_blocks will be freed only when mark_stable advances past
+     * this checkpoint (in tbft_state_mark_stable). */
     tbft_ckpt_record_t *rec = ckpt_slot_for(state, seqno);
-    if (rec->old_blocks) {
-        free(rec->old_blocks);
-        rec->old_blocks = NULL;
-    }
-    rec->num_old_blocks = 0;
     rec->seqno       = seqno;
     rec->root_digest = *tbft_ptree_root_digest(&state->ptree);
     rec->valid       = true;
+    /* Do NOT free old_blocks or reset num_old_blocks here! */
 
-    /* Reset CoW bitmap */
+    /* Reset CoW bitmap for next checkpoint interval */
     cow_zero(state);
 }
 
@@ -234,13 +240,21 @@ void tbft_state_mark_stable(tbft_state_t *state, tbft_seqno_t stable_seqno)
 {
     if (stable_seqno <= state->last_stable) return;
 
-    /* Free old_blocks from the previous stable checkpoint since we can't rollback prior back. */
-    tbft_ckpt_record_t *old_rec = ckpt_slot_for(state, state->last_stable);
-    if (old_rec->old_blocks) {
-        free(old_rec->old_blocks);
-        old_rec->old_blocks = NULL;
+    /* CRITICAL FIX: Only free old_blocks when the checkpoint slot is being
+     * reused (circular buffer wrap). We must NOT free the old_blocks for the
+     * current last_stable, as they are needed for rollback during view-change.
+     *
+     * The slot for stable_seqno may overlap with an older checkpoint's slot.
+     * If so, free the old_blocks from that previous occupant before reusing. */
+    tbft_ckpt_record_t *new_rec = ckpt_slot_for(state, stable_seqno);
+    if (new_rec->valid && new_rec->seqno != stable_seqno) {
+        /* Slot is being reused for a new checkpoint — free old data */
+        if (new_rec->old_blocks) {
+            /* Note: old_blocks is pre-allocated in init, so we don't free
+             * the array itself, just reset the count */
+            new_rec->num_old_blocks = 0;
+        }
     }
-    old_rec->num_old_blocks = 0;
 
     state->last_stable = stable_seqno;
 }
@@ -284,12 +298,29 @@ void tbft_state_handle_meta_data(tbft_state_t *state,
         int child_idx = rep->index * pchildren + i;
         int child_level = level + 1;
 
-        /* Check if local digest matches */
-        if (child_level < state->ptree.dims.p_levels) {
+        /* CRITICAL FIX: Correctly distinguish internal nodes from leaf nodes.
+         * The leaf level is p_levels - 1. When child_level == p_levels - 1,
+         * we need to enqueue a data fetch for the block, not an internal
+         * node fetch. The previous condition (child_level < p_levels) was
+         * always true for leaf nodes, so data fetches were never created. */
+        if (child_level < state->ptree.dims.p_levels - 1) {
+            /* Internal node: compare digest and enqueue fetch if mismatch */
             const tbft_digest_t *local =
                 &state->ptree.ptree[child_level][child_idx].digest;
             if (!tbft_digest_equal(local, &parts[i].digest)) {
-                /* Mismatch: enqueue fetch for this child */
+                if (state->fetch_queue_len < TBFT_MAX_STATE_BLOCKS) {
+                    tbft_fetch_req_t *req =
+                        &state->fetch_queue[state->fetch_queue_len++];
+                    req->level = child_level;
+                    req->index = child_idx;
+                    req->done  = false;
+                }
+            }
+        } else if (child_level == state->ptree.dims.p_levels - 1) {
+            /* Leaf level: enqueue data fetch for this block */
+            const tbft_digest_t *local =
+                &state->ptree.ptree[child_level][child_idx].digest;
+            if (!tbft_digest_equal(local, &parts[i].digest)) {
                 if (state->fetch_queue_len < TBFT_MAX_STATE_BLOCKS) {
                     tbft_fetch_req_t *req =
                         &state->fetch_queue[state->fetch_queue_len++];
@@ -326,7 +357,10 @@ void tbft_state_handle_data(tbft_state_t *state,
     state->block_digests[bidx] = computed;
     tbft_ptree_update_leaf(&state->ptree, bidx, &computed, rep->seqno);
 
-    state->n_data_pending--;
+    /* HIGH FIX H6: Decrement pending count safely (don't go below 0) */
+    if (state->n_data_pending > 0) {
+        state->n_data_pending--;
+    }
 
     /* Check if all pending fetches are resolved */
     bool all_done = (state->n_data_pending == 0);

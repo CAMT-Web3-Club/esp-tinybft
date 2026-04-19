@@ -39,11 +39,13 @@ void tbft_itimer_start(tbft_itimer_t *t, int64_t timeout_us)
 {
     if (t->handle == NULL) return;
 
-    /* Stop first if already running */
-    if (t->running) {
-        esp_timer_stop(t->handle);
-        t->running = false;
-    }
+    /* CRITICAL FIX: Always stop before starting — esp_timer_stop is idempotent.
+     * The previous check on t->running was racy: timer_dispatch clears the flag
+     * *before* the callback executes, so a concurrent start() could skip the
+     * stop and call esp_timer_start_once on an already-active timer, returning
+     * ESP_ERR_INVALID_STATE and leaving t->running inconsistent. */
+    esp_timer_stop(t->handle);
+    t->running = false;
 
     esp_err_t err = esp_timer_start_once(t->handle, timeout_us);
     if (err == ESP_OK) {
@@ -55,7 +57,8 @@ void tbft_itimer_start(tbft_itimer_t *t, int64_t timeout_us)
 
 void tbft_itimer_stop(tbft_itimer_t *t)
 {
-    if (t->handle && t->running) {
+    if (t->handle) {
+        /* Always stop — idempotent if already stopped */
         esp_timer_stop(t->handle);
         t->running = false;
     }

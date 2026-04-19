@@ -104,29 +104,30 @@ void tbft_ptree_update_leaf(tbft_ptree_t *tree, int block_idx,
         psa_hash_operation_t hash_op;
         memset(&hash_op, 0, sizeof(hash_op));
         psa_status_t pst = psa_hash_setup(&hash_op, PSA_ALG_SHA_256);
-        if (pst == PSA_SUCCESS) {
-            for (int c = first_child;
-                 c < first_child + pchildren && c < num_nodes_at_l;
-                 c++) {
-                psa_hash_update(&hash_op,
-                                tree->ptree[l][c].digest.bytes,
-                                TBFT_DIGEST_SIZE);
-            }
-            size_t hash_len = 0;
-            tbft_part_t *parent = &tree->ptree[l - 1][parent_idx];
-            psa_status_t fin = psa_hash_finish(&hash_op, parent->digest.bytes,
-                                                TBFT_DIGEST_SIZE, &hash_len);
-            if (fin == PSA_SUCCESS) {
-                parent->version = version;
-            } else {
-                ESP_LOGE(TAG, "psa_hash_finish failed: %d", (int)fin);
-                psa_hash_abort(&hash_op);
-            }
-        } else {
+        if (pst != PSA_SUCCESS) {
             ESP_LOGE(TAG, "psa_hash_setup failed: %d", (int)pst);
             psa_hash_abort(&hash_op);
+            return; /* HIGH FIX H5: Abort on hash failure — don't corrupt tree */
         }
 
+        for (int c = first_child;
+             c < first_child + pchildren && c < num_nodes_at_l;
+             c++) {
+            psa_hash_update(&hash_op,
+                            tree->ptree[l][c].digest.bytes,
+                            TBFT_DIGEST_SIZE);
+        }
+        size_t hash_len = 0;
+        tbft_part_t *parent = &tree->ptree[l - 1][parent_idx];
+        psa_status_t fin = psa_hash_finish(&hash_op, parent->digest.bytes,
+                                            TBFT_DIGEST_SIZE, &hash_len);
+        if (fin != PSA_SUCCESS) {
+            ESP_LOGE(TAG, "psa_hash_finish failed: %d", (int)fin);
+            psa_hash_abort(&hash_op);
+            return; /* HIGH FIX H5: Abort on hash failure — don't corrupt tree */
+        }
+
+        parent->version = version;
         idx = parent_idx;
     }
 }

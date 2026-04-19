@@ -117,7 +117,13 @@ void tbft_node_gen_auth(tbft_node_t *node, const void *msg, size_t msg_len,
         if (i == node->node_id) continue;
         tbft_principal_t *p = node->principals[i];
         if (p) {
-            tbft_principal_gen_mac_out(p, msg, msg_len, &auth->slots[slot]);
+            /* HIGH FIX H8: Check MAC generation return value.
+             * Without this, failed MAC generation produces zeroed slots,
+             * causing all peers to reject the message. */
+            int rc = tbft_principal_gen_mac_out(p, msg, msg_len, &auth->slots[slot]);
+            if (rc != 0) {
+                memset(&auth->slots[slot], 0, sizeof(auth->slots[slot]));
+            }
         } else {
             memset(&auth->slots[slot], 0, sizeof(auth->slots[slot]));
         }

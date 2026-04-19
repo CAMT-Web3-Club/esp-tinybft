@@ -220,7 +220,10 @@ int tbft_transport_recv(tbft_transport_t *t, void *buf, size_t buf_len,
                      (struct sockaddr *)&from, &from_len);
     if (n < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            vTaskDelay(pdMS_TO_TICKS(10));
+            /* HIGH FIX H4: Return immediately without delay.
+             * The previous vTaskDelay(10) capped the entire BFT protocol to
+             * 100 receive attempts/second, significantly increasing latency
+             * and potentially triggering timeout cascades. */
             return 0; /* nothing available */
         }
         ESP_LOGE(TAG, "recvfrom failed: %d", errno);

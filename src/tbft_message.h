@@ -105,6 +105,7 @@ typedef struct __attribute__((packed)) {
     tbft_msg_hdr_t  hdr;
     tbft_view_t     view;
     tbft_seqno_t    seqno;
+    tbft_digest_t   digest;   /* SHA-256 digest of the request (PBFT: <COMMIT, v, n, d, i>) */
     int32_t         id;   /* sender's replica id */
     int32_t         _pad;
 } tbft_commit_rep_t;

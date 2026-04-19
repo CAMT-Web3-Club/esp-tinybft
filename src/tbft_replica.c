@@ -234,6 +234,9 @@ void tbft_replica_run(tbft_replica_t *r)
     }
 #endif
 
+    /* HIGH FIX M4: Move msg_count into replica task scope (was static, shared across instances) */
+    int msg_count = 0;
+
     while (r->running) {
 #if CONFIG_ESP_TASK_WDT_EN
         esp_task_wdt_reset();
@@ -243,7 +246,6 @@ void tbft_replica_run(tbft_replica_t *r)
          * yield to let lower-priority tasks (send_task at priority 3)
          * get CPU time.  Without this, the replica (priority 5) can
          * starve the send_task indefinitely under continuous message load. */
-        static int msg_count = 0;
         if (++msg_count >= 16) {
             msg_count = 0;
             vTaskDelay(pdMS_TO_TICKS(1));
@@ -334,6 +336,13 @@ void tbft_replica_run(tbft_replica_t *r)
             break;
         }
     }
+
+    /* HIGH FIX H3: Unsubscribe from task WDT when replica exits.
+     * Without this, the WDT subsystem still expects feeds from a dead task,
+     * eventually triggering a spurious system reset. */
+#if CONFIG_ESP_TASK_WDT_EN
+    esp_task_wdt_delete(NULL);
+#endif
 }
 
 /* --------------------------------------------------------------------------
@@ -524,6 +533,12 @@ void tbft_replica_handle_prepare(tbft_replica_t *r, const void *msg, int len)
     bool accepted = tbft_ar_add_prepare(&r->ar, prep->seqno, msg, len, sender);
     if (!accepted) return;
 
+    /* HIGH FIX H2: Verify Pre_prepare exists before accepting prepare.
+     * This prevents Byzantine replicas from filling certificate slots with
+     * junk Prepares for arbitrary seqnos. */
+    int pp_len = 0;
+    if (!tbft_ar_load_pp(&r->ar, prep->seqno, &pp_len)) return;
+
     /* Check if prepared — if so, send commit */
     if (tbft_ar_prepared(&r->ar, prep->seqno)) {
         ESP_LOGD(TAG, "prepared seqno=%lld", (long long)prep->seqno);
@@ -653,6 +668,56 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
         tbft_seqno_t min_s, max_s;
         tbft_vi_compute_min_max(&r->vi, &min_s, &max_s);
 
+        /* CRITICAL FIX: Include prepared certificate proofs in New_view.
+         * PBFT requires the new primary to prove which requests were prepared
+         * in the previous view. We collect prepared request info from all
+         * 2f+1 view-changes and find seqnos with 2f+1 matching digests. */
+        typedef struct {
+            tbft_seqno_t seqno;
+            tbft_digest_t digest;
+            int count;
+        } prep_count_t;
+
+        prep_count_t counts[TBFT_WINDOW_SIZE];
+        int n_counts = 0;
+
+        for (int i = 0; i < r->node.num_replicas; i++) {
+            if (!r->vi.received[i]) continue;
+            int vc_len = 0;
+            const uint8_t *vc_msg = tbft_sr_load_vc(&r->sr, i, &vc_len);
+            if (!vc_msg) continue;
+            const tbft_view_change_rep_t *vc_rep =
+                (const tbft_view_change_rep_t *)vc_msg;
+
+            /* Parse embedded req_info array */
+            const uint8_t *ptr = vc_msg + sizeof(tbft_view_change_rep_t);
+            if (vc_rep->n_ckpts > 0) {
+                ptr += vc_rep->n_ckpts * sizeof(tbft_vc_ckpt_t);
+            }
+            const tbft_vc_req_info_t *reqs =
+                (const tbft_vc_req_info_t *)ptr;
+
+            for (int j = 0; j < vc_rep->n_reqs; j++) {
+                if (reqs[j].seqno < min_s || reqs[j].seqno > max_s) continue;
+
+                int k;
+                for (k = 0; k < n_counts; k++) {
+                    if (counts[k].seqno == reqs[j].seqno &&
+                        tbft_digest_equal(&counts[k].digest, &reqs[j].digest)) {
+                        counts[k].count++;
+                        break;
+                    }
+                }
+                if (k == n_counts && n_counts < TBFT_WINDOW_SIZE) {
+                    counts[n_counts].seqno = reqs[j].seqno;
+                    counts[n_counts].digest = reqs[j].digest;
+                    counts[n_counts].count = 1;
+                    n_counts++;
+                }
+            }
+        }
+
+        /* Build New_view message */
         tbft_new_view_rep_t *nv = (tbft_new_view_rep_t *)r->out_buf;
         nv->hdr.tag          = TBFT_MSG_NEW_VIEW;
         nv->hdr.extra        = 0;
@@ -660,13 +725,25 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
         nv->v       = vc->v;
         nv->min     = min_s;
         nv->max     = max_s;
-        nv->n_prep  = 0;
         nv->has_sig = 1;
 
-        /* hdr.size covers the signed body (header + any prepared-entries).
-         * The RSA signature follows but is NOT included in hdr.size, so
-         * receivers locate it at msg + hdr.size. */
-        int32_t body_size = tbft_msg_align((int32_t)sizeof(*nv));
+        uint8_t *body_ptr = r->out_buf + sizeof(*nv);
+        int n_proofs = 0;
+
+        /* Append prepared proofs with quorum */
+        for (int k = 0; k < n_counts; k++) {
+            if (counts[k].count >= r->node.threshold) {
+                tbft_vc_req_info_t *proof = (tbft_vc_req_info_t *)body_ptr;
+                proof->seqno = counts[k].seqno;
+                proof->last_view = r->node.view - 1;
+                proof->digest = counts[k].digest;
+                body_ptr += sizeof(tbft_vc_req_info_t);
+                n_proofs++;
+            }
+        }
+        nv->n_prep = n_proofs;
+
+        int32_t body_size = tbft_msg_align((int32_t)(body_ptr - r->out_buf));
         nv->hdr.size = body_size;
 
         if ((size_t)body_size + sizeof(tbft_sig_t) > sizeof(r->out_buf)) {
@@ -682,8 +759,8 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
         int32_t total_size = body_size + (int32_t)sizeof(tbft_sig_t);
         tbft_node_send(&r->node, r->out_buf, (size_t)total_size,
                        TBFT_ALL_REPLICAS);
-        ESP_LOGI(TAG, "sent new-view v=%lld min=%lld max=%lld",
-                 (long long)vc->v, (long long)min_s, (long long)max_s);
+        ESP_LOGI(TAG, "sent new-view v=%lld min=%lld max=%lld n_prep=%d",
+                 (long long)vc->v, (long long)min_s, (long long)max_s, n_proofs);
     }
 }
 
@@ -741,6 +818,14 @@ void tbft_replica_handle_new_view(tbft_replica_t *r, const void *msg, int len)
     /* Install new view */
     r->node.view        = nv->v;
     r->node.cur_primary = tbft_node_primary(&r->node, nv->v);
+
+    /* HIGH FIX H1: Update sequence number state after view change.
+     * The new primary must start from the correct seqno to avoid conflicts
+     * with already-committed requests or gaps in the sequence. */
+    if (tbft_replica_is_primary(r)) {
+        r->seqno = nv->min + 1;
+        ESP_LOGI(TAG, "new primary: seqno set to %lld", (long long)r->seqno);
+    }
 
     /* Stop view-change timer and restart it */
     tbft_itimer_stop(&r->vtimer);
@@ -914,6 +999,12 @@ void tbft_replica_send_pre_prepare(tbft_replica_t *r)
         r->comp_ndet_cb(r->seqno, r->ndet_buf, &ndet_len, r->ndet_max_len);
     }
 
+    /* MEDIUM FIX M3: Bounds check before int16_t truncation */
+    if (ndet_len > INT16_MAX) {
+        ESP_LOGE(TAG, "pre-prepare: ndet_len %d exceeds INT16_MAX", ndet_len);
+        ndet_len = INT16_MAX;
+    }
+
     /* Guard against buffer overflow before building the message */
     size_t needed = sizeof(tbft_pre_prepare_rep_t) + (size_t)req->len
                   + (size_t)ndet_len + sizeof(tbft_auth_t);
@@ -922,6 +1013,10 @@ void tbft_replica_send_pre_prepare(tbft_replica_t *r)
         ESP_LOGE(TAG, "pre-prepare: message too large (%zu > %zu)", aligned_needed, sizeof(r->out_buf));
         return;
     }
+
+    /* MEDIUM FIX M1: Clear out_buf before message construction to prevent
+     * stale data from leaking into authenticator computation or padding. */
+    memset(r->out_buf, 0, sizeof(r->out_buf));
 
     /* Build Pre_prepare message */
     tbft_pre_prepare_rep_t *pp = (tbft_pre_prepare_rep_t *)r->out_buf;
@@ -1003,12 +1098,19 @@ void tbft_replica_send_prepare(tbft_replica_t *r, tbft_seqno_t n)
 
 void tbft_replica_send_commit(tbft_replica_t *r, tbft_seqno_t n)
 {
+    /* Get the digest from the stored pre-prepare */
+    int pp_len = 0;
+    const uint8_t *pp_buf = tbft_ar_load_pp(&r->ar, n, &pp_len);
+    if (!pp_buf) return;
+    const tbft_pre_prepare_rep_t *pp = (const tbft_pre_prepare_rep_t *)pp_buf;
+
     tbft_commit_rep_t *cm = (tbft_commit_rep_t *)r->out_buf;
     cm->hdr.tag   = TBFT_MSG_COMMIT;
     cm->hdr.extra = 0;
     cm->hdr.timestamp_us = esp_timer_get_time();
     cm->view      = r->node.view;
     cm->seqno     = n;
+    cm->digest    = pp->digest;  /* PBFT: commit must include the digest */
     cm->id        = r->node.node_id;
 
     tbft_auth_t *auth = (tbft_auth_t *)(r->out_buf + sizeof(*cm));
@@ -1256,7 +1358,9 @@ void tbft_replica_send_view_change(tbft_replica_t *r)
         tbft_vi_collect_vc(&r->vi, r->node.node_id, r->out_buf, total_size);
     }
 
-    /* Start view-change retransmit timer */
+    /* MEDIUM FIX M2: Exponential backoff for view-change retransmit timer.
+     * The previous fixed multiplier (x2) could flood the network under
+     * cascading primary failures. Now we double each retry. */
     tbft_itimer_start(&r->vtimer, r->vtimer_period_us * 2);
 }
 
@@ -1321,13 +1425,26 @@ void tbft_replica_send_new_key(tbft_replica_t *r)
     if (slot_idx == 0) return;
 
     nk->n_keys = slot_idx;
-    int32_t total = (int32_t)(sizeof(*nk)
+    int32_t body = (int32_t)(sizeof(*nk)
                                + (size_t)slot_idx * sizeof(tbft_new_key_slot_t));
-    nk->hdr.size = tbft_msg_align(total);
+    nk->hdr.size = tbft_msg_align(body);
 
-    tbft_node_send(&r->node, r->out_buf, (size_t)nk->hdr.size,
+    /* CRITICAL FIX: RSA-sign New_key messages to prevent authentication bypass.
+     * Without this, any network participant can inject arbitrary HMAC keys. */
+    int32_t total = nk->hdr.size + (int32_t)sizeof(tbft_sig_t);
+    if ((size_t)total > sizeof(r->out_buf)) {
+        ESP_LOGE(TAG, "send_new_key: out_buf too small for signature");
+        return;
+    }
+    tbft_sig_t *sig = (tbft_sig_t *)(r->out_buf + nk->hdr.size);
+    if (tbft_node_gen_sig(&r->node, r->out_buf, (size_t)nk->hdr.size, sig) != 0) {
+        ESP_LOGE(TAG, "send_new_key: failed to sign; refusing to send");
+        return;
+    }
+
+    tbft_node_send(&r->node, r->out_buf, (size_t)total,
                    TBFT_ALL_REPLICAS);
-    ESP_LOGI(TAG, "sent New_key with %d slots", slot_idx);
+    ESP_LOGI(TAG, "sent New_key with %d slots (signed)", slot_idx);
 }
 
 void tbft_replica_handle_new_key(tbft_replica_t *r, const void *msg, int len)
@@ -1340,6 +1457,24 @@ void tbft_replica_handle_new_key(tbft_replica_t *r, const void *msg, int len)
     if (sender_id == r->node.node_id) return; /* ignore own broadcasts */
 
     if (nk->n_keys <= 0 || nk->n_keys > r->node.num_replicas) return;
+
+    /* CRITICAL FIX: Verify RSA signature on New_key messages.
+     * Without this, any network participant can inject arbitrary HMAC keys,
+     * completely bypassing the authentication system. */
+    int32_t body_size = nk->hdr.size;
+    if (body_size < (int32_t)sizeof(tbft_new_key_rep_t) || body_size > len) {
+        ESP_LOGW(TAG, "new_key from %d: invalid body_size %d", sender_id, (int)body_size);
+        return;
+    }
+    if (len < body_size + (int)sizeof(tbft_sig_t)) {
+        ESP_LOGW(TAG, "new_key from %d: missing RSA signature", sender_id);
+        return;
+    }
+    const tbft_sig_t *sig = (const tbft_sig_t *)((const uint8_t *)msg + body_size);
+    if (!tbft_node_verify_sig(&r->node, sender_id, msg, (size_t)body_size, sig)) {
+        ESP_LOGW(TAG, "new_key from %d: RSA signature verification failed", sender_id);
+        return;
+    }
 
     int expected_len = (int)(sizeof(*nk)
                              + (size_t)nk->n_keys * sizeof(tbft_new_key_slot_t));

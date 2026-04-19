@@ -42,6 +42,7 @@
 #define TBFT_CERT_DECLARE(name, msg_size)                                      \
 typedef struct {                                                               \
     tbft_bitmap_t  bmap;              /* which sender IDs have contributed */  \
+    tbft_digest_t  val_digests[TBFT_CERT_MAX_VALS]; /* digests for comparison */ \
     uint8_t        vals[TBFT_CERT_MAX_VALS][(msg_size)]; /* stored msgs */     \
     int            correct[TBFT_CERT_MAX_VALS]; /* match count per value */    \
     int            num_vals;          /* distinct values stored so far */      \

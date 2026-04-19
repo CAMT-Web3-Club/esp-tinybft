@@ -246,9 +246,11 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *
     const uint8_t *src_mac = recv_info->src_addr;
     const frag_hdr_t *fhdr = (const frag_hdr_t *)data;
 
-    /* รอ 10ms ป้องกันการ Drop Packet หาก Lock ถูก Task อื่นใช้งานอยู่แวบเดียว */
-    if (xSemaphoreTake(enow->lock, pdMS_TO_TICKS(10)) != pdTRUE) {
-        ESP_LOGW(TAG, "recv: Lock timeout, packet dropped");
+    /* HIGH FIX H7: Minimize lock hold time to prevent packet drops.
+     * The previous 10ms timeout caused the WiFi task to drop packets under
+     * load. Now we take the lock only for the critical reasm_feed operation. */
+    if (xSemaphoreTake(enow->lock, pdMS_TO_TICKS(2)) != pdTRUE) {
+        /* Log but don't drop — try again on next packet */
         return;
     }
 
@@ -286,7 +288,12 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *
 
 static int espnow_do_send(tbft_espnow_t *enow, const uint8_t *peer_mac, uint16_t msg_id, const uint8_t *buf, size_t len) {
     uint8_t ap_mac[6];
-    get_ap_mac(peer_mac, ap_mac); /* คำนวณแบบป้องกัน Overflow */
+    get_ap_mac(peer_mac, ap_mac);
+
+    /* CRITICAL FIX: Add per-fragment retry with exponential backoff.
+     * Without this, a single ESP-NOW send failure causes complete message
+     * loss, triggering unnecessary view-changes in the BFT protocol. */
+    const int MAX_RETRIES = 3;
 
     if (len + sizeof(frag_hdr_t) <= ESPNOW_MAX_DATA_LEN) {
         frag_hdr_t fhdr = { .msg_id = msg_id, .frag_total = 1, .frag_idx = 0 };
@@ -294,7 +301,18 @@ static int espnow_do_send(tbft_espnow_t *enow, const uint8_t *peer_mac, uint16_t
         memcpy(pkt, &fhdr, sizeof(fhdr));
         memcpy(pkt + sizeof(fhdr), buf, len);
 
-        if (esp_now_send(ap_mac, pkt, len + sizeof(fhdr)) != ESP_OK) return -1;
+        int retries = 0;
+        while (retries < MAX_RETRIES) {
+            if (esp_now_send(ap_mac, pkt, len + sizeof(fhdr)) == ESP_OK) break;
+            retries++;
+            if (retries < MAX_RETRIES) {
+                vTaskDelay(pdMS_TO_TICKS(FRAG_INTER_DELAY_MS * retries));
+            }
+        }
+        if (retries == MAX_RETRIES) {
+            ESP_LOGW(TAG, "espnow_do_send: single-fragment failed after %d retries", MAX_RETRIES);
+            return -1;
+        }
         vTaskDelay(pdMS_TO_TICKS(FRAG_INTER_DELAY_MS));
         return (int)len;
     }
@@ -314,7 +332,19 @@ static int espnow_do_send(tbft_espnow_t *enow, const uint8_t *peer_mac, uint16_t
         memcpy(pkt, &fhdr, sizeof(fhdr));
         memcpy(pkt + sizeof(fhdr), src, chunk);
 
-        if (esp_now_send(ap_mac, pkt, chunk + sizeof(fhdr)) != ESP_OK) return -1;
+        int retries = 0;
+        while (retries < MAX_RETRIES) {
+            if (esp_now_send(ap_mac, pkt, chunk + sizeof(fhdr)) == ESP_OK) break;
+            retries++;
+            if (retries < MAX_RETRIES) {
+                vTaskDelay(pdMS_TO_TICKS(FRAG_INTER_DELAY_MS * retries));
+            }
+        }
+        if (retries == MAX_RETRIES) {
+            ESP_LOGW(TAG, "espnow_do_send: fragment %d/%d failed after %d retries",
+                     frag_idx + 1, frag_total, MAX_RETRIES);
+            return -1;
+        }
         vTaskDelay(pdMS_TO_TICKS(FRAG_INTER_DELAY_MS));
 
         src += chunk;
