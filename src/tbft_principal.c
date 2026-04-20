@@ -298,15 +298,6 @@ int tbft_principal_encrypt_new_key(tbft_principal_t *p,
 {
     if (!p || !new_out_key || !enc_buf || !out_enc_len) return -1;
 
-    /* Validate that the public key context has been properly loaded.
-     * In MbedTLS 4.x, pk context wraps PSA — check if the key can
-     * perform RSA encryption operations. */
-    if (!mbedtls_pk_can_do_psa(&p->pub_pk, TBFT_KEY_WRAP_ALG,
-                               PSA_KEY_USAGE_ENCRYPT)) {
-        ESP_LOGE(TAG, "encrypt_new_key: no public key loaded for id=%d", p->id);
-        return -1;
-    }
-
     psa_key_attributes_t attr = PSA_KEY_ATTRIBUTES_INIT;
     psa_set_key_type(&attr, PSA_KEY_TYPE_RSA_PUBLIC_KEY);
     psa_set_key_algorithm(&attr, TBFT_KEY_WRAP_ALG);
@@ -336,17 +327,9 @@ int tbft_principal_decrypt_new_key(tbft_principal_t *p,
 {
     if (!p || !enc_buf || !new_in_key) return -1;
 
+    /* Validate that the private key context is properly loaded. */
     if (!p->has_priv_key) {
         ESP_LOGE(TAG, "decrypt_new_key: no private key loaded for id=%d", p->id);
-        return -1;
-    }
-
-    /* Validate that the private key context is properly loaded.
-     * In MbedTLS 4.x, pk context wraps PSA — check if the key can
-     * perform RSA decryption operations. */
-    if (!mbedtls_pk_can_do_psa(&p->priv_pk, TBFT_KEY_WRAP_ALG,
-                               PSA_KEY_USAGE_DECRYPT)) {
-        ESP_LOGE(TAG, "decrypt_new_key: invalid private key context for id=%d", p->id);
         return -1;
     }
 
