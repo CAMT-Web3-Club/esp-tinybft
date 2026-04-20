@@ -1,3 +1,16 @@
+/**
+ * @file tbft_message.c
+ * @brief Message utilities — SHA-256 digest computation and constant-time comparison.
+ *
+ * Provides cryptographic hashing (via PSA Crypto API) for:
+ *   - Request set digest in Pre-prepare messages
+ *   - State block digests in the partition tree
+ *   - General message integrity checks
+ *
+ * The digest comparison uses a constant-time XOR fold to prevent timing
+ * side-channel attacks on digest equality checks.
+ */
+
 #include "tbft_message.h"
 #include "esp_log.h"
 #include "psa/crypto.h"

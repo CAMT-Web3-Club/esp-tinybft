@@ -129,4 +129,22 @@ menu "TinyBFT Configuration"
         help
             Compile in statistics counters (throughput, latency).
 
+    config TBFT_VIEW_CHANGE_TIMEOUT_US
+        int "View-change timeout (microseconds)"
+        default 5000000
+        range 1000000 60000000
+        help
+            Default view-change timeout period in microseconds.
+            This is the time to wait before triggering a view change
+            when the primary is suspected faulty. Default: 5s (5000000).
+
+    config TBFT_STATUS_TIMEOUT_US
+        int "Status broadcast timeout (microseconds)"
+        default 1000000
+        range 100000 30000000
+        help
+            Default status message broadcast period in microseconds.
+            Status messages help replicas catch up during state transfer.
+            Default: 1s (1000000).
+
 endmenu

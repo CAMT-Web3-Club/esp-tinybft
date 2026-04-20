@@ -57,6 +57,14 @@
 #define TBFT_ANTI_REPLAY_WINDOW_US  ((int64_t)CONFIG_TBFT_ANTI_REPLAY_WINDOW_MS * 1000LL)
 #endif
 
+#ifndef TBFT_VIEW_CHANGE_TIMEOUT_US
+#define TBFT_VIEW_CHANGE_TIMEOUT_US  CONFIG_TBFT_VIEW_CHANGE_TIMEOUT_US
+#endif
+
+#ifndef TBFT_STATUS_TIMEOUT_US
+#define TBFT_STATUS_TIMEOUT_US       CONFIG_TBFT_STATUS_TIMEOUT_US
+#endif
+
 /* --------------------------------------------------------------------------
  * Derived protocol constants
  * -------------------------------------------------------------------------- */

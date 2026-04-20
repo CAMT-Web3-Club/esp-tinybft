@@ -1,3 +1,24 @@
+/**
+ * @file tbft_replica.c
+ * @brief PBFT state machine — message dispatch, handlers, and replica lifecycle.
+ *
+ * Implements the core TinyBFT replica logic:
+ *   - Request handling (deduplication, queueing, forwarding)
+ *   - Pre-prepare / Prepare / Commit message processing
+ *   - Checkpoint management and state transfer triggers
+ *   - View-change protocol (collect, verify, new-view)
+ *   - HMAC session key exchange (New_key)
+ *
+ * The replica runs as a single event loop (tbft_replica_run) that drains
+ * messages from the transport layer and dispatches them by tag. All heavy
+ * cryptographic operations (RSA) run in the loop context; timer callbacks
+ * only set event bits to avoid blocking ISR/task contexts.
+ *
+ * Memory model: Three statically-allocated regions (agreement, checkpoint,
+ * special) are embedded directly in the replica struct — no heap allocation
+ * in the steady-state protocol path.
+ */
+
 #include "tbft_replica.h"
 #include "esp_log.h"
 #include "esp_random.h"
@@ -122,9 +143,10 @@ int tbft_replica_init(tbft_replica_t *r,
     r->last_executed            = 0;
     r->last_tentative_execute   = 0;
 
-    /* Timer periods (defaults — overridden by Byz_init_replica from config) */
-    r->vtimer_period_us = 5000000LL;  /* 5 s */
-    r->stimer_period_us = 1000000LL;  /* 1 s */
+    /* Timer periods (defaults — configurable via menuconfig, overridden by
+     * Byz_init_replica from config file). */
+    r->vtimer_period_us = TBFT_VIEW_CHANGE_TIMEOUT_US;
+    r->stimer_period_us = TBFT_STATUS_TIMEOUT_US;
 
     /* Init timers (not started — caller must set periods and start) */
     tbft_itimer_init(&r->vtimer, vtimer_cb, r, "tbft_vtimer");
@@ -1234,18 +1256,21 @@ void tbft_replica_send_view_change(tbft_replica_t *r)
 
     /* Append RSA signature over the body (hdr.size bytes).
      * The body length is stored in hdr.size; the signature follows but is
-     * NOT included in hdr.size so receivers can locate it as msg + hdr.size. */
+     * NOT included in hdr.size so receivers can locate it as msg + hdr.size.
+     *
+     * SECURITY: View-change messages MUST be signed.  An unsigned view-change
+     * could be injected by any network attacker to trigger a view transition.
+     * If signing fails, abort — do not fall back to sending unsigned. */
     int32_t body_size  = vc->hdr.size;
     int32_t total_size = body_size + (int32_t)sizeof(tbft_sig_t);
+    if (total_size > (int32_t)sizeof(r->out_buf)) {
+        ESP_LOGE(TAG, "send_view_change: out_buf too small for signature");
+        return;
+    }
     tbft_sig_t *sig = (tbft_sig_t *)(r->out_buf + body_size);
-    if (total_size <= (int32_t)sizeof(r->out_buf)) {
-        if (tbft_node_gen_sig(&r->node, r->out_buf, (size_t)body_size, sig) != 0) {
-            ESP_LOGW(TAG, "send_view_change: failed to sign message");
-            total_size = body_size; /* send unsigned if signing fails */
-        }
-    } else {
-        ESP_LOGW(TAG, "send_view_change: out_buf too small for signature");
-        total_size = body_size;
+    if (tbft_node_gen_sig(&r->node, r->out_buf, (size_t)body_size, sig) != 0) {
+        ESP_LOGE(TAG, "send_view_change: failed to sign — refusing to send unsigned");
+        return;
     }
 
     tbft_node_send(&r->node, r->out_buf, (size_t)total_size, TBFT_ALL_REPLICAS);

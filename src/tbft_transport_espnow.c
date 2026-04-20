@@ -285,6 +285,8 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *
  * -------------------------------------------------------------------------- */
 
 static int espnow_do_send(tbft_espnow_t *enow, const uint8_t *peer_mac, uint16_t msg_id, const uint8_t *buf, size_t len) {
+    if (!peer_mac || !buf || len == 0) return -1;
+
     uint8_t ap_mac[6];
     get_ap_mac(peer_mac, ap_mac); /* คำนวณแบบป้องกัน Overflow */
 
