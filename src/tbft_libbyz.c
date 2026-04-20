@@ -15,6 +15,8 @@
 #include "esp_timer.h"
 #if CONFIG_TBFT_TRANSPORT_UDP
 #include "lwip/inet.h"
+#include "esp_netif.h"
+#include <string.h>
 #endif
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -214,6 +216,33 @@ static int parse_config(const char *path, tbft_config_t *cfg)
             ESP_LOGW(TAG, "local MAC %s not found in config — "
                      "ensure config contains base (eFuse) MACs, not AP MACs",
                      local_mac_str);
+        }
+    }
+#endif
+
+#if CONFIG_TBFT_TRANSPORT_UDP
+    /* Auto-detect local_node_id by matching the local IP address against
+     * the config entries.  This requires WiFi to be connected and an IP
+     * assigned before calling Byz_init_replica / Byz_init_client. */
+    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (netif) {
+        esp_netif_ip_info_t ip_info;
+        if (esp_netif_get_ip_info(netif, &ip_info) == ESP_OK) {
+            char local_ip_str[16];
+            snprintf(local_ip_str, sizeof(local_ip_str),
+                     IPSTR, IP2STR(&ip_info.ip));
+            for (int i = 0; i < cfg->num_nodes; i++) {
+                if (cfg->nodes[i].ip[0] != '\0' &&
+                    strcmp(cfg->nodes[i].ip, local_ip_str) == 0) {
+                    cfg->local_node_id = i;
+                    ESP_LOGI(TAG, "auto-detected local_node_id=%d (IP=%s)",
+                             i, local_ip_str);
+                    break;
+                }
+            }
+            if (cfg->local_node_id < 0) {
+                ESP_LOGW(TAG, "local IP %s not found in config", local_ip_str);
+            }
         }
     }
 #endif

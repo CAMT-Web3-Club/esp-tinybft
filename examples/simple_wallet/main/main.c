@@ -144,21 +144,14 @@ static void replica_task(void *arg) {
     config_file = "/spiffs/config_espnow.txt";
 #endif
 
-    /* Auto-detect local_id from MAC address (ESP-NOW) or use Kconfig default.
-     * For ESP-NOW, the config file contains MAC addresses and parse_config()
-     * matches the local WiFi STA MAC to determine local_id automatically. */
+    /* Auto-detect local_id from MAC (ESP-NOW) or IP (UDP).
+     * Config file must contain the matching address for this board. */
     int local_id = Byz_detect_local_id(config_file);
     if (local_id < 0) {
-#if CONFIG_TBFT_TRANSPORT_ESPNOW
         ESP_LOGE(TAG, "Failed to auto-detect local ID — "
-                 "check that this board's MAC is in the config file");
+                 "check that this board's MAC/IP is in the config file");
         vTaskDelete(NULL);
         return;
-#else
-        local_id = CONFIG_EXAMPLE_NODE_ID;
-        ESP_LOGW(TAG, "MAC auto-detect not available for UDP; "
-                 "using CONFIG_EXAMPLE_NODE_ID=%d", local_id);
-#endif
     }
     ESP_LOGI(TAG, "Using local_id=%d", local_id);
 
@@ -193,7 +186,19 @@ static void client_task(void *arg) {
 
     vTaskDelay(pdMS_TO_TICKS(5000)); // Wait for replicas to start
 
-    int ret = Byz_init_client(config_file, "/spiffs/priv4.der", -1, 0);
+    int local_id = Byz_detect_local_id(config_file);
+    if (local_id < 0) {
+        ESP_LOGE(TAG, "Failed to auto-detect local ID — "
+                 "check that this board's MAC is in the config file");
+        vTaskDelete(NULL);
+        return;
+    }
+    ESP_LOGI(TAG, "Client detected local_id=%d", local_id);
+
+    char priv_config[32];
+    snprintf(priv_config, sizeof(priv_config), "/spiffs/priv%d.der", local_id);
+
+    int ret = Byz_init_client(config_file, priv_config, local_id, 0);
     if (ret != 0) {
         ESP_LOGE(TAG, "Failed to init client");
         vTaskDelete(NULL);
