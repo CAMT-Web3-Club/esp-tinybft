@@ -85,11 +85,21 @@ void tbft_plog_init(tbft_plog_t *log, int prepare_threshold)
 
 void tbft_plog_truncate(tbft_plog_t *log, tbft_seqno_t new_head)
 {
-    for (tbft_seqno_t s = log->head; s < new_head; s++) {
-        int idx = (int)((log->head_idx + (s - log->head)) & log->mask);
+    if (new_head <= log->head) return; /* nothing to truncate, avoids negative cast */
+
+    /* Cap the loop to at most one full window to prevent billion-iteration
+     * stalls on pathological jumps.  Entries beyond the cap are cleared
+     * implicitly: they will be overwritten by new certificates once their
+     * slot index wraps back, and the stale data is harmless because the
+     * prepare threshold will not be met for a different seqno. */
+    tbft_seqno_t delta = new_head - log->head;
+    if (delta > TBFT_WINDOW_SIZE) delta = TBFT_WINDOW_SIZE;
+
+    for (tbft_seqno_t s = 0; s < delta; s++) {
+        int idx = (int)((log->head_idx + s) & log->mask);
         tbft_prepared_cert_clear(&log->slots[idx]);
     }
-    log->head_idx = (int)((log->head_idx + (int)(new_head - log->head))
+    log->head_idx = (int)((log->head_idx + (new_head - log->head))
                           & log->mask);
     log->head = new_head;
 }

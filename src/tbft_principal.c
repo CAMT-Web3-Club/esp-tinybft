@@ -303,6 +303,9 @@ bool tbft_principal_verify_sig(const tbft_principal_t *p,
                                         hash, sizeof(hash), &hash_len);
     if (pst != PSA_SUCCESS || hash_len != TBFT_DIGEST_SIZE) return false;
 
+    /* MbedTLS pk_verify takes a non-const pk_context but does not mutate it.
+     * Cast-away-const is required here; the const on `p` is a caller contract
+     * (verify is read-only from the caller's perspective). */
     int ret = mbedtls_pk_verify((mbedtls_pk_context *)&p->pub_pk,
                                 MBEDTLS_MD_SHA256,
                                 hash, hash_len,

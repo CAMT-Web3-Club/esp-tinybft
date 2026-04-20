@@ -112,6 +112,12 @@ bool prefix##_add_mine(cert_t *cert, const void *msg, int msg_len,             \
         cert->correct[cert->num_vals] = 1;                                     \
         cert->mym_idx = cert->num_vals;                                        \
         cert->num_vals++;                                                      \
+    } else {                                                                   \
+        /* Certificate is full — we cannot store our own value.  Return false  \
+         * so the caller knows the vote was not recorded.  Do NOT set the      \
+         * bitmap: a marked-but-absent vote would make cvalue() unable to      \
+         * recover the local value, breaking quorum formation. */              \
+        return false;                                                          \
     }                                                                          \
     tbft_bitmap_set(&cert->bmap, my_id);                                       \
     return true;                                                               \

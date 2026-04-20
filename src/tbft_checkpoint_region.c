@@ -3,6 +3,7 @@
 
 static inline int slot_index(tbft_seqno_t seqno)
 {
+    if (seqno < 0) return 0; /* guard negative seqno from Kconfig misuse */
     return (int)((seqno / TBFT_CHECKPOINT_INTERVAL) % TBFT_NUM_CKPT_SLOTS);
 }
 
@@ -20,7 +21,8 @@ bool tbft_cr_store(tbft_checkpoint_region_t *cr,
                    const void *msg, int msg_len)
 {
     if (replica_id < 0 || replica_id >= TBFT_MAX_NUM_REPLICAS) return false;
-    if (msg_len <= 0 || msg_len > (int)TBFT_CKPT_MSG_SIZE) return false;
+    if (msg_len < (int)sizeof(tbft_checkpoint_rep_t) ||
+        msg_len > (int)TBFT_CKPT_MSG_SIZE) return false;
 
     int sidx = slot_index(seqno);
     tbft_ckpt_slot_t *slot = &cr->slots[sidx];
@@ -115,7 +117,8 @@ void tbft_cr_store_above_window(tbft_checkpoint_region_t *cr,
                                 const void *msg, int msg_len)
 {
     if (replica_id < 0 || replica_id >= TBFT_MAX_NUM_REPLICAS) return;
-    if (msg_len <= 0 || msg_len > (int)TBFT_CKPT_MSG_SIZE) return;
+    if (msg_len < (int)sizeof(tbft_checkpoint_rep_t) ||
+        msg_len > (int)TBFT_CKPT_MSG_SIZE) return;
 
     tbft_ckpt_slot_t *slot = &cr->above_window[replica_id];
 
@@ -157,7 +160,16 @@ void tbft_cr_truncate(tbft_checkpoint_region_t *cr, tbft_seqno_t stable_seqno)
 {
     for (int i = 0; i < TBFT_NUM_CKPT_SLOTS; i++) {
         tbft_ckpt_slot_t *slot = &cr->slots[i];
-        if (slot->seqno > 0 && slot->seqno <= stable_seqno) {
+        if (slot->seqno <= stable_seqno) {
+            memset(slot, 0, sizeof(*slot));
+        }
+    }
+    /* Also clear any above-window entry that is now at-or-below the stable
+     * point: it is no longer "above" anything and must not alias a future
+     * slot store. */
+    for (int i = 0; i < TBFT_MAX_NUM_REPLICAS; i++) {
+        tbft_ckpt_slot_t *slot = &cr->above_window[i];
+        if (slot->present[0] && slot->seqno <= stable_seqno) {
             memset(slot, 0, sizeof(*slot));
         }
     }

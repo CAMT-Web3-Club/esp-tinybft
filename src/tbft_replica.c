@@ -723,18 +723,19 @@ void tbft_replica_handle_prepare(tbft_replica_t *r, const void *msg, int len)
         }
     }
 
-    bool accepted = tbft_ar_add_prepare(&r->ar, prep->seqno, msg, len, sender);
-    if (!accepted) {
-        ESP_LOGW(TAG, "prepare: rejected by agreement region seqno=%lld",
+    /* HIGH FIX H2: Verify Pre_prepare exists BEFORE storing prepare in the
+     * agreement region.  If we stored first and then returned on missing PP,
+     * the prepare would remain in the AR, polluting certificate slots with
+     * junk for seqnos that have no pre-prepare. */
+    if (!pp_bytes) {
+        ESP_LOGW(TAG, "prepare: no pre-prepare for seqno=%lld",
                  (long long)prep->seqno);
         return;
     }
 
-    /* HIGH FIX H2: Verify Pre_prepare exists before accepting prepare.
-     * This prevents Byzantine replicas from filling certificate slots with
-     * junk Prepares for arbitrary seqnos. */
-    if (!pp_bytes) {
-        ESP_LOGW(TAG, "prepare: no pre-prepare for seqno=%lld",
+    bool accepted = tbft_ar_add_prepare(&r->ar, prep->seqno, msg, len, sender);
+    if (!accepted) {
+        ESP_LOGW(TAG, "prepare: rejected by agreement region seqno=%lld",
                  (long long)prep->seqno);
         return;
     }
@@ -953,10 +954,21 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
             const tbft_view_change_rep_t *vc_rep =
                 (const tbft_view_change_rep_t *)vc_msg;
 
+            /* Validate that the claimed arrays fit within the actual message
+             * length.  A Byzantine replica can inflate n_ckpts/n_reqs beyond
+             * the stored message size, causing ptr to advance past valid data
+             * and read garbage (or OOB) as req_info entries. */
+            int ckpts_bytes = vc_rep->n_ckpts * (int)sizeof(tbft_vc_ckpt_t);
+            int reqs_bytes  = vc_rep->n_reqs  * (int)sizeof(tbft_vc_req_info_t);
+            int header_sz     = (int)sizeof(tbft_view_change_rep_t);
+            if (vc_rep->n_ckpts < 0 || vc_rep->n_reqs < 0) continue;
+            if (ckpts_bytes < 0 || reqs_bytes < 0) continue; /* overflow guard */
+            if (vc_len < header_sz + ckpts_bytes + reqs_bytes) continue;
+
             /* Parse embedded req_info array */
-            const uint8_t *ptr = vc_msg + sizeof(tbft_view_change_rep_t);
+            const uint8_t *ptr = vc_msg + header_sz;
             if (vc_rep->n_ckpts > 0) {
-                ptr += vc_rep->n_ckpts * sizeof(tbft_vc_ckpt_t);
+                ptr += ckpts_bytes;
             }
             const tbft_vc_req_info_t *reqs =
                 (const tbft_vc_req_info_t *)ptr;
@@ -1118,6 +1130,15 @@ void tbft_replica_handle_fetch(tbft_replica_t *r, const void *msg, int len)
     /* Respond with Meta_data for the requested level/index */
     int level = fetch->level;
     int index = fetch->index;
+
+    /* Validate level and index as non-negative before using them for array
+     * indexing.  A negative value from a malicious peer would bypass the
+     * upper-bound checks (e.g. -1 >= p_levels is false, but the negative
+     * value would then be used as an array index). */
+    if (level < 0 || index < 0) {
+        ESP_LOGW(TAG, "fetch: negative level=%d or index=%d", level, index);
+        return;
+    }
 
     if (level >= r->state.ptree.dims.p_levels) return;
 

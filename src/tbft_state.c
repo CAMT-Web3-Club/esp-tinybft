@@ -448,7 +448,13 @@ bool tbft_state_next_fetch_req(tbft_state_t *state, int *level, int *index)
             *index = state->fetch_queue[i].index;
             state->fetch_queue[i].done = true;
             if (*level == state->ptree.dims.p_levels - 1) {
-                state->n_data_pending++;
+                /* A data message may have arrived before this request was
+                 * dequeued (network reordering or unsolicited replier).  If
+                 * so, handle_data already wrote and marked the block — do
+                 * NOT increment n_data_pending or the fetch will hang. */
+                if (!fetch_received_test(state, *index)) {
+                    state->n_data_pending++;
+                }
             }
             return true;
         }

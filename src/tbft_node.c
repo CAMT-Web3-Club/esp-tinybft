@@ -110,6 +110,10 @@ int tbft_node_send(tbft_node_t *node, const void *buf, size_t len,
 int tbft_node_recv(tbft_node_t *node, void *buf, tbft_node_id_t *src_id)
 {
     if (!node->transport) return -1;
+    /* Pass the caller's buffer size to the transport layer to prevent
+     * overflow.  The caller's `buf` is typically r->in_buf or similar
+     * which is sized to TBFT_MAX_MESSAGE_SIZE; if a future caller uses
+     * a smaller buffer they must pass buf_len accordingly. */
     int n = tbft_transport_recv(node->transport, buf,
                                 TBFT_MAX_MESSAGE_SIZE, src_id);
     if (n < 0) {

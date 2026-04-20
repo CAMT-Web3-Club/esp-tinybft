@@ -48,7 +48,11 @@ static int socket_open(uint16_t port, bool use_multicast,
 
     /* Enable address reuse */
     int one = 1;
-    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) < 0) {
+        ESP_LOGE(TAG, "setsockopt(SO_REUSEADDR) failed: %d", errno);
+        close(sock);
+        return -1;
+    }
 
     /* Set non-blocking.  Must not silently continue on failure: if the
      * socket stays blocking, tbft_transport_recv blocks forever and the
@@ -78,18 +82,33 @@ static int socket_open(uint16_t port, bool use_multicast,
     }
 
     if (use_multicast && mcast_ip) {
+        /* Validate multicast IP string before use */
+        struct in_addr mcast_addr;
+        mcast_addr.s_addr = inet_addr(mcast_ip);
+        if (mcast_addr.s_addr == INADDR_NONE) {
+            ESP_LOGE(TAG, "invalid multicast IP: %s", mcast_ip);
+            close(sock);
+            return -1;
+        }
+
         /* Join multicast group */
         struct ip_mreq mreq;
-        mreq.imr_multiaddr.s_addr = inet_addr(mcast_ip);
+        mreq.imr_multiaddr.s_addr = mcast_addr.s_addr;
         mreq.imr_interface.s_addr = htonl(INADDR_ANY);
         if (setsockopt(sock, IPPROTO_IP, IP_ADD_MEMBERSHIP,
                        &mreq, sizeof(mreq)) < 0) {
-            ESP_LOGW(TAG, "IP_ADD_MEMBERSHIP failed: %d (continuing)", errno);
+            ESP_LOGE(TAG, "IP_ADD_MEMBERSHIP failed: %d", errno);
+            close(sock);
+            return -1;
         }
 
         /* Set multicast TTL */
         uint8_t ttl = 32;
-        setsockopt(sock, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl));
+        if (setsockopt(sock, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl)) < 0) {
+            ESP_LOGE(TAG, "setsockopt(IP_MULTICAST_TTL) failed: %d", errno);
+            close(sock);
+            return -1;
+        }
 
         /* Store multicast destination address */
         memset(mcast_addr_out, 0, sizeof(*mcast_addr_out));
