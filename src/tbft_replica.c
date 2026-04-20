@@ -379,6 +379,8 @@ void tbft_replica_run(tbft_replica_t *r)
                 }
             }
             if (keys_ok < r->node.threshold - 1) {
+                ESP_LOGD(TAG, "dropping msg tag=%d: keys=%d/%d",
+                         hdr->tag, keys_ok, r->node.threshold - 1);
                 continue; /* drop until keys ready */
             }
         }
@@ -440,6 +442,10 @@ void tbft_replica_handle_request(tbft_replica_t *r, const void *msg, int len)
     if (len < (int)sizeof(tbft_request_rep_t)) return;
     const tbft_request_rep_t *req = (const tbft_request_rep_t *)msg;
 
+    ESP_LOGI(TAG, "recv request: cid=%d rid=%llu cmd_size=%d (primary=%d)",
+             req->cid, (unsigned long long)req->rid, req->command_size,
+             tbft_replica_is_primary(r) ? 1 : 0);
+
     if (req->command_size < 0 ||
         (size_t)req->command_size > TBFT_MAX_MESSAGE_SIZE - sizeof(*req) - sizeof(tbft_sig_t)) {
         ESP_LOGW(TAG, "request: invalid command_size %d", req->command_size);
@@ -447,7 +453,8 @@ void tbft_replica_handle_request(tbft_replica_t *r, const void *msg, int len)
     }
 
     if (req->cid < 0 || req->cid >= r->node.num_principals) {
-        ESP_LOGW(TAG, "request: invalid client id %d", req->cid);
+        ESP_LOGW(TAG, "request: invalid client id %d (num_principals=%d)",
+                 req->cid, r->node.num_principals);
         return;
     }
 
@@ -473,6 +480,8 @@ void tbft_replica_handle_request(tbft_replica_t *r, const void *msg, int len)
      * when every replica re-broadcasts every forwarded request. */
     if (!tbft_replica_is_primary(r)) {
         int primary = tbft_node_primary(&r->node, r->node.view);
+        ESP_LOGD(TAG, "forwarding request to primary %d (view=%lld)",
+                 primary, (long long)r->node.view);
         tbft_node_send(&r->node, msg, (size_t)len, primary);
         tbft_itimer_start(&r->vtimer, r->vtimer_period_us);
         return;
@@ -488,15 +497,19 @@ void tbft_replica_handle_request(tbft_replica_t *r, const void *msg, int len)
         const tbft_request_rep_t *existing =
             (const tbft_request_rep_t *)q->entries[idx].buf;
         if (existing->cid == req->cid && existing->rid == req->rid) {
+            ESP_LOGD(TAG, "request dedup: cid=%d rid=%llu", req->cid, (unsigned long long)req->rid);
             return;
         }
     }
 
     if (!rqueue_push(q, msg, len, ro)) {
-        ESP_LOGW(TAG, "request queue full, dropping request from client %d",
-                 req->cid);
+        ESP_LOGW(TAG, "request queue full (count=%d), dropping request from client %d",
+                 q->count, req->cid);
         return;
     }
+
+    ESP_LOGI(TAG, "enqueued request: cid=%d rid=%llu (queue count=%d), trying pre-prepare",
+             req->cid, (unsigned long long)req->rid, q->count);
 
     /* Try to send a pre-prepare if window allows */
     tbft_replica_send_pre_prepare(r);
@@ -508,11 +521,18 @@ void tbft_replica_handle_request(tbft_replica_t *r, const void *msg, int len)
 
 void tbft_replica_handle_pre_prepare(tbft_replica_t *r, const void *msg, int len)
 {
-    if (len < (int)sizeof(tbft_pre_prepare_rep_t)) return;
+    if (len < (int)sizeof(tbft_pre_prepare_rep_t)) {
+        ESP_LOGW(TAG, "pp: too short (len=%d)", len);
+        return;
+    }
     const tbft_pre_prepare_rep_t *pp = (const tbft_pre_prepare_rep_t *)msg;
 
     /* Reject if wrong view */
-    if (pp->view != r->node.view) return;
+    if (pp->view != r->node.view) {
+        ESP_LOGW(TAG, "pp: wrong view (got=%lld, expected=%lld)",
+                 (long long)pp->view, (long long)r->node.view);
+        return;
+    }
 
     /* Must come from current primary */
     int expected_primary = tbft_node_primary(&r->node, pp->view);
@@ -520,7 +540,8 @@ void tbft_replica_handle_pre_prepare(tbft_replica_t *r, const void *msg, int len
 
     /* Check sequence number is in window */
     if (!tbft_replica_in_window(r, pp->seqno)) {
-        ESP_LOGD(TAG, "pp seqno %lld out of window", (long long)pp->seqno);
+        ESP_LOGW(TAG, "pp seqno %lld out of window (last_stable=%lld)",
+                 (long long)pp->seqno, (long long)r->last_stable);
         return;
     }
 
@@ -535,7 +556,8 @@ void tbft_replica_handle_pre_prepare(tbft_replica_t *r, const void *msg, int len
     }
     if ((int64_t)sizeof(*pp) + pp->rset_size + pp->non_det_size +
         (int64_t)sizeof(tbft_auth_t) > len) {
-        ESP_LOGW(TAG, "pp: embedded sizes exceed message length");
+        ESP_LOGW(TAG, "pp: embedded sizes exceed message length (need=%lld, have=%d)",
+                 (long long)(sizeof(*pp) + pp->rset_size + pp->non_det_size + sizeof(tbft_auth_t)), len);
         return;
     }
 
@@ -547,7 +569,10 @@ void tbft_replica_handle_pre_prepare(tbft_replica_t *r, const void *msg, int len
     }
     {
         int slot = tbft_node_auth_slot_index(&r->node, expected_primary);
-        if (slot < 0) return;
+        if (slot < 0) {
+            ESP_LOGW(TAG, "pp: invalid auth slot for primary %d", expected_primary);
+            return;
+        }
         const tbft_auth_t *auth =
             (const tbft_auth_t *)((const uint8_t *)msg + auth_offset);
         if (!tbft_node_verify_auth(&r->node, expected_primary, msg,
@@ -573,8 +598,13 @@ void tbft_replica_handle_pre_prepare(tbft_replica_t *r, const void *msg, int len
 
     /* Store in agreement region */
     if (!tbft_ar_store_pp(&r->ar, pp->seqno, msg, len)) {
+        ESP_LOGW(TAG, "pp: failed to store in agreement region seqno=%lld",
+                 (long long)pp->seqno);
         return;
     }
+
+    ESP_LOGI(TAG, "pp accepted: seqno=%lld view=%lld from primary %d",
+             (long long)pp->seqno, (long long)pp->view, expected_primary);
 
     /* Update last_prepared if needed */
     if (pp->seqno > r->last_prepared) {
@@ -591,11 +621,21 @@ void tbft_replica_handle_pre_prepare(tbft_replica_t *r, const void *msg, int len
 
 void tbft_replica_handle_prepare(tbft_replica_t *r, const void *msg, int len)
 {
-    if (len < (int)sizeof(tbft_prepare_rep_t) + (int)sizeof(tbft_auth_t)) return;
+    if (len < (int)sizeof(tbft_prepare_rep_t) + (int)sizeof(tbft_auth_t)) {
+        ESP_LOGW(TAG, "prepare: too short (len=%d)", len);
+        return;
+    }
     const tbft_prepare_rep_t *prep = (const tbft_prepare_rep_t *)msg;
 
-    if (prep->view != r->node.view) return;
-    if (!tbft_replica_in_window(r, prep->seqno)) return;
+    if (prep->view != r->node.view) {
+        ESP_LOGW(TAG, "prepare: wrong view (got=%lld, expected=%lld)",
+                 (long long)prep->view, (long long)r->node.view);
+        return;
+    }
+    if (!tbft_replica_in_window(r, prep->seqno)) {
+        ESP_LOGW(TAG, "prepare: seqno %lld out of window", (long long)prep->seqno);
+        return;
+    }
 
     tbft_node_id_t sender = prep->id;
     if (sender < 0 || sender >= r->node.num_replicas) {
@@ -606,7 +646,10 @@ void tbft_replica_handle_prepare(tbft_replica_t *r, const void *msg, int len)
     if (sender == r->node.node_id) return;
 
     int slot = tbft_node_auth_slot_index(&r->node, sender);
-    if (slot < 0) return;
+    if (slot < 0) {
+        ESP_LOGW(TAG, "prepare: invalid auth slot for sender %d", sender);
+        return;
+    }
 
     const tbft_msg_hdr_t *hdr = (const tbft_msg_hdr_t *)msg;
     const tbft_auth_t *auth = (const tbft_auth_t *)((const uint8_t *)msg + sizeof(*prep));
@@ -617,17 +660,29 @@ void tbft_replica_handle_prepare(tbft_replica_t *r, const void *msg, int len)
     }
 
     bool accepted = tbft_ar_add_prepare(&r->ar, prep->seqno, msg, len, sender);
-    if (!accepted) return;
+    if (!accepted) {
+        ESP_LOGW(TAG, "prepare: rejected by agreement region seqno=%lld",
+                 (long long)prep->seqno);
+        return;
+    }
 
     /* HIGH FIX H2: Verify Pre_prepare exists before accepting prepare.
      * This prevents Byzantine replicas from filling certificate slots with
      * junk Prepares for arbitrary seqnos. */
     int pp_len = 0;
-    if (!tbft_ar_load_pp(&r->ar, prep->seqno, &pp_len)) return;
+    if (!tbft_ar_load_pp(&r->ar, prep->seqno, &pp_len)) {
+        ESP_LOGW(TAG, "prepare: no pre-prepare for seqno=%lld",
+                 (long long)prep->seqno);
+        return;
+    }
+
+    ESP_LOGI(TAG, "prepare accepted: seqno=%lld from replica %d",
+             (long long)prep->seqno, sender);
 
     /* Check if prepared — if so, send commit */
     if (tbft_ar_prepared(&r->ar, prep->seqno)) {
-        ESP_LOGD(TAG, "prepared seqno=%lld", (long long)prep->seqno);
+        ESP_LOGI(TAG, "prepared seqno=%lld, sending commit",
+                 (long long)prep->seqno);
         tbft_replica_send_commit(r, prep->seqno);
     }
 }
@@ -638,11 +693,21 @@ void tbft_replica_handle_prepare(tbft_replica_t *r, const void *msg, int len)
 
 void tbft_replica_handle_commit(tbft_replica_t *r, const void *msg, int len)
 {
-    if (len < (int)sizeof(tbft_commit_rep_t) + (int)sizeof(tbft_auth_t)) return;
+    if (len < (int)sizeof(tbft_commit_rep_t) + (int)sizeof(tbft_auth_t)) {
+        ESP_LOGW(TAG, "commit: too short (len=%d)", len);
+        return;
+    }
     const tbft_commit_rep_t *cm = (const tbft_commit_rep_t *)msg;
 
-    if (cm->view != r->node.view) return;
-    if (!tbft_replica_in_window(r, cm->seqno)) return;
+    if (cm->view != r->node.view) {
+        ESP_LOGW(TAG, "commit: wrong view (got=%lld, expected=%lld)",
+                 (long long)cm->view, (long long)r->node.view);
+        return;
+    }
+    if (!tbft_replica_in_window(r, cm->seqno)) {
+        ESP_LOGW(TAG, "commit: seqno %lld out of window", (long long)cm->seqno);
+        return;
+    }
 
     tbft_node_id_t sender = cm->id;
     if (sender < 0 || sender >= r->node.num_replicas) {
@@ -652,7 +717,10 @@ void tbft_replica_handle_commit(tbft_replica_t *r, const void *msg, int len)
     if (sender == r->node.node_id) return;
 
     int slot = tbft_node_auth_slot_index(&r->node, sender);
-    if (slot < 0) return;
+    if (slot < 0) {
+        ESP_LOGW(TAG, "commit: invalid auth slot for sender %d", sender);
+        return;
+    }
 
     const tbft_msg_hdr_t *hdr = (const tbft_msg_hdr_t *)msg;
     const tbft_auth_t *auth = (const tbft_auth_t *)((const uint8_t *)msg + sizeof(*cm));
@@ -663,11 +731,19 @@ void tbft_replica_handle_commit(tbft_replica_t *r, const void *msg, int len)
     }
 
     bool accepted = tbft_ar_add_commit(&r->ar, cm->seqno, msg, len, sender);
-    if (!accepted) return;
+    if (!accepted) {
+        ESP_LOGW(TAG, "commit: rejected by agreement region seqno=%lld",
+                 (long long)cm->seqno);
+        return;
+    }
+
+    ESP_LOGI(TAG, "commit accepted: seqno=%lld from replica %d",
+             (long long)cm->seqno, sender);
 
     /* Check if committed-local */
     if (tbft_ar_committed(&r->ar, cm->seqno)) {
-        ESP_LOGD(TAG, "committed seqno=%lld", (long long)cm->seqno);
+        ESP_LOGI(TAG, "committed seqno=%lld, executing",
+                 (long long)cm->seqno);
         tbft_replica_execute_committed(r);
     }
 }
@@ -1081,7 +1157,8 @@ void tbft_replica_send_pre_prepare(tbft_replica_t *r)
 
     /* Check window */
     if (!tbft_replica_in_window(r, r->seqno)) {
-        ESP_LOGD(TAG, "seqno %lld out of window, waiting", (long long)r->seqno);
+        ESP_LOGW(TAG, "pre-prepare: seqno=%lld out of window (last_stable=%lld, window=%d)",
+                 (long long)r->seqno, (long long)r->last_stable, TBFT_WINDOW_SIZE);
         return;
     }
 
@@ -1148,8 +1225,9 @@ void tbft_replica_send_pre_prepare(tbft_replica_t *r)
     tbft_node_send(&r->node, r->out_buf, (size_t)pp->hdr.size,
                    TBFT_ALL_REPLICAS);
 
-    ESP_LOGD(TAG, "sent pre-prepare seqno=%lld view=%lld",
-             (long long)r->seqno, (long long)r->node.view);
+    ESP_LOGI(TAG, "sent pre-prepare seqno=%lld view=%lld (rset=%d, ndet=%d, total=%d)",
+             (long long)r->seqno, (long long)r->node.view,
+             req->len, ndet_len, pp->hdr.size);
 
     rqueue_pop(src_queue);
     r->seqno++;
@@ -1189,7 +1267,7 @@ void tbft_replica_send_prepare(tbft_replica_t *r, tbft_seqno_t n)
 
     tbft_node_send(&r->node, r->out_buf, (size_t)prep->hdr.size,
                    TBFT_ALL_REPLICAS);
-    ESP_LOGD(TAG, "sent prepare seqno=%lld", (long long)n);
+    ESP_LOGI(TAG, "sent prepare seqno=%lld", (long long)n);
 }
 
 void tbft_replica_send_commit(tbft_replica_t *r, tbft_seqno_t n)
@@ -1219,7 +1297,7 @@ void tbft_replica_send_commit(tbft_replica_t *r, tbft_seqno_t n)
 
     tbft_node_send(&r->node, r->out_buf, (size_t)cm->hdr.size,
                    TBFT_ALL_REPLICAS);
-    ESP_LOGD(TAG, "sent commit seqno=%lld", (long long)n);
+    ESP_LOGI(TAG, "sent commit seqno=%lld", (long long)n);
 }
 
 void tbft_replica_execute_committed(tbft_replica_t *r)
@@ -1290,11 +1368,18 @@ void tbft_replica_execute_committed(tbft_replica_t *r)
                     }
                 }
 
+                ESP_LOGI(TAG, "sending reply: cid=%d rid=%llu seqno=%lld size=%d",
+                         req_rep->cid, (unsigned long long)req_rep->rid,
+                         (long long)n, total);
+
                 if (r->recv_reply_cb) {
                     r->recv_reply_cb(r->out_buf, total, req_rep->cid);
                 }
                 tbft_node_send(&r->node, r->out_buf, (size_t)total,
                                req_rep->cid);
+            } else {
+                ESP_LOGW(TAG, "exec_cb failed for seqno=%lld rc=%d",
+                         (long long)n, rc);
             }
         }
 

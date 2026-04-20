@@ -234,7 +234,7 @@ static void client_task(void *arg) {
         }
 
         Byz_free_request(&req);
-        vTaskDelay(pdMS_TO_TICKS(5000));
+        vTaskDelay(pdMS_TO_TICKS(30000));
     }
 }
 #endif /* CONFIG_EXAMPLE_ROLE_REPLICA / else */

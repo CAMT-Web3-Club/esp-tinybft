@@ -40,10 +40,10 @@ static const char *TAG = "tbft_espnow";
 #define FRAG_MAX_PARTS      ((TBFT_MAX_MESSAGE_SIZE + FRAG_MAX_PAYLOAD - 1) / FRAG_MAX_PAYLOAD + 1)
 #define REASM_MAX_SLOTS     4
 #define REASM_TIMEOUT_MS    5000
-#define FRAG_INTER_DELAY_MS 5
+#define FRAG_INTER_DELAY_MS 20
 
-#define MSG_QUEUE_DEPTH     24
-#define SEND_QUEUE_DEPTH    4
+#define MSG_QUEUE_DEPTH     48
+#define SEND_QUEUE_DEPTH    8
 #define SEND_TASK_PRIORITY  3
 #define SEND_TASK_STACK_SIZE 4096
 #define SEND_TASK_RECV_TIMEOUT_MS  50
@@ -291,6 +291,10 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *
     const uint8_t *src_mac = recv_info->src_addr;
     const frag_hdr_t *fhdr = (const frag_hdr_t *)data;
 
+    /* Log every fragment arriving at the ESP-NOW callback */
+    ESP_LOGI(TAG, "espnow_cb: frag %d/%d msg_id=%u len=%d from " MACSTR,
+             fhdr->frag_idx, fhdr->frag_total, fhdr->msg_id, data_len, MAC2STR(src_mac));
+
     /* HIGH FIX H7: Minimize lock hold time to prevent packet drops.
      * The previous 10ms timeout caused the WiFi task to drop packets under
      * load. Now we take the lock only for the critical reasm_feed operation. */
@@ -323,8 +327,13 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *
         q_entry.buf_len = s->buf_len;
         memcpy(q_entry.payload, s->buf, (size_t)s->buf_len);
 
+        int msg_tag = s->buf[0];
         if (xQueueSend(enow->msg_queue, &q_entry, 0) != pdTRUE) {
-            ESP_LOGW(TAG, "msg_queue full, dropping reassembled msg");
+            ESP_LOGW(TAG, "msg_queue full, dropping reassembled msg tag=%d len=%d",
+                     msg_tag, s->buf_len);
+        } else {
+            ESP_LOGI(TAG, "recv: tag=%d len=%d from " MACSTR,
+                     msg_tag, s->buf_len, MAC2STR(src_mac));
         }
 
         s->stale = true;
@@ -436,6 +445,9 @@ static void espnow_send_task(void *pvParameters) {
 
         if (entry.dest == TBFT_ALL_REPLICAS) {
             int limit = enow->num_replicas > 0 ? enow->num_replicas : enow->num_nodes;
+            int msg_tag = entry.buf[0]; /* first byte is hdr.tag */
+            ESP_LOGI(TAG, "send_task: broadcast tag=%d size=%d to %d peers (limit=%d)",
+                     msg_tag, entry.len, limit - 1, limit);
             for (int i = 0; i < limit; i++) {
                 if (i == enow->local_id) continue;
 
@@ -445,9 +457,20 @@ static void espnow_send_task(void *pvParameters) {
                 uint16_t this_msg_id = enow->next_msg_id++;
                 xSemaphoreGive(enow->lock);
 
-                if (valid) espnow_do_send(enow, peer_addr.u.mac.bytes, this_msg_id, entry.buf, (size_t)entry.len);
-                else ESP_LOGW(TAG, "send: skipping broadcast to node %d — peer not registered", i);
+                if (valid) {
+                    int rc = espnow_do_send(enow, peer_addr.u.mac.bytes, this_msg_id, entry.buf, (size_t)entry.len);
+                    ESP_LOGI(TAG, "send_task: broadcast to node %d → %s (rc=%d)", i, rc > 0 ? "OK" : "FAIL", rc);
+                    /* Delay between individual peer sends — ESP-NOW in softAP mode
+                     * needs time to complete each transmission before the next. */
+                    vTaskDelay(pdMS_TO_TICKS(20));
+                } else {
+                    ESP_LOGW(TAG, "send: skipping broadcast to node %d — peer not registered", i);
+                }
             }
+            /* Inter-message delay to prevent ESP-NOW transmit queue overflow.
+             * ESP-NOW has a small internal TX queue (~6 packets). Without this
+             * delay, rapid broadcasts silently drop packets. */
+            vTaskDelay(pdMS_TO_TICKS(50));
         } else if (entry.dest >= 0 && entry.dest < enow->num_nodes) {
             xSemaphoreTake(enow->lock, portMAX_DELAY);
             bool valid = enow->peer_valid[entry.dest];
@@ -455,8 +478,16 @@ static void espnow_send_task(void *pvParameters) {
             uint16_t this_msg_id = enow->next_msg_id++;
             xSemaphoreGive(enow->lock);
 
-            if (valid) espnow_do_send(enow, peer_addr.u.mac.bytes, this_msg_id, entry.buf, (size_t)entry.len);
-            else ESP_LOGW(TAG, "send: skipping unicast to node %d — peer not registered", entry.dest);
+            if (valid) {
+                int msg_tag = entry.buf[0];
+                int rc = espnow_do_send(enow, peer_addr.u.mac.bytes, this_msg_id, entry.buf, (size_t)entry.len);
+                ESP_LOGI(TAG, "send_task: unicast to node %d tag=%d → %s (rc=%d)",
+                         entry.dest, msg_tag, rc > 0 ? "OK" : "FAIL", rc);
+            } else {
+                ESP_LOGW(TAG, "send: skipping unicast to node %d — peer not registered", entry.dest);
+            }
+            /* Inter-message delay to prevent ESP-NOW transmit queue overflow */
+            vTaskDelay(pdMS_TO_TICKS(10));
         }
     }
 }

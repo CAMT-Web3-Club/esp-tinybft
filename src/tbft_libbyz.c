@@ -523,6 +523,9 @@ int Byz_recv_reply(Byz_rep *rep)
         if (hdr->tag != TBFT_MSG_REPLY) continue;
 
         const tbft_reply_rep_t *r0 = (const tbft_reply_rep_t *)buf;
+        ESP_LOGI(TAG, "recv reply: cid=%d rid=%llu view=%lld seqno=%lld reply_size=%d",
+                 r0->cid, (unsigned long long)r0->rid,
+                 (long long)r0->view, (long long)r0->seqno, r0->reply_size);
 
         /* Verify RSA signature and identify sender.
          * The replica appends the sig after hdr.size; total wire = hdr.size + SIG.
@@ -606,6 +609,9 @@ int Byz_recv_reply(Byz_rep *rep)
             memcpy(rep->contents, winning_payload, (size_t)winning_payload_len);
             rep->size = winning_payload_len;
 
+            ESP_LOGI(TAG, "reply accepted: %d matching replies (needed=%d)",
+                     match, needed);
+
             /* Clear reply cache */
             memset(s_replies, 0, sizeof(s_replies));
             s_reply_count = 0;
@@ -613,6 +619,8 @@ int Byz_recv_reply(Byz_rep *rep)
         }
     }
 
+    ESP_LOGW(TAG, "recv_reply timeout: got %d replies (needed=%d)",
+             s_reply_count, needed);
     return -1; /* timeout */
 }
 
