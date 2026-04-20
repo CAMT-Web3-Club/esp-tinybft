@@ -208,6 +208,7 @@ void tbft_replica_run(tbft_replica_t *r)
     while (drained < 64) {
         tbft_node_id_t src_id = -1;
         int n = tbft_node_recv(&r->node, r->node.recv_buf, &src_id);
+        if (n < 0) break; /* transport error during drain */
         if (n < (int)sizeof(tbft_msg_hdr_t)) break;
         const tbft_msg_hdr_t *hdr = (const tbft_msg_hdr_t *)r->node.recv_buf;
         if (n >= hdr->size && hdr->tag == TBFT_MSG_NEW_KEY) {
@@ -237,6 +238,7 @@ void tbft_replica_run(tbft_replica_t *r)
             while (drained < 32) {
                 tbft_node_id_t src_id = -1;
                 int n = tbft_node_recv(&r->node, r->node.recv_buf, &src_id);
+                if (n < 0) break; /* transport error during key drain */
                 if (n < (int)sizeof(tbft_msg_hdr_t)) break;
                 const tbft_msg_hdr_t *hdr = (const tbft_msg_hdr_t *)r->node.recv_buf;
                 if (n >= hdr->size && hdr->tag == TBFT_MSG_NEW_KEY) {
@@ -264,10 +266,12 @@ void tbft_replica_run(tbft_replica_t *r)
         /* Periodic yield counter: after processing a burst of messages,
          * yield to let lower-priority tasks (send_task at priority 3)
          * get CPU time.  Without this, the replica (priority 5) can
-         * starve the send_task indefinitely under continuous message load. */
-        static int msg_count = 0;
-        if (++msg_count >= 16) {
-            msg_count = 0;
+         * starve the send_task indefinitely under continuous message load.
+         *
+         * NOTE: This counter lives in the replica struct (not static) so
+         * that restarting the replica correctly resets it. */
+        if (++r->yield_counter >= 16) {
+            r->yield_counter = 0;
             vTaskDelay(pdMS_TO_TICKS(1));
         }
 
@@ -300,6 +304,12 @@ void tbft_replica_run(tbft_replica_t *r)
 
         tbft_node_id_t src_id = -1;
         int n = tbft_node_recv(&r->node, r->node.recv_buf, &src_id);
+        if (n < 0) {
+            /* Transport error — log and yield before retrying */
+            ESP_LOGW(TAG, "recv: transport error (id=%d)", r->node.node_id);
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
         if (n < (int)sizeof(tbft_msg_hdr_t)) {
             /* No message available — yield to let the WiFi task, lwIP,
              * and the IDLE task get CPU time on single-core MCUs. */

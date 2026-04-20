@@ -171,12 +171,15 @@ static reasm_slot_t *reasm_find_or_alloc(tbft_espnow_t *enow, uint16_t msg_id, c
         if (!s->valid) return s;
         TickType_t elapsed = now - s->last_tick;
         if (elapsed > pdMS_TO_TICKS(REASM_TIMEOUT_MS)) {
-            s->stale = true;
-            enow->reasm_stale_flag = true;
+            /* Slot timed out — clear it immediately so the new message
+             * starts with a clean buffer. */
+            memset(s, 0, sizeof(*s));
+            s->last_tick = now;
             return s;
         }
     }
 
+    /* All slots full and non-stale: evict the oldest. */
     int oldest = 0;
     TickType_t oldest_tick = enow->reasm[0].last_tick;
     for (int i = 1; i < REASM_MAX_SLOTS; i++) {
@@ -185,8 +188,8 @@ static reasm_slot_t *reasm_find_or_alloc(tbft_espnow_t *enow, uint16_t msg_id, c
             oldest_tick = enow->reasm[i].last_tick;
         }
     }
-    enow->reasm[oldest].stale = true;
-    enow->reasm_stale_flag = true;
+    memset(&enow->reasm[oldest], 0, sizeof(reasm_slot_t));
+    enow->reasm[oldest].last_tick = now;
     return &enow->reasm[oldest];
 }
 
@@ -246,11 +249,20 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *
     const uint8_t *src_mac = recv_info->src_addr;
     const frag_hdr_t *fhdr = (const frag_hdr_t *)data;
 
-    /* รอ 10ms ป้องกันการ Drop Packet หาก Lock ถูก Task อื่นใช้งานอยู่แวบเดียว */
+    /* Wait up to 10ms for the lock — if unavailable, drop the packet to
+     * avoid blocking the WiFi task.  A dropped fragment will cause the
+     * receiver to timeout and discard the partial message anyway. */
     if (xSemaphoreTake(enow->lock, pdMS_TO_TICKS(10)) != pdTRUE) {
         ESP_LOGW(TAG, "recv: Lock timeout, packet dropped");
         return;
     }
+
+    /* Proactively clear any stale reassembly slots before processing
+     * a new fragment.  This prevents stale entries from consuming
+     * slots when the send_task hasn't had a chance to run (e.g. under
+     * heavy receive load where the queue never times out). */
+    reasm_clear_stale(enow);
+    enow->reasm_stale_flag = false;
 
     reasm_slot_t *s = reasm_find_or_alloc(enow, fhdr->msg_id, src_mac);
     if (!s) {
@@ -316,7 +328,11 @@ static int espnow_do_send(tbft_espnow_t *enow, const uint8_t *peer_mac, uint16_t
         memcpy(pkt, &fhdr, sizeof(fhdr));
         memcpy(pkt + sizeof(fhdr), src, chunk);
 
-        if (esp_now_send(ap_mac, pkt, chunk + sizeof(fhdr)) != ESP_OK) return -1;
+        if (esp_now_send(ap_mac, pkt, chunk + sizeof(fhdr)) != ESP_OK) {
+            ESP_LOGW(TAG, "esp_now_send frag %d/%d failed, dropping msg",
+                     frag_idx, frag_total);
+            return -1;
+        }
         vTaskDelay(pdMS_TO_TICKS(FRAG_INTER_DELAY_MS));
 
         src += chunk;

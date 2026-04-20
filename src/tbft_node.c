@@ -112,8 +112,11 @@ int tbft_node_recv(tbft_node_t *node, void *buf, tbft_node_id_t *src_id)
     if (!node->transport) return -1;
     int n = tbft_transport_recv(node->transport, buf,
                                 TBFT_MAX_MESSAGE_SIZE, src_id);
+    if (n < 0) {
+        return -1; /* transport error */
+    }
     if (n < (int)sizeof(tbft_msg_hdr_t)) {
-        return 0; /* truncated or nothing available */
+        return 0; /* no message or truncated */
     }
     return n;
 }
