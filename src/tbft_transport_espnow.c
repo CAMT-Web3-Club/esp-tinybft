@@ -143,18 +143,25 @@ static void get_base_mac(const uint8_t *ap_mac, uint8_t *base_mac) {
  * ฟังก์ชันจัดการ Reassembly (Stale-slot / Find / Feed)
  * -------------------------------------------------------------------------- */
 
+static TickType_t now_ticks(void) {
+    return xTaskGetTickCount();
+}
+
 static void reasm_clear_stale(tbft_espnow_t *enow) {
     for (int i = 0; i < REASM_MAX_SLOTS; i++) {
         reasm_slot_t *s = &enow->reasm[i];
         if (s->stale) {
+            if (s->valid && s->frag_received < s->frag_total) {
+                ESP_LOGD(TAG, "reasm: clearing stale slot %d "
+                         "(msg_id=%u, %d/%d frags, %ums old)",
+                         i, (unsigned)s->msg_id, s->frag_received,
+                         s->frag_total,
+                         (unsigned)((now_ticks() - s->last_tick) * portTICK_PERIOD_MS));
+            }
             memset(s, 0, sizeof(*s));
             s->stale = false;
         }
     }
-}
-
-static TickType_t now_ticks(void) {
-    return xTaskGetTickCount();
 }
 
 static reasm_slot_t *reasm_find_or_alloc(tbft_espnow_t *enow, uint16_t msg_id, const uint8_t *src_mac) {
@@ -173,6 +180,13 @@ static reasm_slot_t *reasm_find_or_alloc(tbft_espnow_t *enow, uint16_t msg_id, c
         if (elapsed > pdMS_TO_TICKS(REASM_TIMEOUT_MS)) {
             /* Slot timed out — clear it immediately so the new message
              * starts with a clean buffer. */
+            if (s->valid && s->frag_received > 0) {
+                ESP_LOGW(TAG, "reasm: slot %d timed out (msg_id=%u, %d/%d frags, "
+                         "%ums old) — clearing for new message",
+                         i, (unsigned)s->msg_id, s->frag_received,
+                         s->frag_total,
+                         (unsigned)(elapsed * portTICK_PERIOD_MS));
+            }
             memset(s, 0, sizeof(*s));
             s->last_tick = now;
             return s;
@@ -187,6 +201,15 @@ static reasm_slot_t *reasm_find_or_alloc(tbft_espnow_t *enow, uint16_t msg_id, c
             oldest = i;
             oldest_tick = enow->reasm[i].last_tick;
         }
+    }
+    /* Log eviction of a partial message so operators can diagnose
+     * high fragment loss or undersized REASM_MAX_SLOTS. */
+    if (enow->reasm[oldest].valid && enow->reasm[oldest].frag_received > 0) {
+        ESP_LOGW(TAG, "reasm: evicting slot %d (msg_id=%u, %d/%d frags) — "
+                 "all slots full, oldest entry dropped",
+                 oldest, (unsigned)enow->reasm[oldest].msg_id,
+                 enow->reasm[oldest].frag_received,
+                 enow->reasm[oldest].frag_total);
     }
     memset(&enow->reasm[oldest], 0, sizeof(reasm_slot_t));
     enow->reasm[oldest].last_tick = now;
@@ -208,12 +231,31 @@ static bool reasm_feed(tbft_espnow_t *enow, reasm_slot_t *s, const uint8_t *data
         s->last_tick = now_ticks();
     }
 
-    if (msg_id != s->msg_id || frag_total != s->frag_total) return false;
-    if (frag_idx >= frag_total || frag_idx >= 32) return false;
-    if (s->frag_mask & (1U << frag_idx)) return false;
+    if (msg_id != s->msg_id || frag_total != s->frag_total) {
+        ESP_LOGW(TAG, "reasm: rejecting frag %d/%d — msg_id=%u mismatch "
+                 "(expected %u, frag_total mismatch %d vs %d)",
+                 frag_idx, frag_total, (unsigned)msg_id,
+                 (unsigned)s->msg_id, frag_total, s->frag_total);
+        return false;
+    }
+    if (frag_idx >= frag_total || frag_idx >= 32) {
+        ESP_LOGW(TAG, "reasm: rejecting frag idx=%d (total=%d) — out of range",
+                 frag_idx, frag_total);
+        return false;
+    }
+    if (s->frag_mask & (1U << frag_idx)) {
+        ESP_LOGD(TAG, "reasm: duplicate frag idx=%d for msg_id=%u, skipping",
+                 frag_idx, (unsigned)s->msg_id);
+        return false;
+    }
 
     int offset = (int)frag_idx * FRAG_MAX_PAYLOAD;
-    if (offset + data_len > TBFT_MAX_MESSAGE_SIZE) return false;
+    if (offset + data_len > TBFT_MAX_MESSAGE_SIZE) {
+        ESP_LOGW(TAG, "reasm: rejecting frag idx=%d — would overflow buffer "
+                 "(offset=%d + len=%d > %d)",
+                 frag_idx, offset, data_len, TBFT_MAX_MESSAGE_SIZE);
+        return false;
+    }
 
     memcpy(s->buf + offset, data, (size_t)data_len);
     s->frag_mask |= (1U << frag_idx);
@@ -380,6 +422,7 @@ static void espnow_send_task(void *pvParameters) {
                 xSemaphoreGive(enow->lock);
 
                 if (valid) espnow_do_send(enow, peer_addr.u.mac.bytes, this_msg_id, entry.buf, (size_t)entry.len);
+                else ESP_LOGW(TAG, "send: skipping broadcast to node %d — peer not registered", i);
             }
         } else if (entry.dest >= 0 && entry.dest < enow->num_nodes) {
             xSemaphoreTake(enow->lock, portMAX_DELAY);
@@ -389,6 +432,7 @@ static void espnow_send_task(void *pvParameters) {
             xSemaphoreGive(enow->lock);
 
             if (valid) espnow_do_send(enow, peer_addr.u.mac.bytes, this_msg_id, entry.buf, (size_t)entry.len);
+            else ESP_LOGW(TAG, "send: skipping unicast to node %d — peer not registered", entry.dest);
         }
     }
 }
@@ -554,15 +598,27 @@ void tbft_transport_set_peer(tbft_transport_t *t, tbft_node_id_t node_id, const 
 
 int tbft_transport_send(tbft_transport_t *t, const void *buf, size_t len, tbft_node_id_t dest) {
     tbft_espnow_t *enow = (tbft_espnow_t *)t;
-    if (!enow || !enow->send_queue || enow->shutting_down) return -1;
-    if (len > (size_t)INT_MAX || len > TBFT_MAX_MESSAGE_SIZE) return -1;
+    if (!enow || !enow->send_queue || enow->shutting_down) {
+        ESP_LOGD(TAG, "send rejected: transport %svalid, queue %svalid, shutting_down=%d",
+                 enow ? "" : "in", enow && enow->send_queue ? "" : "in",
+                 enow ? enow->shutting_down : -1);
+        return -1;
+    }
+    if (len > (size_t)INT_MAX || len > TBFT_MAX_MESSAGE_SIZE) {
+        ESP_LOGW(TAG, "send rejected: message too large (%zu bytes, max %d)",
+                 len, TBFT_MAX_MESSAGE_SIZE);
+        return -1;
+    }
 
     send_entry_t entry;
     memcpy(entry.buf, buf, len);
     entry.len  = (int)len;
     entry.dest = dest;
 
-    if (xQueueSend(enow->send_queue, &entry, pdMS_TO_TICKS(SEND_QUEUE_TIMEOUT_MS)) != pdTRUE) return -1;
+    if (xQueueSend(enow->send_queue, &entry, pdMS_TO_TICKS(SEND_QUEUE_TIMEOUT_MS)) != pdTRUE) {
+        ESP_LOGW(TAG, "send_queue full, dropping msg to node %d (%d bytes)", dest, (int)len);
+        return -1;
+    }
     return (int)len;
 }
 
