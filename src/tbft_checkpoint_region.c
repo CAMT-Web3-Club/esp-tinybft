@@ -20,12 +20,21 @@ bool tbft_cr_store(tbft_checkpoint_region_t *cr,
                    const void *msg, int msg_len)
 {
     if (replica_id < 0 || replica_id >= TBFT_MAX_NUM_REPLICAS) return false;
-    if (msg_len > (int)TBFT_CKPT_MSG_SIZE) return false;
+    if (msg_len <= 0 || msg_len > (int)TBFT_CKPT_MSG_SIZE) return false;
 
     int sidx = slot_index(seqno);
     tbft_ckpt_slot_t *slot = &cr->slots[sidx];
 
-    slot->seqno = seqno;
+    /* Slot aliasing: slot_index wraps modulo TBFT_NUM_CKPT_SLOTS, so two
+     * distinct checkpoint seqnos map to the same slot once the caller has
+     * advanced past one full window.  If the slot's stored seqno does not
+     * match, the old seqno's votes/digests/candidates are stale and must
+     * be discarded before we record the new ones — otherwise stale-vote
+     * poisoning can spuriously complete a quorum. */
+    if (slot->seqno != seqno) {
+        memset(slot, 0, sizeof(*slot));
+        slot->seqno = seqno;
+    }
 
     if (slot->present[replica_id]) return false; /* duplicate */
 
@@ -106,10 +115,21 @@ void tbft_cr_store_above_window(tbft_checkpoint_region_t *cr,
                                 const void *msg, int msg_len)
 {
     if (replica_id < 0 || replica_id >= TBFT_MAX_NUM_REPLICAS) return;
-    if (msg_len > (int)TBFT_CKPT_MSG_SIZE) return;
+    if (msg_len <= 0 || msg_len > (int)TBFT_CKPT_MSG_SIZE) return;
 
     tbft_ckpt_slot_t *slot = &cr->above_window[replica_id];
+
+    /* Only advance if the incoming message is for a strictly newer checkpoint
+     * than what we already have from this replica.  This prevents a Byzantine
+     * (or duplicate-legitimate) peer from spamming above-window checkpoints
+     * and silently overwriting useful earlier state. */
+    const tbft_checkpoint_rep_t *rep = (const tbft_checkpoint_rep_t *)msg;
+    if (slot->present[0] && rep->seqno <= slot->seqno) {
+        return;
+    }
+
     memset(slot, 0, sizeof(*slot));
+    slot->seqno = rep->seqno;
     memcpy(slot->msgs[0], msg, (size_t)msg_len);
     slot->msg_lens[0]  = msg_len;
     slot->present[0]   = true;
@@ -138,6 +158,15 @@ void tbft_cr_truncate(tbft_checkpoint_region_t *cr, tbft_seqno_t stable_seqno)
     for (int i = 0; i < TBFT_NUM_CKPT_SLOTS; i++) {
         tbft_ckpt_slot_t *slot = &cr->slots[i];
         if (slot->seqno > 0 && slot->seqno <= stable_seqno) {
+            memset(slot, 0, sizeof(*slot));
+        }
+    }
+    /* Also clear any above-window entry that is now at-or-below the stable
+     * point: it is no longer "above" anything and must not alias a future
+     * slot store. */
+    for (int i = 0; i < TBFT_MAX_NUM_REPLICAS; i++) {
+        tbft_ckpt_slot_t *slot = &cr->above_window[i];
+        if (slot->present[0] && slot->seqno <= stable_seqno) {
             memset(slot, 0, sizeof(*slot));
         }
     }

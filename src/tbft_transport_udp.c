@@ -50,9 +50,20 @@ static int socket_open(uint16_t port, bool use_multicast,
     int one = 1;
     setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
 
-    /* Set non-blocking */
+    /* Set non-blocking.  Must not silently continue on failure: if the
+     * socket stays blocking, tbft_transport_recv blocks forever and the
+     * BFT main loop hangs.  Bail out and let the caller retry. */
     int flags = fcntl(sock, F_GETFL, 0);
-    fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+    if (flags < 0) {
+        ESP_LOGE(TAG, "fcntl(F_GETFL) failed: %d", errno);
+        close(sock);
+        return -1;
+    }
+    if (fcntl(sock, F_SETFL, flags | O_NONBLOCK) < 0) {
+        ESP_LOGE(TAG, "fcntl(F_SETFL) failed: %d", errno);
+        close(sock);
+        return -1;
+    }
 
     /* Bind to port */
     struct sockaddr_in bind_addr = {

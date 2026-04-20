@@ -594,6 +594,53 @@ void tbft_replica_handle_pre_prepare(tbft_replica_t *r, const void *msg, int len
             ESP_LOGW(TAG, "pp: request set digest mismatch");
             return;
         }
+
+        /* Re-verify the embedded client RSA signature.  Without this, a
+         * Byzantine primary could inject forged requests attributed to
+         * arbitrary clients — backups would accept the PP (digest matches,
+         * HMAC from primary is valid), prepare, commit, and execute an
+         * operation the client never signed.  PBFT safety assumes client
+         * authorisation is cryptographically tied to each request; do NOT
+         * trust the primary's claim that the embedded bytes are well-formed. */
+        if ((size_t)pp->rset_size < sizeof(tbft_request_rep_t) + sizeof(tbft_sig_t)) {
+            ESP_LOGW(TAG, "pp: embedded request too short (%d)",
+                     (int)pp->rset_size);
+            return;
+        }
+        const tbft_request_rep_t *ereq =
+            (const tbft_request_rep_t *)req_set;
+        if (ereq->hdr.tag != TBFT_MSG_REQUEST) {
+            ESP_LOGW(TAG, "pp: embedded message is not a Request (tag=%d)",
+                     (int)ereq->hdr.tag);
+            return;
+        }
+        if (ereq->command_size < 0 ||
+            (size_t)ereq->command_size >
+                (size_t)pp->rset_size - sizeof(tbft_request_rep_t) - sizeof(tbft_sig_t)) {
+            ESP_LOGW(TAG, "pp: embedded command_size %d doesn't fit in rset_size %d",
+                     (int)ereq->command_size, (int)pp->rset_size);
+            return;
+        }
+        if (ereq->cid < 0 || ereq->cid >= r->node.num_principals) {
+            ESP_LOGW(TAG, "pp: embedded invalid cid %d", (int)ereq->cid);
+            return;
+        }
+        size_t sig_off = sizeof(tbft_request_rep_t) + (size_t)ereq->command_size;
+        /* The embedded request must fit exactly: hdr+rep+cmd+sig == rset_size.
+         * Anything larger means the primary packed untrusted trailing data. */
+        if (sig_off + sizeof(tbft_sig_t) != (size_t)pp->rset_size) {
+            ESP_LOGW(TAG, "pp: embedded request size mismatch (sig_off=%zu, rset=%d)",
+                     sig_off, (int)pp->rset_size);
+            return;
+        }
+        const tbft_sig_t *ereq_sig =
+            (const tbft_sig_t *)(req_set + sig_off);
+        if (!tbft_node_verify_sig(&r->node, (tbft_node_id_t)ereq->cid,
+                                  ereq, sig_off, ereq_sig)) {
+            ESP_LOGW(TAG, "pp: embedded request signature invalid from cid=%d",
+                     (int)ereq->cid);
+            return;
+        }
     }
 
     /* Store in agreement region */
@@ -659,6 +706,23 @@ void tbft_replica_handle_prepare(tbft_replica_t *r, const void *msg, int len)
         return;
     }
 
+    /* If we already have the corresponding Pre_prepare, require the Prepare's
+     * digest to match it — otherwise this Prepare is either for a different
+     * request (Byzantine) or we are the one with a tampered PP.  Reject here
+     * before storing so the certificate's f+1 value slots are not poisoned
+     * with bogus digests. */
+    int pp_len = 0;
+    const uint8_t *pp_bytes = tbft_ar_load_pp(&r->ar, prep->seqno, &pp_len);
+    if (pp_bytes && pp_len >= (int)sizeof(tbft_pre_prepare_rep_t)) {
+        const tbft_pre_prepare_rep_t *pp =
+            (const tbft_pre_prepare_rep_t *)pp_bytes;
+        if (!tbft_digest_equal(&pp->digest, &prep->digest)) {
+            ESP_LOGW(TAG, "prepare: digest mismatch from %d seqno=%lld",
+                     sender, (long long)prep->seqno);
+            return;
+        }
+    }
+
     bool accepted = tbft_ar_add_prepare(&r->ar, prep->seqno, msg, len, sender);
     if (!accepted) {
         ESP_LOGW(TAG, "prepare: rejected by agreement region seqno=%lld",
@@ -669,8 +733,7 @@ void tbft_replica_handle_prepare(tbft_replica_t *r, const void *msg, int len)
     /* HIGH FIX H2: Verify Pre_prepare exists before accepting prepare.
      * This prevents Byzantine replicas from filling certificate slots with
      * junk Prepares for arbitrary seqnos. */
-    int pp_len = 0;
-    if (!tbft_ar_load_pp(&r->ar, prep->seqno, &pp_len)) {
+    if (!pp_bytes) {
         ESP_LOGW(TAG, "prepare: no pre-prepare for seqno=%lld",
                  (long long)prep->seqno);
         return;
@@ -730,6 +793,24 @@ void tbft_replica_handle_commit(tbft_replica_t *r, const void *msg, int len)
         return;
     }
 
+    /* If we have the PP, require cm->digest == pp->digest.  PBFT commits must
+     * be for the same value as the pre-prepare they follow; without this
+     * check, Byzantine replicas can push f+1 distinct-digest commits into
+     * the certificate and starve legitimate commits of value slots. */
+    {
+        int pp_len = 0;
+        const uint8_t *pp_bytes = tbft_ar_load_pp(&r->ar, cm->seqno, &pp_len);
+        if (pp_bytes && pp_len >= (int)sizeof(tbft_pre_prepare_rep_t)) {
+            const tbft_pre_prepare_rep_t *pp =
+                (const tbft_pre_prepare_rep_t *)pp_bytes;
+            if (!tbft_digest_equal(&pp->digest, &cm->digest)) {
+                ESP_LOGW(TAG, "commit: digest mismatch from %d seqno=%lld",
+                         sender, (long long)cm->seqno);
+                return;
+            }
+        }
+    }
+
     bool accepted = tbft_ar_add_commit(&r->ar, cm->seqno, msg, len, sender);
     if (!accepted) {
         ESP_LOGW(TAG, "commit: rejected by agreement region seqno=%lld",
@@ -756,6 +837,17 @@ void tbft_replica_handle_checkpoint(tbft_replica_t *r, const void *msg, int len)
 {
     if (len < (int)sizeof(tbft_checkpoint_rep_t) + (int)sizeof(tbft_auth_t)) return;
     const tbft_checkpoint_rep_t *ckpt = (const tbft_checkpoint_rep_t *)msg;
+
+    /* Enforce seqno alignment to the checkpoint interval.  An unaligned
+     * Byzantine Checkpoint (e.g. seqno=3 when interval=10) would otherwise be
+     * stored at an arbitrary slot, and with enough conspirators could cause
+     * mark_stable() to truncate the agreement region at a non-checkpoint
+     * boundary. */
+    if (ckpt->seqno <= 0 || (ckpt->seqno % TBFT_CHECKPOINT_INTERVAL) != 0) {
+        ESP_LOGW(TAG, "checkpoint: unaligned seqno %lld (interval=%d)",
+                 (long long)ckpt->seqno, (int)TBFT_CHECKPOINT_INTERVAL);
+        return;
+    }
 
     /* Never trust ckpt->id from the wire as proof of identity.
      * Our own checkpoint is stored directly in execute_committed at send time,
@@ -1378,8 +1470,15 @@ void tbft_replica_execute_committed(tbft_replica_t *r)
                 tbft_node_send(&r->node, r->out_buf, (size_t)total,
                                req_rep->cid);
             } else {
-                ESP_LOGW(TAG, "exec_cb failed for seqno=%lld rc=%d",
+                /* A failed exec_cb leaves the application state unchanged,
+                 * so advancing last_executed here would cause our checkpoint
+                 * digest to diverge from honest peers (they applied the op,
+                 * we didn't).  Halt execution at this seqno; the retry /
+                 * view-change machinery will eventually handle it. */
+                ESP_LOGE(TAG, "exec_cb failed for seqno=%lld rc=%d; halting "
+                         "execution to preserve checkpoint consistency",
                          (long long)n, rc);
+                break;
             }
         }
 
@@ -1494,7 +1593,16 @@ void tbft_replica_send_view_change(tbft_replica_t *r)
         vc->n_ckpts = 1;
     }
 
-    int max_reqs = (int)((sizeof(r->out_buf) - (size_t)(ptr - r->out_buf) - sizeof(tbft_sig_t)) / sizeof(tbft_vc_req_info_t));
+    /* Guard the max_reqs subtraction: if ptr has already advanced past the
+     * space budget, a plain (size_t)-(size_t) underflows to a huge unsigned
+     * value and the loop would iterate unbounded. */
+    size_t consumed_bytes = (size_t)(ptr - r->out_buf);
+    size_t budget_bytes   = sizeof(r->out_buf) - sizeof(tbft_sig_t);
+    int max_reqs = 0;
+    if (consumed_bytes < budget_bytes) {
+        max_reqs = (int)((budget_bytes - consumed_bytes) /
+                         sizeof(tbft_vc_req_info_t));
+    }
     for (tbft_seqno_t s = r->last_stable + 1; s <= r->last_prepared; s++) {
         if (tbft_ar_in_range(&r->ar, s) && tbft_ar_prepared(&r->ar, s)) {
             if (vc->n_reqs >= TBFT_WINDOW_SIZE || vc->n_reqs >= max_reqs) break;

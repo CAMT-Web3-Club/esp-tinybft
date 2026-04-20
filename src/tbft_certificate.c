@@ -20,8 +20,11 @@ static const tbft_digest_t *extract_msg_digest(const void *msg, int msg_len,
                                                 tbft_msg_tag_t expected_tag,
                                                 size_t digest_offset)
 {
+    if (!msg || msg_len <= 0) {
+        return NULL;
+    }
     const tbft_msg_hdr_t *hdr = (const tbft_msg_hdr_t *)msg;
-    if (msg_len < (int)(digest_offset + sizeof(tbft_digest_t))) {
+    if ((size_t)msg_len < digest_offset + sizeof(tbft_digest_t)) {
         return NULL;
     }
     if (hdr->tag != expected_tag) {
@@ -50,6 +53,9 @@ void prefix##_clear(cert_t *cert)                                              \
 bool prefix##_add(cert_t *cert, const void *msg, int msg_len,                  \
                   tbft_node_id_t sender_id)                                    \
 {                                                                              \
+    if (msg_len <= 0 || (size_t)msg_len > (msg_slot_size)) {                   \
+        return false; /* reject negative / oversized — no silent truncation */ \
+    }                                                                          \
     if (tbft_bitmap_test(&cert->bmap, sender_id)) {                            \
         return false; /* already have from this sender */                      \
     }                                                                          \
@@ -76,10 +82,8 @@ bool prefix##_add(cert_t *cert, const void *msg, int msg_len,                  \
     /* Store the digest for comparison */                                      \
     memcpy(&cert->val_digests[cert->num_vals], msg_digest,                     \
            sizeof(tbft_digest_t));                                             \
-    /* Also store the full message for retrieval */                            \
-    size_t copy_len = (size_t)msg_len < (msg_slot_size) ?                      \
-                      (size_t)msg_len : (msg_slot_size);                       \
-    memcpy(cert->vals[cert->num_vals], msg, copy_len);                         \
+    /* Also store the full message for retrieval (bounded by slot size) */    \
+    memcpy(cert->vals[cert->num_vals], msg, (size_t)msg_len);                  \
     cert->correct[cert->num_vals] = 1;                                         \
     tbft_bitmap_set(&cert->bmap, sender_id);                                   \
     cert->num_vals++;                                                          \
@@ -89,6 +93,9 @@ bool prefix##_add(cert_t *cert, const void *msg, int msg_len,                  \
 bool prefix##_add_mine(cert_t *cert, const void *msg, int msg_len,             \
                        tbft_node_id_t my_id)                                   \
 {                                                                              \
+    if (msg_len <= 0 || (size_t)msg_len > (msg_slot_size)) {                   \
+        return false; /* reject negative / oversized — no silent truncation */ \
+    }                                                                          \
     if (tbft_bitmap_test(&cert->bmap, my_id)) {                                \
         return false;                                                          \
     }                                                                          \
@@ -101,9 +108,7 @@ bool prefix##_add_mine(cert_t *cert, const void *msg, int msg_len,             \
     if (cert->num_vals < TBFT_CERT_MAX_VALS) {                                 \
         memcpy(&cert->val_digests[cert->num_vals], msg_digest,                 \
                sizeof(tbft_digest_t));                                         \
-        size_t copy_len = (size_t)msg_len < (msg_slot_size) ?                  \
-                          (size_t)msg_len : (msg_slot_size);                   \
-        memcpy(cert->vals[cert->num_vals], msg, copy_len);                     \
+        memcpy(cert->vals[cert->num_vals], msg, (size_t)msg_len);              \
         cert->correct[cert->num_vals] = 1;                                     \
         cert->mym_idx = cert->num_vals;                                        \
         cert->num_vals++;                                                      \

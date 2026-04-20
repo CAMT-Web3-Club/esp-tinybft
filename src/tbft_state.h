@@ -67,6 +67,7 @@ typedef struct {
     int               n_data_pending; /* number of leaf requests dispatched but not fulfilled */
     int64_t           fetch_timeout_us;
     int               fetch_replier;  /* replica id we're fetching from */
+    tbft_bitmap_t     fetch_received[(TBFT_MAX_STATE_BLOCKS + 63) / 64]; /* blocks already received */
 
     /* Stable seqno (updated when checkpoints become stable) */
     tbft_seqno_t      last_stable;

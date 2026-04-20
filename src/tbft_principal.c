@@ -16,9 +16,18 @@
 #include "tbft_principal.h"
 #include "esp_log.h"
 #include "esp_random.h"
+#include "esp_timer.h"
 #include "mbedtls/pk.h"
 #include "psa/crypto.h"
 #include <string.h>
+
+/* Upper-bound slack for future-dated timestamps.  A Byzantine peer holding
+ * the in-key can otherwise send a single message with msg_time_us near
+ * INT64_MAX, latching last_auth_time_us and silently rejecting every
+ * subsequent legitimate message as "stale". */
+#ifndef TBFT_ANTI_REPLAY_FUTURE_SLACK_US
+#define TBFT_ANTI_REPLAY_FUTURE_SLACK_US  ((int64_t)60 * 1000 * 1000) /* 60 s */
+#endif
 
 static const char *TAG = "tbft_principal";
 
@@ -189,6 +198,20 @@ bool tbft_principal_verify_mac_in_with_replay_check(tbft_principal_t *p,
                      (long long)msg_time_us, (int)p->id);
             return false;
         }
+        /* Reject timestamps far in the future.  Without this bound a single
+         * authenticated Byzantine message with msg_time_us ≈ INT64_MAX would
+         * latch the watermark and silently reject every subsequent legitimate
+         * message from this principal for ~292 000 years. */
+        int64_t now_us = esp_timer_get_time();
+        if (msg_time_us > now_us + TBFT_ANTI_REPLAY_FUTURE_SLACK_US) {
+            ESP_LOGW(TAG, "anti-replay: future-dated timestamp from id=%d "
+                     "(msg=%lld, now=%lld, slack=%lld)",
+                     (int)p->id,
+                     (long long)msg_time_us,
+                     (long long)now_us,
+                     (long long)TBFT_ANTI_REPLAY_FUTURE_SLACK_US);
+            return false;
+        }
         if (msg_time_us <= p->last_auth_time_us) {
             ESP_LOGW(TAG, "anti-replay: stale timestamp from id=%d "
                      "(msg=%lld, last=%lld)",
@@ -213,8 +236,12 @@ void tbft_principal_set_in_key(tbft_principal_t *p, const tbft_hmac_key_t *key)
     p->psa_hmac_in_id = import_hmac_key(key, PSA_KEY_USAGE_VERIFY_MESSAGE);
     p->keys_fresh  = true;
 
-    /* Reset the anti-replay watermark: old timestamps do not apply to the
-     * new key stream, and the peer's clock may have reset on reboot. */
+    /* Reset the anti-replay watermark: old timestamps belong to the previous
+     * key stream.  Capture-and-replay of pre-rotation messages is prevented
+     * by the key itself — their HMAC was computed under the old key and
+     * will fail verification under the newly installed one.  Replay of
+     * post-rotation messages relies on the HMAC key being reinstated
+     * unchanged (which requires New_key replay; see New_key freshness). */
     p->last_auth_time_us = 0;
 }
 
@@ -248,15 +275,16 @@ int tbft_principal_sign(tbft_principal_t *p,
     psa_status_t pst = psa_hash_compute(PSA_ALG_SHA_256,
                                         (const uint8_t *)msg, msg_len,
                                         hash, sizeof(hash), &hash_len);
-    if (pst != PSA_SUCCESS) {
-        ESP_LOGE(TAG, "psa_hash_compute failed: %d", (int)pst);
-        return (int)pst;
+    if (pst != PSA_SUCCESS || hash_len != TBFT_DIGEST_SIZE) {
+        ESP_LOGE(TAG, "psa_hash_compute failed: st=%d hash_len=%zu",
+                 (int)pst, hash_len);
+        return (int)(pst != PSA_SUCCESS ? pst : -1);
     }
 
     size_t sig_len = 0;
     /* MbedTLS 4.x pk_sign: no rng callback */
     int ret = mbedtls_pk_sign(&p->priv_pk, MBEDTLS_MD_SHA256,
-                              hash, sizeof(hash),
+                              hash, hash_len,
                               sig->bytes, TBFT_SIG_SIZE, &sig_len);
     if (ret != 0) {
         ESP_LOGE(TAG, "pk_sign failed: -0x%04x", (unsigned)(-ret));
@@ -273,11 +301,11 @@ bool tbft_principal_verify_sig(const tbft_principal_t *p,
     psa_status_t pst = psa_hash_compute(PSA_ALG_SHA_256,
                                         (const uint8_t *)msg, msg_len,
                                         hash, sizeof(hash), &hash_len);
-    if (pst != PSA_SUCCESS) return false;
+    if (pst != PSA_SUCCESS || hash_len != TBFT_DIGEST_SIZE) return false;
 
     int ret = mbedtls_pk_verify((mbedtls_pk_context *)&p->pub_pk,
                                 MBEDTLS_MD_SHA256,
-                                hash, sizeof(hash),
+                                hash, hash_len,
                                 sig->bytes, TBFT_SIG_SIZE);
     return ret == 0;
 }

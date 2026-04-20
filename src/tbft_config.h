@@ -108,6 +108,14 @@ _Static_assert((TBFT_WINDOW_SIZE & (TBFT_WINDOW_SIZE - 1)) == 0,
 _Static_assert(TBFT_MAX_NUM_REPLICAS >= 4,
                "Need at least 4 replicas for BFT (n = 3f+1, f >= 1)");
 
+_Static_assert(TBFT_MAX_NUM_REPLICAS <= 64,
+               "tbft_bitmap_t is uint64_t; bumping this above 64 silently drops "
+               "sender accounting (tbft_bitmap_set/test become no-ops) and allows "
+               "Byzantine re-voting to forge certificate quorums");
+
+_Static_assert(TBFT_CHECKPOINT_INTERVAL >= 1,
+               "TBFT_CHECKPOINT_INTERVAL must be >= 1 (division by zero in slot_index)");
+
 _Static_assert(TBFT_MAX_REPLY_SIZE < TBFT_MAX_MESSAGE_SIZE,
                "TBFT_MAX_REPLY_SIZE must be less than TBFT_MAX_MESSAGE_SIZE");
 

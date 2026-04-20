@@ -25,6 +25,25 @@ static inline void cow_zero(tbft_state_t *s)
 }
 
 /* --------------------------------------------------------------------------
+ * Fetch-received bitmap helpers (multi-word, mirrors cow_set/test/zero)
+ * -------------------------------------------------------------------------- */
+
+static inline void fetch_received_set(tbft_state_t *s, int i)
+{
+    s->fetch_received[i / 64] |= (1ULL << (i % 64));
+}
+
+static inline bool fetch_received_test(const tbft_state_t *s, int i)
+{
+    return (s->fetch_received[i / 64] >> (i % 64)) & 1ULL;
+}
+
+static inline void fetch_received_zero(tbft_state_t *s)
+{
+    memset(s->fetch_received, 0, sizeof(s->fetch_received));
+}
+
+/* --------------------------------------------------------------------------
  * Checkpoint record helpers
  * -------------------------------------------------------------------------- */
 
@@ -272,12 +291,29 @@ void tbft_state_start_fetch(tbft_state_t *state, tbft_seqno_t seqno,
     state->fetch_queue_len  = 0;
     state->n_data_pending   = 0;
     state->fetch_timeout_us = 100000; /* 100 ms */
+    fetch_received_zero(state);
 
-    /* Enqueue a root-level fetch request */
-    state->fetch_queue[0].level = 0;
-    state->fetch_queue[0].index = 0;
-    state->fetch_queue[0].done  = false;
-    state->fetch_queue_len      = 1;
+    /* When the partition tree has only one level (all nodes are leaves,
+     * which occurs when num_blocks <= p_children), there is no internal-
+     * node meta_data to exchange.  Enqueue direct data fetches for every
+     * block so state transfer can proceed. */
+    if (state->ptree.dims.p_levels == 1) {
+        for (int i = 0; i < state->num_blocks; i++) {
+            if (state->fetch_queue_len >= TBFT_MAX_STATE_BLOCKS) break;
+            state->fetch_queue[state->fetch_queue_len].level = 0;
+            state->fetch_queue[state->fetch_queue_len].index = i;
+            state->fetch_queue[state->fetch_queue_len].done  = false;
+            state->fetch_queue_len++;
+            /* Do NOT increment n_data_pending here — next_fetch_req does it
+             * when it sees level 0 == p_levels - 1 (the leaf level). */
+        }
+    } else {
+        /* Enqueue a root-level meta_data fetch request */
+        state->fetch_queue[0].level = 0;
+        state->fetch_queue[0].index = 0;
+        state->fetch_queue[0].done  = false;
+        state->fetch_queue_len      = 1;
+    }
 
     ESP_LOGI(TAG, "start_fetch seqno=%lld replier=%d",
              (long long)seqno, replier);
@@ -292,42 +328,60 @@ void tbft_state_handle_meta_data(tbft_state_t *state,
     if (rep->seqno != state->fetch_seqno) return;
 
     int level = rep->level;
+    int index = rep->index;
     int pchildren = state->ptree.dims.p_children;
+    int p_levels  = state->ptree.dims.p_levels;
+
+    /* Validate inputs before using them to index into state->ptree.ptree[].
+     * A malicious Meta_data with out-of-range level/index/n_parts would
+     * otherwise OOB-index the partition tree array. */
+    if (level < 0 || level >= p_levels - 1) {
+        ESP_LOGW(TAG, "meta_data: invalid level %d (p_levels=%d)",
+                 level, p_levels);
+        return;
+    }
+    int nodes_at_level = tbft_ptree_nodes_at_level(level, pchildren);
+    if (index < 0 || index >= nodes_at_level) {
+        ESP_LOGW(TAG, "meta_data: invalid index %d at level %d (max=%d)",
+                 index, level, nodes_at_level);
+        return;
+    }
+    if (n_parts < 0 || n_parts > pchildren) {
+        ESP_LOGW(TAG, "meta_data: invalid n_parts %d (pchildren=%d)",
+                 n_parts, pchildren);
+        return;
+    }
+
+    int child_level = level + 1;
+    int child_nodes_at_level =
+        tbft_ptree_nodes_at_level(child_level, pchildren);
+    bool is_leaf_children = (child_level == p_levels - 1);
 
     for (int i = 0; i < n_parts; i++) {
-        int child_idx = rep->index * pchildren + i;
-        int child_level = level + 1;
+        int child_idx = index * pchildren + i;
+        if (child_idx < 0 || child_idx >= child_nodes_at_level) {
+            ESP_LOGW(TAG, "meta_data: child_idx %d OOB at level %d",
+                     child_idx, child_level);
+            continue;
+        }
 
-        /* CRITICAL FIX: Correctly distinguish internal nodes from leaf nodes.
-         * The leaf level is p_levels - 1. When child_level == p_levels - 1,
-         * we need to enqueue a data fetch for the block, not an internal
-         * node fetch. The previous condition (child_level < p_levels) was
-         * always true for leaf nodes, so data fetches were never created. */
-        if (child_level < state->ptree.dims.p_levels - 1) {
-            /* Internal node: compare digest and enqueue fetch if mismatch */
-            const tbft_digest_t *local =
-                &state->ptree.ptree[child_level][child_idx].digest;
-            if (!tbft_digest_equal(local, &parts[i].digest)) {
-                if (state->fetch_queue_len < TBFT_MAX_STATE_BLOCKS) {
-                    tbft_fetch_req_t *req =
-                        &state->fetch_queue[state->fetch_queue_len++];
-                    req->level = child_level;
-                    req->index = child_idx;
-                    req->done  = false;
-                }
-            }
-        } else if (child_level == state->ptree.dims.p_levels - 1) {
-            /* Leaf level: enqueue data fetch for this block */
-            const tbft_digest_t *local =
-                &state->ptree.ptree[child_level][child_idx].digest;
-            if (!tbft_digest_equal(local, &parts[i].digest)) {
-                if (state->fetch_queue_len < TBFT_MAX_STATE_BLOCKS) {
-                    tbft_fetch_req_t *req =
-                        &state->fetch_queue[state->fetch_queue_len++];
-                    req->level = child_level;
-                    req->index = child_idx;
-                    req->done  = false;
-                }
+        /* Both internal and leaf children use the same enqueue logic —
+         * tbft_state_next_fetch_req differentiates by checking whether the
+         * level is the leaf level (to bump n_data_pending). */
+        (void)is_leaf_children;
+        const tbft_digest_t *local =
+            &state->ptree.ptree[child_level][child_idx].digest;
+        if (!tbft_digest_equal(local, &parts[i].digest)) {
+            if (state->fetch_queue_len < TBFT_MAX_STATE_BLOCKS) {
+                tbft_fetch_req_t *req =
+                    &state->fetch_queue[state->fetch_queue_len++];
+                req->level = child_level;
+                req->index = child_idx;
+                req->done  = false;
+            } else {
+                ESP_LOGW(TAG, "meta_data: fetch queue full, dropping "
+                         "child level=%d idx=%d (max=%d)",
+                         child_level, child_idx, TBFT_MAX_STATE_BLOCKS);
             }
         }
     }
@@ -343,6 +397,12 @@ void tbft_state_handle_data(tbft_state_t *state,
     int bidx = rep->block_index;
     if (bidx < 0 || bidx >= state->num_blocks) return;
 
+    /* Deduplicate: ignore blocks already received (e.g. network retransmits).
+     * Without this, a duplicate data message would decrement n_data_pending
+     * a second time, potentially triggering fetch_complete prematurely before
+     * all blocks have arrived. */
+    if (fetch_received_test(state, bidx)) return;
+
     /* Verify block digest */
     tbft_digest_t computed;
     tbft_msg_digest(block_data, TBFT_BLOCK_SIZE, &computed);
@@ -356,6 +416,9 @@ void tbft_state_handle_data(tbft_state_t *state,
            block_data, TBFT_BLOCK_SIZE);
     state->block_digests[bidx] = computed;
     tbft_ptree_update_leaf(&state->ptree, bidx, &computed, rep->seqno);
+
+    /* Mark received so retransmits don't double-decrement */
+    fetch_received_set(state, bidx);
 
     /* HIGH FIX H6: Decrement pending count safely (don't go below 0) */
     if (state->n_data_pending > 0) {
@@ -399,4 +462,5 @@ void tbft_state_fetch_complete(tbft_state_t *state)
     state->in_fetch        = false;
     state->fetch_queue_len = 0;
     state->n_data_pending  = 0;
+    fetch_received_zero(state);
 }

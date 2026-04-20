@@ -128,6 +128,12 @@ int tbft_node_recv(tbft_node_t *node, void *buf, tbft_node_id_t *src_id)
 void tbft_node_gen_auth(tbft_node_t *node, const void *msg, size_t msg_len,
                         tbft_auth_t *auth)
 {
+    /* Zero the entire authenticator first.  Callers commonly stack-allocate
+     * tbft_auth_t at the natural TBFT_MAX_NUM_REPLICAS-1 size, but actual
+     * num_replicas may be smaller.  Without this memset, trailing unused
+     * slots would be sent with whatever stack garbage happened to be there. */
+    memset(auth, 0, sizeof(*auth));
+
     int slot = 0;
     int expected_slots = node->num_replicas - 1; /* exclude self */
     for (int i = 0; i < node->num_replicas; i++) {

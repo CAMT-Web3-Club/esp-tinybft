@@ -25,6 +25,9 @@ bool tbft_prepared_cert_add_pp(tbft_prepared_cert_t *cert,
     if (cert->pp_len > 0) {
         return false; /* already have a pre-prepare */
     }
+    if (pp_len < (int)sizeof(tbft_pre_prepare_rep_t)) {
+        return false; /* shorter than the fixed header — and guards negatives */
+    }
     if (pp_len > TBFT_PP_MAX_SIZE) {
         return false; /* too large */
     }
