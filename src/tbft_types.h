@@ -104,16 +104,17 @@ typedef uint64_t tbft_bitmap_t;
 
 static inline void tbft_bitmap_set(tbft_bitmap_t *bm, int i)
 {
-    *bm |= (1ULL << i);
+    if (i >= 0 && i < 64) *bm |= (1ULL << i);
 }
 
 static inline void tbft_bitmap_clear(tbft_bitmap_t *bm, int i)
 {
-    *bm &= ~(1ULL << i);
+    if (i >= 0 && i < 64) *bm &= ~(1ULL << i);
 }
 
 static inline bool tbft_bitmap_test(const tbft_bitmap_t *bm, int i)
 {
+    if (i < 0 || i >= 64) return false;
     return (*bm >> i) & 1ULL;
 }
 

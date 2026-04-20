@@ -106,6 +106,12 @@ typedef struct {
     /* Running flag */
     volatile bool  running;
 
+    /* Yield counter for periodic cooperative scheduling.
+     * Incremented each message loop iteration; when it reaches the
+     * threshold the replica yields to let lower-priority tasks run.
+     * Reset to 0 on replica restart to avoid stale values. */
+    int yield_counter;
+
     /* Event group for decoupling timer callbacks from heavy processing */
     EventGroupHandle_t evt_group;
 } tbft_replica_t;

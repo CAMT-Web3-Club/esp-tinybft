@@ -1,3 +1,16 @@
+/**
+ * @file tbft_node.c
+ * @brief Network I/O delegation layer — abstracts transport (UDP/ESP-NOW).
+ *
+ * The node layer sits between the replica (protocol logic) and the transport
+ * backend. It handles:
+ *   - Transport creation (type selected via Kconfig at compile time)
+ *   - Message send/recv delegation to transport
+ *   - Authenticator generation (HMAC) and verification (with replay check)
+ *   - RSA signature generation and verification
+ *   - Node ID to auth slot index mapping
+ */
+
 #include "tbft_node.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -99,8 +112,11 @@ int tbft_node_recv(tbft_node_t *node, void *buf, tbft_node_id_t *src_id)
     if (!node->transport) return -1;
     int n = tbft_transport_recv(node->transport, buf,
                                 TBFT_MAX_MESSAGE_SIZE, src_id);
+    if (n < 0) {
+        return -1; /* transport error */
+    }
     if (n < (int)sizeof(tbft_msg_hdr_t)) {
-        return 0; /* truncated or nothing available */
+        return 0; /* no message or truncated */
     }
     return n;
 }
@@ -113,8 +129,11 @@ void tbft_node_gen_auth(tbft_node_t *node, const void *msg, size_t msg_len,
                         tbft_auth_t *auth)
 {
     int slot = 0;
+    int expected_slots = node->num_replicas - 1; /* exclude self */
     for (int i = 0; i < node->num_replicas; i++) {
         if (i == node->node_id) continue;
+        /* Guard: ensure slot index never exceeds auth->slots capacity */
+        if (slot >= expected_slots) break;
         tbft_principal_t *p = node->principals[i];
         if (p) {
             /* HIGH FIX H8: Check MAC generation return value.

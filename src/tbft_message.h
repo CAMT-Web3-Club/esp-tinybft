@@ -2,6 +2,7 @@
 
 #include "tbft_types.h"
 #include <string.h>
+#include <limits.h>
 
 /* --------------------------------------------------------------------------
  * Message tag constants (section 4)
@@ -334,9 +335,12 @@ static inline void tbft_msg_set_hdr(tbft_msg_t *m, tbft_msg_tag_t tag,
     h->size  = size;
 }
 
-/* Align size up to 8-byte boundary (as required by wire format) */
+/* Align size up to 8-byte boundary (as required by wire format).
+ * Returns -1 if the size is negative or would overflow after alignment. */
 static inline int32_t tbft_msg_align(int32_t size)
 {
+    if (size < 0) return -1;
+    if (size > INT32_MAX - 7) return -1; /* overflow guard */
     return (size + 7) & ~7;
 }
 

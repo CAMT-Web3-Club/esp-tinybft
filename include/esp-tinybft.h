@@ -8,6 +8,36 @@
  * memory regions optimised for embedded systems.  This header exposes the
  * client and replica APIs mirroring the original libbyz interface.
  *
+ * ## Transport Layer Selection
+ *
+ * The component supports two interchangeable transport backends, selected at
+ * compile time via `CONFIG_TBFT_TRANSPORT_TYPE` in `idf.py menuconfig`
+ * (under Component config → TinyBFT Configuration → Transport Type):
+ *
+ * | Backend    | Config Value           | Protocol     | Max Payload    | Use Case                  |
+ * |------------|------------------------|--------------|----------------|---------------------------|
+ * | **UDP**    | `TBFT_TRANSPORT_UDP`   | lwIP sockets | Unbounded      | Ethernet/Wi-Fi STA + AP   |
+ * | **ESP-NOW**| `TBFT_TRANSPORT_ESPNOW`| esp_now API  | 1470 bytes     | Direct device-to-device   |
+ *
+ * ### UDP Transport
+ * Uses standard lwIP UDP sockets. Supports multicast for broadcast sends.
+ * Requires the host application to initialise the network stack (WiFi or
+ * Ethernet) before calling `Byz_init_replica()`. The config file uses
+ * IP addresses and ports to identify peers.
+ *
+ * ### ESP-NOW Transport
+ * Uses the ESP-NOW API for direct device-to-device communication without
+ * requiring an access point. Messages exceeding 1470 bytes are automatically
+ * fragmented and reassembled. The config file uses MAC addresses to identify
+ * peers. The host application must:
+ *   1. Initialise WiFi (`esp_wifi_init`, `esp_wifi_set_mode`, `esp_wifi_start`)
+ *   2. Call `esp_now_init()` before `Byz_init_replica()`
+ *   3. Ensure the device is in STA or AP+STA mode (required by ESP-NOW)
+ *
+ * Switching transports requires **no code changes** — only the menuconfig
+ * setting and the config file format differ. Both backends handle the same
+ * message formats, HMAC authentication, and RSA signatures.
+ *
  * Typical client usage:
  * @code
  *   Byz_req req;
