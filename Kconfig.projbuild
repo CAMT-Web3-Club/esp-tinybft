@@ -147,4 +147,12 @@ menu "TinyBFT Configuration"
             Status messages help replicas catch up during state transfer.
             Default: 1s (1000000).
 
+    config TBFT_CLIENT_REPLY_TIMEOUT_MS
+        int "Client reply timeout (milliseconds)"
+        default 10000
+        range 1000 120000
+        help
+            Timeout for waiting for f+1 matching replies after sending
+            a request. Default: 10s (10000ms).
+
 endmenu

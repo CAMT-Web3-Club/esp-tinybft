@@ -535,11 +535,12 @@ int Byz_recv_reply(Byz_rep *rep)
     int f = s_client->max_faulty;
     int needed = f + 1; /* f+1 matching replies from DISTINCT replicas */
     int num_replicas = s_client->num_replicas;
-    int64_t deadline_us = esp_timer_get_time() + 10000000LL; /* 10 s timeout */
+    int64_t deadline_us = esp_timer_get_time()
+        + (int64_t)TBFT_CLIENT_REPLY_TIMEOUT_MS * 1000LL;
 
     while (esp_timer_get_time() < deadline_us) {
         uint8_t buf[TBFT_MAX_MESSAGE_SIZE];
-        int n = tbft_node_recv(s_client, buf, NULL);
+        int n = tbft_node_recv(s_client, buf, sizeof(buf), NULL);
         if (n < (int)sizeof(tbft_reply_rep_t)) {
             vTaskDelay(pdMS_TO_TICKS(1));
             continue;
@@ -784,17 +785,14 @@ int Byz_init_replica(const char *config_file, const char *priv_config,
         return -1;
     }
 
-    /* Set timer periods from config.
-     * Use a 3x grace period for the initial view-change timer to allow
-     * the cluster to complete HMAC key exchange before triggering view-change. */
+    /* Set timer periods from config */
     s_replica->vtimer_period_us = (int64_t)cfg.vc_timeout_ms * 1000LL;
     s_replica->stimer_period_us = (int64_t)cfg.status_timeout_ms * 1000LL;
 
-    /* Restart timers with correct periods */
-    tbft_itimer_stop(&s_replica->vtimer);
-    tbft_itimer_stop(&s_replica->stimer);
-    tbft_itimer_start(&s_replica->vtimer, s_replica->vtimer_period_us * 3);
-    tbft_itimer_start(&s_replica->stimer, s_replica->stimer_period_us);
+    /* M4 FIX: Setup principals FIRST (including private keys and HMAC session
+     * keys), then start timers. Starting the view-change timer before key
+     * exchange completes could trigger spurious view-changes if the 3x grace
+     * period expires while principals are still being initialised. */
 
     /* Setup principals */
     if (setup_principals(&s_replica->node, &cfg, priv_config, local_id) != 0) {
@@ -803,6 +801,14 @@ int Byz_init_replica(const char *config_file, const char *priv_config,
         s_replica = NULL;
         return -1;
     }
+
+    /* Start timers with correct periods after principals are ready.
+     * Use a 3x grace period for the initial view-change timer to allow
+     * the cluster to complete HMAC key exchange before triggering view-change. */
+    tbft_itimer_stop(&s_replica->vtimer);
+    tbft_itimer_stop(&s_replica->stimer);
+    tbft_itimer_start(&s_replica->vtimer, s_replica->vtimer_period_us * 3);
+    tbft_itimer_start(&s_replica->stimer, s_replica->stimer_period_us);
 
     s_is_replica = true;
     ESP_LOGI(TAG, "replica %d initialised", local_id);

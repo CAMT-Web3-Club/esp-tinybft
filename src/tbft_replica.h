@@ -83,8 +83,7 @@ typedef struct {
     /* Timers */
     tbft_itimer_t vtimer;  /* view-change timeout */
     tbft_itimer_t stimer;  /* status broadcast */
-    tbft_itimer_t rtimer;  /* recovery */
-    tbft_itimer_t ntimer;  /* null-request (keep-alive) */
+    /* rtimer (recovery) and ntimer (keep-alive) reserved for future use */
 
     /* Timer periods */
     int64_t vtimer_period_us;

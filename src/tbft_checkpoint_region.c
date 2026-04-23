@@ -3,7 +3,9 @@
 
 static inline int slot_index(tbft_seqno_t seqno)
 {
-    if (seqno < 0) return 0; /* guard negative seqno from Kconfig misuse */
+    /* tbft_seqno_t is int64_t; negative seqno would indicate a logic bug
+     * in the caller. The division-by-zero guard in Kconfig (_Static_assert
+     * TBFT_CHECKPOINT_INTERVAL >= 1) ensures the modulo is safe. */
     return (int)((seqno / TBFT_CHECKPOINT_INTERVAL) % TBFT_NUM_CKPT_SLOTS);
 }
 
@@ -136,6 +138,10 @@ void tbft_cr_store_above_window(tbft_checkpoint_region_t *cr,
     memcpy(slot->msgs[0], msg, (size_t)msg_len);
     slot->msg_lens[0]  = msg_len;
     slot->present[0]   = true;
+    /* L3 FIX: above-window entries are NOT used for quorum detection.
+     * match_count is set to 1 merely as a placeholder so tbft_cr_load
+     * can check present[0]. Do not call tbft_cr_count() for above-window
+     * seqnos — it will return 1 which is not a real vote count. */
     slot->match_count  = 1;
 }
 

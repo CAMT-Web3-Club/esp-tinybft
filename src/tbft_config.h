@@ -65,6 +65,10 @@
 #define TBFT_STATUS_TIMEOUT_US       CONFIG_TBFT_STATUS_TIMEOUT_US
 #endif
 
+#ifndef TBFT_CLIENT_REPLY_TIMEOUT_MS
+#define TBFT_CLIENT_REPLY_TIMEOUT_MS  CONFIG_TBFT_CLIENT_REPLY_TIMEOUT_MS
+#endif
+
 /* --------------------------------------------------------------------------
  * Derived protocol constants
  * -------------------------------------------------------------------------- */

@@ -117,12 +117,20 @@ bool tbft_ar_committed(const tbft_agreement_region_t *ar, tbft_seqno_t seqno)
 
 void tbft_ar_truncate(tbft_agreement_region_t *ar, tbft_seqno_t new_head)
 {
-    for (tbft_seqno_t s = ar->head; s < new_head; s++) {
-        int idx = (int)((ar->head_idx + (s - ar->head)) & ar->mask);
+    if (new_head <= ar->head) return;
+
+    /* M1 FIX: Cap delta to TBFT_WINDOW_SIZE to prevent a large new_head
+     * jump from iterating billions of times (freezing the replica). The
+     * circular buffer only has TBFT_WINDOW_SIZE slots; advancing beyond
+     * that wraps around multiple times, clearing the same slots repeatedly. */
+    tbft_seqno_t delta = new_head - ar->head;
+    if (delta > TBFT_WINDOW_SIZE) delta = TBFT_WINDOW_SIZE;
+
+    for (tbft_seqno_t i = 0; i < delta; i++) {
+        int idx = (int)((ar->head_idx + (int)i) & ar->mask);
         tbft_prepared_cert_clear(&ar->slices[idx].prepared_cert);
         tbft_commit_cert_clear(&ar->slices[idx].commit_cert);
     }
-    ar->head_idx = (int)((ar->head_idx + (int)(new_head - ar->head))
-                         & ar->mask);
+    ar->head_idx = (int)((ar->head_idx + (int)delta) & ar->mask);
     ar->head = new_head;
 }

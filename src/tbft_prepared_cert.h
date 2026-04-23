@@ -88,29 +88,7 @@ static inline const tbft_pre_prepare_rep_t *tbft_prepared_cert_pp_rep(
 }
 
 /* --------------------------------------------------------------------------
- * Prepare log  (Log<Prepared_cert>)
+ * NOTE: tbft_plog_t (Log<Prepared_cert>) was superseded by
+ * tbft_agreement_region_t which serves the same purpose with better
+ * memory layout. The plog type and its functions are no longer used.
  * -------------------------------------------------------------------------- */
-
-typedef struct {
-    tbft_prepared_cert_t  slots[TBFT_WINDOW_SIZE];
-    tbft_seqno_t          head;
-    int                   head_idx;
-    int                   mask;
-    int                   prepare_threshold; /* 2f */
-} tbft_plog_t;
-
-void tbft_plog_init(tbft_plog_t *log, int prepare_threshold);
-
-static inline bool tbft_plog_in_range(const tbft_plog_t *log, tbft_seqno_t n)
-{
-    return (n > log->head - 1) && (n <= log->head + TBFT_WINDOW_SIZE - 1);
-}
-
-static inline tbft_prepared_cert_t *tbft_plog_get(tbft_plog_t *log,
-                                                   tbft_seqno_t n)
-{
-    int idx = (int)((log->head_idx + (n - log->head)) & log->mask);
-    return &log->slots[idx];
-}
-
-void tbft_plog_truncate(tbft_plog_t *log, tbft_seqno_t new_head);

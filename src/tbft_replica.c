@@ -35,6 +35,9 @@ static const char *TAG = "tbft_replica";
 #define TBFT_KEY_DRAIN_LIMIT      32   /* max messages to drain during key confirmation */
 #define TBFT_YIELD_THRESHOLD      16   /* message loop iterations before cooperative yield */
 
+/* M2 FIX: Read-only request flag in hdr.extra field */
+#define TBFT_REQUEST_RO_FLAG      0x1
+
 /* --------------------------------------------------------------------------
  * Request queue helpers
  * -------------------------------------------------------------------------- */
@@ -153,19 +156,19 @@ int tbft_replica_init(tbft_replica_t *r,
     r->vtimer_period_us = TBFT_VIEW_CHANGE_TIMEOUT_US;
     r->stimer_period_us = TBFT_STATUS_TIMEOUT_US;
 
-    /* Init timers (not started — caller must set periods and start) */
+    /* Init timers (not started — caller must set periods and start).
+     * NOTE: rtimer (recovery) and ntimer (keep-alive) are reserved for
+     * future use. They are not initialised or freed to avoid allocating
+     * unused esp_timer handles. */
     tbft_itimer_init(&r->vtimer, vtimer_cb, r, "tbft_vtimer");
     tbft_itimer_init(&r->stimer, stimer_cb, r, "tbft_stimer");
-    tbft_itimer_init(&r->rtimer, NULL,       r, "tbft_rtimer");
-    tbft_itimer_init(&r->ntimer, NULL,       r, "tbft_ntimer");
 
     r->evt_group = xEventGroupCreate();
     if (!r->evt_group) {
         ESP_LOGE(TAG, "replica: failed to create event group");
         tbft_itimer_free(&r->vtimer);
         tbft_itimer_free(&r->stimer);
-        tbft_itimer_free(&r->rtimer);
-        tbft_itimer_free(&r->ntimer);
+        /* rtimer/ntimer not initialised — nothing to free */
         tbft_state_free(&r->state);
         tbft_node_free(&r->node);
         return -1;
@@ -181,8 +184,7 @@ void tbft_replica_free(tbft_replica_t *r)
     r->running = false;
     tbft_itimer_free(&r->vtimer);
     tbft_itimer_free(&r->stimer);
-    tbft_itimer_free(&r->rtimer);
-    tbft_itimer_free(&r->ntimer);
+    /* rtimer/ntimer are not initialised — nothing to free */
     if (r->evt_group) {
         vEventGroupDelete(r->evt_group);
         r->evt_group = NULL;
@@ -214,7 +216,7 @@ void tbft_replica_run(tbft_replica_t *r)
     int drained = 0;
     while (drained < TBFT_INIT_DRAIN_LIMIT) {
         tbft_node_id_t src_id = -1;
-        int n = tbft_node_recv(&r->node, r->node.recv_buf, &src_id);
+        int n = tbft_node_recv(&r->node, r->node.recv_buf, sizeof(r->node.recv_buf), &src_id);
         if (n < 0) break; /* transport error during drain */
         if (n < (int)sizeof(tbft_msg_hdr_t)) break;
         const tbft_msg_hdr_t *hdr = (const tbft_msg_hdr_t *)r->node.recv_buf;
@@ -244,7 +246,7 @@ void tbft_replica_run(tbft_replica_t *r)
             drained = 0;
             while (drained < TBFT_KEY_DRAIN_LIMIT) {
                 tbft_node_id_t src_id = -1;
-                int n = tbft_node_recv(&r->node, r->node.recv_buf, &src_id);
+                int n = tbft_node_recv(&r->node, r->node.recv_buf, sizeof(r->node.recv_buf), &src_id);
                 if (n < 0) break; /* transport error during key drain */
                 if (n < (int)sizeof(tbft_msg_hdr_t)) break;
                 const tbft_msg_hdr_t *hdr = (const tbft_msg_hdr_t *)r->node.recv_buf;
@@ -345,7 +347,7 @@ void tbft_replica_run(tbft_replica_t *r)
         }
 
         tbft_node_id_t src_id = -1;
-        int n = tbft_node_recv(&r->node, r->node.recv_buf, &src_id);
+        int n = tbft_node_recv(&r->node, r->node.recv_buf, sizeof(r->node.recv_buf), &src_id);
         if (n < 0) {
             /* Transport error — log and yield before retrying */
             ESP_LOGW(TAG, "recv: transport error (id=%d)", r->node.node_id);
@@ -495,7 +497,7 @@ void tbft_replica_handle_request(tbft_replica_t *r, const void *msg, int len)
     /* Primary: deduplicate by (cid, rid) before enqueuing.
      * Multiple copies of the same request can arrive — once from the
      * client's broadcast and again from each replica's forward. */
-    bool ro = (req->hdr.extra & 0x1) != 0;
+    bool ro = (req->hdr.extra & TBFT_REQUEST_RO_FLAG) != 0;
     tbft_rqueue_t *q = ro ? &r->ro_rqueue : &r->rqueue;
     for (int i = 0; i < q->count; i++) {
         int idx = (q->head + i) % TBFT_RQUEUE_MAX;
@@ -914,7 +916,8 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
         return;
     }
 
-    if (!tbft_vi_collect_vc(&r->vi, sender_id, msg, len)) {
+    bool collected = tbft_vi_collect_vc(&r->vi, sender_id, msg, len);
+    if (!collected) {
         if (vc->v > r->node.view && !r->vi.received[r->node.node_id]) {
             /* Suppress catch-up view-change until we have enough HMAC keys */
             int keys_ok = 0;
@@ -931,8 +934,12 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
         return;
     }
 
-    /* If we are the new primary and have enough view-changes, send new-view */
-    int new_primary = tbft_node_primary(&r->node, vc->v);
+    /* C1 FIX: Check quorum after EVERY successful VC collection, including
+     * when tbft_vi_collect_vc advanced target_view to a higher value.
+     * Previously this was inside an `if (!collect_vc)` block, so if a VC
+     * for a higher view caused target_view to reset+advance, the quorum
+     * check was skipped and the new primary would never send New_view. */
+    int new_primary = tbft_node_primary(&r->node, r->vi.target_view);
     if (new_primary == r->node.node_id && tbft_vi_has_quorum(&r->vi)) {
         /* Build and send New_view */
         tbft_seqno_t min_s, max_s;
@@ -1003,7 +1010,7 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
         nv->hdr.tag          = TBFT_MSG_NEW_VIEW;
         nv->hdr.extra        = 0;
         nv->hdr.timestamp_us = esp_timer_get_time();
-        nv->v       = vc->v;
+        nv->v       = r->vi.target_view;  /* C1 FIX: use target_view, not vc->v */
         nv->min     = min_s;
         nv->max     = max_s;
         nv->has_sig = 1;
@@ -1041,7 +1048,7 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
         tbft_node_send(&r->node, r->out_buf, (size_t)total_size,
                        TBFT_ALL_REPLICAS);
         ESP_LOGI(TAG, "sent new-view v=%lld min=%lld max=%lld n_prep=%d",
-                 (long long)vc->v, (long long)min_s, (long long)max_s, n_proofs);
+                 (long long)r->vi.target_view, (long long)min_s, (long long)max_s, n_proofs);
     }
 }
 
@@ -1449,7 +1456,7 @@ void tbft_replica_execute_committed(tbft_replica_t *r)
             tbft_reply_rep_t *reply = (tbft_reply_rep_t *)r->out_buf;
             uint8_t *rep_payload    = r->out_buf + sizeof(*reply);
             int      rep_len        = 0;
-            bool     ro = (req_rep->hdr.extra & 0x1) != 0;
+            bool     ro = (req_rep->hdr.extra & TBFT_REQUEST_RO_FLAG) != 0;
 
             /* Ensure enough room: hdr + payload + sig */
             if (sizeof(*reply) + TBFT_MAX_REPLY_SIZE + TBFT_SIG_SIZE
@@ -1731,11 +1738,10 @@ void tbft_replica_send_new_key(tbft_replica_t *r)
                                                  &enc_len);
         if (rc != 0 || enc_len != TBFT_SIG_SIZE) {
             ESP_LOGW(TAG, "send_new_key: encrypt for replica %d failed", i);
-            /* Medium #2 FIX: Skip this slot entirely instead of sending a
-             * zeroed ciphertext. Including invalid slots causes peers to
-             * attempt decryption of garbage, failing key setup. */
-            memset(slots[slot_idx].ciphertext, 0,
-                   sizeof(slots[slot_idx].ciphertext));
+            /* M3 FIX: Skip this slot entirely — don't zero or include it.
+             * The slot_idx is NOT incremented, so this slot is excluded
+             * from the final message. Zeroing it would leave garbage
+             * recipient_id=0 which could confuse the recipient. */
             continue;
         }
 
