@@ -155,7 +155,9 @@ static int parse_config(const char *path, tbft_config_t *cfg)
 
         if (is_mac) {
             /* ESP-NOW format: <hostname> <mac> <pubkey_path> */
-            memcpy(cfg->nodes[i].mac_str, field2, sizeof(cfg->nodes[i].mac_str));
+            /* M7 FIX: Use snprintf instead of memcpy to avoid copying
+             * garbage bytes beyond the null terminator of field2. */
+            snprintf(cfg->nodes[i].mac_str, sizeof(cfg->nodes[i].mac_str), "%s", field2);
             if (fscanf(f, "%127s", cfg->nodes[i].pubkey_path) != 1) {
                 ESP_LOGE(TAG, "failed to parse node %d pubkey_path", i);
                 goto fail;
@@ -164,10 +166,16 @@ static int parse_config(const char *path, tbft_config_t *cfg)
             cfg->nodes[i].ip[0] = '\0';
         } else {
             /* UDP format: <hostname> <ip> <port> <pubkey_path> */
-            memcpy(cfg->nodes[i].ip, field2, sizeof(cfg->nodes[i].ip));
+            /* M7 FIX: Use snprintf instead of memcpy. */
+            snprintf(cfg->nodes[i].ip, sizeof(cfg->nodes[i].ip), "%s", field2);
             int port_int = 0;
             if (fscanf(f, "%d %127s", &port_int, cfg->nodes[i].pubkey_path) != 2) {
                 ESP_LOGE(TAG, "failed to parse node %d port/pubkey", i);
+                goto fail;
+            }
+            /* M8 FIX: Validate port range. */
+            if (port_int < 1 || port_int > 65535) {
+                ESP_LOGE(TAG, "node %d: port %d out of valid range [1, 65535]", i, port_int);
                 goto fail;
             }
             cfg->nodes[i].port = (uint16_t)port_int;
@@ -366,8 +374,26 @@ static int setup_principals(tbft_node_t *node, const tbft_config_t *cfg,
             size_t priv_len = 0;
             uint8_t *priv = load_key_file(priv_config_path, &priv_len);
             if (priv) {
-                tbft_principal_load_priv_key(p, priv, priv_len);
+                /* CRITICAL FIX #1: Check return value — if private key loading
+                 * fails, the node will send unsigned messages causing protocol
+                 * stall. This is fatal — abort initialization. */
+                int pk_ret = tbft_principal_load_priv_key(p, priv, priv_len);
                 free(priv);
+                if (pk_ret != 0) {
+                    ESP_LOGE(TAG, "failed to load private key for node %d: -0x%04x",
+                             i, (unsigned)(-pk_ret));
+                    for (int j = 0; j <= i; j++) {
+                        if (node->principals[j]) {
+                            tbft_principal_free(node->principals[j]);
+                            free(node->principals[j]);
+                            node->principals[j] = NULL;
+                        }
+                    }
+                    return -1;
+                }
+            } else {
+                ESP_LOGW(TAG, "no private key file for node %d: %s",
+                         i, priv_config_path);
             }
             node->local_principal = p;
 

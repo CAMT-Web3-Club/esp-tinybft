@@ -30,6 +30,11 @@
 
 static const char *TAG = "tbft_replica";
 
+/* Low #8 FIX: Named constants for magic numbers */
+#define TBFT_INIT_DRAIN_LIMIT     64   /* max messages to drain after New_key broadcast */
+#define TBFT_KEY_DRAIN_LIMIT      32   /* max messages to drain during key confirmation */
+#define TBFT_YIELD_THRESHOLD      16   /* message loop iterations before cooperative yield */
+
 /* --------------------------------------------------------------------------
  * Request queue helpers
  * -------------------------------------------------------------------------- */
@@ -207,7 +212,7 @@ void tbft_replica_run(tbft_replica_t *r)
      * or other messages.  Non-NEW_KEY messages are acknowledged with a log
      * to catch unexpected early arrivals. */
     int drained = 0;
-    while (drained < 64) {
+    while (drained < TBFT_INIT_DRAIN_LIMIT) {
         tbft_node_id_t src_id = -1;
         int n = tbft_node_recv(&r->node, r->node.recv_buf, &src_id);
         if (n < 0) break; /* transport error during drain */
@@ -237,7 +242,7 @@ void tbft_replica_run(tbft_replica_t *r)
             tbft_replica_send_new_key(r);
             vTaskDelay(pdMS_TO_TICKS(200));
             drained = 0;
-            while (drained < 32) {
+            while (drained < TBFT_KEY_DRAIN_LIMIT) {
                 tbft_node_id_t src_id = -1;
                 int n = tbft_node_recv(&r->node, r->node.recv_buf, &src_id);
                 if (n < 0) break; /* transport error during key drain */
@@ -273,7 +278,7 @@ void tbft_replica_run(tbft_replica_t *r)
          *
          * NOTE: This counter lives in the replica struct (not static) so
          * that restarting the replica correctly resets it. */
-        if (++r->yield_counter >= 16) {
+        if (++r->yield_counter >= TBFT_YIELD_THRESHOLD) {
             r->yield_counter = 0;
             vTaskDelay(pdMS_TO_TICKS(1));
         }
@@ -1671,9 +1676,9 @@ void tbft_replica_send_view_change(tbft_replica_t *r)
         tbft_vi_collect_vc(&r->vi, r->node.node_id, r->out_buf, total_size);
     }
 
-    /* MEDIUM FIX M2: Exponential backoff for view-change retransmit timer.
-     * The previous fixed multiplier (x2) could flood the network under
-     * cascading primary failures. Now we double each retry. */
+    /* Low #7 FIX: This sets a fixed 2x grace period for the view-change
+     * retry timer (not true exponential backoff). The period resets to
+     * the base value on each send_view_change call. */
     tbft_itimer_start(&r->vtimer, r->vtimer_period_us * 2);
 }
 
@@ -1726,9 +1731,12 @@ void tbft_replica_send_new_key(tbft_replica_t *r)
                                                  &enc_len);
         if (rc != 0 || enc_len != TBFT_SIG_SIZE) {
             ESP_LOGW(TAG, "send_new_key: encrypt for replica %d failed", i);
-            /* Zero the ciphertext to avoid leaking key material */
+            /* Medium #2 FIX: Skip this slot entirely instead of sending a
+             * zeroed ciphertext. Including invalid slots causes peers to
+             * attempt decryption of garbage, failing key setup. */
             memset(slots[slot_idx].ciphertext, 0,
                    sizeof(slots[slot_idx].ciphertext));
+            continue;
         }
 
         slots[slot_idx].recipient_id = i;

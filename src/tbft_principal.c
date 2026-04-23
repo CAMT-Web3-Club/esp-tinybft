@@ -49,6 +49,11 @@ static void ensure_psa_init(void)
     }
 }
 
+void tbft_principal_ensure_psa(void)
+{
+    ensure_psa_init();
+}
+
 /* --------------------------------------------------------------------------
  * Lifecycle
  * -------------------------------------------------------------------------- */
@@ -104,8 +109,10 @@ void tbft_principal_free(tbft_principal_t *p)
  * Fallback to transient import if the persistent handle is not set.
  * -------------------------------------------------------------------------- */
 
-/* Import a raw key into PSA and return the key ID; 0 on failure. */
-static psa_key_id_t import_hmac_key(const tbft_hmac_key_t *key,
+/* Import a raw key into PSA and return the key ID; 0 on failure.
+ * M2 FIX: Use mbedtls_svc_key_id_t consistently — psa_import_key in
+ * MbedTLS 4.x expects this type, not plain psa_key_id_t. */
+static mbedtls_svc_key_id_t import_hmac_key(const tbft_hmac_key_t *key,
                                     psa_key_usage_t usage)
 {
     psa_key_attributes_t attr = PSA_KEY_ATTRIBUTES_INIT;
@@ -113,10 +120,10 @@ static psa_key_id_t import_hmac_key(const tbft_hmac_key_t *key,
     psa_set_key_algorithm(&attr, PSA_ALG_HMAC(PSA_ALG_SHA_256));
     psa_set_key_usage_flags(&attr, usage);
 
-    psa_key_id_t kid = 0;
+    mbedtls_svc_key_id_t kid = MBEDTLS_SVC_KEY_ID_INIT;
     psa_status_t st = psa_import_key(&attr, key->bytes, sizeof(key->bytes), &kid);
     if (st != PSA_SUCCESS) {
-        return 0;
+        return MBEDTLS_SVC_KEY_ID_INIT;
     }
     return kid;
 }

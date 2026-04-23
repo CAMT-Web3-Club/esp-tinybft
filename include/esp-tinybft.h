@@ -245,11 +245,11 @@ void Byz_replica_run(void);
  * Auto-detect the local node ID from the cluster config file.
  *
  * For ESP-NOW transport, reads the WiFi STA MAC and matches it against
- * the MAC addresses in the config.  For UDP transport, returns -1
- * (IP-based auto-detection is not supported in the embedded context).
+ * the MAC addresses in the config. For UDP transport, reads the local
+ * STA IP and matches it against the IP addresses in the config.
  *
- * WiFi must be initialised and started before calling this function
- * when using ESP-NOW transport.
+ * WiFi (ESP-NOW) or network (UDP) must be initialised and started
+ * before calling this function.
  *
  * @param config_file   Path to the cluster configuration file
  * @return node index (0-based) if found, -1 if not detected

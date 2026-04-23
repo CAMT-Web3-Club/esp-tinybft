@@ -291,14 +291,18 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *
     const uint8_t *src_mac = recv_info->src_addr;
     const frag_hdr_t *fhdr = (const frag_hdr_t *)data;
 
-    /* Log every fragment arriving at the ESP-NOW callback */
-    ESP_LOGI(TAG, "espnow_cb: frag %d/%d msg_id=%u len=%d from " MACSTR,
+    /* M12 FIX: Log at DEBUG level to prevent massive log spam under load.
+     * Every fragment arriving at high rate would overwhelm UART and increase
+     * latency. Use DEBUG for per-fragment logging; completed messages
+     * already log at INFO level below. */
+    ESP_LOGD(TAG, "espnow_cb: frag %d/%d msg_id=%u len=%d from " MACSTR,
              fhdr->frag_idx, fhdr->frag_total, fhdr->msg_id, data_len, MAC2STR(src_mac));
 
-    /* HIGH FIX H7: Minimize lock hold time to prevent packet drops.
-     * The previous 10ms timeout caused the WiFi task to drop packets under
-     * load. Now we take the lock only for the critical reasm_feed operation. */
-    if (xSemaphoreTake(enow->lock, pdMS_TO_TICKS(2)) != pdTRUE) {
+    /* HIGH FIX H1: Increase lock timeout from 2ms to 50ms.
+     * The recv_cb runs in the WiFi task context. A longer timeout ensures
+     * it can acquire the lock even when send_task or other tasks are
+     * briefly holding it for reassembly operations. */
+    if (xSemaphoreTake(enow->lock, pdMS_TO_TICKS(50)) != pdTRUE) {
         /* Log but don't drop — try again on next packet */
         return;
     }
@@ -328,8 +332,12 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *
         memcpy(q_entry.payload, s->buf, (size_t)s->buf_len);
 
         int msg_tag = s->buf[0];
-        if (xQueueSend(enow->msg_queue, &q_entry, 0) != pdTRUE) {
-            ESP_LOGW(TAG, "msg_queue full, dropping reassembled msg tag=%d len=%d",
+        /* HIGH FIX H2: Use 100ms blocking timeout instead of timeout=0.
+         * Dropping completed BFT messages (Pre-prepare, Commit, etc.) can
+         * trigger view-changes or stall consensus. A moderate timeout gives
+         * the replica task time to drain the queue under burst load. */
+        if (xQueueSend(enow->msg_queue, &q_entry, pdMS_TO_TICKS(100)) != pdTRUE) {
+            ESP_LOGW(TAG, "msg_queue full after 100ms, dropping reassembled msg tag=%d len=%d",
                      msg_tag, s->buf_len);
         } else {
             ESP_LOGI(TAG, "recv: tag=%d len=%d from " MACSTR,
@@ -358,15 +366,21 @@ static int espnow_do_send(tbft_espnow_t *enow, const uint8_t *peer_mac, uint16_t
      * loss, triggering unnecessary view-changes in the BFT protocol. */
     const int MAX_RETRIES = 3;
 
+    /* M5 FIX: Use static buffer for packet assembly to avoid consuming
+     * ~1474B (36%) of the 4KB send_task stack per call. Thread-safe since
+     * send_task is the sole caller — no concurrent access. */
+    static uint8_t pkt[sizeof(frag_hdr_t) + FRAG_MAX_PAYLOAD];
+
     if (len + sizeof(frag_hdr_t) <= ESPNOW_MAX_DATA_LEN) {
         frag_hdr_t fhdr = { .msg_id = msg_id, .frag_total = 1, .frag_idx = 0 };
-        uint8_t pkt[sizeof(frag_hdr_t) + ESPNOW_MAX_DATA_LEN];
-        memcpy(pkt, &fhdr, sizeof(fhdr));
-        memcpy(pkt + sizeof(fhdr), buf, len);
+        /* Small packet: use a minimal stack buffer since it fits in one frame */
+        uint8_t small_pkt[sizeof(frag_hdr_t) + ESPNOW_MAX_DATA_LEN];
+        memcpy(small_pkt, &fhdr, sizeof(fhdr));
+        memcpy(small_pkt + sizeof(fhdr), buf, len);
 
         int retries = 0;
         while (retries < MAX_RETRIES) {
-            if (esp_now_send(ap_mac, pkt, len + sizeof(fhdr)) == ESP_OK) break;
+            if (esp_now_send(ap_mac, small_pkt, len + sizeof(fhdr)) == ESP_OK) break;
             retries++;
             if (retries < MAX_RETRIES) {
                 vTaskDelay(pdMS_TO_TICKS(FRAG_INTER_DELAY_MS * retries));
@@ -386,7 +400,7 @@ static int espnow_do_send(tbft_espnow_t *enow, const uint8_t *peer_mac, uint16_t
     uint8_t frag_idx = 0;
 
     frag_hdr_t fhdr = { .msg_id = msg_id, .frag_total = frag_total };
-    uint8_t pkt[sizeof(frag_hdr_t) + FRAG_MAX_PAYLOAD];
+    /* Reuse static pkt buffer declared above (M5 FIX) */
 
     while (remaining > 0) {
         fhdr.frag_idx = frag_idx;
@@ -555,7 +569,8 @@ int tbft_transport_create(tbft_transport_t **out, tbft_transport_type_t type, in
         return -1;
     }
 
-    xSemaphoreGive(enow->lock);
+    /* NOTE: xSemaphoreCreateMutex() creates the mutex in "not taken" state,
+     * so an immediate xSemaphoreGive would return pdFALSE. Removed dead code. */
     g_espnow_ctx = enow;
 
     esp_err_t rcb_err = esp_now_register_recv_cb(espnow_recv_cb);
@@ -688,8 +703,11 @@ int tbft_transport_recv(tbft_transport_t *t, void *buf, size_t buf_len, tbft_nod
         xSemaphoreGive(enow->lock);
     }
 
+    /* M10 FIX: Use non-blocking recv (timeout=0) to match UDP transport
+     * API contract. The previous 50ms blocking call capped the replica
+     * loop at 20Hz, creating inconsistent behavior between transports. */
     recv_entry_t entry;
-    if (xQueueReceive(enow->msg_queue, &entry, pdMS_TO_TICKS(SEND_TASK_RECV_TIMEOUT_MS)) != pdTRUE) return 0;
+    if (xQueueReceive(enow->msg_queue, &entry, 0) != pdTRUE) return 0;
 
     if (entry.buf_len < 0 || (size_t)entry.buf_len > buf_len || (size_t)entry.buf_len > TBFT_MAX_MESSAGE_SIZE) return -1;
 

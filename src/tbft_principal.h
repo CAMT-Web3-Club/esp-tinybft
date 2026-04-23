@@ -78,6 +78,13 @@ int  tbft_principal_load_priv_key(tbft_principal_t *p,
  */
 void tbft_principal_free(tbft_principal_t *p);
 
+/**
+ * Ensure PSA crypto subsystem is initialized.
+ * Safe to call multiple times — idempotent.
+ * Exposed for use by tbft_msg_digest before any principal exists.
+ */
+void tbft_principal_ensure_psa(void);
+
 /* --------------------------------------------------------------------------
  * HMAC (authenticator path — hot path)
  * -------------------------------------------------------------------------- */

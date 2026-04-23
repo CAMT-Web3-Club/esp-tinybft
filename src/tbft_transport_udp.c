@@ -110,6 +110,15 @@ static int socket_open(uint16_t port, bool use_multicast,
             return -1;
         }
 
+        /* M6 FIX: Disable multicast loopback to prevent receiving our own
+         * messages. Without this, every broadcast is echoed back to the
+         * sender, wasting CPU cycles processing self-sent BFT messages. */
+        int loop = 0;
+        if (setsockopt(sock, IPPROTO_IP, IP_MULTICAST_LOOP, &loop, sizeof(loop)) < 0) {
+            ESP_LOGW(TAG, "setsockopt(IP_MULTICAST_LOOP) failed: %d", errno);
+            /* Non-fatal: continue without disabling loopback */
+        }
+
         /* Store multicast destination address */
         memset(mcast_addr_out, 0, sizeof(*mcast_addr_out));
         mcast_addr_out->sin_family      = AF_INET;
@@ -169,6 +178,15 @@ void tbft_transport_free(tbft_transport_t *t)
     if (!t) return;
     tbft_udp_t *udp = (tbft_udp_t *)t;
     if (udp->sock >= 0) {
+        /* L1 FIX: Leave multicast group before closing socket to ensure
+         * IGMP membership is properly cleaned up. */
+        if (udp->use_multicast) {
+            struct ip_mreq mreq;
+            mreq.imr_multiaddr = udp->mcast_addr.sin_addr;
+            mreq.imr_interface.s_addr = htonl(INADDR_ANY);
+            setsockopt(udp->sock, IPPROTO_IP, IP_DROP_MEMBERSHIP,
+                       &mreq, sizeof(mreq));
+        }
         close(udp->sock);
     }
     free(udp);

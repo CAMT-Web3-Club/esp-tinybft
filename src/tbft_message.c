@@ -20,6 +20,14 @@ static const char *TAG = "tbft_msg";
 
 void tbft_msg_digest(const void *data, size_t len, tbft_digest_t *out)
 {
+    /* M1 FIX: Ensure PSA crypto subsystem is initialized before any hash
+     * operation. Without this, if tbft_msg_digest is called before any
+     * principal has been initialized (e.g., during early state setup),
+     * psa_hash_compute fails silently and produces a zero digest,
+     * corrupting state block digests and partition tree nodes. */
+    extern void tbft_principal_ensure_psa(void);
+    tbft_principal_ensure_psa();
+
     size_t hash_len = 0;
     psa_status_t st = psa_hash_compute(PSA_ALG_SHA_256,
                                        (const uint8_t *)data, len,

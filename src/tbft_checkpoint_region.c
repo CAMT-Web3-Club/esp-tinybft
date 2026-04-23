@@ -173,13 +173,4 @@ void tbft_cr_truncate(tbft_checkpoint_region_t *cr, tbft_seqno_t stable_seqno)
             memset(slot, 0, sizeof(*slot));
         }
     }
-    /* Also clear any above-window entry that is now at-or-below the stable
-     * point: it is no longer "above" anything and must not alias a future
-     * slot store. */
-    for (int i = 0; i < TBFT_MAX_NUM_REPLICAS; i++) {
-        tbft_ckpt_slot_t *slot = &cr->above_window[i];
-        if (slot->present[0] && slot->seqno <= stable_seqno) {
-            memset(slot, 0, sizeof(*slot));
-        }
-    }
 }

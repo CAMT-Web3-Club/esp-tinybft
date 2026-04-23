@@ -270,9 +270,13 @@ void tbft_state_mark_stable(tbft_state_t *state, tbft_seqno_t stable_seqno)
         /* Slot is being reused for a new checkpoint — free old data */
         if (new_rec->old_blocks) {
             /* Note: old_blocks is pre-allocated in init, so we don't free
-             * the array itself, just reset the count */
+             * the array itself, just reset the count. */
             new_rec->num_old_blocks = 0;
         }
+        /* M11 FIX: Clear stale data in reused checkpoint slot to prevent
+         * wasted memory and potential confusion during debugging. */
+        memset(new_rec->old_blocks, 0,
+               (size_t)state->num_blocks * sizeof(tbft_cow_entry_t));
     }
 
     state->last_stable = stable_seqno;
@@ -355,7 +359,9 @@ void tbft_state_handle_meta_data(tbft_state_t *state,
     int child_level = level + 1;
     int child_nodes_at_level =
         tbft_ptree_nodes_at_level(child_level, pchildren);
-    bool is_leaf_children = (child_level == p_levels - 1);
+    /* NOTE: is_leaf_children was previously computed here but never used.
+     * tbft_state_next_fetch_req handles the leaf vs internal differentiation
+     * by checking if level == p_levels - 1. */
 
     for (int i = 0; i < n_parts; i++) {
         int child_idx = index * pchildren + i;
@@ -368,7 +374,6 @@ void tbft_state_handle_meta_data(tbft_state_t *state,
         /* Both internal and leaf children use the same enqueue logic —
          * tbft_state_next_fetch_req differentiates by checking whether the
          * level is the leaf level (to bump n_data_pending). */
-        (void)is_leaf_children;
         const tbft_digest_t *local =
             &state->ptree.ptree[child_level][child_idx].digest;
         if (!tbft_digest_equal(local, &parts[i].digest)) {

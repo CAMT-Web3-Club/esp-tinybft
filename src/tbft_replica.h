@@ -14,13 +14,12 @@
  * Replica — the PBFT state machine (section 5 / Replica).
  *
  * Extends tbft_node_t with:
- *  - Sequence number tracking
- *  - Request queues
- *  - Protocol logs (plog, clog, elog)
- *  - Static memory regions (agreement, checkpoint, special)
- *  - State management
- *  - View-change support
- *  - Timers
+ *  - Sequence number tracking (seqno, last_stable, last_executed, ...)
+ *  - Request queues (rqueue, ro_rqueue)
+ *  - Static memory regions: ar (agreement), cr (checkpoint), sr (special)
+ *  - View-change protocol (vi)
+ *  - Timers (vtimer, stimer, rtimer, ntimer)
+ *  - Application callbacks and buffers
  * -------------------------------------------------------------------------- */
 
 /* TBFT_RQUEUE_MAX sourced from Kconfig (default 16) */
