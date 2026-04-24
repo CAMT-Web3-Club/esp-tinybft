@@ -943,17 +943,31 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
 
     bool collected = tbft_vi_collect_vc(&r->vi, sender_id, msg, len);
     if (!collected) {
-        if (vc->v > r->node.view && !r->vi.received[r->node.node_id]) {
-            /* Suppress catch-up view-change until we have enough HMAC keys */
-            int keys_ok = 0;
-            for (int i = 0; i < r->node.num_replicas; i++) {
-                if (i == r->node.node_id) continue;
-                if (r->node.principals[i] && r->node.principals[i]->keys_fresh) {
-                    keys_ok++;
+        if (vc->v > r->node.view) {
+            /* CRITICAL FIX: Advance view and reset seqno immediately when
+             * receiving a view-change for a higher view.  Without this,
+             * replicas can accumulate different view numbers from idling
+             * (vc timers fire at different times), each keeping their own
+             * stale seqno.  By advancing view + resetting seqno as soon
+             * as we learn about a higher view, all replicas self-synchronize
+             * without requiring simultaneous restart. */
+            r->node.view = vc->v;
+            r->node.cur_primary = tbft_node_primary(&r->node, vc->v);
+            r->seqno = 1;
+            ESP_LOGI(TAG, "sync view to %lld (from vc of %d), seqno reset to 1",
+                     (long long)vc->v, sender_id);
+            if (!r->vi.received[r->node.node_id]) {
+                /* Suppress catch-up view-change until we have enough HMAC keys */
+                int keys_ok = 0;
+                for (int i = 0; i < r->node.num_replicas; i++) {
+                    if (i == r->node.node_id) continue;
+                    if (r->node.principals[i] && r->node.principals[i]->keys_fresh) {
+                        keys_ok++;
+                    }
                 }
-            }
-            if (keys_ok >= r->node.threshold - 1) {
-                tbft_replica_send_view_change(r);
+                if (keys_ok >= r->node.threshold - 1) {
+                    tbft_replica_send_view_change(r);
+                }
             }
         }
         return;
