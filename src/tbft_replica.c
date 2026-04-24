@@ -699,6 +699,11 @@ void tbft_replica_handle_pre_prepare(tbft_replica_t *r, const void *msg, int len
     ESP_LOGI(TAG, "pp accepted: seqno=%lld view=%lld from primary %d",
              (long long)pp->seqno, (long long)pp->view, expected_primary);
 
+    /* Reset view-change timer — the primary is alive and making progress.
+     * Without this, backups can trigger a view-change during normal operation
+     * if the timeout fires while waiting for pre-prepares. */
+    tbft_itimer_start(&r->vtimer, r->vtimer_period_us);
+
     /* Update last_prepared if needed */
     if (pp->seqno > r->last_prepared) {
         r->last_prepared = pp->seqno;
