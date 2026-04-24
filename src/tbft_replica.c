@@ -789,8 +789,15 @@ void tbft_replica_handle_prepare(tbft_replica_t *r, const void *msg, int len)
     ESP_LOGI(TAG, "prepare accepted: seqno=%lld from replica %d",
              (long long)prep->seqno, sender);
 
+    /* Debug: check prepared state */
+    int pp_len2 = 0;
+    const uint8_t *pp2 = tbft_ar_load_pp(&r->ar, prep->seqno, &pp_len2);
+    bool is_prep = tbft_ar_prepared(&r->ar, prep->seqno);
+    ESP_LOGI(TAG, "prepare debug: seqno=%lld has_pp=%d prepared=%d",
+             (long long)prep->seqno, pp2 ? 1 : 0, is_prep ? 1 : 0);
+
     /* Check if prepared — if so, send commit */
-    if (tbft_ar_prepared(&r->ar, prep->seqno)) {
+    if (is_prep) {
         ESP_LOGI(TAG, "prepared seqno=%lld, sending commit",
                  (long long)prep->seqno);
         tbft_replica_send_commit(r, prep->seqno);
@@ -1519,6 +1526,28 @@ void tbft_replica_send_pre_prepare(tbft_replica_t *r)
     ESP_LOGI(TAG, "sent pre-prepare seqno=%lld view=%lld (rset=%d, ndet=%d, total=%d)",
              (long long)r->seqno, (long long)r->node.view,
              req->len, ndet_len, pp->hdr.size);
+
+    /* The primary's pre-prepare implicitly serves as its own Prepare.
+     * Add a self-prepare to the certificate so the primary counts toward
+     * the f+1 prepare threshold needed to reach the prepared state. */
+    {
+        tbft_prepare_rep_t *prep = (tbft_prepare_rep_t *)r->out_buf;
+        prep->hdr.tag   = TBFT_MSG_PREPARE;
+        prep->hdr.extra = 0;
+        prep->hdr.timestamp_us = esp_timer_get_time();
+        prep->view      = r->node.view;
+        prep->seqno     = r->seqno;
+        prep->digest    = rset_digest;
+        prep->id        = r->node.node_id;
+
+        tbft_auth_t *auth2 = (tbft_auth_t *)(r->out_buf + sizeof(*prep));
+        prep->hdr.size = tbft_msg_align(
+            (int32_t)(sizeof(*prep) + sizeof(tbft_auth_t)));
+        tbft_node_gen_auth(&r->node, r->out_buf, sizeof(*prep), auth2);
+
+        tbft_ar_add_my_prepare(&r->ar, r->seqno, r->out_buf, prep->hdr.size,
+                               r->node.node_id);
+    }
 
     /* Mark this request ID as assigned to prevent duplicate seqno. */
     {
