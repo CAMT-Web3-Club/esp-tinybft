@@ -605,8 +605,11 @@ void tbft_replica_handle_pre_prepare(tbft_replica_t *r, const void *msg, int len
         }
         const tbft_auth_t *auth =
             (const tbft_auth_t *)((const uint8_t *)msg + auth_offset);
-        ESP_LOGD(TAG, "pp: verifying MAC from primary %d, slot=%d, ts=%lld, auth_offset=%d, msg_len=%d",
-                 expected_primary, slot, (long long)pp->hdr.timestamp_us, auth_offset, len);
+        ESP_LOGI(TAG, "pp: verifying MAC from primary %d, slot=%d, ts=%lld, auth_offset=%d, msg_len=%d, rset=%d, ndet=%d, hdr[0..7]=%02x%02x%02x%02x%02x%02x%02x%02x",
+                 expected_primary, slot, (long long)pp->hdr.timestamp_us, auth_offset, len,
+                 (int)pp->rset_size, (int)pp->non_det_size,
+                 ((uint8_t*)msg)[0], ((uint8_t*)msg)[1], ((uint8_t*)msg)[2], ((uint8_t*)msg)[3],
+                 ((uint8_t*)msg)[4], ((uint8_t*)msg)[5], ((uint8_t*)msg)[6], ((uint8_t*)msg)[7]);
         if (!tbft_node_verify_auth(&r->node, expected_primary, msg,
                                    (size_t)auth_offset,
                                    &auth->slots[slot],
@@ -1472,14 +1475,19 @@ void tbft_replica_send_pre_prepare(tbft_replica_t *r)
     /* Debug: log the key and auth offset used for each recipient */
     {
         int auth_off = (int)(ptr - r->out_buf);
+        ESP_LOGI(TAG, "send_pp: tag=%d extra=%d size=%d ts=%lld, hdr[0..7]=%02x%02x%02x%02x%02x%02x%02x%02x, auth_offset=%d",
+                 pp->hdr.tag, pp->hdr.extra, pp->hdr.size,
+                 (long long)pp->hdr.timestamp_us,
+                 r->out_buf[0], r->out_buf[1], r->out_buf[2], r->out_buf[3],
+                 r->out_buf[4], r->out_buf[5], r->out_buf[6], r->out_buf[7],
+                 auth_off);
         for (int i = 0; i < r->node.num_replicas; i++) {
             if (i == r->node.node_id) continue;
             tbft_principal_t *p = r->node.principals[i];
             if (p) {
-                ESP_LOGI(TAG, "send_pp: out_key for replica %d, key[0..3]=%02x%02x%02x%02x, auth_offset=%d",
+                ESP_LOGI(TAG, "send_pp: out_key for replica %d, key[0..3]=%02x%02x%02x%02x",
                          i, p->hmac_out_key.bytes[0], p->hmac_out_key.bytes[1],
-                         p->hmac_out_key.bytes[2], p->hmac_out_key.bytes[3],
-                         auth_off);
+                         p->hmac_out_key.bytes[2], p->hmac_out_key.bytes[3]);
             }
         }
     }
@@ -1487,11 +1495,16 @@ void tbft_replica_send_pre_prepare(tbft_replica_t *r)
     /* Authenticator */
     tbft_auth_t *auth = (tbft_auth_t *)ptr;
     int32_t msg_len_before_auth = (int32_t)(ptr - r->out_buf);
+
+    /* CRITICAL FIX: Set the message size BEFORE computing the HMAC.
+     * The header's size field is part of the message bytes covered by
+     * the MAC. If set after gen_auth, the sender signs size=0 but the
+     * receiver verifies with the actual size → MAC mismatch. */
+    pp->hdr.size = tbft_msg_align(msg_len_before_auth + (int32_t)sizeof(tbft_auth_t));
+
     tbft_node_gen_auth(&r->node, r->out_buf, (size_t)msg_len_before_auth,
                        auth);
     ptr += sizeof(tbft_auth_t);
-
-    pp->hdr.size = tbft_msg_align((int32_t)(ptr - r->out_buf));
 
     /* Store in agreement region */
     tbft_ar_store_pp(&r->ar, r->seqno, r->out_buf, pp->hdr.size);
