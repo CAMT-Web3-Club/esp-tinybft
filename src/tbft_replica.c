@@ -1551,9 +1551,9 @@ void tbft_replica_send_prepare(tbft_replica_t *r, tbft_seqno_t n)
     prep->id        = r->node.node_id;
 
     tbft_auth_t *auth = (tbft_auth_t *)(r->out_buf + sizeof(*prep));
-    tbft_node_gen_auth(&r->node, r->out_buf, sizeof(*prep), auth);
     prep->hdr.size = tbft_msg_align(
         (int32_t)(sizeof(*prep) + sizeof(tbft_auth_t)));
+    tbft_node_gen_auth(&r->node, r->out_buf, sizeof(*prep), auth);
 
     /* Store own prepare */
     tbft_ar_add_my_prepare(&r->ar, n, r->out_buf, prep->hdr.size,
@@ -1582,9 +1582,9 @@ void tbft_replica_send_commit(tbft_replica_t *r, tbft_seqno_t n)
     cm->id        = r->node.node_id;
 
     tbft_auth_t *auth = (tbft_auth_t *)(r->out_buf + sizeof(*cm));
-    tbft_node_gen_auth(&r->node, r->out_buf, sizeof(*cm), auth);
     cm->hdr.size = tbft_msg_align(
         (int32_t)(sizeof(*cm) + sizeof(tbft_auth_t)));
+    tbft_node_gen_auth(&r->node, r->out_buf, sizeof(*cm), auth);
 
     tbft_ar_add_my_commit(&r->ar, n, r->out_buf, cm->hdr.size,
                           r->node.node_id);
