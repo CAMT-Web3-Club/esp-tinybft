@@ -22,6 +22,10 @@ CONFIG_TBFT_MAX_REPLY_SIZE=900
 # Task WDT: 10s timeout for single-core ESP32-C3 where replica/send_task
 # context-switching can exceed the default 5s watchdog window.
 CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
+# Client blocks on reply for 10s+; IDLE task gets starved on single-core
+# because WiFi (prio 23) and send_task (prio 3) consume all CPU time.
+# Application tasks (client_task, replica_task) still feed their own WDT.
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=n
 CONFIG_TBFT_RQUEUE_MAX=4
 CONFIG_TBFT_NDET_BUF_SIZE=256
 CONFIG_TBFT_MAX_STATE_BLOCKS=8

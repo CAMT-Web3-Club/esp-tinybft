@@ -242,6 +242,9 @@ static void client_task(void *arg) {
         }
 
         Byz_free_request(&req);
+#if CONFIG_ESP_TASK_WDT_EN
+        esp_task_wdt_reset();
+#endif
         vTaskDelay(pdMS_TO_TICKS(30000));
     }
 }
