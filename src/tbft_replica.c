@@ -1138,12 +1138,17 @@ void tbft_replica_handle_new_view(tbft_replica_t *r, const void *msg, int len)
     r->node.view        = nv->v;
     r->node.cur_primary = tbft_node_primary(&r->node, nv->v);
 
-    /* HIGH FIX H1: Update sequence number state after view change.
-     * The new primary must start from the correct seqno to avoid conflicts
-     * with already-committed requests or gaps in the sequence. */
+    /* CRITICAL FIX: Reset seqno for ALL replicas, not just the new primary.
+     * During idle view-changes (no requests processed), seqno can drift
+     * past the window (e.g., seqno=9, last_stable=0, window=8). If only
+     * the primary resets seqno, non-primary replicas retain stale seqno
+     * values, causing out-of-window errors when they later become primary. */
+    r->seqno = nv->min + 1;
     if (tbft_replica_is_primary(r)) {
-        r->seqno = nv->min + 1;
-        ESP_LOGI(TAG, "new primary: seqno set to %lld", (long long)r->seqno);
+        ESP_LOGI(TAG, "new primary: seqno reset to %lld", (long long)r->seqno);
+    } else {
+        ESP_LOGD(TAG, "replica %d: seqno reset to %lld for view %lld",
+                 r->node.node_id, (long long)r->seqno, (long long)nv->v);
     }
 
     /* Process prepared proofs from New_view to recover unexecuted requests.
