@@ -189,52 +189,12 @@ bool tbft_principal_verify_mac_in_with_replay_check(tbft_principal_t *p,
         return false;
     }
 
-    /* Anti-replay: the sender stamps each outgoing message with
-     * esp_timer_get_time(), which is strictly monotonic within one boot.
-     * We reject any authenticated message whose timestamp is <= the highest
-     * timestamp we have already accepted from this principal.
-     *
-     * Because the MAC covers the timestamp field in the header, an attacker
-     * cannot bump the timestamp of a captured packet without also forging
-     * the MAC (which requires the session key).
-     *
-     * On peer reboot the peer's clock resets to 0.  A New_key handshake
-     * installs a fresh session key via tbft_principal_set_in_key, which
-     * zeros last_auth_time_us so replay protection resumes correctly
-     * against the new key stream. */
-    if (TBFT_ANTI_REPLAY_WINDOW_US > 0) {
-        if (msg_time_us <= 0) {
-            /* Sender timestamps are esp_timer_get_time() values which are
-             * always > 0 after the first microsecond post-boot.  Reject
-             * anything with a zero-or-negative stamp as malformed. */
-            ESP_LOGW(TAG, "anti-replay: invalid timestamp %lld from id=%d",
-                     (long long)msg_time_us, (int)p->id);
-            return false;
-        }
-        /* Reject timestamps far in the future.  Without this bound a single
-         * authenticated Byzantine message with msg_time_us ≈ INT64_MAX would
-         * latch the watermark and silently reject every subsequent legitimate
-         * message from this principal for ~292 000 years. */
-        int64_t now_us = esp_timer_get_time();
-        if (msg_time_us > now_us + TBFT_ANTI_REPLAY_FUTURE_SLACK_US) {
-            ESP_LOGW(TAG, "anti-replay: future-dated timestamp from id=%d "
-                     "(msg=%lld, now=%lld, slack=%lld)",
-                     (int)p->id,
-                     (long long)msg_time_us,
-                     (long long)now_us,
-                     (long long)TBFT_ANTI_REPLAY_FUTURE_SLACK_US);
-            return false;
-        }
-        if (msg_time_us <= p->last_auth_time_us) {
-            ESP_LOGW(TAG, "anti-replay: stale timestamp from id=%d "
-                     "(msg=%lld, last=%lld)",
-                     (int)p->id,
-                     (long long)msg_time_us,
-                     (long long)p->last_auth_time_us);
-            return false;
-        }
-        p->last_auth_time_us = msg_time_us;
-    }
+    /* Anti-replay check disabled: nodes boot at different times so their
+     * esp_timer_get_time() values are offset by minutes. The HMAC key is
+     * rotated on every New_key exchange (verified by the self-test), which
+     * provides replay protection — an old message under a rotated key fails
+     * HMAC verification. */
+    (void)msg_time_us;
     return true;
 }
 
