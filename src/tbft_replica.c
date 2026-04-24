@@ -927,7 +927,7 @@ void tbft_replica_handle_checkpoint(tbft_replica_t *r, const void *msg, int len)
 
     const tbft_msg_hdr_t *hdr = (const tbft_msg_hdr_t *)msg;
     const tbft_auth_t *auth = (const tbft_auth_t *)((const uint8_t *)msg + sizeof(*ckpt));
-    if (!tbft_node_verify_auth(&r->node, sender, msg, sizeof(*ckpt),
+    if (!tbft_node_verify_auth(&r->node, sender, msg, (size_t)hdr->size,
                                &auth->slots[slot], hdr->timestamp_us)) {
         ESP_LOGW(TAG, "checkpoint: MAC verification failed from %d", sender);
         return;
