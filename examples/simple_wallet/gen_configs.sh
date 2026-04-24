@@ -30,19 +30,16 @@ client4 127.0.0.1 5004 /spiffs/pub4.der
 EOF
 
 echo "Generating ESP-NOW config..."
-echo "NOTE: Replace MAC addresses below with your boards' real MACs."
-echo "      Run 'esptool -p /dev/ttyACMx flash_id' on each board to find its MAC."
-echo "      The config has 4 nodes (all replicas, no client entry)."
 cat <<EOF > spiffs_image/config_espnow.txt
 wallet
 1
 3000
 4
 0.0.0.0
-node0 88:56:a6:5b:f2:f0 /spiffs/pub0.der
-node1 1c:db:d4:c6:41:14 /spiffs/pub1.der
-node2 1c:db:d4:c5:7f:20 /spiffs/pub2.der
-node3 88:56:a6:5b:76:84 /spiffs/pub3.der
+node0 e8:3d:c1:8c:18:58 /spiffs/pub0.der
+node1 88:56:a6:5b:76:ac /spiffs/pub1.der
+node2 1c:db:d4:c6:41:14 /spiffs/pub2.der
+node3 88:56:a6:5b:7c:ac /spiffs/pub3.der
 2000
 5000
 10000
