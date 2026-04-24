@@ -1359,6 +1359,17 @@ void tbft_replica_send_pre_prepare(tbft_replica_t *r)
         if (keys_ok < r->node.threshold - 1) return;
     }
 
+    /* CRITICAL FIX: Wait for key exchange to settle before sending pre-prepares.
+     * The primary's keys_fresh means it received a peer's New_key, but the
+     * peer might not yet have received the primary's New_key (network asymmetry).
+     * Waiting 3s (>= one full 2s re-broadcast cycle) ensures peers have time
+     * to receive and decrypt the primary's key before pre-prepares arrive. */
+    {
+        TickType_t now = xTaskGetTickCount();
+        if (r->last_key_exchange_tick != 0 &&
+            now - r->last_key_exchange_tick < pdMS_TO_TICKS(3000)) return;
+    }
+
     /* Track which queue the request came from so we pop from the right one
      * after successfully building and broadcasting the Pre_prepare. */
     tbft_rqueue_t *src_queue = &r->rqueue;
@@ -1960,6 +1971,7 @@ void tbft_replica_handle_new_key(tbft_replica_t *r, const void *msg, int len)
         tbft_principal_t *p = r->node.principals[sender_id];
         if (p) {
             tbft_principal_set_in_key(p, &new_key);
+            r->last_key_exchange_tick = xTaskGetTickCount();
             ESP_LOGI(TAG, "installed HMAC in-key from replica %d", sender_id);
         }
 
