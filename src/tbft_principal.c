@@ -26,7 +26,7 @@
  * INT64_MAX, latching last_auth_time_us and silently rejecting every
  * subsequent legitimate message as "stale". */
 #ifndef TBFT_ANTI_REPLAY_FUTURE_SLACK_US
-#define TBFT_ANTI_REPLAY_FUTURE_SLACK_US  ((int64_t)60 * 1000 * 1000) /* 60 s */
+#define TBFT_ANTI_REPLAY_FUTURE_SLACK_US  ((int64_t)300 * 1000 * 1000) /* 5 min: allow for staggered boot */
 #endif
 
 static const char *TAG = "tbft_principal";
