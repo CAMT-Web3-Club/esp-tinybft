@@ -1401,7 +1401,16 @@ void tbft_replica_send_pre_prepare(tbft_replica_t *r)
         src_queue = &r->ro_rqueue;
         req = rqueue_front(src_queue);
     }
-    if (!req) return;
+    if (!req) {
+        /* No pending requests — stop the view-change timer so it doesn't
+         * fire during idle periods.  The client sends every ~30s, so a 5s
+         * timer would constantly trigger spurious view-changes. */
+        tbft_itimer_stop(&r->vtimer);
+        return;
+    }
+
+    /* Restart the vtimer now that we're actively working on a request. */
+    tbft_itimer_start(&r->vtimer, r->vtimer_period_us);
 
     /* CRITICAL FIX: Dedup by request ID.  The same request can arrive
      * multiple times: once from the client's broadcast, then forwarded
