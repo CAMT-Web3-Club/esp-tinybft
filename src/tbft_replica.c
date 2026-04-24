@@ -1355,6 +1355,30 @@ void tbft_replica_send_pre_prepare(tbft_replica_t *r)
     }
     if (!req) return;
 
+    /* CRITICAL FIX: Dedup by request ID.  The same request can arrive
+     * multiple times: once from the client's broadcast, then forwarded
+     * by each non-primary replica.  Without dedup here, the primary
+     * would assign a different seqno to each duplicate, rapidly draining
+     * the sequence window and preventing consensus. */
+    {
+        const tbft_request_rep_t *rr = (const tbft_request_rep_t *)req->buf;
+        if (rr->rid == r->last_assigned_rid) {
+            /* Already assigned a seqno for this request — drop duplicate. */
+            rqueue_pop(src_queue);
+            /* Check the other queue too */
+            tbft_rqueue_entry_t *next_req = rqueue_front(src_queue);
+            if (!next_req) {
+                src_queue = (src_queue == &r->rqueue) ? &r->ro_rqueue : &r->rqueue;
+                next_req = rqueue_front(src_queue);
+            }
+            if (!next_req) return;
+            src_queue = (src_queue == &r->rqueue) ? &r->ro_rqueue : &r->rqueue;
+            const tbft_request_rep_t *rr2 = (const tbft_request_rep_t *)next_req->buf;
+            if (rr2->rid == r->last_assigned_rid) return;  /* all dups */
+            req = next_req;
+        }
+    }
+
     /* Check window */
     if (!tbft_replica_in_window(r, r->seqno)) {
         ESP_LOGW(TAG, "pre-prepare: seqno=%lld out of window (last_stable=%lld, window=%d)",
@@ -1428,6 +1452,12 @@ void tbft_replica_send_pre_prepare(tbft_replica_t *r)
     ESP_LOGI(TAG, "sent pre-prepare seqno=%lld view=%lld (rset=%d, ndet=%d, total=%d)",
              (long long)r->seqno, (long long)r->node.view,
              req->len, ndet_len, pp->hdr.size);
+
+    /* Mark this request ID as assigned to prevent duplicate seqno. */
+    {
+        const tbft_request_rep_t *rr_final = (const tbft_request_rep_t *)req->buf;
+        r->last_assigned_rid = rr_final->rid;
+    }
 
     rqueue_pop(src_queue);
     r->seqno++;
