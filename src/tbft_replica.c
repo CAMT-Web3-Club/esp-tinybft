@@ -669,9 +669,12 @@ void tbft_replica_handle_pre_prepare(tbft_replica_t *r, const void *msg, int len
             return;
         }
         size_t sig_off = sizeof(tbft_request_rep_t) + (size_t)ereq->command_size;
-        /* The embedded request must fit exactly: hdr+rep+cmd+sig == rset_size.
-         * Anything larger means the primary packed untrusted trailing data. */
-        if (sig_off + sizeof(tbft_sig_t) != (size_t)pp->rset_size) {
+        /* The embedded request must fit within rset_size: hdr+rep+cmd+sig
+         * ≤ rset_size.  The client aligns messages to 8 bytes with zero
+         * padding, so rset_size may be slightly larger than the exact
+         * data size.  Allow up to 7 bytes of alignment padding. */
+        if (sig_off + sizeof(tbft_sig_t) > (size_t)pp->rset_size ||
+            (size_t)pp->rset_size - sig_off - sizeof(tbft_sig_t) > 7) {
             ESP_LOGW(TAG, "pp: embedded request size mismatch (sig_off=%zu, rset=%d)",
                      sig_off, (int)pp->rset_size);
             return;
