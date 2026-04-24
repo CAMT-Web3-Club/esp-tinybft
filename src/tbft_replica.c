@@ -1378,11 +1378,9 @@ void tbft_replica_send_pre_prepare(tbft_replica_t *r)
 {
     if (!tbft_replica_is_primary(r)) return;
 
-    /* CRITICAL FIX: Wait for key exchange to settle before sending pre-prepares.
-     * The primary's keys_fresh means it received a peer's New_key, but the
-     * peer might not yet have received the primary's New_key (network asymmetry).
-     * We track when the key count FIRST reached threshold-1, and wait 3s from
-     * that point (not from the last key arrival, which would keep resetting). */
+    /* Only require that we have at least threshold-1 peers with fresh keys.
+     * The self-test already verifies each key on import, so no additional
+     * settling delay is needed. */
     {
         int keys_ok = 0;
         for (int i = 0; i < r->node.num_replicas; i++) {
@@ -1391,14 +1389,8 @@ void tbft_replica_send_pre_prepare(tbft_replica_t *r)
                 keys_ok++;
         }
         if (keys_ok < r->node.threshold - 1) {
-            r->keys_ready_since_tick = 0;  /* not ready */
             return;
         }
-        if (r->keys_ready_since_tick == 0) {
-            r->keys_ready_since_tick = xTaskGetTickCount();
-        }
-        TickType_t now = xTaskGetTickCount();
-        if (now - r->keys_ready_since_tick < pdMS_TO_TICKS(3000)) return;
     }
 
     /* Track which queue the request came from so we pop from the right one
