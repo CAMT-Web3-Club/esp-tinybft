@@ -13,6 +13,7 @@
 #include "esp_log.h"
 #include "esp_spiffs.h"
 #include "esp_timer.h"
+#include "esp_task_wdt.h"
 #if CONFIG_TBFT_TRANSPORT_UDP
 #include "lwip/inet.h"
 #include "esp_netif.h"
@@ -556,6 +557,9 @@ int Byz_recv_reply(Byz_rep *rep)
         int n = tbft_node_recv(s_client, buf, sizeof(buf), NULL);
         if (n < (int)sizeof(tbft_reply_rep_t)) {
             vTaskDelay(pdMS_TO_TICKS(1));
+#if CONFIG_ESP_TASK_WDT_EN
+            esp_task_wdt_reset();
+#endif
             continue;
         }
 

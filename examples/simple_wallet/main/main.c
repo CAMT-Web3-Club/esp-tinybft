@@ -10,6 +10,7 @@
 #include "esp_wifi.h"
 #include "esp_now.h"
 #include "esp-tinybft.h"
+#include "esp_task_wdt.h"
 
 #if CONFIG_TBFT_TRANSPORT_UDP
 #include "esp_event.h"
@@ -207,7 +208,14 @@ static void client_task(void *arg) {
 
     ESP_LOGI(TAG, "Client running...");
 
+#if CONFIG_ESP_TASK_WDT_EN
+    esp_task_wdt_add(NULL);
+#endif
+
     while(1) {
+#if CONFIG_ESP_TASK_WDT_EN
+        esp_task_wdt_reset();
+#endif
         Byz_req req;
         Byz_rep rep;
         if (Byz_alloc_request(&req, sizeof(wallet_req_t)) != 0) {
