@@ -61,7 +61,7 @@ typedef struct {
     /* Sequence number state */
     tbft_seqno_t  seqno;                  /* next seqno to assign (primary) */
     tbft_req_id_t last_assigned_rid;      /* last rid assigned a seqno (dedup) */
-    TickType_t    last_key_exchange_tick; /* when last HMAC key was installed */
+    TickType_t    keys_ready_since_tick;  /* when key count first hit threshold-1 */
     tbft_seqno_t  last_stable;            /* last stable checkpoint seqno */
     tbft_seqno_t  last_prepared;          /* highest prepared seqno */
     tbft_seqno_t  last_executed;          /* highest committed + executed */

@@ -1345,10 +1345,11 @@ void tbft_replica_send_pre_prepare(tbft_replica_t *r)
 {
     if (!tbft_replica_is_primary(r)) return;
 
-    /* CRITICAL FIX: Ensure enough peers have our HMAC out-key before sending
-     * pre-prepares.  Without this, the primary sends pre-prepares that
-     * backups reject with MAC verification failure because they haven't
-     * received the primary's key yet. */
+    /* CRITICAL FIX: Wait for key exchange to settle before sending pre-prepares.
+     * The primary's keys_fresh means it received a peer's New_key, but the
+     * peer might not yet have received the primary's New_key (network asymmetry).
+     * We track when the key count FIRST reached threshold-1, and wait 3s from
+     * that point (not from the last key arrival, which would keep resetting). */
     {
         int keys_ok = 0;
         for (int i = 0; i < r->node.num_replicas; i++) {
@@ -1356,18 +1357,15 @@ void tbft_replica_send_pre_prepare(tbft_replica_t *r)
             if (r->node.principals[i] && r->node.principals[i]->keys_fresh)
                 keys_ok++;
         }
-        if (keys_ok < r->node.threshold - 1) return;
-    }
-
-    /* CRITICAL FIX: Wait for key exchange to settle before sending pre-prepares.
-     * The primary's keys_fresh means it received a peer's New_key, but the
-     * peer might not yet have received the primary's New_key (network asymmetry).
-     * Waiting 3s (>= one full 2s re-broadcast cycle) ensures peers have time
-     * to receive and decrypt the primary's key before pre-prepares arrive. */
-    {
+        if (keys_ok < r->node.threshold - 1) {
+            r->keys_ready_since_tick = 0;  /* not ready */
+            return;
+        }
+        if (r->keys_ready_since_tick == 0) {
+            r->keys_ready_since_tick = xTaskGetTickCount();
+        }
         TickType_t now = xTaskGetTickCount();
-        if (r->last_key_exchange_tick != 0 &&
-            now - r->last_key_exchange_tick < pdMS_TO_TICKS(3000)) return;
+        if (now - r->keys_ready_since_tick < pdMS_TO_TICKS(3000)) return;
     }
 
     /* Track which queue the request came from so we pop from the right one
@@ -1971,7 +1969,6 @@ void tbft_replica_handle_new_key(tbft_replica_t *r, const void *msg, int len)
         tbft_principal_t *p = r->node.principals[sender_id];
         if (p) {
             tbft_principal_set_in_key(p, &new_key);
-            r->last_key_exchange_tick = xTaskGetTickCount();
             ESP_LOGI(TAG, "installed HMAC in-key from replica %d", sender_id);
         }
 
