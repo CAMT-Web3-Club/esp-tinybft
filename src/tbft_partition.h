@@ -100,8 +100,9 @@ void tbft_ptree_free(tbft_ptree_t *tree);
 /**
  * Update the digest for leaf @p block_idx using the new block digest.
  * Propagates changes up the tree (stree then ptree).
+ * @return 0 on success, -1 on hash or validation failure
  */
-void tbft_ptree_update_leaf(tbft_ptree_t *tree, int block_idx,
+int tbft_ptree_update_leaf(tbft_ptree_t *tree, int block_idx,
                             const tbft_digest_t *block_digest,
                             tbft_seqno_t version);
 

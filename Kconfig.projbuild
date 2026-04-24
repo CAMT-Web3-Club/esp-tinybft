@@ -9,9 +9,10 @@ menu "TinyBFT Configuration"
 
     config TBFT_MAX_REPLY_SIZE
         int "Maximum reply payload size (bytes)"
-        default 1240
+        default 1136
         help
             Maximum reply payload size. Must be less than TBFT_MAX_MESSAGE_SIZE.
+            Default is 1136 = 1440 (MAX_MESSAGE_SIZE) - 48 (reply header) - 256 (RSA sig).
 
     config TBFT_BLOCK_SIZE
         int "State block size (bytes)"

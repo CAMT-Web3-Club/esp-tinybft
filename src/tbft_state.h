@@ -3,6 +3,7 @@
 #include "tbft_types.h"
 #include "tbft_message.h"
 #include "tbft_partition.h"
+#include "esp_timer.h"
 #include <stdbool.h>
 
 /* --------------------------------------------------------------------------
@@ -66,6 +67,7 @@ typedef struct {
     int               fetch_queue_len;
     int               n_data_pending; /* number of leaf requests dispatched but not fulfilled */
     int64_t           fetch_timeout_us;
+    int64_t           fetch_start_time_us;
     int               fetch_replier;  /* replica id we're fetching from */
     tbft_bitmap_t     fetch_received[(TBFT_MAX_STATE_BLOCKS + 63) / 64]; /* blocks already received */
 
@@ -171,6 +173,16 @@ void tbft_state_handle_data(tbft_state_t *state,
 static inline bool tbft_state_in_fetch(const tbft_state_t *state)
 {
     return state->in_fetch;
+}
+
+/**
+ * Check if the current fetch has timed out.
+ * @return true if fetch has exceeded timeout
+ */
+static inline bool tbft_state_fetch_timedout(const tbft_state_t *state)
+{
+    return state->in_fetch &&
+           (esp_timer_get_time() - state->fetch_start_time_us) > state->fetch_timeout_us;
 }
 
 /**

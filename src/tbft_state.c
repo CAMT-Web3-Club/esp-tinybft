@@ -203,8 +203,12 @@ void tbft_state_checkpoint(tbft_state_t *state, tbft_seqno_t seqno)
 
         const uint8_t *block = state->mem + (size_t)i * TBFT_BLOCK_SIZE;
         tbft_msg_digest(block, TBFT_BLOCK_SIZE, &state->block_digests[i]);
-        tbft_ptree_update_leaf(&state->ptree, i, &state->block_digests[i],
-                               seqno);
+        if (tbft_ptree_update_leaf(&state->ptree, i, &state->block_digests[i],
+                                   seqno) != 0) {
+            ESP_LOGW(TAG, "checkpoint: failed to update leaf %d at seqno=%lld",
+                     i, (long long)seqno);
+            /* Continue — other leaves may succeed */
+        }
     }
 
     /* CRITICAL FIX: Do NOT free old_blocks here. The CoW-saved blocks
@@ -246,9 +250,12 @@ tbft_seqno_t tbft_state_rollback(tbft_state_t *state)
         /* Rebuild leaf digest */
         tbft_msg_digest(state->mem + (size_t)bidx * TBFT_BLOCK_SIZE,
                         TBFT_BLOCK_SIZE, &state->block_digests[bidx]);
-        tbft_ptree_update_leaf(&state->ptree, bidx,
-                               &state->block_digests[bidx],
-                               rec->seqno);
+        if (tbft_ptree_update_leaf(&state->ptree, bidx,
+                                   &state->block_digests[bidx],
+                                   rec->seqno) != 0) {
+            ESP_LOGW(TAG, "rollback: failed to rebuild leaf %d at seqno=%lld",
+                     bidx, (long long)rec->seqno);
+        }
     }
 
     cow_zero(state);
@@ -272,11 +279,12 @@ void tbft_state_mark_stable(tbft_state_t *state, tbft_seqno_t stable_seqno)
             /* Note: old_blocks is pre-allocated in init, so we don't free
              * the array itself, just reset the count. */
             new_rec->num_old_blocks = 0;
+            /* M11 FIX: Clear stale data in reused checkpoint slot to prevent
+             * wasted memory and potential confusion during debugging.
+             * Moved inside the NULL guard to prevent crash on OOM. */
+            memset(new_rec->old_blocks, 0,
+                   (size_t)state->num_blocks * sizeof(tbft_cow_entry_t));
         }
-        /* M11 FIX: Clear stale data in reused checkpoint slot to prevent
-         * wasted memory and potential confusion during debugging. */
-        memset(new_rec->old_blocks, 0,
-               (size_t)state->num_blocks * sizeof(tbft_cow_entry_t));
     }
 
     state->last_stable = stable_seqno;
@@ -295,6 +303,7 @@ void tbft_state_start_fetch(tbft_state_t *state, tbft_seqno_t seqno,
     state->fetch_queue_len  = 0;
     state->n_data_pending   = 0;
     state->fetch_timeout_us = 100000; /* 100 ms */
+    state->fetch_start_time_us = esp_timer_get_time();
     fetch_received_zero(state);
 
     /* When the partition tree has only one level (all nodes are leaves,
@@ -420,7 +429,10 @@ void tbft_state_handle_data(tbft_state_t *state,
     memcpy(state->mem + (size_t)bidx * TBFT_BLOCK_SIZE,
            block_data, TBFT_BLOCK_SIZE);
     state->block_digests[bidx] = computed;
-    tbft_ptree_update_leaf(&state->ptree, bidx, &computed, rep->seqno);
+    if (tbft_ptree_update_leaf(&state->ptree, bidx, &computed, rep->seqno) != 0) {
+        ESP_LOGW(TAG, "handle_data: failed to update leaf %d", bidx);
+        /* Block was written — continue with best-effort tree state */
+    }
 
     /* Mark received so retransmits don't double-decrement */
     fetch_received_set(state, bidx);

@@ -325,7 +325,14 @@ static int setup_principals(tbft_node_t *node, const tbft_config_t *cfg,
         }
 #else
         /* UDP: use IP + port */
-        tbft_addr_udp_ip(addr)   = inet_addr(cfg->nodes[i].ip);
+        struct in_addr parsed_ip;
+        if (inet_pton(AF_INET, cfg->nodes[i].ip, &parsed_ip) != 1) {
+            ESP_LOGE(TAG, "invalid IP for node %d: %s", i, cfg->nodes[i].ip);
+            tbft_principal_free(p);
+            free(p);
+            return -1;
+        }
+        tbft_addr_udp_ip(addr) = parsed_ip.s_addr;
         tbft_addr_udp_port(addr) = htons(cfg->nodes[i].port);
 #endif
 
@@ -524,6 +531,12 @@ int Byz_send_request(Byz_req *req, bool read_only)
      * primary (based on the client's stale view) is fragile: if the
      * cluster has advanced to a different view, the client's primary
      * may no longer be the real primary. */
+    /* Zero padding bytes between end of message and aligned size to prevent
+     * stack content leakage over the network. */
+    if ((size_t)rep->hdr.size > (size_t)total) {
+        memset(out + total, 0, (size_t)(rep->hdr.size - total));
+    }
+
     return tbft_node_send(s_client, out, (size_t)rep->hdr.size,
                           TBFT_ALL_REPLICAS) > 0 ? 0 : -1;
 }
@@ -817,9 +830,21 @@ int Byz_init_replica(const char *config_file, const char *priv_config,
 
 void Byz_modify(void *mem, int size)
 {
-    if (s_replica) {
-        tbft_state_cow(&s_replica->state, mem, (size_t)size);
+    if (!s_replica || !mem || size <= 0) return;
+
+    uintptr_t base  = (uintptr_t)s_replica->state.mem;
+    uintptr_t addr  = (uintptr_t)mem;
+    size_t    sz    = (size_t)size;
+
+    /* Overflow-safe bounds check: addr >= base && sz <= remaining space */
+    if (addr < base || sz > s_replica->state.mem_size ||
+        (addr - base) > s_replica->state.mem_size - sz) {
+        ESP_LOGW(TAG, "Byz_modify: address range [%p, +%zu) out of state bounds [%p, %zu)",
+                 mem, sz, (void *)base, s_replica->state.mem_size);
+        return;
     }
+
+    tbft_state_cow(&s_replica->state, mem, sz);
 }
 
 void Byz_modify1(void *mem)

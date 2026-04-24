@@ -295,6 +295,11 @@ int tbft_principal_sign(tbft_principal_t *p,
                               sig->bytes, TBFT_SIG_SIZE, &sig_len);
     if (ret != 0) {
         ESP_LOGE(TAG, "pk_sign failed: -0x%04x", (unsigned)(-ret));
+        return ret;
+    }
+    /* Zero trailing bytes if signature is shorter than expected */
+    if (sig_len < TBFT_SIG_SIZE) {
+        memset(sig->bytes + sig_len, 0, TBFT_SIG_SIZE - sig_len);
     }
     return ret;
 }

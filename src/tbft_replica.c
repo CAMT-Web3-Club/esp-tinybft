@@ -346,6 +346,18 @@ void tbft_replica_run(tbft_replica_t *r)
             }
         }
 
+        /* Check for fetch timeout — retry with different replier */
+        if (tbft_state_in_fetch(&r->state) && tbft_state_fetch_timedout(&r->state)) {
+            ESP_LOGW(TAG, "fetch timeout at seqno=%lld — restarting",
+                     (long long)r->state.fetch_seqno);
+            /* Pick a different replier */
+            int new_replier = (r->state.fetch_replier + 1) % r->node.num_replicas;
+            if (new_replier == r->node.node_id) {
+                new_replier = (new_replier + 1) % r->node.num_replicas;
+            }
+            tbft_state_start_fetch(&r->state, r->state.fetch_seqno, new_replier);
+        }
+
         tbft_node_id_t src_id = -1;
         int n = tbft_node_recv(&r->node, r->node.recv_buf, sizeof(r->node.recv_buf), &src_id);
         if (n < 0) {
@@ -592,6 +604,14 @@ void tbft_replica_handle_pre_prepare(tbft_replica_t *r, const void *msg, int len
         }
     }
 
+    /* Reject empty request sets.  A zero rset_size would bypass the
+     * digest and client-signature re-verification below, allowing a
+     * Byzantine primary to inject a pre-prepare with no actual request. */
+    if (pp->rset_size == 0) {
+        ESP_LOGW(TAG, "pp: empty request set (rset_size=0) rejected");
+        return;
+    }
+
     /* Verify request set digest */
     if (pp->rset_size > 0) {
         const uint8_t *req_set = (const uint8_t *)msg + sizeof(*pp);
@@ -808,14 +828,19 @@ void tbft_replica_handle_commit(tbft_replica_t *r, const void *msg, int len)
     {
         int pp_len = 0;
         const uint8_t *pp_bytes = tbft_ar_load_pp(&r->ar, cm->seqno, &pp_len);
-        if (pp_bytes && pp_len >= (int)sizeof(tbft_pre_prepare_rep_t)) {
-            const tbft_pre_prepare_rep_t *pp =
-                (const tbft_pre_prepare_rep_t *)pp_bytes;
-            if (!tbft_digest_equal(&pp->digest, &cm->digest)) {
-                ESP_LOGW(TAG, "commit: digest mismatch from %d seqno=%lld",
-                         sender, (long long)cm->seqno);
-                return;
-            }
+        if (!pp_bytes || pp_len < (int)sizeof(tbft_pre_prepare_rep_t)) {
+            /* Pre-prepare hasn't arrived yet — defer this commit.
+             * A valid commit must reference a pre-prepared value. */
+            ESP_LOGW(TAG, "commit: no pre-prepare for seqno=%lld from %d — deferring",
+                     (long long)cm->seqno, sender);
+            return;
+        }
+        const tbft_pre_prepare_rep_t *pp =
+            (const tbft_pre_prepare_rep_t *)pp_bytes;
+        if (!tbft_digest_equal(&pp->digest, &cm->digest)) {
+            ESP_LOGW(TAG, "commit: digest mismatch from %d seqno=%lld",
+                     sender, (long long)cm->seqno);
+            return;
         }
     }
 
@@ -1023,7 +1048,7 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
             if (counts[k].count >= r->node.threshold) {
                 tbft_vc_req_info_t *proof = (tbft_vc_req_info_t *)body_ptr;
                 proof->seqno = counts[k].seqno;
-                proof->last_view = r->node.view - 1;
+                proof->last_view = r->node.view > 0 ? (r->node.view - 1) : 0;
                 proof->digest = counts[k].digest;
                 body_ptr += sizeof(tbft_vc_req_info_t);
                 n_proofs++;
@@ -1103,6 +1128,12 @@ void tbft_replica_handle_new_view(tbft_replica_t *r, const void *msg, int len)
         return;
     }
 
+    /* Validate n_prep bounds before processing prepared proofs. */
+    if (nv->n_prep < 0 || nv->n_prep > TBFT_WINDOW_SIZE) {
+        ESP_LOGW(TAG, "new-view: invalid n_prep=%d", nv->n_prep);
+        return;
+    }
+
     /* Install new view */
     r->node.view        = nv->v;
     r->node.cur_primary = tbft_node_primary(&r->node, nv->v);
@@ -1113,6 +1144,31 @@ void tbft_replica_handle_new_view(tbft_replica_t *r, const void *msg, int len)
     if (tbft_replica_is_primary(r)) {
         r->seqno = nv->min + 1;
         ESP_LOGI(TAG, "new primary: seqno set to %lld", (long long)r->seqno);
+    }
+
+    /* Process prepared proofs from New_view to recover unexecuted requests.
+     * PBFT requires the new primary to prove which requests were prepared
+     * in the previous view. We log the proofs for observability; the new
+     * primary will re-send pre-prepares for unexecuted seqnos via normal
+     * operation once it starts. */
+    if (nv->n_prep > 0) {
+        const uint8_t *proofs = (const uint8_t *)msg + sizeof(*nv);
+        int n_prep = nv->n_prep;
+        size_t proofs_size = (size_t)n_prep * sizeof(tbft_vc_req_info_t);
+        if ((size_t)len < sizeof(*nv) + proofs_size) {
+            ESP_LOGW(TAG, "new-view: message too short for n_prep=%d (len=%d)", n_prep, len);
+            return;
+        }
+        for (int p = 0; p < n_prep; p++) {
+            const tbft_vc_req_info_t *proof =
+                (const tbft_vc_req_info_t *)(proofs + p * sizeof(tbft_vc_req_info_t));
+            if (proof->seqno > r->last_executed &&
+                proof->seqno <= nv->max) {
+                ESP_LOGI(TAG, "new-view: prepared seqno=%lld digest=[...%02x] from view %lld",
+                         (long long)proof->seqno, proof->digest.bytes[0],
+                         (long long)proof->last_view);
+            }
+        }
     }
 
     /* Stop view-change timer and restart it */
@@ -1458,10 +1514,10 @@ void tbft_replica_execute_committed(tbft_replica_t *r)
             int      rep_len        = 0;
             bool     ro = (req_rep->hdr.extra & TBFT_REQUEST_RO_FLAG) != 0;
 
-            /* Ensure enough room: hdr + payload + sig */
-            if (sizeof(*reply) + TBFT_MAX_REPLY_SIZE + TBFT_SIG_SIZE
-                    > sizeof(r->out_buf)) {
-                ESP_LOGE(TAG, "out_buf too small for reply");
+            /* Ensure enough room: hdr + actual payload + sig */
+            if (sizeof(*reply) + (size_t)rep_len + TBFT_SIG_SIZE > sizeof(r->out_buf)) {
+                ESP_LOGE(TAG, "reply too large for out_buf (%d + %d + %d > %zu)",
+                         (int)sizeof(*reply), rep_len, (int)TBFT_SIG_SIZE, sizeof(r->out_buf));
                 break;
             }
 
@@ -1490,7 +1546,14 @@ void tbft_replica_execute_committed(tbft_replica_t *r)
                     if (tbft_node_gen_sig(&r->node, r->out_buf,
                                           (size_t)reply->hdr.size, sig) == 0) {
                         total = reply->hdr.size + (int32_t)sizeof(tbft_sig_t);
+                    } else {
+                        ESP_LOGE(TAG, "reply signing failed for seqno=%lld — dropping reply",
+                                 (long long)n);
+                        break;
                     }
+                } else {
+                    ESP_LOGE(TAG, "reply exceeds buffer after signing — dropping");
+                    break;
                 }
 
                 ESP_LOGI(TAG, "sending reply: cid=%d rid=%llu seqno=%lld size=%d",

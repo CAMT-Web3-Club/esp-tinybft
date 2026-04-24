@@ -87,7 +87,7 @@ void tbft_ptree_free(tbft_ptree_t *tree)
     memset(tree, 0, sizeof(*tree));
 }
 
-void tbft_ptree_update_leaf(tbft_ptree_t *tree, int block_idx,
+int tbft_ptree_update_leaf(tbft_ptree_t *tree, int block_idx,
                             const tbft_digest_t *block_digest,
                             tbft_seqno_t version)
 {
@@ -101,11 +101,11 @@ void tbft_ptree_update_leaf(tbft_ptree_t *tree, int block_idx,
     if (block_idx < 0 || block_idx >= tree->dims.num_blocks) {
         ESP_LOGE(TAG, "update_leaf: block_idx %d out of range [0, %d)",
                  block_idx, tree->dims.num_blocks);
-        return;
+        return -1;
     }
     if (leaf_level < 0 || leaf_level >= TBFT_P_LEVELS) {
         ESP_LOGE(TAG, "update_leaf: invalid leaf_level %d", leaf_level);
-        return;
+        return -1;
     }
 
     /* Update the leaf */
@@ -131,7 +131,7 @@ void tbft_ptree_update_leaf(tbft_ptree_t *tree, int block_idx,
         if (pst != PSA_SUCCESS) {
             ESP_LOGE(TAG, "psa_hash_setup failed: %d", (int)pst);
             psa_hash_abort(&hash_op);
-            return; /* HIGH FIX H5: Abort on hash failure — don't corrupt tree */
+            return -1; /* HIGH FIX H5: Abort on hash failure — don't corrupt tree */
         }
 
         for (int c = first_child;
@@ -148,10 +148,11 @@ void tbft_ptree_update_leaf(tbft_ptree_t *tree, int block_idx,
         if (fin != PSA_SUCCESS) {
             ESP_LOGE(TAG, "psa_hash_finish failed: %d", (int)fin);
             psa_hash_abort(&hash_op);
-            return; /* HIGH FIX H5: Abort on hash failure — don't corrupt tree */
+            return -1; /* HIGH FIX H5: Abort on hash failure — don't corrupt tree */
         }
 
         parent->version = version;
         idx = parent_idx;
     }
+    return 0;
 }
