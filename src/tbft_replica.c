@@ -546,11 +546,22 @@ void tbft_replica_handle_pre_prepare(tbft_replica_t *r, const void *msg, int len
     }
     const tbft_pre_prepare_rep_t *pp = (const tbft_pre_prepare_rep_t *)msg;
 
-    /* Reject if wrong view */
+    /* Reject if wrong view — but advance if the pre-prepare is from a
+     * higher view (primary is ahead of this replica). */
     if (pp->view != r->node.view) {
-        ESP_LOGW(TAG, "pp: wrong view (got=%lld, expected=%lld)",
-                 (long long)pp->view, (long long)r->node.view);
-        return;
+        if (pp->view > r->node.view) {
+            ESP_LOGI(TAG, "pp: advancing view from %lld to %lld (primary is ahead)",
+                     (long long)r->node.view, (long long)pp->view);
+            r->node.view = pp->view;
+            r->seqno = 1;
+            r->last_stable = 0;
+            r->last_prepared = 0;
+            r->last_executed = 0;
+        } else {
+            ESP_LOGW(TAG, "pp: wrong view (got=%lld, expected=%lld)",
+                     (long long)pp->view, (long long)r->node.view);
+            return;
+        }
     }
 
     /* Must come from current primary */
@@ -594,6 +605,8 @@ void tbft_replica_handle_pre_prepare(tbft_replica_t *r, const void *msg, int len
         }
         const tbft_auth_t *auth =
             (const tbft_auth_t *)((const uint8_t *)msg + auth_offset);
+        ESP_LOGD(TAG, "pp: verifying MAC from primary %d, slot=%d, ts=%lld, auth_offset=%d, msg_len=%d",
+                 expected_primary, slot, (long long)pp->hdr.timestamp_us, auth_offset, len);
         if (!tbft_node_verify_auth(&r->node, expected_primary, msg,
                                    (size_t)auth_offset,
                                    &auth->slots[slot],
@@ -1456,6 +1469,21 @@ void tbft_replica_send_pre_prepare(tbft_replica_t *r)
     memcpy(ptr, r->ndet_buf, (size_t)ndet_len);
     ptr += ndet_len;
 
+    /* Debug: log the key and auth offset used for each recipient */
+    {
+        int auth_off = (int)(ptr - r->out_buf);
+        for (int i = 0; i < r->node.num_replicas; i++) {
+            if (i == r->node.node_id) continue;
+            tbft_principal_t *p = r->node.principals[i];
+            if (p) {
+                ESP_LOGI(TAG, "send_pp: out_key for replica %d, key[0..3]=%02x%02x%02x%02x, auth_offset=%d",
+                         i, p->hmac_out_key.bytes[0], p->hmac_out_key.bytes[1],
+                         p->hmac_out_key.bytes[2], p->hmac_out_key.bytes[3],
+                         auth_off);
+            }
+        }
+    }
+
     /* Authenticator */
     tbft_auth_t *auth = (tbft_auth_t *)ptr;
     int32_t msg_len_before_auth = (int32_t)(ptr - r->out_buf);
@@ -1880,6 +1908,7 @@ void tbft_replica_send_new_key(tbft_replica_t *r)
 
         /* Store locally as the out-key for messages we send TO replica i */
         tbft_principal_set_out_key(p, &new_key);
+        ESP_LOGI(TAG, "send_new_key: set out_key for replica %d (new=%d)", i, need_new_key);
 
         /* Encrypt the key under replica i's RSA public key */
         size_t enc_len = 0;
@@ -1984,6 +2013,9 @@ void tbft_replica_handle_new_key(tbft_replica_t *r, const void *msg, int len)
         /* Install as the in-key for verifying messages FROM sender_id */
         tbft_principal_t *p = r->node.principals[sender_id];
         if (p) {
+            ESP_LOGI(TAG, "handle_new_key: from replica %d, decrypted key[0..3]=%02x%02x%02x%02x",
+                     sender_id, new_key.bytes[0], new_key.bytes[1],
+                     new_key.bytes[2], new_key.bytes[3]);
             tbft_principal_set_in_key(p, &new_key);
             ESP_LOGI(TAG, "installed HMAC in-key from replica %d", sender_id);
         }

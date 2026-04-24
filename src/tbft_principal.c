@@ -179,7 +179,13 @@ bool tbft_principal_verify_mac_in_with_replay_check(tbft_principal_t *p,
                                                      const tbft_mac_t *mac,
                                                      int64_t msg_time_us)
 {
-    if (!tbft_principal_verify_mac_in(p, msg, msg_len, mac)) {
+    bool mac_ok = tbft_principal_verify_mac_in(p, msg, msg_len, mac);
+    if (!mac_ok) {
+        ESP_LOGW(TAG, "verify_mac_in: FAILED for id=%d (in_key set=%d, in_key[0..3]=%02x%02x%02x%02x, msg_len=%zu, mac[0..3]=%02x%02x%02x%02x)",
+                 (int)p->id, p->psa_hmac_in_id != 0,
+                 p->hmac_in_key.bytes[0], p->hmac_in_key.bytes[1],
+                 p->hmac_in_key.bytes[2], p->hmac_in_key.bytes[3],
+                 msg_len, mac->bytes[0], mac->bytes[1], mac->bytes[2], mac->bytes[3]);
         return false;
     }
 
@@ -241,6 +247,38 @@ void tbft_principal_set_in_key(tbft_principal_t *p, const tbft_hmac_key_t *key)
     }
     p->hmac_in_key = *key;
     p->psa_hmac_in_id = import_hmac_key(key, PSA_KEY_USAGE_VERIFY_MESSAGE);
+    if (p->psa_hmac_in_id == 0) {
+        ESP_LOGE(TAG, "set_in_key: PSA import FAILED for id=%d", (int)p->id);
+    } else {
+        ESP_LOGI(TAG, "set_in_key: id=%d key[0..3]=%02x%02x%02x%02x psa_id=%u",
+                 (int)p->id, key->bytes[0], key->bytes[1], key->bytes[2], key->bytes[3],
+                 (unsigned)p->psa_hmac_in_id);
+        /* Self-test: compute MAC with temp key, verify with in_key */
+        uint8_t test_msg[] = "test123";
+        tbft_mac_t test_mac;
+        psa_key_id_t kid = import_hmac_key(key, PSA_KEY_USAGE_SIGN_MESSAGE);
+        if (kid != 0) {
+            size_t mac_len = 0;
+            psa_status_t st1 = psa_mac_compute(kid, PSA_ALG_HMAC(PSA_ALG_SHA_256),
+                            test_msg, sizeof(test_msg)-1,
+                            test_mac.bytes, TBFT_HMAC_SIZE, &mac_len);
+            if (st1 != PSA_SUCCESS) {
+                ESP_LOGE(TAG, "set_in_key: self-test compute FAILED for id=%d (psa=%d)", (int)p->id, (int)st1);
+            } else {
+                psa_status_t st2 = psa_mac_verify(p->psa_hmac_in_id, PSA_ALG_HMAC(PSA_ALG_SHA_256),
+                                test_msg, sizeof(test_msg)-1,
+                                test_mac.bytes, TBFT_HMAC_SIZE);
+                if (st2 != PSA_SUCCESS) {
+                    ESP_LOGE(TAG, "set_in_key: self-test verify FAILED for id=%d (psa=%d)", (int)p->id, (int)st2);
+                } else {
+                    ESP_LOGI(TAG, "set_in_key: self-test OK for id=%d", (int)p->id);
+                }
+            }
+            psa_destroy_key(kid);
+        } else {
+            ESP_LOGE(TAG, "set_in_key: import_hmac_key sign FAILED for id=%d", (int)p->id);
+        }
+    }
     p->keys_fresh  = true;
 
     /* Reset the anti-replay watermark: old timestamps belong to the previous
@@ -260,6 +298,8 @@ void tbft_principal_set_out_key(tbft_principal_t *p, const tbft_hmac_key_t *key)
     }
     p->hmac_out_key = *key;
     p->psa_hmac_out_id = import_hmac_key(key, PSA_KEY_USAGE_SIGN_MESSAGE);
+    ESP_LOGI(TAG, "set_out_key: for id=%d, key[0..3]=%02x%02x%02x%02x",
+             (int)p->id, key->bytes[0], key->bytes[1], key->bytes[2], key->bytes[3]);
 }
 
 /* --------------------------------------------------------------------------
