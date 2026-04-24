@@ -1858,9 +1858,25 @@ void tbft_replica_send_new_key(tbft_replica_t *r)
         tbft_principal_t *p = r->node.principals[i];
         if (!p) continue;
 
-        /* Generate a cryptographically random session key */
+        /* Generate a cryptographically random session key.
+         * CRITICAL FIX: Only generate a new key if the out-key is not yet set.
+         * Re-broadcasts of New_key must use the SAME key — otherwise the
+         * primary's hmac_out_key changes every 2s while backups are still
+         * decrypting and installing keys from older broadcasts, causing
+         * a key mismatch and "pp: MAC verification failed". */
         tbft_hmac_key_t new_key;
-        esp_fill_random(new_key.bytes, sizeof(new_key.bytes));
+        bool need_new_key = true;
+        for (int b = 0; b < (int)sizeof(p->hmac_out_key.bytes); b++) {
+            if (p->hmac_out_key.bytes[b] != 0) {
+                need_new_key = false;
+                break;
+            }
+        }
+        if (need_new_key) {
+            esp_fill_random(new_key.bytes, sizeof(new_key.bytes));
+        } else {
+            new_key = p->hmac_out_key;
+        }
 
         /* Store locally as the out-key for messages we send TO replica i */
         tbft_principal_set_out_key(p, &new_key);
