@@ -57,8 +57,12 @@ typedef struct {
 } __attribute__((packed)) wallet_rep_t;
 
 int exec_cb(Byz_req *in, Byz_rep *out, Byz_buffer *ndet, int cid, bool ro) {
-    if (in->size != sizeof(wallet_req_t)) return -1;
-    wallet_req_t *req = (wallet_req_t *)in->contents;
+    /* The exec callback receives the full embedded request from the
+     * pre-prepare's rset.  This is a tbft_request_rep_t:
+     * [hdr(16)][rid(8)][cid(4)][cmd_size(4)][actual command bytes][padding].
+     * Skip the 32-byte header to reach the wallet_req_t. */
+    if (in->size < 32) return -1;
+    wallet_req_t *req = (wallet_req_t *)((const uint8_t *)in->contents + 32);
     wallet_rep_t *rep = (wallet_rep_t *)out->contents;
     out->size = sizeof(wallet_rep_t);
 
