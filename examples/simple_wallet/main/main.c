@@ -10,6 +10,7 @@
 #include "esp_wifi.h"
 #include "esp_now.h"
 #include "esp-tinybft.h"
+#include "esp_task_wdt.h"
 
 #if CONFIG_TBFT_TRANSPORT_UDP
 #include "esp_event.h"
@@ -56,8 +57,11 @@ typedef struct {
 } __attribute__((packed)) wallet_rep_t;
 
 int exec_cb(Byz_req *in, Byz_rep *out, Byz_buffer *ndet, int cid, bool ro) {
-    if (in->size != sizeof(wallet_req_t)) return -1;
-    wallet_req_t *req = (wallet_req_t *)in->contents;
+    /* The exec callback receives the full embedded request from the
+     * pre-prepare's rset: [tbft_request_rep_t(68)][wallet command][sig].
+     * Skip the 68-byte header to reach the wallet_req_t command. */
+    if (in->size < 68) return -1;
+    wallet_req_t *req = (wallet_req_t *)((const uint8_t *)in->contents + 68);
     wallet_rep_t *rep = (wallet_rep_t *)out->contents;
     out->size = sizeof(wallet_rep_t);
 
@@ -207,7 +211,14 @@ static void client_task(void *arg) {
 
     ESP_LOGI(TAG, "Client running...");
 
+#if CONFIG_ESP_TASK_WDT_EN
+    esp_task_wdt_add(NULL);
+#endif
+
     while(1) {
+#if CONFIG_ESP_TASK_WDT_EN
+        esp_task_wdt_reset();
+#endif
         Byz_req req;
         Byz_rep rep;
         if (Byz_alloc_request(&req, sizeof(wallet_req_t)) != 0) {
@@ -234,7 +245,12 @@ static void client_task(void *arg) {
         }
 
         Byz_free_request(&req);
-        vTaskDelay(pdMS_TO_TICKS(30000));
+        for (int i = 0; i < 30; i++) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+#if CONFIG_ESP_TASK_WDT_EN
+            esp_task_wdt_reset();
+#endif
+        }
     }
 }
 #endif /* CONFIG_EXAMPLE_ROLE_REPLICA / else */

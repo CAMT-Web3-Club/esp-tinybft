@@ -9,20 +9,31 @@ static const char *TAG = "tbft_ptree";
 
 int tbft_ptree_compute_levels(int num_blocks, int p_children)
 {
-    int nodes_at_level = 1;
-    int level          = 0;
+    /* O3 FIX: Validate p_children to prevent infinite loop or overflow. */
+    if (p_children < 2) return TBFT_P_LEVELS + 1; /* invalid: will be caught */
+
+    long nodes_at_level = 1;
+    int level = 0;
     while (nodes_at_level < num_blocks) {
         nodes_at_level *= p_children;
         level++;
+        if (level > TBFT_P_LEVELS) break; /* will be rejected by caller */
     }
     return level + 1; /* +1 to include root */
 }
 
+/* M3 FIX: Use long to prevent integer overflow when computing node counts.
+ * With TBFT_P_CHILDREN ≈ 56 and level=3, 56³ = 175,616 fits in int, but
+ * larger configs could overflow. Return a sentinel value above any valid
+ * bound so callers can detect the overflow. */
 int tbft_ptree_nodes_at_level(int level, int p_children)
 {
-    int n = 1;
-    for (int i = 0; i < level; i++) n *= p_children;
-    return n;
+    long n = 1;
+    for (int i = 0; i < level; i++) {
+        n *= p_children;
+        if (n > 1000000) return 1000001; /* sentinel: overflow guard */
+    }
+    return (int)n;
 }
 
 int tbft_ptree_init(tbft_ptree_t *tree, int num_blocks, int p_children)
@@ -76,13 +87,26 @@ void tbft_ptree_free(tbft_ptree_t *tree)
     memset(tree, 0, sizeof(*tree));
 }
 
-void tbft_ptree_update_leaf(tbft_ptree_t *tree, int block_idx,
+int tbft_ptree_update_leaf(tbft_ptree_t *tree, int block_idx,
                             const tbft_digest_t *block_digest,
                             tbft_seqno_t version)
 {
     int levels    = tree->dims.p_levels;
     int pchildren = tree->dims.p_children;
     int leaf_level = levels - 1;
+
+    /* M4 FIX: Validate block_idx against tree dimensions to prevent
+     * out-of-bounds array access. This function is exposed in the public
+     * header and could be called from unvalidated paths. */
+    if (block_idx < 0 || block_idx >= tree->dims.num_blocks) {
+        ESP_LOGE(TAG, "update_leaf: block_idx %d out of range [0, %d)",
+                 block_idx, tree->dims.num_blocks);
+        return -1;
+    }
+    if (leaf_level < 0 || leaf_level >= TBFT_P_LEVELS) {
+        ESP_LOGE(TAG, "update_leaf: invalid leaf_level %d", leaf_level);
+        return -1;
+    }
 
     /* Update the leaf */
     tbft_part_t *leaf = &tree->ptree[leaf_level][block_idx];
@@ -107,7 +131,7 @@ void tbft_ptree_update_leaf(tbft_ptree_t *tree, int block_idx,
         if (pst != PSA_SUCCESS) {
             ESP_LOGE(TAG, "psa_hash_setup failed: %d", (int)pst);
             psa_hash_abort(&hash_op);
-            return; /* HIGH FIX H5: Abort on hash failure — don't corrupt tree */
+            return -1; /* HIGH FIX H5: Abort on hash failure — don't corrupt tree */
         }
 
         for (int c = first_child;
@@ -124,10 +148,11 @@ void tbft_ptree_update_leaf(tbft_ptree_t *tree, int block_idx,
         if (fin != PSA_SUCCESS) {
             ESP_LOGE(TAG, "psa_hash_finish failed: %d", (int)fin);
             psa_hash_abort(&hash_op);
-            return; /* HIGH FIX H5: Abort on hash failure — don't corrupt tree */
+            return -1; /* HIGH FIX H5: Abort on hash failure — don't corrupt tree */
         }
 
         parent->version = version;
         idx = parent_idx;
     }
+    return 0;
 }

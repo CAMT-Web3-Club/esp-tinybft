@@ -9,9 +9,10 @@ menu "TinyBFT Configuration"
 
     config TBFT_MAX_REPLY_SIZE
         int "Maximum reply payload size (bytes)"
-        default 1240
+        default 1136
         help
             Maximum reply payload size. Must be less than TBFT_MAX_MESSAGE_SIZE.
+            Default is 1136 = 1440 (MAX_MESSAGE_SIZE) - 48 (reply header) - 256 (RSA sig).
 
     config TBFT_BLOCK_SIZE
         int "State block size (bytes)"
@@ -146,5 +147,13 @@ menu "TinyBFT Configuration"
             Default status message broadcast period in microseconds.
             Status messages help replicas catch up during state transfer.
             Default: 1s (1000000).
+
+    config TBFT_CLIENT_REPLY_TIMEOUT_MS
+        int "Client reply timeout (milliseconds)"
+        default 10000
+        range 1000 120000
+        help
+            Timeout for waiting for f+1 matching replies after sending
+            a request. Default: 10s (10000ms).
 
 endmenu

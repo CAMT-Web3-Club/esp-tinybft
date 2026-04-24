@@ -38,7 +38,7 @@ static const char *TAG = "tbft_espnow";
 #define FRAG_HDR_SIZE       4
 #define FRAG_MAX_PAYLOAD    (ESPNOW_MAX_DATA_LEN - FRAG_HDR_SIZE)
 #define FRAG_MAX_PARTS      ((TBFT_MAX_MESSAGE_SIZE + FRAG_MAX_PAYLOAD - 1) / FRAG_MAX_PAYLOAD + 1)
-#define REASM_MAX_SLOTS     4
+#define REASM_MAX_SLOTS     8
 #define REASM_TIMEOUT_MS    5000
 #define FRAG_INTER_DELAY_MS 20
 
@@ -48,7 +48,7 @@ static const char *TAG = "tbft_espnow";
 #define SEND_TASK_STACK_SIZE 4096
 #define SEND_TASK_RECV_TIMEOUT_MS  50
 #define RECV_TASK_TIMEOUT_MS  100
-#define SEND_QUEUE_TIMEOUT_MS 10
+#define SEND_QUEUE_TIMEOUT_MS 100
 #define SHUTDOWN_DRAIN_MS     200
 
 #define SEND_TASK_SHUTDOWN  -999
@@ -76,6 +76,9 @@ typedef struct {
 
 _Static_assert(sizeof(frag_hdr_t) == FRAG_HDR_SIZE, "frag_hdr_t size mismatch");
 _Static_assert(FRAG_MAX_PARTS <= 32, "TBFT_MAX_MESSAGE_SIZE too large");
+/* NOTE: When TBFT_MAX_MESSAGE_SIZE <= ESPNOW_MAX_DATA_LEN (1470), all messages
+ * fit in a single fragment and the multi-fragment code path is dead code.
+ * When TBFT_MAX_MESSAGE_SIZE > 1470, fragmentation is active and tested. */
 
 typedef struct {
     uint8_t  buf[TBFT_MAX_MESSAGE_SIZE];
@@ -291,14 +294,18 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *
     const uint8_t *src_mac = recv_info->src_addr;
     const frag_hdr_t *fhdr = (const frag_hdr_t *)data;
 
-    /* Log every fragment arriving at the ESP-NOW callback */
-    ESP_LOGI(TAG, "espnow_cb: frag %d/%d msg_id=%u len=%d from " MACSTR,
+    /* M12 FIX: Log at DEBUG level to prevent massive log spam under load.
+     * Every fragment arriving at high rate would overwhelm UART and increase
+     * latency. Use DEBUG for per-fragment logging; completed messages
+     * already log at INFO level below. */
+    ESP_LOGD(TAG, "espnow_cb: frag %d/%d msg_id=%u len=%d from " MACSTR,
              fhdr->frag_idx, fhdr->frag_total, fhdr->msg_id, data_len, MAC2STR(src_mac));
 
-    /* HIGH FIX H7: Minimize lock hold time to prevent packet drops.
-     * The previous 10ms timeout caused the WiFi task to drop packets under
-     * load. Now we take the lock only for the critical reasm_feed operation. */
-    if (xSemaphoreTake(enow->lock, pdMS_TO_TICKS(2)) != pdTRUE) {
+    /* HIGH FIX H1: Increase lock timeout from 2ms to 50ms.
+     * The recv_cb runs in the WiFi task context. A longer timeout ensures
+     * it can acquire the lock even when send_task or other tasks are
+     * briefly holding it for reassembly operations. */
+    if (xSemaphoreTake(enow->lock, pdMS_TO_TICKS(50)) != pdTRUE) {
         /* Log but don't drop — try again on next packet */
         return;
     }
@@ -322,25 +329,31 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *
     bool complete = reasm_feed(enow, s, payload, payload_len, fhdr->msg_id, fhdr->frag_idx, fhdr->frag_total, src_mac);
 
     if (complete) {
+        /* Copy completed message out of reassembly buffer BEFORE releasing lock,
+         * so the slot can be reused by the next fragment while we queue. */
         recv_entry_t q_entry;
         memcpy(q_entry.src_mac, src_mac, ESPNOW_MAC_LEN);
         q_entry.buf_len = s->buf_len;
         memcpy(q_entry.payload, s->buf, (size_t)s->buf_len);
-
         int msg_tag = s->buf[0];
-        if (xQueueSend(enow->msg_queue, &q_entry, 0) != pdTRUE) {
-            ESP_LOGW(TAG, "msg_queue full, dropping reassembled msg tag=%d len=%d",
+
+        s->stale = true;
+        enow->reasm_stale_flag = true;
+
+        /* Release lock BEFORE potentially blocking queue send to avoid
+         * priority inversion with send_task. */
+        xSemaphoreGive(enow->lock);
+
+        if (xQueueSend(enow->msg_queue, &q_entry, pdMS_TO_TICKS(100)) != pdTRUE) {
+            ESP_LOGW(TAG, "msg_queue full after 100ms, dropping reassembled msg tag=%d len=%d",
                      msg_tag, s->buf_len);
         } else {
             ESP_LOGI(TAG, "recv: tag=%d len=%d from " MACSTR,
                      msg_tag, s->buf_len, MAC2STR(src_mac));
         }
-
-        s->stale = true;
-        enow->reasm_stale_flag = true;
+    } else {
+        xSemaphoreGive(enow->lock);
     }
-
-    xSemaphoreGive(enow->lock);
 }
 
 /* --------------------------------------------------------------------------
@@ -358,9 +371,14 @@ static int espnow_do_send(tbft_espnow_t *enow, const uint8_t *peer_mac, uint16_t
      * loss, triggering unnecessary view-changes in the BFT protocol. */
     const int MAX_RETRIES = 3;
 
+    /* M5 FIX: Use static buffer for packet assembly to avoid consuming
+     * ~1474B (36%) of the 4KB send_task stack per call. Thread-safe since
+     * send_task is the sole caller — no concurrent access. */
+    static uint8_t pkt[sizeof(frag_hdr_t) + FRAG_MAX_PAYLOAD];
+
     if (len + sizeof(frag_hdr_t) <= ESPNOW_MAX_DATA_LEN) {
         frag_hdr_t fhdr = { .msg_id = msg_id, .frag_total = 1, .frag_idx = 0 };
-        uint8_t pkt[sizeof(frag_hdr_t) + ESPNOW_MAX_DATA_LEN];
+        /* Reuse static pkt buffer (M5 FIX) — single-fragment path */
         memcpy(pkt, &fhdr, sizeof(fhdr));
         memcpy(pkt + sizeof(fhdr), buf, len);
 
@@ -386,7 +404,7 @@ static int espnow_do_send(tbft_espnow_t *enow, const uint8_t *peer_mac, uint16_t
     uint8_t frag_idx = 0;
 
     frag_hdr_t fhdr = { .msg_id = msg_id, .frag_total = frag_total };
-    uint8_t pkt[sizeof(frag_hdr_t) + FRAG_MAX_PAYLOAD];
+    /* Reuse static pkt buffer declared above (M5 FIX) */
 
     while (remaining > 0) {
         fhdr.frag_idx = frag_idx;
@@ -448,13 +466,19 @@ static void espnow_send_task(void *pvParameters) {
             int msg_tag = entry.buf[0]; /* first byte is hdr.tag */
             ESP_LOGI(TAG, "send_task: broadcast tag=%d size=%d to %d peers (limit=%d)",
                      msg_tag, entry.len, limit - 1, limit);
+
+            /* Assign one msg_id per logical message, not per peer */
+            uint16_t this_msg_id;
+            xSemaphoreTake(enow->lock, portMAX_DELAY);
+            this_msg_id = enow->next_msg_id++;
+            xSemaphoreGive(enow->lock);
+
             for (int i = 0; i < limit; i++) {
                 if (i == enow->local_id) continue;
 
                 xSemaphoreTake(enow->lock, portMAX_DELAY);
                 bool valid = enow->peer_valid[i];
                 tbft_addr_t peer_addr = enow->peers[i];
-                uint16_t this_msg_id = enow->next_msg_id++;
                 xSemaphoreGive(enow->lock);
 
                 if (valid) {
@@ -555,7 +579,8 @@ int tbft_transport_create(tbft_transport_t **out, tbft_transport_type_t type, in
         return -1;
     }
 
-    xSemaphoreGive(enow->lock);
+    /* NOTE: xSemaphoreCreateMutex() creates the mutex in "not taken" state,
+     * so an immediate xSemaphoreGive would return pdFALSE. Removed dead code. */
     g_espnow_ctx = enow;
 
     esp_err_t rcb_err = esp_now_register_recv_cb(espnow_recv_cb);
@@ -641,7 +666,11 @@ void tbft_transport_set_peer(tbft_transport_t *t, tbft_node_id_t node_id, const 
         }
     }
 
-    esp_now_peer_info_t peer = { .channel = 1, .ifidx = WIFI_IF_AP, .encrypt = false };
+    /* channel = 0: use current Wi-Fi channel (auto-detect).
+     * Hardcoded channel 1 caused silent failures when AP was on a different
+     * channel.  WiFi must be started before this call for channel 0 to
+     * resolve correctly. */
+    esp_now_peer_info_t peer = { .channel = 0, .ifidx = WIFI_IF_AP, .encrypt = false };
     memcpy(peer.peer_addr, ap_mac, 6);
 
     esp_now_del_peer(ap_mac);
@@ -688,8 +717,11 @@ int tbft_transport_recv(tbft_transport_t *t, void *buf, size_t buf_len, tbft_nod
         xSemaphoreGive(enow->lock);
     }
 
+    /* M10 FIX: Use non-blocking recv (timeout=0) to match UDP transport
+     * API contract. The previous 50ms blocking call capped the replica
+     * loop at 20Hz, creating inconsistent behavior between transports. */
     recv_entry_t entry;
-    if (xQueueReceive(enow->msg_queue, &entry, pdMS_TO_TICKS(SEND_TASK_RECV_TIMEOUT_MS)) != pdTRUE) return 0;
+    if (xQueueReceive(enow->msg_queue, &entry, 0) != pdTRUE) return 0;
 
     if (entry.buf_len < 0 || (size_t)entry.buf_len > buf_len || (size_t)entry.buf_len > TBFT_MAX_MESSAGE_SIZE) return -1;
 

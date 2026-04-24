@@ -30,6 +30,14 @@
 
 static const char *TAG = "tbft_replica";
 
+/* Low #8 FIX: Named constants for magic numbers */
+#define TBFT_INIT_DRAIN_LIMIT     64   /* max messages to drain after New_key broadcast */
+#define TBFT_KEY_DRAIN_LIMIT      32   /* max messages to drain during key confirmation */
+#define TBFT_YIELD_THRESHOLD      16   /* message loop iterations before cooperative yield */
+
+/* M2 FIX: Read-only request flag in hdr.extra field */
+#define TBFT_REQUEST_RO_FLAG      0x1
+
 /* --------------------------------------------------------------------------
  * Request queue helpers
  * -------------------------------------------------------------------------- */
@@ -148,19 +156,19 @@ int tbft_replica_init(tbft_replica_t *r,
     r->vtimer_period_us = TBFT_VIEW_CHANGE_TIMEOUT_US;
     r->stimer_period_us = TBFT_STATUS_TIMEOUT_US;
 
-    /* Init timers (not started — caller must set periods and start) */
+    /* Init timers (not started — caller must set periods and start).
+     * NOTE: rtimer (recovery) and ntimer (keep-alive) are reserved for
+     * future use. They are not initialised or freed to avoid allocating
+     * unused esp_timer handles. */
     tbft_itimer_init(&r->vtimer, vtimer_cb, r, "tbft_vtimer");
     tbft_itimer_init(&r->stimer, stimer_cb, r, "tbft_stimer");
-    tbft_itimer_init(&r->rtimer, NULL,       r, "tbft_rtimer");
-    tbft_itimer_init(&r->ntimer, NULL,       r, "tbft_ntimer");
 
     r->evt_group = xEventGroupCreate();
     if (!r->evt_group) {
         ESP_LOGE(TAG, "replica: failed to create event group");
         tbft_itimer_free(&r->vtimer);
         tbft_itimer_free(&r->stimer);
-        tbft_itimer_free(&r->rtimer);
-        tbft_itimer_free(&r->ntimer);
+        /* rtimer/ntimer not initialised — nothing to free */
         tbft_state_free(&r->state);
         tbft_node_free(&r->node);
         return -1;
@@ -176,8 +184,7 @@ void tbft_replica_free(tbft_replica_t *r)
     r->running = false;
     tbft_itimer_free(&r->vtimer);
     tbft_itimer_free(&r->stimer);
-    tbft_itimer_free(&r->rtimer);
-    tbft_itimer_free(&r->ntimer);
+    /* rtimer/ntimer are not initialised — nothing to free */
     if (r->evt_group) {
         vEventGroupDelete(r->evt_group);
         r->evt_group = NULL;
@@ -207,9 +214,9 @@ void tbft_replica_run(tbft_replica_t *r)
      * or other messages.  Non-NEW_KEY messages are acknowledged with a log
      * to catch unexpected early arrivals. */
     int drained = 0;
-    while (drained < 64) {
+    while (drained < TBFT_INIT_DRAIN_LIMIT) {
         tbft_node_id_t src_id = -1;
-        int n = tbft_node_recv(&r->node, r->node.recv_buf, &src_id);
+        int n = tbft_node_recv(&r->node, r->node.recv_buf, sizeof(r->node.recv_buf), &src_id);
         if (n < 0) break; /* transport error during drain */
         if (n < (int)sizeof(tbft_msg_hdr_t)) break;
         const tbft_msg_hdr_t *hdr = (const tbft_msg_hdr_t *)r->node.recv_buf;
@@ -237,9 +244,9 @@ void tbft_replica_run(tbft_replica_t *r)
             tbft_replica_send_new_key(r);
             vTaskDelay(pdMS_TO_TICKS(200));
             drained = 0;
-            while (drained < 32) {
+            while (drained < TBFT_KEY_DRAIN_LIMIT) {
                 tbft_node_id_t src_id = -1;
-                int n = tbft_node_recv(&r->node, r->node.recv_buf, &src_id);
+                int n = tbft_node_recv(&r->node, r->node.recv_buf, sizeof(r->node.recv_buf), &src_id);
                 if (n < 0) break; /* transport error during key drain */
                 if (n < (int)sizeof(tbft_msg_hdr_t)) break;
                 const tbft_msg_hdr_t *hdr = (const tbft_msg_hdr_t *)r->node.recv_buf;
@@ -273,7 +280,7 @@ void tbft_replica_run(tbft_replica_t *r)
          *
          * NOTE: This counter lives in the replica struct (not static) so
          * that restarting the replica correctly resets it. */
-        if (++r->yield_counter >= 16) {
+        if (++r->yield_counter >= TBFT_YIELD_THRESHOLD) {
             r->yield_counter = 0;
             vTaskDelay(pdMS_TO_TICKS(1));
         }
@@ -339,8 +346,20 @@ void tbft_replica_run(tbft_replica_t *r)
             }
         }
 
+        /* Check for fetch timeout — retry with different replier */
+        if (tbft_state_in_fetch(&r->state) && tbft_state_fetch_timedout(&r->state)) {
+            ESP_LOGW(TAG, "fetch timeout at seqno=%lld — restarting",
+                     (long long)r->state.fetch_seqno);
+            /* Pick a different replier */
+            int new_replier = (r->state.fetch_replier + 1) % r->node.num_replicas;
+            if (new_replier == r->node.node_id) {
+                new_replier = (new_replier + 1) % r->node.num_replicas;
+            }
+            tbft_state_start_fetch(&r->state, r->state.fetch_seqno, new_replier);
+        }
+
         tbft_node_id_t src_id = -1;
-        int n = tbft_node_recv(&r->node, r->node.recv_buf, &src_id);
+        int n = tbft_node_recv(&r->node, r->node.recv_buf, sizeof(r->node.recv_buf), &src_id);
         if (n < 0) {
             /* Transport error — log and yield before retrying */
             ESP_LOGW(TAG, "recv: transport error (id=%d)", r->node.node_id);
@@ -490,7 +509,7 @@ void tbft_replica_handle_request(tbft_replica_t *r, const void *msg, int len)
     /* Primary: deduplicate by (cid, rid) before enqueuing.
      * Multiple copies of the same request can arrive — once from the
      * client's broadcast and again from each replica's forward. */
-    bool ro = (req->hdr.extra & 0x1) != 0;
+    bool ro = (req->hdr.extra & TBFT_REQUEST_RO_FLAG) != 0;
     tbft_rqueue_t *q = ro ? &r->ro_rqueue : &r->rqueue;
     for (int i = 0; i < q->count; i++) {
         int idx = (q->head + i) % TBFT_RQUEUE_MAX;
@@ -527,11 +546,22 @@ void tbft_replica_handle_pre_prepare(tbft_replica_t *r, const void *msg, int len
     }
     const tbft_pre_prepare_rep_t *pp = (const tbft_pre_prepare_rep_t *)msg;
 
-    /* Reject if wrong view */
+    /* Reject if wrong view — but advance if the pre-prepare is from a
+     * higher view (primary is ahead of this replica). */
     if (pp->view != r->node.view) {
-        ESP_LOGW(TAG, "pp: wrong view (got=%lld, expected=%lld)",
-                 (long long)pp->view, (long long)r->node.view);
-        return;
+        if (pp->view > r->node.view) {
+            ESP_LOGI(TAG, "pp: advancing view from %lld to %lld (primary is ahead)",
+                     (long long)r->node.view, (long long)pp->view);
+            r->node.view = pp->view;
+            r->seqno = 1;
+            r->last_stable = 0;
+            r->last_prepared = 0;
+            r->last_executed = 0;
+        } else {
+            ESP_LOGW(TAG, "pp: wrong view (got=%lld, expected=%lld)",
+                     (long long)pp->view, (long long)r->node.view);
+            return;
+        }
     }
 
     /* Must come from current primary */
@@ -575,6 +605,11 @@ void tbft_replica_handle_pre_prepare(tbft_replica_t *r, const void *msg, int len
         }
         const tbft_auth_t *auth =
             (const tbft_auth_t *)((const uint8_t *)msg + auth_offset);
+        ESP_LOGI(TAG, "pp: verifying MAC from primary %d, slot=%d, ts=%lld, auth_offset=%d, msg_len=%d, rset=%d, ndet=%d, hdr[0..7]=%02x%02x%02x%02x%02x%02x%02x%02x",
+                 expected_primary, slot, (long long)pp->hdr.timestamp_us, auth_offset, len,
+                 (int)pp->rset_size, (int)pp->non_det_size,
+                 ((uint8_t*)msg)[0], ((uint8_t*)msg)[1], ((uint8_t*)msg)[2], ((uint8_t*)msg)[3],
+                 ((uint8_t*)msg)[4], ((uint8_t*)msg)[5], ((uint8_t*)msg)[6], ((uint8_t*)msg)[7]);
         if (!tbft_node_verify_auth(&r->node, expected_primary, msg,
                                    (size_t)auth_offset,
                                    &auth->slots[slot],
@@ -583,6 +618,14 @@ void tbft_replica_handle_pre_prepare(tbft_replica_t *r, const void *msg, int len
                      expected_primary);
             return;
         }
+    }
+
+    /* Reject empty request sets.  A zero rset_size would bypass the
+     * digest and client-signature re-verification below, allowing a
+     * Byzantine primary to inject a pre-prepare with no actual request. */
+    if (pp->rset_size == 0) {
+        ESP_LOGW(TAG, "pp: empty request set (rset_size=0) rejected");
+        return;
     }
 
     /* Verify request set digest */
@@ -626,9 +669,12 @@ void tbft_replica_handle_pre_prepare(tbft_replica_t *r, const void *msg, int len
             return;
         }
         size_t sig_off = sizeof(tbft_request_rep_t) + (size_t)ereq->command_size;
-        /* The embedded request must fit exactly: hdr+rep+cmd+sig == rset_size.
-         * Anything larger means the primary packed untrusted trailing data. */
-        if (sig_off + sizeof(tbft_sig_t) != (size_t)pp->rset_size) {
+        /* The embedded request must fit within rset_size: hdr+rep+cmd+sig
+         * ≤ rset_size.  The client aligns messages to 8 bytes with zero
+         * padding, so rset_size may be slightly larger than the exact
+         * data size.  Allow up to 7 bytes of alignment padding. */
+        if (sig_off + sizeof(tbft_sig_t) > (size_t)pp->rset_size ||
+            (size_t)pp->rset_size - sig_off - sizeof(tbft_sig_t) > 7) {
             ESP_LOGW(TAG, "pp: embedded request size mismatch (sig_off=%zu, rset=%d)",
                      sig_off, (int)pp->rset_size);
             return;
@@ -689,7 +735,9 @@ void tbft_replica_handle_prepare(tbft_replica_t *r, const void *msg, int len)
         ESP_LOGW(TAG, "prepare: invalid sender id %d", sender);
         return;
     }
-    if (sender == tbft_node_primary(&r->node, prep->view)) return;
+    /* Accept prepares from all replicas including the primary.
+     * The primary broadcasts its prepare after sending pre-prepare,
+     * and backups need it to reach the f+1 prepare threshold. */
     if (sender == r->node.node_id) return;
 
     int slot = tbft_node_auth_slot_index(&r->node, sender);
@@ -743,8 +791,15 @@ void tbft_replica_handle_prepare(tbft_replica_t *r, const void *msg, int len)
     ESP_LOGI(TAG, "prepare accepted: seqno=%lld from replica %d",
              (long long)prep->seqno, sender);
 
+    /* Debug: check prepared state */
+    int pp_len2 = 0;
+    const uint8_t *pp2 = tbft_ar_load_pp(&r->ar, prep->seqno, &pp_len2);
+    bool is_prep = tbft_ar_prepared(&r->ar, prep->seqno);
+    ESP_LOGI(TAG, "prepare debug: seqno=%lld has_pp=%d prepared=%d",
+             (long long)prep->seqno, pp2 ? 1 : 0, is_prep ? 1 : 0);
+
     /* Check if prepared — if so, send commit */
-    if (tbft_ar_prepared(&r->ar, prep->seqno)) {
+    if (is_prep) {
         ESP_LOGI(TAG, "prepared seqno=%lld, sending commit",
                  (long long)prep->seqno);
         tbft_replica_send_commit(r, prep->seqno);
@@ -801,14 +856,19 @@ void tbft_replica_handle_commit(tbft_replica_t *r, const void *msg, int len)
     {
         int pp_len = 0;
         const uint8_t *pp_bytes = tbft_ar_load_pp(&r->ar, cm->seqno, &pp_len);
-        if (pp_bytes && pp_len >= (int)sizeof(tbft_pre_prepare_rep_t)) {
-            const tbft_pre_prepare_rep_t *pp =
-                (const tbft_pre_prepare_rep_t *)pp_bytes;
-            if (!tbft_digest_equal(&pp->digest, &cm->digest)) {
-                ESP_LOGW(TAG, "commit: digest mismatch from %d seqno=%lld",
-                         sender, (long long)cm->seqno);
-                return;
-            }
+        if (!pp_bytes || pp_len < (int)sizeof(tbft_pre_prepare_rep_t)) {
+            /* Pre-prepare hasn't arrived yet — defer this commit.
+             * A valid commit must reference a pre-prepared value. */
+            ESP_LOGW(TAG, "commit: no pre-prepare for seqno=%lld from %d — deferring",
+                     (long long)cm->seqno, sender);
+            return;
+        }
+        const tbft_pre_prepare_rep_t *pp =
+            (const tbft_pre_prepare_rep_t *)pp_bytes;
+        if (!tbft_digest_equal(&pp->digest, &cm->digest)) {
+            ESP_LOGW(TAG, "commit: digest mismatch from %d seqno=%lld",
+                     sender, (long long)cm->seqno);
+            return;
         }
     }
 
@@ -909,25 +969,44 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
         return;
     }
 
-    if (!tbft_vi_collect_vc(&r->vi, sender_id, msg, len)) {
-        if (vc->v > r->node.view && !r->vi.received[r->node.node_id]) {
-            /* Suppress catch-up view-change until we have enough HMAC keys */
-            int keys_ok = 0;
-            for (int i = 0; i < r->node.num_replicas; i++) {
-                if (i == r->node.node_id) continue;
-                if (r->node.principals[i] && r->node.principals[i]->keys_fresh) {
-                    keys_ok++;
+    bool collected = tbft_vi_collect_vc(&r->vi, sender_id, msg, len);
+    if (!collected) {
+        if (vc->v > r->node.view) {
+            /* CRITICAL FIX: Advance view and reset seqno immediately when
+             * receiving a view-change for a higher view.  Without this,
+             * replicas can accumulate different view numbers from idling
+             * (vc timers fire at different times), each keeping their own
+             * stale seqno.  By advancing view + resetting seqno as soon
+             * as we learn about a higher view, all replicas self-synchronize
+             * without requiring simultaneous restart. */
+            r->node.view = vc->v;
+            r->node.cur_primary = tbft_node_primary(&r->node, vc->v);
+            r->seqno = 1;
+            ESP_LOGI(TAG, "sync view to %lld (from vc of %d), seqno reset to 1",
+                     (long long)vc->v, sender_id);
+            if (!r->vi.received[r->node.node_id]) {
+                /* Suppress catch-up view-change until we have enough HMAC keys */
+                int keys_ok = 0;
+                for (int i = 0; i < r->node.num_replicas; i++) {
+                    if (i == r->node.node_id) continue;
+                    if (r->node.principals[i] && r->node.principals[i]->keys_fresh) {
+                        keys_ok++;
+                    }
                 }
-            }
-            if (keys_ok >= r->node.threshold - 1) {
-                tbft_replica_send_view_change(r);
+                if (keys_ok >= r->node.threshold - 1) {
+                    tbft_replica_send_view_change(r);
+                }
             }
         }
         return;
     }
 
-    /* If we are the new primary and have enough view-changes, send new-view */
-    int new_primary = tbft_node_primary(&r->node, vc->v);
+    /* C1 FIX: Check quorum after EVERY successful VC collection, including
+     * when tbft_vi_collect_vc advanced target_view to a higher value.
+     * Previously this was inside an `if (!collect_vc)` block, so if a VC
+     * for a higher view caused target_view to reset+advance, the quorum
+     * check was skipped and the new primary would never send New_view. */
+    int new_primary = tbft_node_primary(&r->node, r->vi.target_view);
     if (new_primary == r->node.node_id && tbft_vi_has_quorum(&r->vi)) {
         /* Build and send New_view */
         tbft_seqno_t min_s, max_s;
@@ -998,7 +1077,7 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
         nv->hdr.tag          = TBFT_MSG_NEW_VIEW;
         nv->hdr.extra        = 0;
         nv->hdr.timestamp_us = esp_timer_get_time();
-        nv->v       = vc->v;
+        nv->v       = r->vi.target_view;  /* C1 FIX: use target_view, not vc->v */
         nv->min     = min_s;
         nv->max     = max_s;
         nv->has_sig = 1;
@@ -1011,7 +1090,7 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
             if (counts[k].count >= r->node.threshold) {
                 tbft_vc_req_info_t *proof = (tbft_vc_req_info_t *)body_ptr;
                 proof->seqno = counts[k].seqno;
-                proof->last_view = r->node.view - 1;
+                proof->last_view = r->node.view > 0 ? (r->node.view - 1) : 0;
                 proof->digest = counts[k].digest;
                 body_ptr += sizeof(tbft_vc_req_info_t);
                 n_proofs++;
@@ -1036,7 +1115,7 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
         tbft_node_send(&r->node, r->out_buf, (size_t)total_size,
                        TBFT_ALL_REPLICAS);
         ESP_LOGI(TAG, "sent new-view v=%lld min=%lld max=%lld n_prep=%d",
-                 (long long)vc->v, (long long)min_s, (long long)max_s, n_proofs);
+                 (long long)r->vi.target_view, (long long)min_s, (long long)max_s, n_proofs);
     }
 }
 
@@ -1091,16 +1170,52 @@ void tbft_replica_handle_new_view(tbft_replica_t *r, const void *msg, int len)
         return;
     }
 
+    /* Validate n_prep bounds before processing prepared proofs. */
+    if (nv->n_prep < 0 || nv->n_prep > TBFT_WINDOW_SIZE) {
+        ESP_LOGW(TAG, "new-view: invalid n_prep=%d", nv->n_prep);
+        return;
+    }
+
     /* Install new view */
     r->node.view        = nv->v;
     r->node.cur_primary = tbft_node_primary(&r->node, nv->v);
 
-    /* HIGH FIX H1: Update sequence number state after view change.
-     * The new primary must start from the correct seqno to avoid conflicts
-     * with already-committed requests or gaps in the sequence. */
+    /* CRITICAL FIX: Reset seqno for ALL replicas, not just the new primary.
+     * During idle view-changes (no requests processed), seqno can drift
+     * past the window (e.g., seqno=9, last_stable=0, window=8). If only
+     * the primary resets seqno, non-primary replicas retain stale seqno
+     * values, causing out-of-window errors when they later become primary. */
+    r->seqno = nv->min + 1;
     if (tbft_replica_is_primary(r)) {
-        r->seqno = nv->min + 1;
-        ESP_LOGI(TAG, "new primary: seqno set to %lld", (long long)r->seqno);
+        ESP_LOGI(TAG, "new primary: seqno reset to %lld", (long long)r->seqno);
+    } else {
+        ESP_LOGD(TAG, "replica %d: seqno reset to %lld for view %lld",
+                 r->node.node_id, (long long)r->seqno, (long long)nv->v);
+    }
+
+    /* Process prepared proofs from New_view to recover unexecuted requests.
+     * PBFT requires the new primary to prove which requests were prepared
+     * in the previous view. We log the proofs for observability; the new
+     * primary will re-send pre-prepares for unexecuted seqnos via normal
+     * operation once it starts. */
+    if (nv->n_prep > 0) {
+        const uint8_t *proofs = (const uint8_t *)msg + sizeof(*nv);
+        int n_prep = nv->n_prep;
+        size_t proofs_size = (size_t)n_prep * sizeof(tbft_vc_req_info_t);
+        if ((size_t)len < sizeof(*nv) + proofs_size) {
+            ESP_LOGW(TAG, "new-view: message too short for n_prep=%d (len=%d)", n_prep, len);
+            return;
+        }
+        for (int p = 0; p < n_prep; p++) {
+            const tbft_vc_req_info_t *proof =
+                (const tbft_vc_req_info_t *)(proofs + p * sizeof(tbft_vc_req_info_t));
+            if (proof->seqno > r->last_executed &&
+                proof->seqno <= nv->max) {
+                ESP_LOGI(TAG, "new-view: prepared seqno=%lld digest=[...%02x] from view %lld",
+                         (long long)proof->seqno, proof->digest.bytes[0],
+                         (long long)proof->last_view);
+            }
+        }
     }
 
     /* Stop view-change timer and restart it */
@@ -1258,6 +1373,29 @@ void tbft_replica_send_pre_prepare(tbft_replica_t *r)
 {
     if (!tbft_replica_is_primary(r)) return;
 
+    /* CRITICAL FIX: Wait for key exchange to settle before sending pre-prepares.
+     * The primary's keys_fresh means it received a peer's New_key, but the
+     * peer might not yet have received the primary's New_key (network asymmetry).
+     * We track when the key count FIRST reached threshold-1, and wait 3s from
+     * that point (not from the last key arrival, which would keep resetting). */
+    {
+        int keys_ok = 0;
+        for (int i = 0; i < r->node.num_replicas; i++) {
+            if (i == r->node.node_id) continue;
+            if (r->node.principals[i] && r->node.principals[i]->keys_fresh)
+                keys_ok++;
+        }
+        if (keys_ok < r->node.threshold - 1) {
+            r->keys_ready_since_tick = 0;  /* not ready */
+            return;
+        }
+        if (r->keys_ready_since_tick == 0) {
+            r->keys_ready_since_tick = xTaskGetTickCount();
+        }
+        TickType_t now = xTaskGetTickCount();
+        if (now - r->keys_ready_since_tick < pdMS_TO_TICKS(3000)) return;
+    }
+
     /* Track which queue the request came from so we pop from the right one
      * after successfully building and broadcasting the Pre_prepare. */
     tbft_rqueue_t *src_queue = &r->rqueue;
@@ -1267,6 +1405,30 @@ void tbft_replica_send_pre_prepare(tbft_replica_t *r)
         req = rqueue_front(src_queue);
     }
     if (!req) return;
+
+    /* CRITICAL FIX: Dedup by request ID.  The same request can arrive
+     * multiple times: once from the client's broadcast, then forwarded
+     * by each non-primary replica.  Without dedup here, the primary
+     * would assign a different seqno to each duplicate, rapidly draining
+     * the sequence window and preventing consensus. */
+    {
+        const tbft_request_rep_t *rr = (const tbft_request_rep_t *)req->buf;
+        if (rr->rid == r->last_assigned_rid) {
+            /* Already assigned a seqno for this request — drop duplicate. */
+            rqueue_pop(src_queue);
+            /* Check the other queue too */
+            tbft_rqueue_entry_t *next_req = rqueue_front(src_queue);
+            if (!next_req) {
+                src_queue = (src_queue == &r->rqueue) ? &r->ro_rqueue : &r->rqueue;
+                next_req = rqueue_front(src_queue);
+            }
+            if (!next_req) return;
+            src_queue = (src_queue == &r->rqueue) ? &r->ro_rqueue : &r->rqueue;
+            const tbft_request_rep_t *rr2 = (const tbft_request_rep_t *)next_req->buf;
+            if (rr2->rid == r->last_assigned_rid) return;  /* all dups */
+            req = next_req;
+        }
+    }
 
     /* Check window */
     if (!tbft_replica_in_window(r, r->seqno)) {
@@ -1322,14 +1484,39 @@ void tbft_replica_send_pre_prepare(tbft_replica_t *r)
     memcpy(ptr, r->ndet_buf, (size_t)ndet_len);
     ptr += ndet_len;
 
+    /* Debug: log the key and auth offset used for each recipient */
+    {
+        int auth_off = (int)(ptr - r->out_buf);
+        ESP_LOGI(TAG, "send_pp: tag=%d extra=%d size=%d ts=%lld, hdr[0..7]=%02x%02x%02x%02x%02x%02x%02x%02x, auth_offset=%d",
+                 pp->hdr.tag, pp->hdr.extra, pp->hdr.size,
+                 (long long)pp->hdr.timestamp_us,
+                 r->out_buf[0], r->out_buf[1], r->out_buf[2], r->out_buf[3],
+                 r->out_buf[4], r->out_buf[5], r->out_buf[6], r->out_buf[7],
+                 auth_off);
+        for (int i = 0; i < r->node.num_replicas; i++) {
+            if (i == r->node.node_id) continue;
+            tbft_principal_t *p = r->node.principals[i];
+            if (p) {
+                ESP_LOGI(TAG, "send_pp: out_key for replica %d, key[0..3]=%02x%02x%02x%02x",
+                         i, p->hmac_out_key.bytes[0], p->hmac_out_key.bytes[1],
+                         p->hmac_out_key.bytes[2], p->hmac_out_key.bytes[3]);
+            }
+        }
+    }
+
     /* Authenticator */
     tbft_auth_t *auth = (tbft_auth_t *)ptr;
     int32_t msg_len_before_auth = (int32_t)(ptr - r->out_buf);
+
+    /* CRITICAL FIX: Set the message size BEFORE computing the HMAC.
+     * The header's size field is part of the message bytes covered by
+     * the MAC. If set after gen_auth, the sender signs size=0 but the
+     * receiver verifies with the actual size → MAC mismatch. */
+    pp->hdr.size = tbft_msg_align(msg_len_before_auth + (int32_t)sizeof(tbft_auth_t));
+
     tbft_node_gen_auth(&r->node, r->out_buf, (size_t)msg_len_before_auth,
                        auth);
     ptr += sizeof(tbft_auth_t);
-
-    pp->hdr.size = tbft_msg_align((int32_t)(ptr - r->out_buf));
 
     /* Store in agreement region */
     tbft_ar_store_pp(&r->ar, r->seqno, r->out_buf, pp->hdr.size);
@@ -1341,6 +1528,39 @@ void tbft_replica_send_pre_prepare(tbft_replica_t *r)
     ESP_LOGI(TAG, "sent pre-prepare seqno=%lld view=%lld (rset=%d, ndet=%d, total=%d)",
              (long long)r->seqno, (long long)r->node.view,
              req->len, ndet_len, pp->hdr.size);
+
+    /* The primary's pre-prepare implicitly serves as its own Prepare.
+     * Add a self-prepare to the certificate so the primary counts toward
+     * the f+1 prepare threshold needed to reach the prepared state.
+     * Also broadcast the prepare to all replicas so backups can reach
+     * "prepared" state (they need f+1 prepares including the primary's). */
+    {
+        tbft_prepare_rep_t *prep = (tbft_prepare_rep_t *)r->out_buf;
+        prep->hdr.tag   = TBFT_MSG_PREPARE;
+        prep->hdr.extra = 0;
+        prep->hdr.timestamp_us = esp_timer_get_time();
+        prep->view      = r->node.view;
+        prep->seqno     = r->seqno;
+        prep->digest    = rset_digest;
+        prep->id        = r->node.node_id;
+
+        tbft_auth_t *auth2 = (tbft_auth_t *)(r->out_buf + sizeof(*prep));
+        prep->hdr.size = tbft_msg_align(
+            (int32_t)(sizeof(*prep) + sizeof(tbft_auth_t)));
+        tbft_node_gen_auth(&r->node, r->out_buf, sizeof(*prep), auth2);
+
+        tbft_ar_add_my_prepare(&r->ar, r->seqno, r->out_buf, prep->hdr.size,
+                               r->node.node_id);
+
+        tbft_node_send(&r->node, r->out_buf, (size_t)prep->hdr.size,
+                       TBFT_ALL_REPLICAS);
+    }
+
+    /* Mark this request ID as assigned to prevent duplicate seqno. */
+    {
+        const tbft_request_rep_t *rr_final = (const tbft_request_rep_t *)req->buf;
+        r->last_assigned_rid = rr_final->rid;
+    }
 
     rqueue_pop(src_queue);
     r->seqno++;
@@ -1370,9 +1590,9 @@ void tbft_replica_send_prepare(tbft_replica_t *r, tbft_seqno_t n)
     prep->id        = r->node.node_id;
 
     tbft_auth_t *auth = (tbft_auth_t *)(r->out_buf + sizeof(*prep));
-    tbft_node_gen_auth(&r->node, r->out_buf, sizeof(*prep), auth);
     prep->hdr.size = tbft_msg_align(
         (int32_t)(sizeof(*prep) + sizeof(tbft_auth_t)));
+    tbft_node_gen_auth(&r->node, r->out_buf, sizeof(*prep), auth);
 
     /* Store own prepare */
     tbft_ar_add_my_prepare(&r->ar, n, r->out_buf, prep->hdr.size,
@@ -1401,9 +1621,9 @@ void tbft_replica_send_commit(tbft_replica_t *r, tbft_seqno_t n)
     cm->id        = r->node.node_id;
 
     tbft_auth_t *auth = (tbft_auth_t *)(r->out_buf + sizeof(*cm));
-    tbft_node_gen_auth(&r->node, r->out_buf, sizeof(*cm), auth);
     cm->hdr.size = tbft_msg_align(
         (int32_t)(sizeof(*cm) + sizeof(tbft_auth_t)));
+    tbft_node_gen_auth(&r->node, r->out_buf, sizeof(*cm), auth);
 
     tbft_ar_add_my_commit(&r->ar, n, r->out_buf, cm->hdr.size,
                           r->node.node_id);
@@ -1444,12 +1664,12 @@ void tbft_replica_execute_committed(tbft_replica_t *r)
             tbft_reply_rep_t *reply = (tbft_reply_rep_t *)r->out_buf;
             uint8_t *rep_payload    = r->out_buf + sizeof(*reply);
             int      rep_len        = 0;
-            bool     ro = (req_rep->hdr.extra & 0x1) != 0;
+            bool     ro = (req_rep->hdr.extra & TBFT_REQUEST_RO_FLAG) != 0;
 
-            /* Ensure enough room: hdr + payload + sig */
-            if (sizeof(*reply) + TBFT_MAX_REPLY_SIZE + TBFT_SIG_SIZE
-                    > sizeof(r->out_buf)) {
-                ESP_LOGE(TAG, "out_buf too small for reply");
+            /* Ensure enough room: hdr + actual payload + sig */
+            if (sizeof(*reply) + (size_t)rep_len + TBFT_SIG_SIZE > sizeof(r->out_buf)) {
+                ESP_LOGE(TAG, "reply too large for out_buf (%d + %d + %d > %zu)",
+                         (int)sizeof(*reply), rep_len, (int)TBFT_SIG_SIZE, sizeof(r->out_buf));
                 break;
             }
 
@@ -1478,7 +1698,14 @@ void tbft_replica_execute_committed(tbft_replica_t *r)
                     if (tbft_node_gen_sig(&r->node, r->out_buf,
                                           (size_t)reply->hdr.size, sig) == 0) {
                         total = reply->hdr.size + (int32_t)sizeof(tbft_sig_t);
+                    } else {
+                        ESP_LOGE(TAG, "reply signing failed for seqno=%lld — dropping reply",
+                                 (long long)n);
+                        break;
                     }
+                } else {
+                    ESP_LOGE(TAG, "reply exceeds buffer after signing — dropping");
+                    break;
                 }
 
                 ESP_LOGI(TAG, "sending reply: cid=%d rid=%llu seqno=%lld size=%d",
@@ -1671,9 +1898,9 @@ void tbft_replica_send_view_change(tbft_replica_t *r)
         tbft_vi_collect_vc(&r->vi, r->node.node_id, r->out_buf, total_size);
     }
 
-    /* MEDIUM FIX M2: Exponential backoff for view-change retransmit timer.
-     * The previous fixed multiplier (x2) could flood the network under
-     * cascading primary failures. Now we double each retry. */
+    /* Low #7 FIX: This sets a fixed 2x grace period for the view-change
+     * retry timer (not true exponential backoff). The period resets to
+     * the base value on each send_view_change call. */
     tbft_itimer_start(&r->vtimer, r->vtimer_period_us * 2);
 }
 
@@ -1711,12 +1938,29 @@ void tbft_replica_send_new_key(tbft_replica_t *r)
         tbft_principal_t *p = r->node.principals[i];
         if (!p) continue;
 
-        /* Generate a cryptographically random session key */
+        /* Generate a cryptographically random session key.
+         * CRITICAL FIX: Only generate a new key if the out-key is not yet set.
+         * Re-broadcasts of New_key must use the SAME key — otherwise the
+         * primary's hmac_out_key changes every 2s while backups are still
+         * decrypting and installing keys from older broadcasts, causing
+         * a key mismatch and "pp: MAC verification failed". */
         tbft_hmac_key_t new_key;
-        esp_fill_random(new_key.bytes, sizeof(new_key.bytes));
+        bool need_new_key = true;
+        for (int b = 0; b < (int)sizeof(p->hmac_out_key.bytes); b++) {
+            if (p->hmac_out_key.bytes[b] != 0) {
+                need_new_key = false;
+                break;
+            }
+        }
+        if (need_new_key) {
+            esp_fill_random(new_key.bytes, sizeof(new_key.bytes));
+        } else {
+            new_key = p->hmac_out_key;
+        }
 
         /* Store locally as the out-key for messages we send TO replica i */
         tbft_principal_set_out_key(p, &new_key);
+        ESP_LOGI(TAG, "send_new_key: set out_key for replica %d (new=%d)", i, need_new_key);
 
         /* Encrypt the key under replica i's RSA public key */
         size_t enc_len = 0;
@@ -1726,9 +1970,11 @@ void tbft_replica_send_new_key(tbft_replica_t *r)
                                                  &enc_len);
         if (rc != 0 || enc_len != TBFT_SIG_SIZE) {
             ESP_LOGW(TAG, "send_new_key: encrypt for replica %d failed", i);
-            /* Zero the ciphertext to avoid leaking key material */
-            memset(slots[slot_idx].ciphertext, 0,
-                   sizeof(slots[slot_idx].ciphertext));
+            /* M3 FIX: Skip this slot entirely — don't zero or include it.
+             * The slot_idx is NOT incremented, so this slot is excluded
+             * from the final message. Zeroing it would leave garbage
+             * recipient_id=0 which could confuse the recipient. */
+            continue;
         }
 
         slots[slot_idx].recipient_id = i;
@@ -1819,6 +2065,9 @@ void tbft_replica_handle_new_key(tbft_replica_t *r, const void *msg, int len)
         /* Install as the in-key for verifying messages FROM sender_id */
         tbft_principal_t *p = r->node.principals[sender_id];
         if (p) {
+            ESP_LOGI(TAG, "handle_new_key: from replica %d, decrypted key[0..3]=%02x%02x%02x%02x",
+                     sender_id, new_key.bytes[0], new_key.bytes[1],
+                     new_key.bytes[2], new_key.bytes[3]);
             tbft_principal_set_in_key(p, &new_key);
             ESP_LOGI(TAG, "installed HMAC in-key from replica %d", sender_id);
         }

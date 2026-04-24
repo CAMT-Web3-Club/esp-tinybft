@@ -68,6 +68,13 @@ typedef struct __attribute__((packed)) {
     int32_t         reply_size;   /* bytes of reply payload that follow */
 } tbft_reply_rep_t;
 
+/* Compile-time assertion: a fully-sized reply (header + max payload + RSA
+ * signature) must fit within TBFT_MAX_MESSAGE_SIZE.  If a project raises
+ * TBFT_MAX_REPLY_SIZE, this will fire at build time. */
+_Static_assert(sizeof(tbft_reply_rep_t) + TBFT_MAX_REPLY_SIZE + TBFT_SIG_SIZE
+                   <= TBFT_MAX_MESSAGE_SIZE,
+    "Reply message (header + payload + signature) exceeds TBFT_MAX_MESSAGE_SIZE");
+
 /* --------------------------------------------------------------------------
  * Pre-prepare  (tag = 3)  Primary → Replicas
  * Wire: [hdr][Pre_prepare_rep][request_set bytes][non-det bytes][authenticator]

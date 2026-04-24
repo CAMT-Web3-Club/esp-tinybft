@@ -14,13 +14,12 @@
  * Replica — the PBFT state machine (section 5 / Replica).
  *
  * Extends tbft_node_t with:
- *  - Sequence number tracking
- *  - Request queues
- *  - Protocol logs (plog, clog, elog)
- *  - Static memory regions (agreement, checkpoint, special)
- *  - State management
- *  - View-change support
- *  - Timers
+ *  - Sequence number tracking (seqno, last_stable, last_executed, ...)
+ *  - Request queues (rqueue, ro_rqueue)
+ *  - Static memory regions: ar (agreement), cr (checkpoint), sr (special)
+ *  - View-change protocol (vi)
+ *  - Timers (vtimer, stimer, rtimer, ntimer)
+ *  - Application callbacks and buffers
  * -------------------------------------------------------------------------- */
 
 /* TBFT_RQUEUE_MAX sourced from Kconfig (default 16) */
@@ -61,6 +60,8 @@ typedef struct {
 
     /* Sequence number state */
     tbft_seqno_t  seqno;                  /* next seqno to assign (primary) */
+    tbft_req_id_t last_assigned_rid;      /* last rid assigned a seqno (dedup) */
+    TickType_t    keys_ready_since_tick;  /* when key count first hit threshold-1 */
     tbft_seqno_t  last_stable;            /* last stable checkpoint seqno */
     tbft_seqno_t  last_prepared;          /* highest prepared seqno */
     tbft_seqno_t  last_executed;          /* highest committed + executed */
@@ -84,8 +85,7 @@ typedef struct {
     /* Timers */
     tbft_itimer_t vtimer;  /* view-change timeout */
     tbft_itimer_t stimer;  /* status broadcast */
-    tbft_itimer_t rtimer;  /* recovery */
-    tbft_itimer_t ntimer;  /* null-request (keep-alive) */
+    /* rtimer (recovery) and ntimer (keep-alive) reserved for future use */
 
     /* Timer periods */
     int64_t vtimer_period_us;

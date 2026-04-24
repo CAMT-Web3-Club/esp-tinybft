@@ -13,6 +13,7 @@
 #include "esp_log.h"
 #include "esp_spiffs.h"
 #include "esp_timer.h"
+#include "esp_task_wdt.h"
 #if CONFIG_TBFT_TRANSPORT_UDP
 #include "lwip/inet.h"
 #include "esp_netif.h"
@@ -155,7 +156,9 @@ static int parse_config(const char *path, tbft_config_t *cfg)
 
         if (is_mac) {
             /* ESP-NOW format: <hostname> <mac> <pubkey_path> */
-            memcpy(cfg->nodes[i].mac_str, field2, sizeof(cfg->nodes[i].mac_str));
+            /* M7 FIX: Use snprintf instead of memcpy to avoid copying
+             * garbage bytes beyond the null terminator of field2. */
+            snprintf(cfg->nodes[i].mac_str, sizeof(cfg->nodes[i].mac_str), "%s", field2);
             if (fscanf(f, "%127s", cfg->nodes[i].pubkey_path) != 1) {
                 ESP_LOGE(TAG, "failed to parse node %d pubkey_path", i);
                 goto fail;
@@ -164,10 +167,16 @@ static int parse_config(const char *path, tbft_config_t *cfg)
             cfg->nodes[i].ip[0] = '\0';
         } else {
             /* UDP format: <hostname> <ip> <port> <pubkey_path> */
-            memcpy(cfg->nodes[i].ip, field2, sizeof(cfg->nodes[i].ip));
+            /* M7 FIX: Use snprintf instead of memcpy. */
+            snprintf(cfg->nodes[i].ip, sizeof(cfg->nodes[i].ip), "%s", field2);
             int port_int = 0;
             if (fscanf(f, "%d %127s", &port_int, cfg->nodes[i].pubkey_path) != 2) {
                 ESP_LOGE(TAG, "failed to parse node %d port/pubkey", i);
+                goto fail;
+            }
+            /* M8 FIX: Validate port range. */
+            if (port_int < 1 || port_int > 65535) {
+                ESP_LOGE(TAG, "node %d: port %d out of valid range [1, 65535]", i, port_int);
                 goto fail;
             }
             cfg->nodes[i].port = (uint16_t)port_int;
@@ -317,7 +326,14 @@ static int setup_principals(tbft_node_t *node, const tbft_config_t *cfg,
         }
 #else
         /* UDP: use IP + port */
-        tbft_addr_udp_ip(addr)   = inet_addr(cfg->nodes[i].ip);
+        struct in_addr parsed_ip;
+        if (inet_pton(AF_INET, cfg->nodes[i].ip, &parsed_ip) != 1) {
+            ESP_LOGE(TAG, "invalid IP for node %d: %s", i, cfg->nodes[i].ip);
+            tbft_principal_free(p);
+            free(p);
+            return -1;
+        }
+        tbft_addr_udp_ip(addr) = parsed_ip.s_addr;
         tbft_addr_udp_port(addr) = htons(cfg->nodes[i].port);
 #endif
 
@@ -366,8 +382,26 @@ static int setup_principals(tbft_node_t *node, const tbft_config_t *cfg,
             size_t priv_len = 0;
             uint8_t *priv = load_key_file(priv_config_path, &priv_len);
             if (priv) {
-                tbft_principal_load_priv_key(p, priv, priv_len);
+                /* CRITICAL FIX #1: Check return value — if private key loading
+                 * fails, the node will send unsigned messages causing protocol
+                 * stall. This is fatal — abort initialization. */
+                int pk_ret = tbft_principal_load_priv_key(p, priv, priv_len);
                 free(priv);
+                if (pk_ret != 0) {
+                    ESP_LOGE(TAG, "failed to load private key for node %d: -0x%04x",
+                             i, (unsigned)(-pk_ret));
+                    for (int j = 0; j <= i; j++) {
+                        if (node->principals[j]) {
+                            tbft_principal_free(node->principals[j]);
+                            free(node->principals[j]);
+                            node->principals[j] = NULL;
+                        }
+                    }
+                    return -1;
+                }
+            } else {
+                ESP_LOGW(TAG, "no private key file for node %d: %s",
+                         i, priv_config_path);
             }
             node->local_principal = p;
 
@@ -498,6 +532,12 @@ int Byz_send_request(Byz_req *req, bool read_only)
      * primary (based on the client's stale view) is fragile: if the
      * cluster has advanced to a different view, the client's primary
      * may no longer be the real primary. */
+    /* Zero padding bytes between end of message and aligned size to prevent
+     * stack content leakage over the network. */
+    if ((size_t)rep->hdr.size > (size_t)total) {
+        memset(out + total, 0, (size_t)(rep->hdr.size - total));
+    }
+
     return tbft_node_send(s_client, out, (size_t)rep->hdr.size,
                           TBFT_ALL_REPLICAS) > 0 ? 0 : -1;
 }
@@ -509,13 +549,17 @@ int Byz_recv_reply(Byz_rep *rep)
     int f = s_client->max_faulty;
     int needed = f + 1; /* f+1 matching replies from DISTINCT replicas */
     int num_replicas = s_client->num_replicas;
-    int64_t deadline_us = esp_timer_get_time() + 10000000LL; /* 10 s timeout */
+    int64_t deadline_us = esp_timer_get_time()
+        + (int64_t)TBFT_CLIENT_REPLY_TIMEOUT_MS * 1000LL;
 
     while (esp_timer_get_time() < deadline_us) {
         uint8_t buf[TBFT_MAX_MESSAGE_SIZE];
-        int n = tbft_node_recv(s_client, buf, NULL);
+        int n = tbft_node_recv(s_client, buf, sizeof(buf), NULL);
         if (n < (int)sizeof(tbft_reply_rep_t)) {
             vTaskDelay(pdMS_TO_TICKS(1));
+#if CONFIG_ESP_TASK_WDT_EN
+            esp_task_wdt_reset();
+#endif
             continue;
         }
 
@@ -758,17 +802,14 @@ int Byz_init_replica(const char *config_file, const char *priv_config,
         return -1;
     }
 
-    /* Set timer periods from config.
-     * Use a 3x grace period for the initial view-change timer to allow
-     * the cluster to complete HMAC key exchange before triggering view-change. */
+    /* Set timer periods from config */
     s_replica->vtimer_period_us = (int64_t)cfg.vc_timeout_ms * 1000LL;
     s_replica->stimer_period_us = (int64_t)cfg.status_timeout_ms * 1000LL;
 
-    /* Restart timers with correct periods */
-    tbft_itimer_stop(&s_replica->vtimer);
-    tbft_itimer_stop(&s_replica->stimer);
-    tbft_itimer_start(&s_replica->vtimer, s_replica->vtimer_period_us * 3);
-    tbft_itimer_start(&s_replica->stimer, s_replica->stimer_period_us);
+    /* M4 FIX: Setup principals FIRST (including private keys and HMAC session
+     * keys), then start timers. Starting the view-change timer before key
+     * exchange completes could trigger spurious view-changes if the 3x grace
+     * period expires while principals are still being initialised. */
 
     /* Setup principals */
     if (setup_principals(&s_replica->node, &cfg, priv_config, local_id) != 0) {
@@ -778,6 +819,14 @@ int Byz_init_replica(const char *config_file, const char *priv_config,
         return -1;
     }
 
+    /* Start timers with correct periods after principals are ready.
+     * Use a 3x grace period for the initial view-change timer to allow
+     * the cluster to complete HMAC key exchange before triggering view-change. */
+    tbft_itimer_stop(&s_replica->vtimer);
+    tbft_itimer_stop(&s_replica->stimer);
+    tbft_itimer_start(&s_replica->vtimer, s_replica->vtimer_period_us * 3);
+    tbft_itimer_start(&s_replica->stimer, s_replica->stimer_period_us);
+
     s_is_replica = true;
     ESP_LOGI(TAG, "replica %d initialised", local_id);
     return 0;
@@ -785,9 +834,21 @@ int Byz_init_replica(const char *config_file, const char *priv_config,
 
 void Byz_modify(void *mem, int size)
 {
-    if (s_replica) {
-        tbft_state_cow(&s_replica->state, mem, (size_t)size);
+    if (!s_replica || !mem || size <= 0) return;
+
+    uintptr_t base  = (uintptr_t)s_replica->state.mem;
+    uintptr_t addr  = (uintptr_t)mem;
+    size_t    sz    = (size_t)size;
+
+    /* Overflow-safe bounds check: addr >= base && sz <= remaining space */
+    if (addr < base || sz > s_replica->state.mem_size ||
+        (addr - base) > s_replica->state.mem_size - sz) {
+        ESP_LOGW(TAG, "Byz_modify: address range [%p, +%zu) out of state bounds [%p, %zu)",
+                 mem, sz, (void *)base, s_replica->state.mem_size);
+        return;
     }
+
+    tbft_state_cow(&s_replica->state, mem, sz);
 }
 
 void Byz_modify1(void *mem)

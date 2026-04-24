@@ -84,8 +84,7 @@ static int socket_open(uint16_t port, bool use_multicast,
     if (use_multicast && mcast_ip) {
         /* Validate multicast IP string before use */
         struct in_addr mcast_addr;
-        mcast_addr.s_addr = inet_addr(mcast_ip);
-        if (mcast_addr.s_addr == INADDR_NONE) {
+        if (inet_pton(AF_INET, mcast_ip, &mcast_addr) != 1) {
             ESP_LOGE(TAG, "invalid multicast IP: %s", mcast_ip);
             close(sock);
             return -1;
@@ -110,10 +109,19 @@ static int socket_open(uint16_t port, bool use_multicast,
             return -1;
         }
 
+        /* M6 FIX: Disable multicast loopback to prevent receiving our own
+         * messages. Without this, every broadcast is echoed back to the
+         * sender, wasting CPU cycles processing self-sent BFT messages. */
+        int loop = 0;
+        if (setsockopt(sock, IPPROTO_IP, IP_MULTICAST_LOOP, &loop, sizeof(loop)) < 0) {
+            ESP_LOGW(TAG, "setsockopt(IP_MULTICAST_LOOP) failed: %d", errno);
+            /* Non-fatal: continue without disabling loopback */
+        }
+
         /* Store multicast destination address */
         memset(mcast_addr_out, 0, sizeof(*mcast_addr_out));
         mcast_addr_out->sin_family      = AF_INET;
-        mcast_addr_out->sin_addr.s_addr = inet_addr(mcast_ip);
+        mcast_addr_out->sin_addr        = mcast_addr;
         mcast_addr_out->sin_port        = htons(port);
     }
 
@@ -169,6 +177,15 @@ void tbft_transport_free(tbft_transport_t *t)
     if (!t) return;
     tbft_udp_t *udp = (tbft_udp_t *)t;
     if (udp->sock >= 0) {
+        /* L1 FIX: Leave multicast group before closing socket to ensure
+         * IGMP membership is properly cleaned up. */
+        if (udp->use_multicast) {
+            struct ip_mreq mreq;
+            mreq.imr_multiaddr = udp->mcast_addr.sin_addr;
+            mreq.imr_interface.s_addr = htonl(INADDR_ANY);
+            setsockopt(udp->sock, IPPROTO_IP, IP_DROP_MEMBERSHIP,
+                       &mreq, sizeof(mreq));
+        }
         close(udp->sock);
     }
     free(udp);
@@ -208,7 +225,7 @@ int tbft_transport_send(tbft_transport_t *t, const void *buf, size_t len,
                 if (!udp->peer_valid[i]) continue;
                 struct sockaddr_in addr = {
                     .sin_family      = AF_INET,
-                    .sin_addr.s_addr = tbft_addr_udp_ip(udp->peers[i]),
+                    .sin_addr.s_addr = udp->peers[i].u.udp.ip,
                     .sin_port        = tbft_addr_udp_port(udp->peers[i]),
                 };
                 int r = sendto(udp->sock, buf, len, 0,
@@ -265,7 +282,7 @@ int tbft_transport_recv(tbft_transport_t *t, void *buf, size_t buf_len,
         *src_id = -1;
         for (int i = 0; i < udp->num_nodes; i++) {
             if (!udp->peer_valid[i]) continue;
-            if (tbft_addr_udp_ip(udp->peers[i])  == from.sin_addr.s_addr
+            if (udp->peers[i].u.udp.ip.s_addr == from.sin_addr.s_addr
                   && tbft_addr_udp_port(udp->peers[i]) == from.sin_port) {
                 *src_id = (tbft_node_id_t)i;
                 break;

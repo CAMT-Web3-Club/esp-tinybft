@@ -14,13 +14,23 @@ CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
 CONFIG_TBFT_TRANSPORT_ESPNOW=y
 
 # TinyBFT: aggressive RAM reduction for ESP32-C3 (~80KB app heap)
-CONFIG_TBFT_MAX_MESSAGE_SIZE=1152
+# Reply = 48 (header) + 900 (payload) + 256 (RSA sig) = 1204 bytes
+# Message size must be >= 1204, round up to 1248 for 8-byte alignment.
+CONFIG_TBFT_MAX_MESSAGE_SIZE=1248
 CONFIG_TBFT_MAX_REPLY_SIZE=900
+
+# Task WDT: 10s timeout for single-core ESP32-C3 where replica/send_task
+# context-switching can exceed the default 5s watchdog window.
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
+# Client blocks on reply for 10s+; IDLE task gets starved on single-core
+# because WiFi (prio 23) and send_task (prio 3) consume all CPU time.
+# Application tasks (client_task, replica_task) still feed their own WDT.
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=n
 CONFIG_TBFT_RQUEUE_MAX=4
 CONFIG_TBFT_NDET_BUF_SIZE=256
 CONFIG_TBFT_MAX_STATE_BLOCKS=8
 CONFIG_TBFT_P_LEVELS=2
-CONFIG_TBFT_WINDOW_SIZE=8
+CONFIG_TBFT_WINDOW_SIZE=16
 CONFIG_TBFT_CHECKPOINT_INTERVAL=4
 CONFIG_TBFT_ANTI_REPLAY_WINDOW_MS=30000
 

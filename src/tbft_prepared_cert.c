@@ -68,38 +68,6 @@ bool tbft_prepared_cert_is_complete(const tbft_prepared_cert_t *cert)
 }
 
 /* --------------------------------------------------------------------------
- * Prepare log
+ * NOTE: tbft_plog_init and tbft_plog_truncate were superseded by
+ * tbft_agreement_region_t and are no longer used. Implementations removed.
  * -------------------------------------------------------------------------- */
-
-void tbft_plog_init(tbft_plog_t *log, int prepare_threshold)
-{
-    memset(log, 0, sizeof(*log));
-    log->head             = 1;
-    log->head_idx         = 0;
-    log->mask             = TBFT_WINDOW_SIZE - 1;
-    log->prepare_threshold = prepare_threshold;
-    for (int i = 0; i < TBFT_WINDOW_SIZE; i++) {
-        tbft_prepared_cert_init(&log->slots[i], prepare_threshold);
-    }
-}
-
-void tbft_plog_truncate(tbft_plog_t *log, tbft_seqno_t new_head)
-{
-    if (new_head <= log->head) return; /* nothing to truncate, avoids negative cast */
-
-    /* Cap the loop to at most one full window to prevent billion-iteration
-     * stalls on pathological jumps.  Entries beyond the cap are cleared
-     * implicitly: they will be overwritten by new certificates once their
-     * slot index wraps back, and the stale data is harmless because the
-     * prepare threshold will not be met for a different seqno. */
-    tbft_seqno_t delta = new_head - log->head;
-    if (delta > TBFT_WINDOW_SIZE) delta = TBFT_WINDOW_SIZE;
-
-    for (tbft_seqno_t s = 0; s < delta; s++) {
-        int idx = (int)((log->head_idx + s) & log->mask);
-        tbft_prepared_cert_clear(&log->slots[idx]);
-    }
-    log->head_idx = (int)((log->head_idx + (new_head - log->head))
-                          & log->mask);
-    log->head = new_head;
-}

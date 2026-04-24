@@ -93,11 +93,12 @@ int tbft_node_send(tbft_node_t *node, const void *buf, size_t len,
 /**
  * Receive next message (non-blocking).
  * @param node     This node
- * @param buf      Output buffer (must be TBFT_MAX_MESSAGE_SIZE bytes)
+ * @param buf      Output buffer
+ * @param buf_len  Size of @p buf (must be at least TBFT_MAX_MESSAGE_SIZE for normal use)
  * @param src_id   If non-NULL, receives the apparent sender id (best-effort)
  * @return number of bytes received, 0 if nothing available, -1 on error
  */
-int tbft_node_recv(tbft_node_t *node, void *buf, tbft_node_id_t *src_id);
+int tbft_node_recv(tbft_node_t *node, void *buf, size_t buf_len, tbft_node_id_t *src_id);
 
 /* --------------------------------------------------------------------------
  * Authenticator generation / verification

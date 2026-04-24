@@ -30,3 +30,7 @@ CMakeUserPresets.json
 # Example keys — generate with examples/simple_wallet/gen_configs.sh
 examples/**/spiffs_image/priv*.der
 examples/**/spiffs_image/pub*.der
+
+# Agent Coding
+.qwen/
+.claude/

@@ -107,15 +107,10 @@ int tbft_node_send(tbft_node_t *node, const void *buf, size_t len,
     return tbft_transport_send(node->transport, buf, len, dest);
 }
 
-int tbft_node_recv(tbft_node_t *node, void *buf, tbft_node_id_t *src_id)
+int tbft_node_recv(tbft_node_t *node, void *buf, size_t buf_len, tbft_node_id_t *src_id)
 {
     if (!node->transport) return -1;
-    /* Pass the caller's buffer size to the transport layer to prevent
-     * overflow.  The caller's `buf` is typically r->in_buf or similar
-     * which is sized to TBFT_MAX_MESSAGE_SIZE; if a future caller uses
-     * a smaller buffer they must pass buf_len accordingly. */
-    int n = tbft_transport_recv(node->transport, buf,
-                                TBFT_MAX_MESSAGE_SIZE, src_id);
+    int n = tbft_transport_recv(node->transport, buf, buf_len, src_id);
     if (n < 0) {
         return -1; /* transport error */
     }
@@ -198,10 +193,16 @@ bool tbft_node_verify_sig(tbft_node_t *node, tbft_node_id_t sender_id,
 int tbft_node_auth_slot_index(const tbft_node_t *node, tbft_node_id_t sender_id)
 {
     if (sender_id == node->node_id) return -1;
-    if (sender_id > node->node_id) {
-        return (int)sender_id - 1;
+    /* The sender skips its own node_id when generating MACs.
+     * The receiver needs to find the slot that contains the MAC intended
+     * for it.  If the receiver's node_id > sender's node_id, the slot
+     * index is receiver's node_id - 1 (sender skipped itself before us).
+     * If the receiver's node_id < sender's node_id, the slot index is
+     * receiver's node_id (sender hasn't skipped itself yet). */
+    if (node->node_id > sender_id) {
+        return (int)node->node_id - 1;
     }
-    return (int)sender_id;
+    return (int)node->node_id;
 }
 
 tbft_req_id_t tbft_node_new_rid(tbft_node_t *node)

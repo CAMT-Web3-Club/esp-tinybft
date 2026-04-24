@@ -53,6 +53,7 @@ void prefix##_clear(cert_t *cert)                                              \
 bool prefix##_add(cert_t *cert, const void *msg, int msg_len,                  \
                   tbft_node_id_t sender_id)                                    \
 {                                                                              \
+    if (sender_id < 0 || sender_id >= 64) return false;                        \
     if (msg_len <= 0 || (size_t)msg_len > (msg_slot_size)) {                   \
         return false; /* reject negative / oversized — no silent truncation */ \
     }                                                                          \
@@ -93,6 +94,7 @@ bool prefix##_add(cert_t *cert, const void *msg, int msg_len,                  \
 bool prefix##_add_mine(cert_t *cert, const void *msg, int msg_len,             \
                        tbft_node_id_t my_id)                                   \
 {                                                                              \
+    if (my_id < 0 || my_id >= 64) return false;                                \
     if (msg_len <= 0 || (size_t)msg_len > (msg_slot_size)) {                   \
         return false; /* reject negative / oversized — no silent truncation */ \
     }                                                                          \
