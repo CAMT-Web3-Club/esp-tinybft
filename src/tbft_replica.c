@@ -735,7 +735,9 @@ void tbft_replica_handle_prepare(tbft_replica_t *r, const void *msg, int len)
         ESP_LOGW(TAG, "prepare: invalid sender id %d", sender);
         return;
     }
-    if (sender == tbft_node_primary(&r->node, prep->view)) return;
+    /* Accept prepares from all replicas including the primary.
+     * The primary broadcasts its prepare after sending pre-prepare,
+     * and backups need it to reach the f+1 prepare threshold. */
     if (sender == r->node.node_id) return;
 
     int slot = tbft_node_auth_slot_index(&r->node, sender);
@@ -1529,7 +1531,9 @@ void tbft_replica_send_pre_prepare(tbft_replica_t *r)
 
     /* The primary's pre-prepare implicitly serves as its own Prepare.
      * Add a self-prepare to the certificate so the primary counts toward
-     * the f+1 prepare threshold needed to reach the prepared state. */
+     * the f+1 prepare threshold needed to reach the prepared state.
+     * Also broadcast the prepare to all replicas so backups can reach
+     * "prepared" state (they need f+1 prepares including the primary's). */
     {
         tbft_prepare_rep_t *prep = (tbft_prepare_rep_t *)r->out_buf;
         prep->hdr.tag   = TBFT_MSG_PREPARE;
@@ -1547,6 +1551,9 @@ void tbft_replica_send_pre_prepare(tbft_replica_t *r)
 
         tbft_ar_add_my_prepare(&r->ar, r->seqno, r->out_buf, prep->hdr.size,
                                r->node.node_id);
+
+        tbft_node_send(&r->node, r->out_buf, (size_t)prep->hdr.size,
+                       TBFT_ALL_REPLICAS);
     }
 
     /* Mark this request ID as assigned to prevent duplicate seqno. */
