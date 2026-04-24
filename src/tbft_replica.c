@@ -1753,10 +1753,13 @@ void tbft_replica_execute_committed(tbft_replica_t *r)
             ckpt->id       = r->node.node_id;
             tbft_auth_t *auth =
                 (tbft_auth_t *)(r->out_buf + sizeof(*ckpt));
-            tbft_node_gen_auth(&r->node, r->out_buf,
-                               sizeof(*ckpt), auth);
+            /* CRITICAL FIX: Set hdr.size BEFORE computing HMAC, same as
+             * pre-prepare, prepare, and commit. The size field is part of
+             * the message covered by the MAC. */
             ckpt->hdr.size = tbft_msg_align(
                 (int32_t)(sizeof(*ckpt) + sizeof(tbft_auth_t)));
+            tbft_node_gen_auth(&r->node, r->out_buf,
+                               sizeof(*ckpt), auth);
 
             /* Store our own checkpoint NOW, before broadcast.
              * This prevents a spoofed message with id==node_id from
