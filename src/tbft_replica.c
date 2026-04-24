@@ -1345,6 +1345,20 @@ void tbft_replica_send_pre_prepare(tbft_replica_t *r)
 {
     if (!tbft_replica_is_primary(r)) return;
 
+    /* CRITICAL FIX: Ensure enough peers have our HMAC out-key before sending
+     * pre-prepares.  Without this, the primary sends pre-prepares that
+     * backups reject with MAC verification failure because they haven't
+     * received the primary's key yet. */
+    {
+        int keys_ok = 0;
+        for (int i = 0; i < r->node.num_replicas; i++) {
+            if (i == r->node.node_id) continue;
+            if (r->node.principals[i] && r->node.principals[i]->keys_fresh)
+                keys_ok++;
+        }
+        if (keys_ok < r->node.threshold - 1) return;
+    }
+
     /* Track which queue the request came from so we pop from the right one
      * after successfully building and broadcasting the Pre_prepare. */
     tbft_rqueue_t *src_queue = &r->rqueue;
