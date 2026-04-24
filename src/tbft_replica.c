@@ -1569,6 +1569,16 @@ void tbft_replica_send_pre_prepare(tbft_replica_t *r)
     }
 
     rqueue_pop(src_queue);
+
+    /* CRITICAL FIX: The primary skips its own pre-prepare in
+     * handle_pre_prepare, so last_prepared is never updated from received
+     * messages.  Without this, execute_committed's loop (n <= last_prepared)
+     * never enters on the primary, so it never executes requests, never
+     * sends checkpoints, and its application state diverges from backups.
+     * Set last_prepared here, matching what backups do when they receive
+     * the pre-prepare. */
+    r->last_prepared = r->seqno;
+
     r->seqno++;
 
     /* Reset view-change timer — primary is active */
