@@ -699,6 +699,12 @@ void tbft_replica_handle_pre_prepare(tbft_replica_t *r, const void *msg, int len
     ESP_LOGI(TAG, "pp accepted: seqno=%lld view=%lld from primary %d",
              (long long)pp->seqno, (long long)pp->view, expected_primary);
 
+    /* Do NOT restart the vtimer on every pre-prepare. The vtimer on backups
+     * should only run when the backup has actively forwarded a request to the
+     * primary (line 505).  Restarting it on every pre-prepare means a backup
+     * that receives a pre-prepare and then sees 5s of idle time will trigger
+     * a spurious view-change — even though the primary is working correctly. */
+
     /* Update last_prepared if needed */
     if (pp->seqno > r->last_prepared) {
         r->last_prepared = pp->seqno;
@@ -922,6 +928,8 @@ void tbft_replica_handle_checkpoint(tbft_replica_t *r, const void *msg, int len)
 
     const tbft_msg_hdr_t *hdr = (const tbft_msg_hdr_t *)msg;
     const tbft_auth_t *auth = (const tbft_auth_t *)((const uint8_t *)msg + sizeof(*ckpt));
+    /* The MAC was computed over the checkpoint body only (not the auth),
+     * so verify over sizeof(*ckpt), not hdr->size which includes auth. */
     if (!tbft_node_verify_auth(&r->node, sender, msg, sizeof(*ckpt),
                                &auth->slots[slot], hdr->timestamp_us)) {
         ESP_LOGW(TAG, "checkpoint: MAC verification failed from %d", sender);
@@ -972,31 +980,20 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
     bool collected = tbft_vi_collect_vc(&r->vi, sender_id, msg, len);
     if (!collected) {
         if (vc->v > r->node.view) {
-            /* CRITICAL FIX: Advance view and reset seqno immediately when
-             * receiving a view-change for a higher view.  Without this,
-             * replicas can accumulate different view numbers from idling
-             * (vc timers fire at different times), each keeping their own
-             * stale seqno.  By advancing view + resetting seqno as soon
-             * as we learn about a higher view, all replicas self-synchronize
-             * without requiring simultaneous restart. */
+            /* Advance view when receiving a view-change for a higher view.
+             * Do NOT send a catch-up view-change here — that creates a cascade
+             * where each node overshoots to V+1, causing others to jump to V+2,
+             * etc. Just update our view and let the new primary (if we have
+             * enough VCs) send the New_view message. */
             r->node.view = vc->v;
             r->node.cur_primary = tbft_node_primary(&r->node, vc->v);
             r->seqno = 1;
             ESP_LOGI(TAG, "sync view to %lld (from vc of %d), seqno reset to 1",
                      (long long)vc->v, sender_id);
-            if (!r->vi.received[r->node.node_id]) {
-                /* Suppress catch-up view-change until we have enough HMAC keys */
-                int keys_ok = 0;
-                for (int i = 0; i < r->node.num_replicas; i++) {
-                    if (i == r->node.node_id) continue;
-                    if (r->node.principals[i] && r->node.principals[i]->keys_fresh) {
-                        keys_ok++;
-                    }
-                }
-                if (keys_ok >= r->node.threshold - 1) {
-                    tbft_replica_send_view_change(r);
-                }
-            }
+            /* REMOVED: catch-up view-change cascade accelerator.
+             * The old code here called tbft_replica_send_view_change(r) which
+             * computed target = r->node.view + 1 = V + 1, overshooting the
+             * received view and triggering a cascade to ever-higher views. */
         }
         return;
     }
@@ -1373,11 +1370,9 @@ void tbft_replica_send_pre_prepare(tbft_replica_t *r)
 {
     if (!tbft_replica_is_primary(r)) return;
 
-    /* CRITICAL FIX: Wait for key exchange to settle before sending pre-prepares.
-     * The primary's keys_fresh means it received a peer's New_key, but the
-     * peer might not yet have received the primary's New_key (network asymmetry).
-     * We track when the key count FIRST reached threshold-1, and wait 3s from
-     * that point (not from the last key arrival, which would keep resetting). */
+    /* Only require that we have at least threshold-1 peers with fresh keys.
+     * The self-test already verifies each key on import, so no additional
+     * settling delay is needed. */
     {
         int keys_ok = 0;
         for (int i = 0; i < r->node.num_replicas; i++) {
@@ -1386,14 +1381,8 @@ void tbft_replica_send_pre_prepare(tbft_replica_t *r)
                 keys_ok++;
         }
         if (keys_ok < r->node.threshold - 1) {
-            r->keys_ready_since_tick = 0;  /* not ready */
             return;
         }
-        if (r->keys_ready_since_tick == 0) {
-            r->keys_ready_since_tick = xTaskGetTickCount();
-        }
-        TickType_t now = xTaskGetTickCount();
-        if (now - r->keys_ready_since_tick < pdMS_TO_TICKS(3000)) return;
     }
 
     /* Track which queue the request came from so we pop from the right one
@@ -1404,7 +1393,16 @@ void tbft_replica_send_pre_prepare(tbft_replica_t *r)
         src_queue = &r->ro_rqueue;
         req = rqueue_front(src_queue);
     }
-    if (!req) return;
+    if (!req) {
+        /* No pending requests — stop the view-change timer so it doesn't
+         * fire during idle periods.  The client sends every ~30s, so a 5s
+         * timer would constantly trigger spurious view-changes. */
+        tbft_itimer_stop(&r->vtimer);
+        return;
+    }
+
+    /* Restart the vtimer now that we're actively working on a request. */
+    tbft_itimer_start(&r->vtimer, r->vtimer_period_us);
 
     /* CRITICAL FIX: Dedup by request ID.  The same request can arrive
      * multiple times: once from the client's broadcast, then forwarded
@@ -1563,6 +1561,16 @@ void tbft_replica_send_pre_prepare(tbft_replica_t *r)
     }
 
     rqueue_pop(src_queue);
+
+    /* CRITICAL FIX: The primary skips its own pre-prepare in
+     * handle_pre_prepare, so last_prepared is never updated from received
+     * messages.  Without this, execute_committed's loop (n <= last_prepared)
+     * never enters on the primary, so it never executes requests, never
+     * sends checkpoints, and its application state diverges from backups.
+     * Set last_prepared here, matching what backups do when they receive
+     * the pre-prepare. */
+    r->last_prepared = r->seqno;
+
     r->seqno++;
 
     /* Reset view-change timer — primary is active */
@@ -1747,10 +1755,13 @@ void tbft_replica_execute_committed(tbft_replica_t *r)
             ckpt->id       = r->node.node_id;
             tbft_auth_t *auth =
                 (tbft_auth_t *)(r->out_buf + sizeof(*ckpt));
-            tbft_node_gen_auth(&r->node, r->out_buf,
-                               sizeof(*ckpt), auth);
+            /* CRITICAL FIX: Set hdr.size BEFORE computing HMAC, same as
+             * pre-prepare, prepare, and commit. The size field is part of
+             * the message covered by the MAC. */
             ckpt->hdr.size = tbft_msg_align(
                 (int32_t)(sizeof(*ckpt) + sizeof(tbft_auth_t)));
+            tbft_node_gen_auth(&r->node, r->out_buf,
+                               sizeof(*ckpt), auth);
 
             /* Store our own checkpoint NOW, before broadcast.
              * This prevents a spoofed message with id==node_id from
