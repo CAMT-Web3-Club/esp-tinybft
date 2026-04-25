@@ -24,7 +24,7 @@ Add `esp-tinybft` to your host project's `idf_component.yml` (create it in your 
 
 ```yaml
 dependencies:
-  phukrit7171/esp-tinybft: ">=0.1.0"
+  phukrit7171/esp-tinybft: ">=0.2.0"
 ```
 
 Then let the IDF Component Manager fetch it:
@@ -192,6 +192,28 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for full documentation covering
 | 4 (default) | 1 | 3 |
 | 7 | 2 | 5 |
 | 10 | 3 | 7 |
+
+## Changelog
+
+### v0.2.0
+
+All core PBFT protocol bugs fixed — system now reaches consensus end-to-end:
+
+| Fix | Description |
+|-----|-------------|
+| Anti-replay slack | Increased from 60s to 300s to tolerate staggered boot times |
+| hdr.size before HMAC | Set `hdr.size` BEFORE computing HMAC for Prepare, Commit, and Checkpoint messages |
+| View advancement | Advance local view on receiving a higher-view pre-prepare |
+| Embedded request padding | Allow 7-byte alignment padding in embedded request validation |
+| Auth slot index | `tbft_node_auth_slot_index` uses receiver's `node_id`, not sender's |
+| Primary `last_prepared` | Primary updates `last_prepared` when creating a pre-prepare |
+| Checkpoint MAC verify | Receiver passes body size (not `hdr->size`) to `tbft_node_verify_auth` |
+| Backup vtimer | Removed vtimer restart on every pre-prepare — prevents spurious view-changes |
+| View-change cascade | Removed catch-up view-change in `handle_view_change` — prevents cascade to V+1 |
+
+### v0.1.0
+
+Initial release — PBFT consensus with static memory, dual transport (UDP/ESP-NOW), and libbyz-compatible API.
 
 ## License
 
