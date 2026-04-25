@@ -1649,11 +1649,18 @@ void tbft_replica_execute_committed(tbft_replica_t *r)
     for (tbft_seqno_t n = r->last_executed + 1;
          n <= r->last_prepared;
          n++) {
-        if (!tbft_ar_committed(&r->ar, n)) break;
+        if (!tbft_ar_committed(&r->ar, n)) {
+            ESP_LOGW(TAG, "execute: seqno=%lld not committed yet (last_executed=%lld, last_prepared=%lld) — break",
+                     (long long)n, (long long)r->last_executed, (long long)r->last_prepared);
+            break;
+        }
 
         int pp_len = 0;
         const uint8_t *pp_buf = tbft_ar_load_pp(&r->ar, n, &pp_len);
-        if (!pp_buf) break;
+        if (!pp_buf) {
+            ESP_LOGW(TAG, "execute: no pre-prepare for seqno=%lld — break", (long long)n);
+            break;
+        }
 
         const tbft_pre_prepare_rep_t *pp =
             (const tbft_pre_prepare_rep_t *)pp_buf;
@@ -1665,6 +1672,8 @@ void tbft_replica_execute_committed(tbft_replica_t *r)
 
         /* Execute */
         if (r->exec_cb && req_len >= (int)sizeof(tbft_request_rep_t)) {
+            ESP_LOGI(TAG, "execute: calling exec_cb for seqno=%lld req_len=%d",
+                     (long long)n, req_len);
             const tbft_request_rep_t *req_rep =
                 (const tbft_request_rep_t *)req_bytes;
 
@@ -1736,6 +1745,9 @@ void tbft_replica_execute_committed(tbft_replica_t *r)
                          (long long)n, rc);
                 break;
             }
+        } else {
+            ESP_LOGW(TAG, "execute: exec_cb=%p req_len=%d sizeof(req)=%d — skipping exec for seqno=%lld",
+                     r->exec_cb, req_len, (int)sizeof(tbft_request_rep_t), (long long)n);
         }
 
         r->last_executed = n;
