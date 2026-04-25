@@ -699,10 +699,11 @@ void tbft_replica_handle_pre_prepare(tbft_replica_t *r, const void *msg, int len
     ESP_LOGI(TAG, "pp accepted: seqno=%lld view=%lld from primary %d",
              (long long)pp->seqno, (long long)pp->view, expected_primary);
 
-    /* Reset view-change timer — the primary is alive and making progress.
-     * Without this, backups can trigger a view-change during normal operation
-     * if the timeout fires while waiting for pre-prepares. */
-    tbft_itimer_start(&r->vtimer, r->vtimer_period_us);
+    /* Do NOT restart the vtimer on every pre-prepare. The vtimer on backups
+     * should only run when the backup has actively forwarded a request to the
+     * primary (line 505).  Restarting it on every pre-prepare means a backup
+     * that receives a pre-prepare and then sees 5s of idle time will trigger
+     * a spurious view-change — even though the primary is working correctly. */
 
     /* Update last_prepared if needed */
     if (pp->seqno > r->last_prepared) {
@@ -979,31 +980,20 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
     bool collected = tbft_vi_collect_vc(&r->vi, sender_id, msg, len);
     if (!collected) {
         if (vc->v > r->node.view) {
-            /* CRITICAL FIX: Advance view and reset seqno immediately when
-             * receiving a view-change for a higher view.  Without this,
-             * replicas can accumulate different view numbers from idling
-             * (vc timers fire at different times), each keeping their own
-             * stale seqno.  By advancing view + resetting seqno as soon
-             * as we learn about a higher view, all replicas self-synchronize
-             * without requiring simultaneous restart. */
+            /* Advance view when receiving a view-change for a higher view.
+             * Do NOT send a catch-up view-change here — that creates a cascade
+             * where each node overshoots to V+1, causing others to jump to V+2,
+             * etc. Just update our view and let the new primary (if we have
+             * enough VCs) send the New_view message. */
             r->node.view = vc->v;
             r->node.cur_primary = tbft_node_primary(&r->node, vc->v);
             r->seqno = 1;
             ESP_LOGI(TAG, "sync view to %lld (from vc of %d), seqno reset to 1",
                      (long long)vc->v, sender_id);
-            if (!r->vi.received[r->node.node_id]) {
-                /* Suppress catch-up view-change until we have enough HMAC keys */
-                int keys_ok = 0;
-                for (int i = 0; i < r->node.num_replicas; i++) {
-                    if (i == r->node.node_id) continue;
-                    if (r->node.principals[i] && r->node.principals[i]->keys_fresh) {
-                        keys_ok++;
-                    }
-                }
-                if (keys_ok >= r->node.threshold - 1) {
-                    tbft_replica_send_view_change(r);
-                }
-            }
+            /* REMOVED: catch-up view-change cascade accelerator.
+             * The old code here called tbft_replica_send_view_change(r) which
+             * computed target = r->node.view + 1 = V + 1, overshooting the
+             * received view and triggering a cascade to ever-higher views. */
         }
         return;
     }
