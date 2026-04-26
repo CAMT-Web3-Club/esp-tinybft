@@ -12,6 +12,8 @@
 #include "esp-tinybft.h"
 #include "esp_task_wdt.h"
 
+#define TAG "simple_wallet"
+
 #if CONFIG_TBFT_TRANSPORT_UDP
 #include "esp_event.h"
 #include "freertos/event_groups.h"
@@ -25,20 +27,16 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
 {
     static int s_retry = 0;
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
-        if (s_retry < 5) {
-            esp_wifi_connect();
-            s_retry++;
-        } else {
-            xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
-        }
+        /* Retry indefinitely — UDP transport requires persistent WiFi */
+        ESP_LOGW(TAG, "WiFi disconnected, reconnecting...");
+        esp_wifi_connect();
+        s_retry++;
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         s_retry = 0;
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     }
 }
 #endif
-
-#define TAG "simple_wallet"
 
 #define NUM_ACCOUNTS 4
 static int32_t app_state[4096 / sizeof(int32_t)];
@@ -118,7 +116,12 @@ static void wifi_init(void) {
     if (bits & WIFI_CONNECTED_BIT) {
         ESP_LOGI(TAG, "WiFi connected");
     } else {
-        ESP_LOGE(TAG, "WiFi connection failed");
+        /* Should not reach here — handler retries indefinitely.
+         * But if it does, block forever rather than proceed with no IP. */
+        ESP_LOGE(TAG, "WiFi connection failed — halting until reconnected");
+        xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT,
+                            pdFALSE, pdFALSE, portMAX_DELAY);
+        ESP_LOGI(TAG, "WiFi reconnected");
     }
 #else
     ESP_LOGI(TAG, "Starting WiFi AP for ESP-NOW...");

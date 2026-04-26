@@ -282,7 +282,7 @@ int tbft_transport_recv(tbft_transport_t *t, void *buf, size_t buf_len,
         *src_id = -1;
         for (int i = 0; i < udp->num_nodes; i++) {
             if (!udp->peer_valid[i]) continue;
-            if (udp->peers[i].u.udp.ip.s_addr == from.sin_addr.s_addr
+            if (tbft_addr_udp_ip(udp->peers[i]) == from.sin_addr.s_addr
                   && tbft_addr_udp_port(udp->peers[i]) == from.sin_port) {
                 *src_id = (tbft_node_id_t)i;
                 break;

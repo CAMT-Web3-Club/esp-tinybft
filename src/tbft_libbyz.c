@@ -15,6 +15,7 @@
 #include "esp_timer.h"
 #include "esp_task_wdt.h"
 #if CONFIG_TBFT_TRANSPORT_UDP
+#include "lwip/sockets.h"
 #include "lwip/inet.h"
 #include "esp_netif.h"
 #include <string.h>
