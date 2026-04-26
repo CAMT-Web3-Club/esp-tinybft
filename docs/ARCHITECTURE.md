@@ -337,7 +337,9 @@ typedef struct {
     bool                has_priv_key;
     tbft_hmac_key_t hmac_in_key;       /* verify MACs from this principal */
     tbft_hmac_key_t hmac_out_key;      /* generate MACs for this principal */
-    bool            keys_fresh;
+    bool            keys_fresh;        /* true if keys have been exchanged */
+    psa_key_id_t    psa_hmac_in_id;    /* persistent PSA key for verify; 0 = not loaded */
+    psa_key_id_t    psa_hmac_out_id;   /* persistent PSA key for sign; 0 = not loaded */
     int64_t         last_auth_time_us; /* anti-replay timestamp */
 } tbft_principal_t;
 ```
@@ -347,13 +349,16 @@ typedef struct {
 | Function | Signature | Description |
 |---|---|---|
 | `tbft_principal_init` | `(p, id, addr) -> void` | Zero-fill, init MbedTLS contexts, call `psa_crypto_init()` |
+| `tbft_principal_ensure_psa` | `() -> void` | Idempotent PSA crypto initialisation (called before any principal exists) |
 | `tbft_principal_load_pub_key` | `(p, der, der_len) -> int` | Parse DER-encoded public key via `mbedtls_pk_parse_public_key` |
 | `tbft_principal_load_priv_key` | `(p, der, der_len) -> int` | Parse DER-encoded private key via `mbedtls_pk_parse_key` |
-| `tbft_principal_free` | `(p) -> void` | Free MbedTLS contexts, zero-fill |
-| `tbft_principal_gen_mac_out` | `(p, msg, msg_len, mac) -> int` | HMAC-SHA256 with `hmac_out_key` |
-| `tbft_principal_verify_mac_in` | `(p, msg, msg_len, mac) -> bool` | HMAC-SHA256 with `hmac_in_key`, constant-time compare |
-| `tbft_principal_set_in_key` | `(p, key) -> void` | Set `hmac_in_key`, set `keys_fresh = true` |
-| `tbft_principal_set_out_key` | `(p, key) -> void` | Set `hmac_out_key` |
+| `tbft_principal_free` | `(p) -> void` | Free MbedTLS/PSA contexts, zero-fill |
+| `tbft_principal_gen_mac_out` | `(p, msg, msg_len, mac) -> int` | HMAC-SHA256 with persistent PSA `psa_hmac_out_id` |
+| `tbft_principal_verify_mac_in` | `(p, msg, msg_len, mac) -> bool` | HMAC-SHA256 with persistent PSA `psa_hmac_in_id`, constant-time compare |
+| `tbft_principal_verify_mac_in_with_replay_check` | `(p, msg, msg_len, mac, msg_time) -> bool` | As above + anti-replay timestamp validation |
+| `tbft_principal_update_auth_time` | `(p, time_us) -> void` | Inline helper to set `last_auth_time_us` |
+| `tbft_principal_set_in_key` | `(p, key) -> void` | Set `hmac_in_key`, import to PSA, run self-test, set `keys_fresh = true` |
+| `tbft_principal_set_out_key` | `(p, key) -> void` | Set `hmac_out_key`, import to PSA `psa_hmac_out_id` |
 | `tbft_principal_sign` | `(p, msg, msg_len, sig) -> int` | SHA-256 via PSA + `mbedtls_pk_sign` |
 | `tbft_principal_verify_sig` | `(p, msg, msg_len, sig) -> bool` | SHA-256 via PSA + `mbedtls_pk_verify` |
 | `tbft_principal_encrypt_new_key` | `(p, new_out_key, enc_buf, enc_buf_len, out_enc_len) -> int` | Import pub key to PSA, `psa_asymmetric_encrypt` with PKCS#1 v1.5 |
@@ -365,12 +370,9 @@ PSA Crypto is initialised once via `psa_crypto_init()` on the first call to `tbf
 
 ### HMAC Implementation
 
-The `hmac_sha256_psa()` static function:
-1. Creates a transient PSA key with `psa_import_key` using `PSA_KEY_TYPE_HMAC`
-2. Calls `psa_mac_compute` with `PSA_ALG_HMAC(PSA_ALG_SHA_256)`
-3. Destroys the key via `psa_destroy_key`
+HMAC operations use **persistent PSA key handles** (`psa_hmac_in_id`, `psa_hmac_out_id`) imported once when session keys are set via `tbft_principal_set_in_key` / `tbft_principal_set_out_key`. This avoids the import/destroy overhead on every MAC operation. The in-key also runs a self-test (compute + verify round-trip) to validate the key was imported correctly.
 
-This approach is necessary because MbedTLS 4.x does not expose a standalone HMAC API.
+The anti-replay check (`tbft_principal_verify_mac_in_with_replay_check`) was **disabled** in the hot path due to ESP32 boot-time clock skew making `esp_timer_get_time()` unreliable across nodes. Replay protection is provided instead by the HMAC key itself — old messages fail verification under a newly rotated key.
 
 ## 7. Replica State Machine (tbft_replica_t)
 
@@ -446,6 +448,9 @@ typedef struct {
     uint8_t  out_buf[TBFT_MAX_MESSAGE_SIZE];
 
     bool  running;
+
+    /* Yield counter for cooperative scheduling */
+    int yield_counter;  /* incremented each loop iteration; resets at threshold */
 } tbft_replica_t;
 ```
 
@@ -460,6 +465,7 @@ case TBFT_MSG_COMMIT:      tbft_replica_handle_commit(r, buf, n);     break;
 case TBFT_MSG_CHECKPOINT:  tbft_replica_handle_checkpoint(r, buf, n); break;
 case TBFT_MSG_VIEW_CHANGE: tbft_replica_handle_view_change(r, buf, n);break;
 case TBFT_MSG_NEW_VIEW:    tbft_replica_handle_new_view(r, buf, n);   break;
+case TBFT_MSG_NEW_KEY:     tbft_replica_handle_new_key(r, buf, n);    break;
 case TBFT_MSG_FETCH:       tbft_replica_handle_fetch(r, buf, n);      break;
 case TBFT_MSG_META_DATA:   tbft_replica_handle_meta_data(r, buf, n);  break;
 case TBFT_MSG_DATA:        tbft_replica_handle_data(r, buf, n);       break;
@@ -467,7 +473,7 @@ default: /* ignored */
 }
 ```
 
-Messages received but not in this list (Reply, Status, View-change-ack, New-key, Query-stable, Reply-stable) are silently ignored in the current implementation.
+Messages received but not in this list (Reply, Status, View-change-ack, Query-stable, Reply-stable) are silently ignored. New-key (`TBFT_MSG_NEW_KEY`) **is** dispatched to `tbft_replica_handle_new_key`.
 
 ### Event Group and Timer Dispatch
 
@@ -489,10 +495,12 @@ The `tbft_replica_run()` loop calls `xEventGroupClearBits` each iteration and ha
 
 | Timer | Callback | Action |
 |---|---|---|
-| `vtimer` | `vtimer_cb` | Sets `TBFT_EVT_VTIMER` bit — run loop calls `tbft_replica_send_view_change(r)` |
-| `stimer` | `stimer_cb` | Sets `TBFT_EVT_STIMER` bit — run loop builds and broadcasts `tbft_status_rep_t`, restarts stimer |
+| `vtimer` | `vtimer_cb` (signal-only) | Sets `TBFT_EVT_VTIMER` bit — run loop calls `tbft_replica_send_view_change(r)` |
+| `stimer` | `stimer_cb` (signal-only) | Sets `TBFT_EVT_STIMER` bit — run loop builds and broadcasts `tbft_status_rep_t`, restarts stimer |
 | `rtimer` | NULL | Placeholder (not used) |
 | `ntimer` | NULL | Placeholder (not used) |
+
+Timer callbacks **do not** execute protocol logic directly. They call `xEventGroupSetBits()` only, and the `tbft_replica_run()` event loop handles the heavy work. This avoids running RSA or other heavy operations from the `esp_timer` task context.
 
 Default periods: `vtimer = 5000000 us` (5 s), `stimer = 1000000 us` (1 s). Overridden by config file values. Timers are initialised in `tbft_replica_init()` but **not started** — `Byz_init_replica()` sets the correct periods from the config file and then starts them.
 
@@ -507,6 +515,7 @@ Default periods: `vtimer = 5000000 us` (5 s), `stimer = 1000000 us` (1 s). Overr
 | `handle_checkpoint` | Min size check | Store in CR; if threshold reached, call `mark_stable` |
 | `handle_view_change` | Min size check | Collect via VI; if new primary with quorum, build and send New-view |
 | `handle_new_view` | Min size, view > current, VI verify | Install new view, stop/restart vtimer, reset VI for next view |
+| `handle_new_key` | Min size, body_size <= len | Decrypt key slot for local node, verify self-test, install as HMAC in-key |
 | `handle_fetch` | Min size, level valid | Build Meta-data response with child digests |
 | `handle_meta_data` | In fetch, min size | Forward to state; dequeue and send fetch requests |
 | `handle_data` | In fetch, min size | Forward to state; verifies digest, writes block |
@@ -756,9 +765,10 @@ All 17 message tags defined in `src/tbft_message.h`:
 
 ```c
 typedef struct __attribute__((packed)) {
-    int16_t  tag;    /* tbft_msg_tag_t */
-    int16_t  extra;  /* tag-specific flags */
-    int32_t  size;   /* total message byte length (8-byte aligned) */
+    int16_t  tag;          /* tbft_msg_tag_t */
+    int16_t  extra;        /* tag-specific flags */
+    int32_t  size;         /* total message byte length (8-byte aligned) */
+    int64_t  timestamp_us; /* sender monotonic timestamp (anti-replay) */
 } tbft_msg_hdr_t;
 ```
 
@@ -1221,7 +1231,7 @@ static struct {
     uint8_t  buf[TBFT_MAX_MESSAGE_SIZE];
     int      len;
     bool     valid;
-} s_replies[MAX_PENDING_REPLIES];  // MAX_PENDING_REPLIES = TBFT_MAX_NUM_REPLICAS * 2
+} s_replies[TBFT_MAX_NUM_REPLICAS];  // one slot per replica id
 ```
 
 `Byz_recv_reply` loops for up to 10 seconds, collecting Reply messages and counting those with matching `(view, rid, reply_size)`. Returns when `match >= f + 1`.
