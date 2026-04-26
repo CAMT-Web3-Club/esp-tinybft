@@ -132,5 +132,5 @@ void tbft_ar_truncate(tbft_agreement_region_t *ar, tbft_seqno_t new_head)
         tbft_commit_cert_clear(&ar->slices[idx].commit_cert);
     }
     ar->head_idx = (int)((ar->head_idx + (int)delta) & ar->mask);
-    ar->head = new_head;
+    ar->head = ar->head + delta;
 }

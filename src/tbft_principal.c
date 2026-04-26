@@ -210,7 +210,7 @@ void tbft_principal_set_in_key(tbft_principal_t *p, const tbft_hmac_key_t *key)
     if (p->psa_hmac_in_id == 0) {
         ESP_LOGE(TAG, "set_in_key: PSA import FAILED for id=%d", (int)p->id);
     } else {
-        ESP_LOGI(TAG, "set_in_key: id=%d key[0..3]=%02x%02x%02x%02x psa_id=%u",
+        ESP_LOGD(TAG, "set_in_key: id=%d key[0..3]=%02x%02x%02x%02x psa_id=%u",
                  (int)p->id, key->bytes[0], key->bytes[1], key->bytes[2], key->bytes[3],
                  (unsigned)p->psa_hmac_in_id);
         /* Self-test: compute MAC with temp key, verify with in_key */
@@ -231,7 +231,7 @@ void tbft_principal_set_in_key(tbft_principal_t *p, const tbft_hmac_key_t *key)
                 if (st2 != PSA_SUCCESS) {
                     ESP_LOGE(TAG, "set_in_key: self-test verify FAILED for id=%d (psa=%d)", (int)p->id, (int)st2);
                 } else {
-                    ESP_LOGI(TAG, "set_in_key: self-test OK for id=%d", (int)p->id);
+                    ESP_LOGD(TAG, "set_in_key: self-test OK for id=%d", (int)p->id);
                 }
             }
             psa_destroy_key(kid);
@@ -258,7 +258,7 @@ void tbft_principal_set_out_key(tbft_principal_t *p, const tbft_hmac_key_t *key)
     }
     p->hmac_out_key = *key;
     p->psa_hmac_out_id = import_hmac_key(key, PSA_KEY_USAGE_SIGN_MESSAGE);
-    ESP_LOGI(TAG, "set_out_key: for id=%d, key[0..3]=%02x%02x%02x%02x",
+    ESP_LOGD(TAG, "set_out_key: for id=%d, key[0..3]=%02x%02x%02x%02x",
              (int)p->id, key->bytes[0], key->bytes[1], key->bytes[2], key->bytes[3]);
 }
 
