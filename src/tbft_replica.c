@@ -557,6 +557,16 @@ void tbft_replica_handle_pre_prepare(tbft_replica_t *r, const void *msg, int len
             r->last_stable = 0;
             r->last_prepared = 0;
             r->last_executed = 0;
+            /* Re-init clears all slice bitmaps/hashes from the old view.
+             * Patching head after init is safe: all slices are clean. */
+            tbft_ar_init(&r->ar, r->ar.prepare_threshold, r->ar.commit_threshold);
+            r->ar.head = 1;
+            /* Mirror what handle_new_view does: reset view-change state and
+             * restart the view-change timer so a stale target_view doesn't
+             * trigger a spurious view-change in the new view. */
+            tbft_itimer_stop(&r->vtimer);
+            tbft_vi_reset(&r->vi, r->node.view + 1);
+            tbft_itimer_start(&r->vtimer, r->vtimer_period_us);
         } else {
             ESP_LOGW(TAG, "pp: wrong view (got=%lld, expected=%lld)",
                      (long long)pp->view, (long long)r->node.view);
@@ -1183,6 +1193,17 @@ void tbft_replica_handle_new_view(tbft_replica_t *r, const void *msg, int len)
      * the primary resets seqno, non-primary replicas retain stale seqno
      * values, causing out-of-window errors when they later become primary. */
     r->seqno = nv->min + 1;
+    /* Advance local markers to nv->min so tbft_replica_in_window is consistent
+     * with ar.head = nv->min + 1.  nv->min is the highest stable checkpoint
+     * seqno proven by the view-change quorum, so advancing is safe. */
+    if (nv->min > r->last_stable)   r->last_stable   = nv->min;
+    if (nv->min > r->last_executed) r->last_executed = nv->min;
+    if (nv->min > r->last_prepared) r->last_prepared = nv->min;
+    tbft_cr_truncate(&r->cr, nv->min);
+    /* Re-init clears all slice bitmaps/hashes from the old view.
+     * Patching head after init is safe: all slices are clean. */
+    tbft_ar_init(&r->ar, r->ar.prepare_threshold, r->ar.commit_threshold);
+    r->ar.head = nv->min + 1;
     if (tbft_replica_is_primary(r)) {
         ESP_LOGI(TAG, "new primary: seqno reset to %lld", (long long)r->seqno);
     } else {
