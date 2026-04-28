@@ -266,25 +266,17 @@ void tbft_state_mark_stable(tbft_state_t *state, tbft_seqno_t stable_seqno)
 {
     if (stable_seqno <= state->last_stable) return;
 
-    /* CRITICAL FIX: Only free old_blocks when the checkpoint slot is being
-     * reused (circular buffer wrap). We must NOT free the old_blocks for the
-     * current last_stable, as they are needed for rollback during view-change.
-     *
-     * The slot for stable_seqno may overlap with an older checkpoint's slot.
-     * If so, free the old_blocks from that previous occupant before reusing. */
+    /* CRITICAL FIX: Unconditionally reset num_old_blocks for the target
+     * checkpoint slot. The slot may have stale CoW data from a previous
+     * cycle (when it was used as a CoW target via ckpt_slot_for(last_stable)
+     * at a different last_stable value). The valid+seqno guard only catches
+     * the case where the slot was a checkpoint target with a different seqno,
+     * but misses the case where it was only a CoW target (valid=false). */
     tbft_ckpt_record_t *new_rec = ckpt_slot_for(state, stable_seqno);
-    if (new_rec->valid && new_rec->seqno != stable_seqno) {
-        /* Slot is being reused for a new checkpoint — free old data */
-        if (new_rec->old_blocks) {
-            /* Note: old_blocks is pre-allocated in init, so we don't free
-             * the array itself, just reset the count. */
-            new_rec->num_old_blocks = 0;
-            /* M11 FIX: Clear stale data in reused checkpoint slot to prevent
-             * wasted memory and potential confusion during debugging.
-             * Moved inside the NULL guard to prevent crash on OOM. */
-            memset(new_rec->old_blocks, 0,
-                   (size_t)state->num_blocks * sizeof(tbft_cow_entry_t));
-        }
+    if (new_rec->old_blocks) {
+        new_rec->num_old_blocks = 0;
+        memset(new_rec->old_blocks, 0,
+               (size_t)state->num_blocks * sizeof(tbft_cow_entry_t));
     }
 
     state->last_stable = stable_seqno;
