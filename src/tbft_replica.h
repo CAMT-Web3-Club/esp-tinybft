@@ -60,6 +60,7 @@ typedef struct {
 
     /* Sequence number state */
     tbft_seqno_t  seqno;                  /* next seqno to assign (primary) */
+    int           last_assigned_cid;      /* last cid assigned a seqno (dedup) */
     tbft_req_id_t last_assigned_rid;      /* last rid assigned a seqno (dedup) */
     tbft_seqno_t  last_stable;            /* last stable checkpoint seqno */
     tbft_seqno_t  last_prepared;          /* highest prepared seqno */

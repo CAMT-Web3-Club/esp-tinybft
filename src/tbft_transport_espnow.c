@@ -37,7 +37,7 @@ static const char *TAG = "tbft_espnow";
 
 #define FRAG_HDR_SIZE       4
 #define FRAG_MAX_PAYLOAD    (ESPNOW_MAX_DATA_LEN - FRAG_HDR_SIZE)
-#define FRAG_MAX_PARTS      ((TBFT_MAX_MESSAGE_SIZE + FRAG_MAX_PAYLOAD - 1) / FRAG_MAX_PAYLOAD + 1)
+#define FRAG_MAX_PARTS      ((TBFT_MAX_MESSAGE_SIZE + FRAG_MAX_PAYLOAD - 1) / FRAG_MAX_PAYLOAD)
 #define REASM_MAX_SLOTS     8
 #define REASM_TIMEOUT_MS    5000
 #define FRAG_INTER_DELAY_MS 20
@@ -301,12 +301,11 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *
     ESP_LOGD(TAG, "espnow_cb: frag %d/%d msg_id=%u len=%d from " MACSTR,
              fhdr->frag_idx, fhdr->frag_total, fhdr->msg_id, data_len, MAC2STR(src_mac));
 
-    /* HIGH FIX H1: Increase lock timeout from 2ms to 50ms.
-     * The recv_cb runs in the WiFi task context. A longer timeout ensures
-     * it can acquire the lock even when send_task or other tasks are
-     * briefly holding it for reassembly operations. */
-    if (xSemaphoreTake(enow->lock, pdMS_TO_TICKS(50)) != pdTRUE) {
-        /* Log but don't drop — try again on next packet */
+    /* HIGH FIX H1: Keep lock timeout short (5ms) because recv_cb runs in
+     * the WiFi task context. Espressif docs warn against lengthy operations
+     * in WiFi callbacks. If the lock is held, drop the packet — BFT must
+     * tolerate message loss anyway. */
+    if (xSemaphoreTake(enow->lock, pdMS_TO_TICKS(5)) != pdTRUE) {
         return;
     }
 
@@ -344,12 +343,12 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *
          * priority inversion with send_task. */
         xSemaphoreGive(enow->lock);
 
-        if (xQueueSend(enow->msg_queue, &q_entry, pdMS_TO_TICKS(100)) != pdTRUE) {
-            ESP_LOGW(TAG, "msg_queue full after 100ms, dropping reassembled msg tag=%d len=%d",
-                     msg_tag, s->buf_len);
+        if (xQueueSend(enow->msg_queue, &q_entry, 0) != pdTRUE) {
+            ESP_LOGW(TAG, "msg_queue full, dropping reassembled msg tag=%d len=%d",
+                     msg_tag, q_entry.buf_len);
         } else {
             ESP_LOGI(TAG, "recv: tag=%d len=%d from " MACSTR,
-                     msg_tag, s->buf_len, MAC2STR(src_mac));
+                     msg_tag, q_entry.buf_len, MAC2STR(src_mac));
         }
     } else {
         xSemaphoreGive(enow->lock);
@@ -371,10 +370,9 @@ static int espnow_do_send(tbft_espnow_t *enow, const uint8_t *peer_mac, uint16_t
      * loss, triggering unnecessary view-changes in the BFT protocol. */
     const int MAX_RETRIES = 3;
 
-    /* M5 FIX: Use static buffer for packet assembly to avoid consuming
-     * ~1474B (36%) of the 4KB send_task stack per call. Thread-safe since
-     * send_task is the sole caller — no concurrent access. */
-    static uint8_t pkt[sizeof(frag_hdr_t) + FRAG_MAX_PAYLOAD];
+    /* Use stack buffer for packet assembly. Safe because send_task is
+     * the sole caller and this function does not yield. */
+    uint8_t pkt[sizeof(frag_hdr_t) + FRAG_MAX_PAYLOAD] __attribute__((aligned(4)));
 
     if (len + sizeof(frag_hdr_t) <= ESPNOW_MAX_DATA_LEN) {
         frag_hdr_t fhdr = { .msg_id = msg_id, .frag_total = 1, .frag_idx = 0 };
@@ -441,6 +439,10 @@ static void espnow_send_task(void *pvParameters) {
 
     while (1) {
         if (xQueueReceive(enow->send_queue, &entry, pdMS_TO_TICKS(SEND_TASK_RECV_TIMEOUT_MS)) != pdTRUE) {
+            if (enow->shutting_down) {
+                xSemaphoreGive(enow->task_exit_sem);
+                vTaskDelete(NULL);
+            }
             if (enow->reasm_stale_flag) {
                 enow->reasm_stale_flag = false;
                 xSemaphoreTake(enow->lock, portMAX_DELAY);
@@ -463,7 +465,7 @@ static void espnow_send_task(void *pvParameters) {
 
         if (entry.dest == TBFT_ALL_REPLICAS) {
             int limit = enow->num_replicas > 0 ? enow->num_replicas : enow->num_nodes;
-            int msg_tag = entry.buf[0]; /* first byte is hdr.tag */
+            int msg_tag = (entry.len > 0) ? entry.buf[0] : -1; /* first byte is hdr.tag */
             ESP_LOGI(TAG, "send_task: broadcast tag=%d size=%d to %d peers (limit=%d)",
                      msg_tag, entry.len, limit - 1, limit);
 
@@ -590,7 +592,13 @@ int tbft_transport_create(tbft_transport_t **out, tbft_transport_type_t type, in
                  rcb_err, esp_err_to_name(rcb_err));
         goto init_error;
     }
-    esp_now_register_send_cb(espnow_send_cb);
+    esp_err_t scb_err = esp_now_register_send_cb(espnow_send_cb);
+    if (scb_err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_now_register_send_cb failed: 0x%x (%s)",
+                 scb_err, esp_err_to_name(scb_err));
+        esp_now_unregister_recv_cb();
+        goto init_error;
+    }
 
     if (xTaskCreate(espnow_send_task, "tbft_send", SEND_TASK_STACK_SIZE, enow, SEND_TASK_PRIORITY, &enow->send_task_handle) != pdPASS) {
         ESP_LOGE(TAG, "xTaskCreate for send_task failed");
@@ -602,10 +610,12 @@ int tbft_transport_create(tbft_transport_t **out, tbft_transport_type_t type, in
 
 init_error:
     g_espnow_ctx = NULL;
-    vQueueDelete(enow->send_queue);
-    vQueueDelete(enow->msg_queue);
-    vSemaphoreDelete(enow->task_exit_sem);
-    vSemaphoreDelete(enow->lock);
+    esp_now_unregister_recv_cb();
+    esp_now_unregister_send_cb();
+    if (enow->send_queue) vQueueDelete(enow->send_queue);
+    if (enow->msg_queue) vQueueDelete(enow->msg_queue);
+    if (enow->task_exit_sem) vSemaphoreDelete(enow->task_exit_sem);
+    if (enow->lock) vSemaphoreDelete(enow->lock);
     free(enow);
     return -1;
 }
@@ -616,6 +626,7 @@ void tbft_transport_free(tbft_transport_t *t) {
 
     enow->shutting_down = true;
     esp_now_unregister_recv_cb();
+    esp_now_unregister_send_cb();
     g_espnow_ctx = NULL;
 
     vTaskDelay(pdMS_TO_TICKS(50));
@@ -623,8 +634,13 @@ void tbft_transport_free(tbft_transport_t *t) {
     if (enow->send_queue && enow->send_task_handle) {
         send_entry_t sentinel = { .dest = SEND_TASK_SHUTDOWN };
         if (xQueueSend(enow->send_queue, &sentinel, pdMS_TO_TICKS(SHUTDOWN_DRAIN_MS)) == pdTRUE) {
-            /* รอจนกว่า send_task จะสั่งปิดตัวเองเสร็จสิ้นอย่างปลอดภัย */
-            xSemaphoreTake(enow->task_exit_sem, pdMS_TO_TICKS(1000));
+            if (xSemaphoreTake(enow->task_exit_sem, pdMS_TO_TICKS(1000)) != pdTRUE) {
+                ESP_LOGW(TAG, "send_task did not exit cleanly, forcing delete");
+                vTaskDelete(enow->send_task_handle);
+            }
+        } else {
+            ESP_LOGW(TAG, "shutdown sentinel enqueue failed, forcing delete");
+            vTaskDelete(enow->send_task_handle);
         }
     }
 

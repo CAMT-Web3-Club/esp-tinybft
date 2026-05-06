@@ -93,7 +93,7 @@ const uint8_t *tbft_cr_load(const tbft_checkpoint_region_t *cr,
     }
     int sidx = slot_index(seqno);
     const tbft_ckpt_slot_t *slot = &cr->slots[sidx];
-    if (!slot->present[replica_id]) {
+    if (slot->seqno != seqno || !slot->present[replica_id]) {
         if (len_out) *len_out = 0;
         return NULL;
     }
@@ -103,7 +103,10 @@ const uint8_t *tbft_cr_load(const tbft_checkpoint_region_t *cr,
 
 int tbft_cr_count(const tbft_checkpoint_region_t *cr, tbft_seqno_t seqno)
 {
-    return cr->slots[slot_index(seqno)].match_count;
+    int sidx = slot_index(seqno);
+    const tbft_ckpt_slot_t *slot = &cr->slots[sidx];
+    if (slot->seqno != seqno) return 0;
+    return slot->match_count;
 }
 
 const tbft_digest_t *tbft_cr_winning_digest(const tbft_checkpoint_region_t *cr,

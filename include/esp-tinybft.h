@@ -62,6 +62,10 @@
  *                    exec_cb, NULL, 0, NULL, 0);
  *   Byz_replica_run();  // blocks — run in a FreeRTOS task
  * @endcode
+ *
+ * @note Thread safety: Byz_init_replica() is NOT thread-safe with respect
+ * to Byz_replica_run(). The caller must ensure Byz_replica_run() has exited
+ * (the FreeRTOS task has terminated) before calling Byz_init_replica() again.
  */
 
 #include <stdint.h>

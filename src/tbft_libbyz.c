@@ -11,7 +11,7 @@
 #include "tbft_node.h"
 #include "tbft_principal.h"
 #include "esp_log.h"
-#include "esp_spiffs.h"
+
 #include "esp_timer.h"
 #include "esp_task_wdt.h"
 #if CONFIG_TBFT_TRANSPORT_UDP
@@ -187,6 +187,12 @@ static int parse_config(const char *path, tbft_config_t *cfg)
     if (fscanf(f, "%d", &cfg->vc_timeout_ms)       != 1) goto fail;
     if (fscanf(f, "%d", &cfg->status_timeout_ms)    != 1) goto fail;
     if (fscanf(f, "%d", &cfg->recovery_timeout_ms)  != 1) goto fail;
+
+    if (cfg->auth_timeout_ms <= 0 || cfg->vc_timeout_ms <= 0 ||
+        cfg->status_timeout_ms <= 0 || cfg->recovery_timeout_ms <= 0) {
+        ESP_LOGE(TAG, "timeout values must be positive");
+        goto fail;
+    }
 
     fclose(f);
     ESP_LOGI(TAG, "parsed config: service=%s f=%d nodes=%d mcast=%s",
@@ -806,6 +812,8 @@ int Byz_init_replica(const char *config_file, const char *priv_config,
     /* Set timer periods from config */
     s_replica->vtimer_period_us = (int64_t)cfg.vc_timeout_ms * 1000LL;
     s_replica->stimer_period_us = (int64_t)cfg.status_timeout_ms * 1000LL;
+    if (s_replica->vtimer_period_us <= 0) s_replica->vtimer_period_us = 5000000LL;
+    if (s_replica->stimer_period_us <= 0) s_replica->stimer_period_us = 1000000LL;
 
     /* M4 FIX: Setup principals FIRST (including private keys and HMAC session
      * keys), then start timers. Starting the view-change timer before key

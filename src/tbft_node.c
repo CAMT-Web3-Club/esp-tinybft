@@ -134,7 +134,11 @@ void tbft_node_gen_auth(tbft_node_t *node, const void *msg, size_t msg_len,
     memset(auth, 0, sizeof(*auth));
 
     int slot = 0;
+    int max_slots = TBFT_MAX_NUM_REPLICAS - 1;
     int expected_slots = node->num_replicas - 1; /* exclude self */
+    if (expected_slots > max_slots) {
+        expected_slots = max_slots;
+    }
     for (int i = 0; i < node->num_replicas; i++) {
         if (i == node->node_id) continue;
         /* Guard: ensure slot index never exceeds auth->slots capacity */

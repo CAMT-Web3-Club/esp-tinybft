@@ -160,8 +160,15 @@ int tbft_replica_init(tbft_replica_t *r,
      * NOTE: rtimer (recovery) and ntimer (keep-alive) are reserved for
      * future use. They are not initialised or freed to avoid allocating
      * unused esp_timer handles. */
-    tbft_itimer_init(&r->vtimer, vtimer_cb, r, "tbft_vtimer");
-    tbft_itimer_init(&r->stimer, stimer_cb, r, "tbft_stimer");
+    if (tbft_itimer_init(&r->vtimer, vtimer_cb, r, "tbft_vtimer") != ESP_OK ||
+        tbft_itimer_init(&r->stimer, stimer_cb, r, "tbft_stimer") != ESP_OK) {
+        ESP_LOGE(TAG, "replica: timer init failed");
+        tbft_itimer_free(&r->vtimer);
+        tbft_itimer_free(&r->stimer);
+        tbft_state_free(&r->state);
+        tbft_node_free(&r->node);
+        return -1;
+    }
 
     r->evt_group = xEventGroupCreate();
     if (!r->evt_group) {
@@ -305,7 +312,12 @@ void tbft_replica_run(tbft_replica_t *r)
         }
 
         if (r->evt_group) {
-            EventBits_t bits = xEventGroupClearBits(r->evt_group, TBFT_EVT_VTIMER | TBFT_EVT_STIMER);
+            EventBits_t bits = xEventGroupWaitBits(
+                r->evt_group,
+                TBFT_EVT_VTIMER | TBFT_EVT_STIMER,
+                pdTRUE,   /* clear on exit */
+                pdFALSE,  /* wait for any bit */
+                pdMS_TO_TICKS(10));
             /* Suppress view-change timeouts until we have enough HMAC keys.
              * Without keys, Prepare/Commit messages fail verification, so
              * view-changes would be triggered spuriously. */
@@ -369,7 +381,7 @@ void tbft_replica_run(tbft_replica_t *r)
         if (n < (int)sizeof(tbft_msg_hdr_t)) {
             /* No message available — yield to let the WiFi task, lwIP,
              * and the IDLE task get CPU time on single-core MCUs. */
-            vTaskDelay(pdMS_TO_TICKS(1));
+            vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
 
@@ -546,27 +558,15 @@ void tbft_replica_handle_pre_prepare(tbft_replica_t *r, const void *msg, int len
     }
     const tbft_pre_prepare_rep_t *pp = (const tbft_pre_prepare_rep_t *)msg;
 
-    /* Reject if wrong view — but advance if the pre-prepare is from a
+    /* Determine expected primary for this view BEFORE any state changes. */
+    int expected_primary = tbft_node_primary(&r->node, pp->view);
+
+    /* Reject if wrong view — but note if the pre-prepare is from a
      * higher view (primary is ahead of this replica). */
     if (pp->view != r->node.view) {
         if (pp->view > r->node.view) {
-            ESP_LOGI(TAG, "pp: advancing view from %lld to %lld (primary is ahead)",
-                     (long long)r->node.view, (long long)pp->view);
-            r->node.view = pp->view;
-            r->seqno = 1;
-            r->last_stable = 0;
-            r->last_prepared = 0;
-            r->last_executed = 0;
-            /* Re-init clears all slice bitmaps/hashes from the old view.
-             * Patching head after init is safe: all slices are clean. */
-            tbft_ar_init(&r->ar, r->ar.prepare_threshold, r->ar.commit_threshold);
-            r->ar.head = 1;
-            /* Mirror what handle_new_view does: reset view-change state and
-             * restart the view-change timer so a stale target_view doesn't
-             * trigger a spurious view-change in the new view. */
-            tbft_itimer_stop(&r->vtimer);
-            tbft_vi_reset(&r->vi, r->node.view + 1);
-            tbft_itimer_start(&r->vtimer, r->vtimer_period_us);
+            ESP_LOGI(TAG, "pp: higher view %lld (current=%lld), will advance after auth check",
+                     (long long)pp->view, (long long)r->node.view);
         } else {
             ESP_LOGW(TAG, "pp: wrong view (got=%lld, expected=%lld)",
                      (long long)pp->view, (long long)r->node.view);
@@ -575,7 +575,7 @@ void tbft_replica_handle_pre_prepare(tbft_replica_t *r, const void *msg, int len
     }
 
     /* Must come from current primary */
-    int expected_primary = tbft_node_primary(&r->node, pp->view);
+    if (r->node.node_id == expected_primary) return; /* primary ignores own PP */
     if (r->node.node_id == expected_primary) return; /* primary ignores own PP */
 
     /* Check sequence number is in window */
@@ -628,6 +628,20 @@ void tbft_replica_handle_pre_prepare(tbft_replica_t *r, const void *msg, int len
                      expected_primary);
             return;
         }
+    }
+
+    /* Only advance view after successful sender and MAC verification */
+    if (pp->view > r->node.view) {
+        r->node.view = pp->view;
+        r->seqno = 1;
+        r->last_stable = 0;
+        r->last_prepared = 0;
+        r->last_executed = 0;
+        tbft_ar_init(&r->ar, r->ar.prepare_threshold, r->ar.commit_threshold);
+        r->ar.head = 1;
+        tbft_itimer_stop(&r->vtimer);
+        tbft_vi_reset(&r->vi, r->node.view + 1);
+        tbft_itimer_start(&r->vtimer, r->vtimer_period_us);
     }
 
     /* Reject empty request sets.  A zero rset_size would bypass the
@@ -998,6 +1012,11 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
             r->node.view = vc->v;
             r->node.cur_primary = tbft_node_primary(&r->node, vc->v);
             r->seqno = 1;
+            r->last_stable = 0;
+            r->last_executed = 0;
+            r->last_prepared = 0;
+            tbft_ar_init(&r->ar, r->ar.prepare_threshold, r->ar.commit_threshold);
+            r->ar.head = 1;
             ESP_LOGI(TAG, "sync view to %lld (from vc of %d), seqno reset to 1",
                      (long long)vc->v, sender_id);
             /* REMOVED: catch-up view-change cascade accelerator.
@@ -1123,6 +1142,21 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
                        TBFT_ALL_REPLICAS);
         ESP_LOGI(TAG, "sent new-view v=%lld min=%lld max=%lld n_prep=%d",
                  (long long)r->vi.target_view, (long long)min_s, (long long)max_s, n_proofs);
+
+        /* Install the new view locally immediately so we can start acting
+         * as primary even before loopback receipt. */
+        r->node.view = r->vi.target_view;
+        r->node.cur_primary = tbft_node_primary(&r->node, r->node.view);
+        r->seqno = nv->min + 1;
+        if (nv->min > r->last_stable)   r->last_stable   = nv->min;
+        if (nv->min > r->last_executed) r->last_executed = nv->min;
+        if (nv->min > r->last_prepared) r->last_prepared = nv->min;
+        tbft_cr_truncate(&r->cr, nv->min);
+        tbft_ar_init(&r->ar, r->ar.prepare_threshold, r->ar.commit_threshold);
+        r->ar.head = nv->min + 1;
+        tbft_itimer_stop(&r->vtimer);
+        tbft_vi_reset(&r->vi, r->node.view + 1);
+        tbft_itimer_start(&r->vtimer, r->vtimer_period_us);
     }
 }
 
@@ -1432,7 +1466,7 @@ void tbft_replica_send_pre_prepare(tbft_replica_t *r)
      * the sequence window and preventing consensus. */
     {
         const tbft_request_rep_t *rr = (const tbft_request_rep_t *)req->buf;
-        if (rr->rid == r->last_assigned_rid) {
+        if (rr->cid == r->last_assigned_cid && rr->rid == r->last_assigned_rid) {
             /* Already assigned a seqno for this request — drop duplicate. */
             rqueue_pop(src_queue);
             /* Check the other queue too */
@@ -1442,9 +1476,11 @@ void tbft_replica_send_pre_prepare(tbft_replica_t *r)
                 next_req = rqueue_front(src_queue);
             }
             if (!next_req) return;
-            src_queue = (src_queue == &r->rqueue) ? &r->ro_rqueue : &r->rqueue;
             const tbft_request_rep_t *rr2 = (const tbft_request_rep_t *)next_req->buf;
-            if (rr2->rid == r->last_assigned_rid) return;  /* all dups */
+            if (rr2->cid == r->last_assigned_cid && rr2->rid == r->last_assigned_rid) {
+                rqueue_pop(src_queue);
+                return;  /* all dups */
+            }
             req = next_req;
         }
     }
@@ -1477,7 +1513,8 @@ void tbft_replica_send_pre_prepare(tbft_replica_t *r)
                   + (size_t)ndet_len + sizeof(tbft_auth_t);
     size_t aligned_needed = (needed + 7u) & ~7u;
     if (aligned_needed > sizeof(r->out_buf)) {
-        ESP_LOGE(TAG, "pre-prepare: message too large (%zu > %zu)", aligned_needed, sizeof(r->out_buf));
+        ESP_LOGE(TAG, "pre-prepare: request too large to embed, dropping (%zu > %zu)", aligned_needed, sizeof(r->out_buf));
+        rqueue_pop(src_queue);
         return;
     }
 
@@ -1578,6 +1615,7 @@ void tbft_replica_send_pre_prepare(tbft_replica_t *r)
     /* Mark this request ID as assigned to prevent duplicate seqno. */
     {
         const tbft_request_rep_t *rr_final = (const tbft_request_rep_t *)req->buf;
+        r->last_assigned_cid = rr_final->cid;
         r->last_assigned_rid = rr_final->rid;
     }
 
@@ -1704,19 +1742,22 @@ void tbft_replica_execute_committed(tbft_replica_t *r)
             int      rep_len        = 0;
             bool     ro = (req_rep->hdr.extra & TBFT_REQUEST_RO_FLAG) != 0;
 
-            /* Ensure enough room: hdr + actual payload + sig */
-            if (sizeof(*reply) + (size_t)rep_len + TBFT_SIG_SIZE > sizeof(r->out_buf)) {
-                ESP_LOGE(TAG, "reply too large for out_buf (%d + %d + %d > %zu)",
-                         (int)sizeof(*reply), rep_len, (int)TBFT_SIG_SIZE, sizeof(r->out_buf));
-                break;
-            }
-
             int rc = r->exec_cb(req_bytes, req_len,
                                 rep_payload, &rep_len,
                                 (void *)ndet, ndet_len,
                                 req_rep->cid, ro);
 
-            if (rc == 0) {
+            if (rc != 0) {
+                ESP_LOGW(TAG, "exec_cb rejected seqno=%lld", (long long)n);
+                break;
+            }
+
+            /* Validate reply length AFTER exec_cb has set it */
+            if (rep_len < 0 || sizeof(*reply) + (size_t)rep_len + TBFT_SIG_SIZE > sizeof(r->out_buf)) {
+                ESP_LOGE(TAG, "reply too large for out_buf (%d + %d + %d > %zu)",
+                         (int)sizeof(*reply), rep_len, (int)TBFT_SIG_SIZE, sizeof(r->out_buf));
+                break;
+            }
                 reply->hdr.tag    = TBFT_MSG_REPLY;
                 reply->hdr.extra  = 0;
                 reply->view       = r->node.view;
@@ -1755,17 +1796,6 @@ void tbft_replica_execute_committed(tbft_replica_t *r)
                 }
                 tbft_node_send(&r->node, r->out_buf, (size_t)total,
                                req_rep->cid);
-            } else {
-                /* A failed exec_cb leaves the application state unchanged,
-                 * so advancing last_executed here would cause our checkpoint
-                 * digest to diverge from honest peers (they applied the op,
-                 * we didn't).  Halt execution at this seqno; the retry /
-                 * view-change machinery will eventually handle it. */
-                ESP_LOGE(TAG, "exec_cb failed for seqno=%lld rc=%d; halting "
-                         "execution to preserve checkpoint consistency",
-                         (long long)n, rc);
-                break;
-            }
         } else {
             ESP_LOGW(TAG, "execute: exec_cb=%p req_len=%d sizeof(req)=%d — skipping exec for seqno=%lld",
                      r->exec_cb, req_len, (int)sizeof(tbft_request_rep_t), (long long)n);
@@ -1941,6 +1971,12 @@ void tbft_replica_send_view_change(tbft_replica_t *r)
     if (!r->vi.received[r->node.node_id]) {
         tbft_vi_collect_vc(&r->vi, r->node.node_id, r->out_buf, total_size);
     }
+
+    /* If our own VC completed the quorum and we are the new primary,
+     * the New_view construction logic inside handle_view_change will
+     * be triggered when the next VC arrives. We cannot call it directly
+     * here because collect_vc already returned false for our own VC. */
+    (void)total_size; /* silence unused warning when NDEBUG */
 
     /* Low #7 FIX: This sets a fixed 2x grace period for the view-change
      * retry timer (not true exponential backoff). The period resets to

@@ -17,6 +17,7 @@
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
 #include "mbedtls/pk.h"
 #include "psa/crypto.h"
 #include <string.h>
@@ -36,9 +37,12 @@ static const char *TAG = "tbft_principal";
  * -------------------------------------------------------------------------- */
 
 static bool s_psa_init = false;
+static portMUX_TYPE s_psa_spinlock = portMUX_INITIALIZER_UNLOCKED;
 
 static void ensure_psa_init(void)
 {
+    if (s_psa_init) return;
+    portENTER_CRITICAL(&s_psa_spinlock);
     if (!s_psa_init) {
         psa_status_t st = psa_crypto_init();
         if (st == PSA_SUCCESS) {
@@ -47,6 +51,7 @@ static void ensure_psa_init(void)
             ESP_LOGE(TAG, "psa_crypto_init failed: %d", (int)st);
         }
     }
+    portEXIT_CRITICAL(&s_psa_spinlock);
 }
 
 void tbft_principal_ensure_psa(void)
@@ -94,11 +99,30 @@ int tbft_principal_load_priv_key(tbft_principal_t *p,
 
 void tbft_principal_free(tbft_principal_t *p)
 {
-    if (p->psa_hmac_in_id  != 0) { psa_destroy_key(p->psa_hmac_in_id);  }
-    if (p->psa_hmac_out_id != 0) { psa_destroy_key(p->psa_hmac_out_id); }
+    if (!p) return;
+    if (p->psa_hmac_in_id  != 0) {
+        psa_status_t st = psa_destroy_key(p->psa_hmac_in_id);
+        if (st != PSA_SUCCESS) {
+            ESP_LOGW(TAG, "destroy in_key failed: %d", (int)st);
+        }
+    }
+    if (p->psa_hmac_out_id != 0) {
+        psa_status_t st = psa_destroy_key(p->psa_hmac_out_id);
+        if (st != PSA_SUCCESS) {
+            ESP_LOGW(TAG, "destroy out_key failed: %d", (int)st);
+        }
+    }
     mbedtls_pk_free(&p->pub_pk);
     mbedtls_pk_free(&p->priv_pk);
     memset(p, 0, sizeof(*p));
+}
+
+void tbft_principal_psa_deinit(void)
+{
+    portENTER_CRITICAL(&s_psa_spinlock);
+    mbedtls_psa_crypto_free();
+    s_psa_init = false;
+    portEXIT_CRITICAL(&s_psa_spinlock);
 }
 
 /* --------------------------------------------------------------------------
@@ -122,6 +146,7 @@ static mbedtls_svc_key_id_t import_hmac_key(const tbft_hmac_key_t *key,
 
     mbedtls_svc_key_id_t kid = MBEDTLS_SVC_KEY_ID_INIT;
     psa_status_t st = psa_import_key(&attr, key->bytes, sizeof(key->bytes), &kid);
+    psa_reset_key_attributes(&attr);
     if (st != PSA_SUCCESS) {
         return MBEDTLS_SVC_KEY_ID_INIT;
     }
@@ -140,17 +165,25 @@ int tbft_principal_gen_mac_out(const tbft_principal_t *p,
             p->psa_hmac_out_id, PSA_ALG_HMAC(PSA_ALG_SHA_256),
             (const uint8_t *)msg, msg_len,
             mac->bytes, TBFT_HMAC_SIZE, &mac_len);
-        return (st == PSA_SUCCESS) ? 0 : (int)st;
+        if (st != PSA_SUCCESS || mac_len != TBFT_HMAC_SIZE) {
+            ESP_LOGE(TAG, "gen_mac_out failed: st=%d mac_len=%zu", (int)st, mac_len);
+            return (st != PSA_SUCCESS) ? (int)st : -1;
+        }
+        return 0;
     }
 
     /* Slow fallback: import-per-op */
-    psa_key_id_t kid = import_hmac_key(&p->hmac_out_key, PSA_KEY_USAGE_SIGN_MESSAGE);
+    mbedtls_svc_key_id_t kid = import_hmac_key(&p->hmac_out_key, PSA_KEY_USAGE_SIGN_MESSAGE);
     if (kid == 0) return -1;
     psa_status_t st = psa_mac_compute(kid, PSA_ALG_HMAC(PSA_ALG_SHA_256),
                                       (const uint8_t *)msg, msg_len,
                                       mac->bytes, TBFT_HMAC_SIZE, &mac_len);
     psa_destroy_key(kid);
-    return (st == PSA_SUCCESS) ? 0 : (int)st;
+    if (st != PSA_SUCCESS || mac_len != TBFT_HMAC_SIZE) {
+        ESP_LOGE(TAG, "gen_mac_out fallback failed: st=%d mac_len=%zu", (int)st, mac_len);
+        return (st != PSA_SUCCESS) ? (int)st : -1;
+    }
+    return 0;
 }
 
 bool tbft_principal_verify_mac_in(const tbft_principal_t *p,
@@ -165,7 +198,7 @@ bool tbft_principal_verify_mac_in(const tbft_principal_t *p,
     }
 
     /* Slow fallback: import-per-op then constant-time compare */
-    psa_key_id_t kid = import_hmac_key(&p->hmac_in_key, PSA_KEY_USAGE_VERIFY_MESSAGE);
+    mbedtls_svc_key_id_t kid = import_hmac_key(&p->hmac_in_key, PSA_KEY_USAGE_VERIFY_MESSAGE);
     if (kid == 0) return false;
     psa_status_t st = psa_mac_verify(kid, PSA_ALG_HMAC(PSA_ALG_SHA_256),
                                      (const uint8_t *)msg, msg_len,
@@ -209,6 +242,7 @@ void tbft_principal_set_in_key(tbft_principal_t *p, const tbft_hmac_key_t *key)
     p->psa_hmac_in_id = import_hmac_key(key, PSA_KEY_USAGE_VERIFY_MESSAGE);
     if (p->psa_hmac_in_id == 0) {
         ESP_LOGE(TAG, "set_in_key: PSA import FAILED for id=%d", (int)p->id);
+        p->keys_fresh = false;
     } else {
         ESP_LOGD(TAG, "set_in_key: id=%d key[0..3]=%02x%02x%02x%02x psa_id=%u",
                  (int)p->id, key->bytes[0], key->bytes[1], key->bytes[2], key->bytes[3],
@@ -216,14 +250,14 @@ void tbft_principal_set_in_key(tbft_principal_t *p, const tbft_hmac_key_t *key)
         /* Self-test: compute MAC with temp key, verify with in_key */
         uint8_t test_msg[] = "test123";
         tbft_mac_t test_mac;
-        psa_key_id_t kid = import_hmac_key(key, PSA_KEY_USAGE_SIGN_MESSAGE);
+        mbedtls_svc_key_id_t kid = import_hmac_key(key, PSA_KEY_USAGE_SIGN_MESSAGE);
         if (kid != 0) {
             size_t mac_len = 0;
             psa_status_t st1 = psa_mac_compute(kid, PSA_ALG_HMAC(PSA_ALG_SHA_256),
                             test_msg, sizeof(test_msg)-1,
                             test_mac.bytes, TBFT_HMAC_SIZE, &mac_len);
-            if (st1 != PSA_SUCCESS) {
-                ESP_LOGE(TAG, "set_in_key: self-test compute FAILED for id=%d (psa=%d)", (int)p->id, (int)st1);
+            if (st1 != PSA_SUCCESS || mac_len != TBFT_HMAC_SIZE) {
+                ESP_LOGE(TAG, "set_in_key: self-test compute FAILED for id=%d (psa=%d mac_len=%zu)", (int)p->id, (int)st1, mac_len);
             } else {
                 psa_status_t st2 = psa_mac_verify(p->psa_hmac_in_id, PSA_ALG_HMAC(PSA_ALG_SHA_256),
                                 test_msg, sizeof(test_msg)-1,
@@ -238,8 +272,9 @@ void tbft_principal_set_in_key(tbft_principal_t *p, const tbft_hmac_key_t *key)
         } else {
             ESP_LOGE(TAG, "set_in_key: import_hmac_key sign FAILED for id=%d", (int)p->id);
         }
+        /* Only mark keys fresh if self-test passed */
+        p->keys_fresh = (p->psa_hmac_in_id != 0);
     }
-    p->keys_fresh  = true;
 
     /* Reset the anti-replay watermark: old timestamps belong to the previous
      * key stream.  Capture-and-replay of pre-rotation messages is prevented
@@ -258,8 +293,12 @@ void tbft_principal_set_out_key(tbft_principal_t *p, const tbft_hmac_key_t *key)
     }
     p->hmac_out_key = *key;
     p->psa_hmac_out_id = import_hmac_key(key, PSA_KEY_USAGE_SIGN_MESSAGE);
-    ESP_LOGD(TAG, "set_out_key: for id=%d, key[0..3]=%02x%02x%02x%02x",
-             (int)p->id, key->bytes[0], key->bytes[1], key->bytes[2], key->bytes[3]);
+    if (p->psa_hmac_out_id == 0) {
+        ESP_LOGE(TAG, "set_out_key: PSA import FAILED for id=%d", (int)p->id);
+    } else {
+        ESP_LOGD(TAG, "set_out_key: for id=%d, key[0..3]=%02x%02x%02x%02x",
+                 (int)p->id, key->bytes[0], key->bytes[1], key->bytes[2], key->bytes[3]);
+    }
 }
 
 /* --------------------------------------------------------------------------
@@ -297,9 +336,11 @@ int tbft_principal_sign(tbft_principal_t *p,
         ESP_LOGE(TAG, "pk_sign failed: -0x%04x", (unsigned)(-ret));
         return ret;
     }
-    /* Zero trailing bytes if signature is shorter than expected */
-    if (sig_len < TBFT_SIG_SIZE) {
-        memset(sig->bytes + sig_len, 0, TBFT_SIG_SIZE - sig_len);
+    /* Reject unexpected signature length — zero-padding would mask key
+     * misconfiguration (e.g. 1024-bit key loaded by mistake). */
+    if (sig_len != TBFT_SIG_SIZE) {
+        ESP_LOGE(TAG, "pk_sign: unexpected sig_len=%zu (expected %d)", sig_len, TBFT_SIG_SIZE);
+        return -1;
     }
     return ret;
 }
@@ -341,6 +382,11 @@ int tbft_principal_encrypt_new_key(tbft_principal_t *p,
 {
     if (!p || !new_out_key || !enc_buf || !out_enc_len) return -1;
 
+    if (enc_buf_len < TBFT_SIG_SIZE) {
+        ESP_LOGE(TAG, "encrypt_new_key: buffer too small (%zu < %d)", enc_buf_len, TBFT_SIG_SIZE);
+        return -1;
+    }
+
     psa_key_attributes_t attr = PSA_KEY_ATTRIBUTES_INIT;
     psa_set_key_type(&attr, PSA_KEY_TYPE_RSA_PUBLIC_KEY);
     psa_set_key_algorithm(&attr, TBFT_KEY_WRAP_ALG);
@@ -348,6 +394,7 @@ int tbft_principal_encrypt_new_key(tbft_principal_t *p,
 
     mbedtls_svc_key_id_t key_id;
     int rc = mbedtls_pk_import_into_psa(&p->pub_pk, &attr, &key_id);
+    psa_reset_key_attributes(&attr);
     if (rc != 0) {
         ESP_LOGE(TAG, "pk_import_into_psa (enc) failed: -0x%04x", (unsigned)(-rc));
         return rc;
@@ -383,6 +430,7 @@ int tbft_principal_decrypt_new_key(tbft_principal_t *p,
 
     mbedtls_svc_key_id_t key_id;
     int rc = mbedtls_pk_import_into_psa(&p->priv_pk, &attr, &key_id);
+    psa_reset_key_attributes(&attr);
     if (rc != 0) {
         ESP_LOGE(TAG, "pk_import_into_psa (dec) failed: -0x%04x", (unsigned)(-rc));
         return rc;
@@ -397,6 +445,11 @@ int tbft_principal_decrypt_new_key(tbft_principal_t *p,
     psa_destroy_key(key_id);
     if (st != PSA_SUCCESS) {
         ESP_LOGE(TAG, "psa_asymmetric_decrypt failed: %d", (int)st);
+        return (int)st;
     }
-    return (st == PSA_SUCCESS) ? 0 : (int)st;
+    if (out_len != sizeof(new_in_key->bytes)) {
+        ESP_LOGE(TAG, "decrypt_new_key: bad out_len=%zu (expected %zu)", out_len, sizeof(new_in_key->bytes));
+        return -1;
+    }
+    return 0;
 }

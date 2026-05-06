@@ -100,14 +100,16 @@
  * Static assertions (compile-time validation)
  * -------------------------------------------------------------------------- */
 
-_Static_assert((TBFT_BLOCK_SIZE & (TBFT_BLOCK_SIZE - 1)) == 0,
-               "TBFT_BLOCK_SIZE must be a power of two");
+_Static_assert(TBFT_BLOCK_SIZE > 0 &&
+               (TBFT_BLOCK_SIZE & (TBFT_BLOCK_SIZE - 1)) == 0,
+               "TBFT_BLOCK_SIZE must be a positive power of two");
 
 _Static_assert(TBFT_WINDOW_SIZE > TBFT_CHECKPOINT_INTERVAL,
                "TBFT_WINDOW_SIZE must be greater than TBFT_CHECKPOINT_INTERVAL");
 
-_Static_assert((TBFT_WINDOW_SIZE & (TBFT_WINDOW_SIZE - 1)) == 0,
-               "TBFT_WINDOW_SIZE must be a power of two");
+_Static_assert(TBFT_WINDOW_SIZE > 0 &&
+               (TBFT_WINDOW_SIZE & (TBFT_WINDOW_SIZE - 1)) == 0,
+               "TBFT_WINDOW_SIZE must be a positive power of two");
 
 _Static_assert(TBFT_MAX_NUM_REPLICAS >= 4,
                "Need at least 4 replicas for BFT (n = 3f+1, f >= 1)");
@@ -122,6 +124,12 @@ _Static_assert(TBFT_CHECKPOINT_INTERVAL >= 1,
 
 _Static_assert(TBFT_MAX_REPLY_SIZE < TBFT_MAX_MESSAGE_SIZE,
                "TBFT_MAX_REPLY_SIZE must be less than TBFT_MAX_MESSAGE_SIZE");
+
+_Static_assert(TBFT_MAX_MESSAGE_SIZE % 8 == 0,
+               "TBFT_MAX_MESSAGE_SIZE must be a multiple of 8");
+
+_Static_assert(TBFT_P_CHILDREN > 0,
+               "TBFT_MAX_MESSAGE_SIZE too small for partition tree");
 
 _Static_assert(TBFT_P_LEVELS >= 2,
                "TBFT_P_LEVELS must be at least 2");

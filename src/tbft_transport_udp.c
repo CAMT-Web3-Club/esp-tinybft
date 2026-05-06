@@ -112,7 +112,7 @@ static int socket_open(uint16_t port, bool use_multicast,
         /* M6 FIX: Disable multicast loopback to prevent receiving our own
          * messages. Without this, every broadcast is echoed back to the
          * sender, wasting CPU cycles processing self-sent BFT messages. */
-        int loop = 0;
+        uint8_t loop = 0;
         if (setsockopt(sock, IPPROTO_IP, IP_MULTICAST_LOOP, &loop, sizeof(loop)) < 0) {
             ESP_LOGW(TAG, "setsockopt(IP_MULTICAST_LOOP) failed: %d", errno);
             /* Non-fatal: continue without disabling loopback */
@@ -149,6 +149,10 @@ int tbft_transport_create(tbft_transport_t **out,
 
     tbft_udp_t *udp = (tbft_udp_t *)calloc(1, sizeof(*udp));
     if (!udp) return -1;
+    if (len > TBFT_MAX_MESSAGE_SIZE) {
+        ESP_LOGW(TAG, "send rejected: message too large (%zu)", len);
+        return -1;
+    }
 
     udp->num_nodes    = num_nodes;
     udp->num_replicas = num_replicas;
@@ -219,7 +223,7 @@ int tbft_transport_send(tbft_transport_t *t, const void *buf, size_t len,
             return ret;
         } else {
             /* Unicast to each replica */
-            int sent = 0;
+            int ok = 0;
             int limit = udp->num_replicas > 0 ? udp->num_replicas : udp->num_nodes;
             for (int i = 0; i < limit; i++) {
                 if (!udp->peer_valid[i]) continue;
@@ -230,9 +234,9 @@ int tbft_transport_send(tbft_transport_t *t, const void *buf, size_t len,
                 };
                 int r = sendto(udp->sock, buf, len, 0,
                                (struct sockaddr *)&addr, sizeof(addr));
-                if (r > 0) sent += r;
+                if (r >= 0) ok++;
             }
-            return sent;
+            return (ok > 0) ? (int)len : -1;
         }
     }
 

@@ -24,7 +24,7 @@ Add `esp-tinybft` to your host project's `idf_component.yml` (create it in your 
 
 ```yaml
 dependencies:
-  phukrit7171/esp-tinybft: ">=0.2.0"
+  phukrit7171/esp-tinybft: ">=0.2.2"
 ```
 
 Then let the IDF Component Manager fetch it:

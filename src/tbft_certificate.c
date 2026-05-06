@@ -106,6 +106,17 @@ bool prefix##_add_mine(cert_t *cert, const void *msg, int msg_len,             \
     if (!msg_digest) {                                                         \
         return false;                                                          \
     }                                                                          \
+    /* Check if this message's digest matches an existing value */             \
+    for (int i = 0; i < cert->num_vals; i++) {                                 \
+        const tbft_digest_t *stored_digest =                                   \
+            &cert->val_digests[i];                                           \
+        if (tbft_digest_equal(msg_digest, stored_digest)) {                    \
+            tbft_bitmap_set(&cert->bmap, my_id);                               \
+            cert->correct[i]++;                                                \
+            cert->mym_idx = i;                                                 \
+            return true;                                                       \
+        }                                                                      \
+    }                                                                          \
     /* Store as first value if slot available */                               \
     if (cert->num_vals < TBFT_CERT_MAX_VALS) {                                 \
         memcpy(&cert->val_digests[cert->num_vals], msg_digest,                 \

@@ -37,8 +37,8 @@ typedef struct {
     bool            keys_fresh;    /* true if keys have been exchanged */
 
     /* Persistent PSA key handles — avoid import/destroy on every MAC op */
-    psa_key_id_t    psa_hmac_in_id;  /* VERIFY_MESSAGE key; 0 = not loaded */
-    psa_key_id_t    psa_hmac_out_id; /* SIGN_MESSAGE key; 0 = not loaded */
+    mbedtls_svc_key_id_t psa_hmac_in_id;  /* VERIFY_MESSAGE key; 0 = not loaded */
+    mbedtls_svc_key_id_t psa_hmac_out_id; /* SIGN_MESSAGE key; 0 = not loaded */
 
     /* Monotonic timestamp of last successful MAC verification (anti-replay) */
     int64_t         last_auth_time_us;

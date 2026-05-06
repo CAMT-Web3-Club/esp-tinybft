@@ -22,7 +22,7 @@ typedef struct {
     esp_timer_handle_t  handle;
     tbft_timer_cb_t     cb;
     void               *arg;
-    bool                running;
+    volatile bool       running;
 } tbft_itimer_t;
 
 /**

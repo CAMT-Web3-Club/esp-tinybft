@@ -38,6 +38,10 @@ esp_err_t tbft_itimer_init(tbft_itimer_t *t, tbft_timer_cb_t cb,
 void tbft_itimer_start(tbft_itimer_t *t, int64_t timeout_us)
 {
     if (t->handle == NULL) return;
+    if (timeout_us <= 0) {
+        ESP_LOGE(TAG, "refusing to start timer with non-positive timeout %lld", (long long)timeout_us);
+        return;
+    }
 
     /* CRITICAL FIX: Always stop before starting — esp_timer_stop is idempotent.
      * The previous check on t->running was racy: timer_dispatch clears the flag
