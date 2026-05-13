@@ -7,6 +7,7 @@
 
 #include "tbft_transport.h"
 #include "esp_log.h"
+#include "esp_netif.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "lwip/inet.h"
@@ -31,7 +32,35 @@ typedef struct {
     bool         peer_valid[TBFT_MAX_NUM_REPLICAS + TBFT_MAX_NUM_CLIENTS];
     int          num_nodes;
     int          num_replicas;
+    int          local_id;       /* auto-detected via local netif IP; -1 if unknown */
 } tbft_udp_t;
+
+/* sendto with bounded retry on transient TX-queue stalls.
+ *
+ * The socket is non-blocking (O_NONBLOCK set in socket_open), so a
+ * momentarily-full WiFi MAC / lwIP TX queue causes sendto to return
+ * EAGAIN/EWOULDBLOCK. Without retry, replies fired by 4 replicas at
+ * roughly the same instant race for the same queue and most fail
+ * silently — observed as "only one replica's reply reaches the client".
+ * Hard errors (e.g. ENETUNREACH) are returned immediately. */
+static int udp_sendto_retry(int sock, const void *buf, size_t len,
+                            const struct sockaddr_in *addr)
+{
+    const int MAX_RETRIES = 3;
+    int last_errno = 0;
+    for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
+        int r = sendto(sock, buf, len, 0,
+                       (const struct sockaddr *)addr, sizeof(*addr));
+        if (r >= 0) return r;
+        last_errno = errno;
+        if (last_errno != EAGAIN && last_errno != EWOULDBLOCK) break;
+        if (attempt + 1 < MAX_RETRIES) {
+            vTaskDelay(pdMS_TO_TICKS(5 * (attempt + 1)));
+        }
+    }
+    errno = last_errno;
+    return -1;
+}
 
 /* --------------------------------------------------------------------------
  * Socket setup
@@ -149,13 +178,10 @@ int tbft_transport_create(tbft_transport_t **out,
 
     tbft_udp_t *udp = (tbft_udp_t *)calloc(1, sizeof(*udp));
     if (!udp) return -1;
-    if (len > TBFT_MAX_MESSAGE_SIZE) {
-        ESP_LOGW(TAG, "send rejected: message too large (%zu)", len);
-        return -1;
-    }
 
     udp->num_nodes    = num_nodes;
     udp->num_replicas = num_replicas;
+    udp->local_id     = -1;
 
 #ifdef CONFIG_TBFT_DISABLE_MULTICAST
     udp->use_multicast = false;
@@ -204,6 +230,20 @@ void tbft_transport_set_peer(tbft_transport_t *t,
     tbft_udp_t *udp = (tbft_udp_t *)t;
     udp->peers[node_id] = *addr;
     udp->peer_valid[node_id] = true;
+
+    /* Auto-detect local_id by matching the peer's IP against the WiFi STA
+     * netif IP. Mirrors the ESP-NOW backend (which matches by eFuse MAC).
+     * Used by the broadcast-unicast fallback to avoid sendto'ing to
+     * ourselves via UDP loopback, which would waste a TX-queue slot. */
+    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (netif) {
+        esp_netif_ip_info_t ip_info;
+        if (esp_netif_get_ip_info(netif, &ip_info) == ESP_OK
+            && ip_info.ip.addr != 0
+            && ip_info.ip.addr == tbft_addr_udp_ip(*addr)) {
+            udp->local_id = node_id;
+        }
+    }
 }
 
 int tbft_transport_send(tbft_transport_t *t, const void *buf, size_t len,
@@ -214,9 +254,7 @@ int tbft_transport_send(tbft_transport_t *t, const void *buf, size_t len,
 
     if (dest == TBFT_ALL_REPLICAS) {
         if (udp->use_multicast) {
-            int ret = sendto(udp->sock, buf, len, 0,
-                             (struct sockaddr *)&udp->mcast_addr,
-                             sizeof(udp->mcast_addr));
+            int ret = udp_sendto_retry(udp->sock, buf, len, &udp->mcast_addr);
             if (ret < 0) {
                 ESP_LOGE(TAG, "sendto(multicast) failed: %d", errno);
             }
@@ -226,14 +264,14 @@ int tbft_transport_send(tbft_transport_t *t, const void *buf, size_t len,
             int ok = 0;
             int limit = udp->num_replicas > 0 ? udp->num_replicas : udp->num_nodes;
             for (int i = 0; i < limit; i++) {
+                if (i == udp->local_id) continue;   /* skip self via loopback */
                 if (!udp->peer_valid[i]) continue;
                 struct sockaddr_in addr = {
                     .sin_family      = AF_INET,
-                    .sin_addr.s_addr = udp->peers[i].u.udp.ip,
+                    .sin_addr.s_addr = tbft_addr_udp_ip(udp->peers[i]),
                     .sin_port        = tbft_addr_udp_port(udp->peers[i]),
                 };
-                int r = sendto(udp->sock, buf, len, 0,
-                               (struct sockaddr *)&addr, sizeof(addr));
+                int r = udp_sendto_retry(udp->sock, buf, len, &addr);
                 if (r >= 0) ok++;
             }
             return (ok > 0) ? (int)len : -1;
@@ -250,8 +288,7 @@ int tbft_transport_send(tbft_transport_t *t, const void *buf, size_t len,
         .sin_addr.s_addr = tbft_addr_udp_ip(udp->peers[dest]),
         .sin_port        = tbft_addr_udp_port(udp->peers[dest]),
     };
-    int ret = sendto(udp->sock, buf, len, 0,
-                     (struct sockaddr *)&addr, sizeof(addr));
+    int ret = udp_sendto_retry(udp->sock, buf, len, &addr);
     if (ret < 0) {
         ESP_LOGE(TAG, "sendto(%d) failed: %d", dest, errno);
     }
