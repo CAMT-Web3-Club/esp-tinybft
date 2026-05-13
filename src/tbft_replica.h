@@ -128,6 +128,7 @@ typedef struct {
  * @param r               Replica to initialise
  * @param node_id         This replica's id
  * @param f               Max Byzantine faults
+ * @param num_replicas    Actual replica count; may be less than 3f+1 for demos
  * @param num_nodes       Total nodes (replicas + clients)
  * @param mcast_ip        Multicast IP string
  * @param auth_timeout_us Authentication freshness timeout
@@ -141,7 +142,7 @@ typedef struct {
  * @return 0 on success, -1 on failure
  */
 int tbft_replica_init(tbft_replica_t *r,
-                      tbft_node_id_t node_id, int f, int num_nodes,
+                      tbft_node_id_t node_id, int f, int num_replicas, int num_nodes,
                       const char *mcast_ip, int64_t auth_timeout_us,
                       uint16_t port,
                       void *state_mem, size_t state_size,

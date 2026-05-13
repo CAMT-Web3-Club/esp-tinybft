@@ -96,7 +96,7 @@ static void stimer_cb(void *arg)
  * -------------------------------------------------------------------------- */
 
 int tbft_replica_init(tbft_replica_t *r,
-                      tbft_node_id_t node_id, int f, int num_nodes,
+                      tbft_node_id_t node_id, int f, int num_replicas, int num_nodes,
                       const char *mcast_ip, int64_t auth_timeout_us,
                       uint16_t port,
                       void *state_mem, size_t state_size,
@@ -108,12 +108,12 @@ int tbft_replica_init(tbft_replica_t *r,
     memset(r, 0, sizeof(*r));
 
     /* Init base node */
-    if (tbft_node_init(&r->node, node_id, f, num_nodes,
+    if (tbft_node_init(&r->node, node_id, f, num_replicas, num_nodes,
                        mcast_ip, auth_timeout_us, port) != 0) {
         return -1;
     }
 
-    int n = 3 * f + 1;
+    int n = num_replicas;
     int prepare_threshold = 2 * f;   /* 2f prepares (primary's PP counts) */
     int commit_threshold  = 2 * f + 1;
 
