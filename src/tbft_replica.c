@@ -1435,6 +1435,7 @@ void tbft_replica_handle_data(tbft_replica_t *r, const void *msg, int len)
 void tbft_replica_send_pre_prepare(tbft_replica_t *r)
 {
     if (!tbft_replica_is_primary(r)) return;
+    if (r->vi.target_view > r->node.view) return; /* view-change in progress */
 
     /* Only require that we have at least threshold-1 peers with fresh keys.
      * The self-test already verifies each key on import, so no additional
@@ -1703,8 +1704,10 @@ void tbft_replica_send_commit(tbft_replica_t *r, tbft_seqno_t n)
         (int32_t)(sizeof(*cm) + sizeof(tbft_auth_t)));
     tbft_node_gen_auth(&r->node, r->out_buf, sizeof(*cm), auth);
 
-    tbft_ar_add_my_commit(&r->ar, n, r->out_buf, cm->hdr.size,
-                          r->node.node_id);
+    if (!tbft_ar_add_my_commit(&r->ar, n, r->out_buf, cm->hdr.size,
+                               r->node.node_id)) {
+        return; /* already sent commit for this seqno */
+    }
 
     tbft_node_send(&r->node, r->out_buf, (size_t)cm->hdr.size,
                    TBFT_ALL_REPLICAS);
