@@ -1,4 +1,4 @@
-version: "0.2.4"
+version: "0.2.5"
 description: TinyBFT — memory-optimised PBFT consensus for ESP-IDF
 url: https://github.com/CAMT-Web3-Club/esp-tinybft
 license: "BSD-3-Clause AND MIT"

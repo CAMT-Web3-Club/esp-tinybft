@@ -633,11 +633,20 @@ void tbft_replica_handle_pre_prepare(tbft_replica_t *r, const void *msg, int len
     if (pp->view > r->node.view) {
         r->node.view = pp->view;
         r->node.cur_primary = tbft_node_primary(&r->node, r->node.view);
-        /* Resume from last stable checkpoint, not from seqno 1. Resetting to
-         * 1 when last_stable > 0 re-opens already-executed slots in the window
-         * and causes "rejected by agreement region" for any seqno > window. */
-        r->seqno        = r->last_stable + 1;
-        r->last_prepared = r->last_stable;
+        /* If we have no stable checkpoint, also reset last_executed/last_prepared
+         * so the new view's seqno=1 can be executed. Preserving last_executed
+         * without an anchoring checkpoint causes the execute loop
+         * (last_executed+1..last_prepared) to skip newly-committed seqnos in
+         * the new view — observed as "commit accepted" with no "executing". */
+        if (r->last_stable == 0) {
+            r->seqno         = 1;
+            r->last_prepared = 0;
+            r->last_executed = 0;
+        } else {
+            r->seqno         = r->last_stable + 1;
+            r->last_prepared = r->last_stable;
+            /* last_executed preserved — safe because checkpoint anchors it */
+        }
         tbft_cr_truncate(&r->cr, r->last_stable);
         tbft_ar_init(&r->ar, r->ar.prepare_threshold, r->ar.commit_threshold);
         r->ar.head = r->last_stable + 1;
@@ -1014,8 +1023,14 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
              * enough VCs) send the New_view message. */
             r->node.view = vc->v;
             r->node.cur_primary = tbft_node_primary(&r->node, vc->v);
-            r->seqno        = r->last_stable + 1;
-            r->last_prepared = r->last_stable;
+            if (r->last_stable == 0) {
+                r->seqno         = 1;
+                r->last_prepared = 0;
+                r->last_executed = 0;
+            } else {
+                r->seqno         = r->last_stable + 1;
+                r->last_prepared = r->last_stable;
+            }
             tbft_cr_truncate(&r->cr, r->last_stable);
             tbft_ar_init(&r->ar, r->ar.prepare_threshold, r->ar.commit_threshold);
             r->ar.head = r->last_stable + 1;
