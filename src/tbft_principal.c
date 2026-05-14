@@ -214,10 +214,8 @@ bool tbft_principal_verify_mac_in_with_replay_check(tbft_principal_t *p,
 {
     bool mac_ok = tbft_principal_verify_mac_in(p, msg, msg_len, mac);
     if (!mac_ok) {
-        ESP_LOGW(TAG, "verify_mac_in: FAILED for id=%d (in_key set=%d, in_key[0..3]=%02x%02x%02x%02x, msg_len=%zu, mac[0..3]=%02x%02x%02x%02x)",
+        ESP_LOGW(TAG, "verify_mac_in: FAILED for id=%d (in_key set=%d, msg_len=%zu, mac[0..3]=%02x%02x%02x%02x)",
                  (int)p->id, p->psa_hmac_in_id != 0,
-                 p->hmac_in_key.bytes[0], p->hmac_in_key.bytes[1],
-                 p->hmac_in_key.bytes[2], p->hmac_in_key.bytes[3],
                  msg_len, mac->bytes[0], mac->bytes[1], mac->bytes[2], mac->bytes[3]);
         return false;
     }

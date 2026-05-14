@@ -27,6 +27,7 @@
 #include <string.h>
 #include <ctype.h>
 #include "esp_mac.h"
+#include "mbedtls/platform_util.h"
 #if CONFIG_TBFT_TRANSPORT_ESPNOW
 #include "esp_efuse.h"
 #endif
@@ -407,10 +408,8 @@ static int setup_principals(tbft_node_t *node, const tbft_config_t *cfg,
             size_t priv_len = 0;
             uint8_t *priv = load_key_file(priv_config_path, &priv_len);
             if (priv) {
-                /* CRITICAL FIX #1: Check return value — if private key loading
-                 * fails, the node will send unsigned messages causing protocol
-                 * stall. This is fatal — abort initialization. */
                 int pk_ret = tbft_principal_load_priv_key(p, priv, priv_len);
+                mbedtls_platform_zeroize(priv, priv_len);
                 free(priv);
                 if (pk_ret != 0) {
                     ESP_LOGE(TAG, "failed to load private key for node %d: -0x%04x",
@@ -530,6 +529,11 @@ int Byz_send_request(Byz_req *req, bool read_only)
 
     tbft_msg_digest(req->contents, (size_t)req->size, &rep->od);
 
+    /* Bounds check BEFORE computing total to avoid signed overflow UB. */
+    if (sizeof(*rep) + (size_t)req->size + TBFT_SIG_SIZE > TBFT_MAX_MESSAGE_SIZE) {
+        return -1;
+    }
+
     /* Set header size and timestamp BEFORE signing — the signature covers
      * the full header (including hdr.size) so it must have its final value. */
     int32_t total = (int32_t)(sizeof(*rep) + (size_t)req->size + TBFT_SIG_SIZE);
@@ -538,9 +542,6 @@ int Byz_send_request(Byz_req *req, bool read_only)
 
     /* Append command */
     uint8_t *cmd_ptr = out + sizeof(*rep);
-    if (sizeof(*rep) + (size_t)req->size + TBFT_SIG_SIZE > TBFT_MAX_MESSAGE_SIZE) {
-        return -1;
-    }
     memcpy(cmd_ptr, req->contents, (size_t)req->size);
 
     /* Sign */
@@ -656,6 +657,11 @@ int Byz_recv_reply(Byz_rep *rep)
                 (const tbft_reply_rep_t *)s_replies[i].buf;
             if (ri->rid != r0->rid) continue;
             if (ri->reply_size != r0->reply_size) continue;
+            /* Validate reply_size is non-negative and fits within stored message.
+             * Check len >= sizeof(*ri) first to prevent unsigned underflow. */
+            if (ri->reply_size < 0 ||
+                (size_t)s_replies[i].len < sizeof(*ri) ||
+                (size_t)ri->reply_size > (size_t)s_replies[i].len - sizeof(*ri)) continue;
 
             const uint8_t *payload_i = s_replies[i].buf + sizeof(*ri);
             tbft_digest_t digest_i;
@@ -668,6 +674,10 @@ int Byz_recv_reply(Byz_rep *rep)
                     (const tbft_reply_rep_t *)s_replies[j].buf;
                 if (rj->rid != r0->rid) continue;
                 if (rj->reply_size != ri->reply_size) continue;
+                /* Validate rj->reply_size before use */
+                if (rj->reply_size < 0 ||
+                    (size_t)s_replies[j].len < sizeof(*rj) ||
+                    (size_t)rj->reply_size > (size_t)s_replies[j].len - sizeof(*rj)) continue;
                 const uint8_t *payload_j = s_replies[j].buf + sizeof(*rj);
                 tbft_digest_t digest_j;
                 tbft_msg_digest(payload_j, (size_t)rj->reply_size, &digest_j);

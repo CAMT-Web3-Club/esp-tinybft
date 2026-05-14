@@ -249,7 +249,7 @@ void tbft_replica_run(tbft_replica_t *r)
             ESP_LOGW(TAG, "only %d/%d HMAC keys ready after drain — retrying",
                      keys_ok, r->node.threshold - 1);
             tbft_replica_send_new_key(r);
-            vTaskDelay(pdMS_TO_TICKS(200));
+            vTaskDelay(pdMS_TO_TICKS(20));
             drained = 0;
             while (drained < TBFT_KEY_DRAIN_LIMIT) {
                 tbft_node_id_t src_id = -1;
@@ -575,7 +575,6 @@ void tbft_replica_handle_pre_prepare(tbft_replica_t *r, const void *msg, int len
     }
 
     /* Must come from current primary */
-    if (r->node.node_id == expected_primary) return; /* primary ignores own PP */
     if (r->node.node_id == expected_primary) return; /* primary ignores own PP */
 
     /* Check sequence number is in window */
@@ -1048,8 +1047,11 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
             int count;
         } prep_count_t;
 
-        prep_count_t counts[TBFT_WINDOW_SIZE];
+        /* Static to avoid stack overflow with large TBFT_WINDOW_SIZE.
+         * Safe: handle_view_change only runs in the single replica event loop task. */
+        static prep_count_t counts[TBFT_WINDOW_SIZE];
         int n_counts = 0;
+        memset(counts, 0, sizeof(counts));
 
         for (int i = 0; i < r->node.num_replicas; i++) {
             if (!r->vi.received[i]) continue;
@@ -1062,18 +1064,21 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
             /* Validate that the claimed arrays fit within the actual message
              * length.  A Byzantine replica can inflate n_ckpts/n_reqs beyond
              * the stored message size, causing ptr to advance past valid data
-             * and read garbage (or OOB) as req_info entries. */
-            int ckpts_bytes = vc_rep->n_ckpts * (int)sizeof(tbft_vc_ckpt_t);
-            int reqs_bytes  = vc_rep->n_reqs  * (int)sizeof(tbft_vc_req_info_t);
-            int header_sz     = (int)sizeof(tbft_view_change_rep_t);
+             * and read garbage (or OOB) as req_info entries.
+             * Use int64_t for the multiplications to prevent signed overflow
+             * before the bounds check (signed overflow with plain int could
+             * wrap to a small positive, bypassing the < 0 guard). */
             if (vc_rep->n_ckpts < 0 || vc_rep->n_reqs < 0) continue;
-            if (ckpts_bytes < 0 || reqs_bytes < 0) continue; /* overflow guard */
-            if (vc_len < header_sz + ckpts_bytes + reqs_bytes) continue;
+            if (vc_rep->n_ckpts > TBFT_WINDOW_SIZE || vc_rep->n_reqs > TBFT_WINDOW_SIZE) continue;
+            int64_t ckpts_bytes = (int64_t)vc_rep->n_ckpts * (int64_t)sizeof(tbft_vc_ckpt_t);
+            int64_t reqs_bytes  = (int64_t)vc_rep->n_reqs  * (int64_t)sizeof(tbft_vc_req_info_t);
+            int64_t header_sz   = (int64_t)sizeof(tbft_view_change_rep_t);
+            if (vc_len < (int)(header_sz + ckpts_bytes + reqs_bytes)) continue;
 
             /* Parse embedded req_info array */
-            const uint8_t *ptr = vc_msg + header_sz;
+            const uint8_t *ptr = vc_msg + (ptrdiff_t)header_sz;
             if (vc_rep->n_ckpts > 0) {
-                ptr += ckpts_bytes;
+                ptr += (ptrdiff_t)ckpts_bytes;
             }
             const tbft_vc_req_info_t *reqs =
                 (const tbft_vc_req_info_t *)ptr;
@@ -1109,11 +1114,17 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
         nv->has_sig = 1;
 
         uint8_t *body_ptr = r->out_buf + sizeof(*nv);
+        const uint8_t *body_end = r->out_buf + sizeof(r->out_buf) - sizeof(tbft_sig_t);
         int n_proofs = 0;
 
-        /* Append prepared proofs with quorum */
+        /* Append prepared proofs with quorum.
+         * Guard each iteration: writing past body_end would overflow out_buf. */
         for (int k = 0; k < n_counts; k++) {
             if (counts[k].count >= r->node.threshold) {
+                if (body_ptr + sizeof(tbft_vc_req_info_t) > body_end) {
+                    ESP_LOGE(TAG, "new-view: out_buf full, truncating proofs at %d", n_proofs);
+                    break;
+                }
                 tbft_vc_req_info_t *proof = (tbft_vc_req_info_t *)body_ptr;
                 proof->seqno = counts[k].seqno;
                 proof->last_view = r->node.view > 0 ? (r->node.view - 1) : 0;
@@ -1972,15 +1983,6 @@ void tbft_replica_send_view_change(tbft_replica_t *r)
         tbft_vi_collect_vc(&r->vi, r->node.node_id, r->out_buf, total_size);
     }
 
-    /* If our own VC completed the quorum and we are the new primary,
-     * the New_view construction logic inside handle_view_change will
-     * be triggered when the next VC arrives. We cannot call it directly
-     * here because collect_vc already returned false for our own VC. */
-    (void)total_size; /* silence unused warning when NDEBUG */
-
-    /* Low #7 FIX: This sets a fixed 2x grace period for the view-change
-     * retry timer (not true exponential backoff). The period resets to
-     * the base value on each send_view_change call. */
     tbft_itimer_start(&r->vtimer, r->vtimer_period_us * 2);
 }
 

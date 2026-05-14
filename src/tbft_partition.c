@@ -51,10 +51,17 @@ int tbft_ptree_init(tbft_ptree_t *tree, int num_blocks, int p_children)
     tree->dims.p_children = p_children;
     tree->dims.num_blocks = num_blocks;
 
-    /* Count total nodes across all levels */
+    /* Count total nodes across all levels.
+     * Check the sentinel return (1000001) before accumulating to avoid
+     * passing a wildly large count to calloc. */
     int total = 0;
     for (int l = 0; l < levels; l++) {
-        total += tbft_ptree_nodes_at_level(l, p_children);
+        int n_at_l = tbft_ptree_nodes_at_level(l, p_children);
+        if (n_at_l > 1000000) {
+            ESP_LOGE(TAG, "ptree: level %d node count overflow", l);
+            return -1;
+        }
+        total += n_at_l;
     }
     tree->total_nodes = total;
 
@@ -137,9 +144,14 @@ int tbft_ptree_update_leaf(tbft_ptree_t *tree, int block_idx,
         for (int c = first_child;
              c < first_child + pchildren && c < num_nodes_at_l;
              c++) {
-            psa_hash_update(&hash_op,
-                            tree->ptree[l][c].digest.bytes,
-                            TBFT_DIGEST_SIZE);
+            pst = psa_hash_update(&hash_op,
+                                  tree->ptree[l][c].digest.bytes,
+                                  TBFT_DIGEST_SIZE);
+            if (pst != PSA_SUCCESS) {
+                ESP_LOGE(TAG, "psa_hash_update failed: %d", (int)pst);
+                psa_hash_abort(&hash_op);
+                return -1;
+            }
         }
         size_t hash_len = 0;
         tbft_part_t *parent = &tree->ptree[l - 1][parent_idx];
