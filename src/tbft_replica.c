@@ -632,14 +632,18 @@ void tbft_replica_handle_pre_prepare(tbft_replica_t *r, const void *msg, int len
     /* Only advance view after successful sender and MAC verification */
     if (pp->view > r->node.view) {
         r->node.view = pp->view;
-        r->seqno = 1;
-        r->last_stable = 0;
-        r->last_prepared = 0;
-        r->last_executed = 0;
+        r->node.cur_primary = tbft_node_primary(&r->node, r->node.view);
+        /* Resume from last stable checkpoint, not from seqno 1. Resetting to
+         * 1 when last_stable > 0 re-opens already-executed slots in the window
+         * and causes "rejected by agreement region" for any seqno > window. */
+        r->seqno        = r->last_stable + 1;
+        r->last_prepared = r->last_stable;
+        tbft_cr_truncate(&r->cr, r->last_stable);
         tbft_ar_init(&r->ar, r->ar.prepare_threshold, r->ar.commit_threshold);
-        r->ar.head = 1;
+        r->ar.head = r->last_stable + 1;
         tbft_itimer_stop(&r->vtimer);
         tbft_vi_reset(&r->vi, r->node.view + 1);
+        r->vi.in_progress = false;
         tbft_itimer_start(&r->vtimer, r->vtimer_period_us);
     }
 
@@ -1010,14 +1014,13 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
              * enough VCs) send the New_view message. */
             r->node.view = vc->v;
             r->node.cur_primary = tbft_node_primary(&r->node, vc->v);
-            r->seqno = 1;
-            r->last_stable = 0;
-            r->last_executed = 0;
-            r->last_prepared = 0;
+            r->seqno        = r->last_stable + 1;
+            r->last_prepared = r->last_stable;
+            tbft_cr_truncate(&r->cr, r->last_stable);
             tbft_ar_init(&r->ar, r->ar.prepare_threshold, r->ar.commit_threshold);
-            r->ar.head = 1;
-            ESP_LOGI(TAG, "sync view to %lld (from vc of %d), seqno reset to 1",
-                     (long long)vc->v, sender_id);
+            r->ar.head = r->last_stable + 1;
+            ESP_LOGI(TAG, "sync view to %lld (from vc of %d), seqno reset to %lld",
+                     (long long)vc->v, sender_id, (long long)r->last_stable + 1);
             /* REMOVED: catch-up view-change cascade accelerator.
              * The old code here called tbft_replica_send_view_change(r) which
              * computed target = r->node.view + 1 = V + 1, overshooting the
@@ -1167,6 +1170,7 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
         r->ar.head = nv->min + 1;
         tbft_itimer_stop(&r->vtimer);
         tbft_vi_reset(&r->vi, r->node.view + 1);
+        r->vi.in_progress = false;
         tbft_itimer_start(&r->vtimer, r->vtimer_period_us);
     }
 }
@@ -1284,6 +1288,7 @@ void tbft_replica_handle_new_view(tbft_replica_t *r, const void *msg, int len)
     /* Stop view-change timer and restart it */
     tbft_itimer_stop(&r->vtimer);
     tbft_vi_reset(&r->vi, nv->v + 1);
+    r->vi.in_progress = false;
 
     tbft_itimer_start(&r->vtimer, r->vtimer_period_us);
 
@@ -1435,7 +1440,7 @@ void tbft_replica_handle_data(tbft_replica_t *r, const void *msg, int len)
 void tbft_replica_send_pre_prepare(tbft_replica_t *r)
 {
     if (!tbft_replica_is_primary(r)) return;
-    if (r->vi.target_view > r->node.view) return; /* view-change in progress */
+    if (r->vi.in_progress) return; /* view-change in progress */
 
     /* Only require that we have at least threshold-1 peers with fresh keys.
      * The self-test already verifies each key on import, so no additional
@@ -1673,9 +1678,11 @@ void tbft_replica_send_prepare(tbft_replica_t *r, tbft_seqno_t n)
         (int32_t)(sizeof(*prep) + sizeof(tbft_auth_t)));
     tbft_node_gen_auth(&r->node, r->out_buf, sizeof(*prep), auth);
 
-    /* Store own prepare */
-    tbft_ar_add_my_prepare(&r->ar, n, r->out_buf, prep->hdr.size,
-                           r->node.node_id);
+    /* Store own prepare; bail if already sent (duplicate PP delivery) */
+    if (!tbft_ar_add_my_prepare(&r->ar, n, r->out_buf, prep->hdr.size,
+                                r->node.node_id)) {
+        return;
+    }
 
     tbft_node_send(&r->node, r->out_buf, (size_t)prep->hdr.size,
                    TBFT_ALL_REPLICAS);
@@ -1898,6 +1905,7 @@ void tbft_replica_send_view_change(tbft_replica_t *r)
     if (r->vi.target_view != target) {
         tbft_vi_reset(&r->vi, target);
     }
+    r->vi.in_progress = true;
 
     uint8_t *ptr = r->out_buf;
 
