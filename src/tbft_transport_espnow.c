@@ -103,6 +103,7 @@ typedef struct {
 typedef struct tbft_espnow {
     tbft_addr_t  peers[TBFT_MAX_NUM_REPLICAS + TBFT_MAX_NUM_CLIENTS];
     bool         peer_valid[TBFT_MAX_NUM_REPLICAS + TBFT_MAX_NUM_CLIENTS];
+    uint8_t      peer_ap_mac[TBFT_MAX_NUM_REPLICAS + TBFT_MAX_NUM_CLIENTS][6];
     int          num_nodes;
     int          num_replicas;
     int          local_id;
@@ -359,11 +360,10 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *
  * ฟังก์ชันส่งข้อมูลและ Send Task
  * -------------------------------------------------------------------------- */
 
-static int espnow_do_send(tbft_espnow_t *enow, const uint8_t *peer_mac, uint16_t msg_id, const uint8_t *buf, size_t len) {
-    if (!peer_mac || !buf || len == 0) return -1;
+static int espnow_do_send(tbft_espnow_t *enow, tbft_node_id_t dest_id, uint16_t msg_id, const uint8_t *buf, size_t len) {
+    if (dest_id < 0 || dest_id >= enow->num_nodes || !buf || len == 0) return -1;
 
-    uint8_t ap_mac[6];
-    get_ap_mac(peer_mac, ap_mac);
+    const uint8_t *ap_mac = enow->peer_ap_mac[dest_id];
 
     /* CRITICAL FIX: Add per-fragment retry with exponential backoff.
      * Without this, a single ESP-NOW send failure causes complete message
@@ -482,11 +482,10 @@ static void espnow_send_task(void *pvParameters) {
 
                 xSemaphoreTake(enow->lock, portMAX_DELAY);
                 bool valid = enow->peer_valid[i];
-                tbft_addr_t peer_addr = enow->peers[i];
                 xSemaphoreGive(enow->lock);
 
                 if (valid) {
-                    int rc = espnow_do_send(enow, peer_addr.u.mac.bytes, this_msg_id, entry.buf, (size_t)entry.len);
+                    int rc = espnow_do_send(enow, i, this_msg_id, entry.buf, (size_t)entry.len);
                     ESP_LOGI(TAG, "send_task: broadcast to node %d → %s (rc=%d)", i, rc > 0 ? "OK" : "FAIL", rc);
                     /* Delay between individual peer sends — ESP-NOW in softAP mode
                      * needs time to complete each transmission before the next. */
@@ -502,13 +501,12 @@ static void espnow_send_task(void *pvParameters) {
         } else if (entry.dest >= 0 && entry.dest < enow->num_nodes) {
             xSemaphoreTake(enow->lock, portMAX_DELAY);
             bool valid = enow->peer_valid[entry.dest];
-            tbft_addr_t peer_addr = enow->peers[entry.dest];
             uint16_t this_msg_id = enow->next_msg_id++;
             xSemaphoreGive(enow->lock);
 
             if (valid) {
                 int msg_tag = entry.buf[0];
-                int rc = espnow_do_send(enow, peer_addr.u.mac.bytes, this_msg_id, entry.buf, (size_t)entry.len);
+                int rc = espnow_do_send(enow, entry.dest, this_msg_id, entry.buf, (size_t)entry.len);
                 ESP_LOGI(TAG, "send_task: unicast to node %d tag=%d → %s (rc=%d)",
                          entry.dest, msg_tag, rc > 0 ? "OK" : "FAIL", rc);
             } else {
@@ -660,6 +658,9 @@ void tbft_transport_set_peer(tbft_transport_t *t, tbft_node_id_t node_id, const 
     xSemaphoreTake(enow->lock, portMAX_DELAY);
     enow->peers[node_id] = *addr;
     enow->peer_valid[node_id] = true;
+
+    /* Cache the peer's AP MAC for the hot send path */
+    get_ap_mac(addr->u.mac.bytes, enow->peer_ap_mac[node_id]);
 
     uint8_t self_mac[6];
     if (esp_efuse_mac_get_default(self_mac) == ESP_OK && memcmp(self_mac, addr->u.mac.bytes, 6) == 0) {

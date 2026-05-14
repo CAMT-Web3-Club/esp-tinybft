@@ -117,14 +117,6 @@ void tbft_principal_free(tbft_principal_t *p)
     memset(p, 0, sizeof(*p));
 }
 
-void tbft_principal_psa_deinit(void)
-{
-    portENTER_CRITICAL(&s_psa_spinlock);
-    mbedtls_psa_crypto_free();
-    s_psa_init = false;
-    portEXIT_CRITICAL(&s_psa_spinlock);
-}
-
 /* --------------------------------------------------------------------------
  * HMAC helpers (PSA Crypto — mbedtls/md.h HMAC API is private in 4.x)
  *

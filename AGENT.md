@@ -135,6 +135,20 @@ Additional important fields:
 - **Slow path** (Request, View_change, New_view): RSA-2048 signature via `tbft_principal_sign` / `tbft_principal_verify_sig`.
 - Session key rotation: `tbft_principal_encrypt_new_key` / `tbft_principal_decrypt_new_key` — imports RSA key into PSA, uses `psa_asymmetric_encrypt/decrypt` with PKCS#1 v1.5 to distribute fresh HMAC session keys.
 
+#### Anti-replay design (why timestamp checking is disabled)
+
+`tbft_principal_verify_mac_in_with_replay_check` intentionally skips the `timestamp_us` monotonicity check (`(void)msg_time_us; return true;`). This is by design, not an oversight:
+
+1. **Staggered boot problem**: ESP32 boards use `esp_timer_get_time()` which starts at 0 on each boot. When boards are flashed sequentially (minutes apart), their timers diverge — a freshly-booted board's timestamps appear "stale" (too far in the past) to boards that have been running longer. A 5-minute slack only helps in one direction; the lagging board's messages are always rejected.
+
+2. **Key rotation as replay protection**: Each `New_key` exchange generates fresh random HMAC session keys (`esp_fill_random`). Once keys rotate, any captured pre-rotation message fails HMAC verification under the new key — the attacker can't replay across key boundaries.
+
+3. **Sender bitmap as duplicate guard**: Each certificate (`tbft_certificate.c`) tracks per-sender contributions via `tbft_bitmap_t`. A replayed Prepare/Commit from the same sender for the same seqno is rejected as a duplicate sender. Cross-seqno replay fails because the HMAC covers the entire message including `seqno`.
+
+Together, key rotation + sender bitmap provide equivalent protection without requiring synchronized clocks across embedded devices.
+
+**Do not re-enable timestamp-based anti-replay** without solving the staggered-boot clock synchronization problem first.
+
 ### Configuration file format (section 12 of ARCHITECTURE.md)
 
 Read by `parse_config()` in `tbft_libbyz.c`. Plain text, line-based:

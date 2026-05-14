@@ -517,8 +517,9 @@ int Byz_send_request(Byz_req *req, bool read_only)
 {
     if (!s_client) return -1;
 
-    /* Build Request message on stack */
-    uint8_t out[TBFT_MAX_MESSAGE_SIZE];
+    /* Build Request message. Use a static buffer to avoid stack overflow
+     * on tasks with limited stack size (TBFT_MAX_MESSAGE_SIZE can be large). */
+    static uint8_t out[TBFT_MAX_MESSAGE_SIZE];
     tbft_request_rep_t *rep = (tbft_request_rep_t *)out;
     rep->hdr.tag      = TBFT_MSG_REQUEST;
     rep->hdr.extra    = (int16_t)(read_only ? 1 : 0);

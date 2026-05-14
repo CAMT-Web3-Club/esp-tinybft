@@ -55,26 +55,6 @@ TBFT_CERT_DECLARE(tbft_checkpoint_cert_t, TBFT_CERT_CHECKPOINT_MSG_SIZE);
 TBFT_CERT_DECLARE(tbft_prepare_cert_t,    TBFT_CERT_PREPARE_MSG_SIZE);
 
 /* --------------------------------------------------------------------------
- * Generic certificate operations (operate on the common prefix of all certs)
- * -------------------------------------------------------------------------- */
-
-/**
- * Internal layout shared by all TBFT_CERT_DECLARE structs:
- * The first field is bmap, second is vals (opaque from here), then
- * correct[], num_vals, mym_idx, complete_threshold.
- *
- * We define a "raw" view for the common-prefix operations.
- */
-typedef struct {
-    tbft_bitmap_t  bmap;
-    /* vals and correct are accessed via pointer arithmetic by callers */
-    int            correct_dummy[1]; /* placeholder */
-    int            num_vals;
-    int            mym_idx;
-    int            complete_threshold;
-} tbft_cert_common_t;
-
-/* --------------------------------------------------------------------------
  * Typed add / query operations
  *
  * These operate directly on the concrete types to avoid void* games.
