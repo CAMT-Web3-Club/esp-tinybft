@@ -444,9 +444,11 @@ static void espnow_send_task(void *pvParameters) {
                 vTaskDelete(NULL);
             }
             if (enow->reasm_stale_flag) {
-                enow->reasm_stale_flag = false;
                 xSemaphoreTake(enow->lock, portMAX_DELAY);
-                reasm_clear_stale(enow);
+                if (enow->reasm_stale_flag) {
+                    enow->reasm_stale_flag = false;
+                    reasm_clear_stale(enow);
+                }
                 xSemaphoreGive(enow->lock);
             }
             continue;

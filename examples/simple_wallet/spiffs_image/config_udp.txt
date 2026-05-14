@@ -1,13 +1,12 @@
 wallet
 1
 3000
-5
+4
 239.0.0.1
-node0 192.168.100.190 5000 /spiffs/pub0.der
-node1 192.168.100.191 5000 /spiffs/pub1.der
-node2 192.168.100.192 5000 /spiffs/pub2.der
-node3 192.168.100.193 5000 /spiffs/pub3.der
-client4 192.168.100.194 5000 /spiffs/pub4.der
-60000
+node0 192.168.100.191 5000 /spiffs/pub0.der
+node1 192.168.100.190 5000 /spiffs/pub1.der
+node2 192.168.100.193 5000 /spiffs/pub2.der
+client 192.168.100.192 5000 /spiffs/pub3.der
+2000
 5000
 10000

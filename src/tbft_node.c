@@ -24,7 +24,7 @@ static const char *TAG = "tbft_node";
  * -------------------------------------------------------------------------- */
 
 int tbft_node_init(tbft_node_t *node, tbft_node_id_t node_id,
-                   int f, int num_nodes,
+                   int f, int num_replicas, int num_nodes,
                    const char *mcast_ip, int64_t auth_timeout_us,
                    uint16_t port)
 {
@@ -32,7 +32,7 @@ int tbft_node_init(tbft_node_t *node, tbft_node_id_t node_id,
 
     node->node_id       = node_id;
     node->max_faulty    = f;
-    node->num_replicas  = 3 * f + 1;
+    node->num_replicas  = num_replicas;
     node->threshold     = 2 * f + 1;
     node->num_principals = num_nodes;
     node->view           = 0;

@@ -23,7 +23,7 @@ struct tbft_node {
     /* Protocol identity */
     tbft_node_id_t  node_id;
     int             max_faulty;    /* f: max Byzantine faults */
-    int             num_replicas;  /* n = 3f + 1 */
+    int             num_replicas;  /* actual replica count (>= 3f+1 for full BFT) */
     int             threshold;     /* 2f + 1 */
     tbft_view_t     view;
     int             cur_primary;   /* view % num_replicas */
@@ -59,6 +59,7 @@ struct tbft_node {
  * @param node           Node to initialise
  * @param node_id        This node's id
  * @param f              Max Byzantine faults
+ * @param num_replicas   Actual replica count; may be less than 3f+1 for demos
  * @param num_nodes      Total node count (replicas + clients)
  * @param mcast_ip       Multicast group IP string (UDP only, e.g. "234.5.6.8")
  * @param auth_timeout_us  Authentication timer period in microseconds
@@ -66,7 +67,7 @@ struct tbft_node {
  * @return 0 on success, -1 on error
  */
 int tbft_node_init(tbft_node_t *node, tbft_node_id_t node_id,
-                   int f, int num_nodes,
+                   int f, int num_replicas, int num_nodes,
                    const char *mcast_ip, int64_t auth_timeout_us,
                    uint16_t port);
 

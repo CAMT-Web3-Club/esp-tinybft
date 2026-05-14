@@ -19,6 +19,11 @@ typedef struct {
     int          num_replicas;
     int          threshold;       /* 2f+1 */
 
+    /* Set when send_view_change has fired; cleared when a new view is
+     * installed.  Drives the PP-suppression guard so the primary does not
+     * broadcast Pre-prepares while a view-change is in flight. */
+    bool         in_progress;
+
     /* Received view-change messages (stored in special_region) */
     tbft_special_region_t *sr;    /* back-pointer to special region */
 

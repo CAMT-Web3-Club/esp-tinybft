@@ -1,13 +1,12 @@
 wallet
 1
 60000
-5
+4
 0.0.0.0
-node0 e8:3d:c1:8c:18:58 /spiffs/pub0.der
-node1 88:56:a6:5b:76:ac /spiffs/pub1.der
-node2 1c:db:d4:c6:41:14 /spiffs/pub2.der
-node3 88:56:a6:5b:7c:ac /spiffs/pub3.der
-client4 88:56:a6:5b:78:dc /spiffs/pub4.der
+node0 88:56:a6:5b:76:ac /spiffs/pub0.der
+node1 e8:3d:c1:8c:18:58 /spiffs/pub1.der
+node2 88:56:a6:5b:7c:ac /spiffs/pub2.der
+client3 1c:db:d4:c6:41:14 /spiffs/pub3.der
 60000
 5000
 10000

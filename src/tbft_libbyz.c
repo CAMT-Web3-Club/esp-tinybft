@@ -27,6 +27,7 @@
 #include <string.h>
 #include <ctype.h>
 #include "esp_mac.h"
+#include "mbedtls/platform_util.h"
 #if CONFIG_TBFT_TRANSPORT_ESPNOW
 #include "esp_efuse.h"
 #endif
@@ -73,6 +74,7 @@ typedef struct {
     int    f;
     int    auth_timeout_ms;
     int    num_nodes;
+    int    num_replicas;  /* counted from "node*" hostname prefixes */
     char   mcast_ip[32];
 
     struct {
@@ -182,6 +184,23 @@ static int parse_config(const char *path, tbft_config_t *cfg)
             }
             cfg->nodes[i].port = (uint16_t)port_int;
         }
+    }
+
+    /* Count actual replicas by hostname prefix: "node*" = replica, anything else = client */
+    cfg->num_replicas = 0;
+    for (int i = 0; i < cfg->num_nodes; i++) {
+        if (strncmp(cfg->nodes[i].hostname, "node", 4) == 0)
+            cfg->num_replicas++;
+    }
+    if (cfg->num_replicas < 1) {
+        ESP_LOGE(TAG, "no replica entries found (hostnames must start with \"node\")");
+        goto fail;
+    }
+    if (cfg->num_replicas < 3 * cfg->f + 1) {
+        ESP_LOGW(TAG, "num_replicas=%d < 3f+1=%d: reduced fault tolerance "
+                 "(max tolerated faults with %d replicas = %d)",
+                 cfg->num_replicas, 3 * cfg->f + 1,
+                 cfg->num_replicas, (cfg->num_replicas - 1) / 3);
     }
 
     if (fscanf(f, "%d", &cfg->vc_timeout_ms)       != 1) goto fail;
@@ -389,10 +408,8 @@ static int setup_principals(tbft_node_t *node, const tbft_config_t *cfg,
             size_t priv_len = 0;
             uint8_t *priv = load_key_file(priv_config_path, &priv_len);
             if (priv) {
-                /* CRITICAL FIX #1: Check return value — if private key loading
-                 * fails, the node will send unsigned messages causing protocol
-                 * stall. This is fatal — abort initialization. */
                 int pk_ret = tbft_principal_load_priv_key(p, priv, priv_len);
+                mbedtls_platform_zeroize(priv, priv_len);
                 free(priv);
                 if (pk_ret != 0) {
                     ESP_LOGE(TAG, "failed to load private key for node %d: -0x%04x",
@@ -444,9 +461,9 @@ int Byz_init_client(const char *config_file, const char *priv_config,
     tbft_config_t cfg;
     if (parse_config(config_file, &cfg) != 0) return -1;
 
-    int num_replicas = 3 * cfg.f + 1;
+    int num_replicas = cfg.num_replicas;
 
-    /* local_id == -1: auto-select first client slot (3f+1) */
+    /* local_id == -1: auto-select first client slot */
     if (local_id == -1) local_id = num_replicas;
 
     /* Validate: local_id must be a client slot (beyond the replicas) */
@@ -464,7 +481,7 @@ int Byz_init_client(const char *config_file, const char *priv_config,
     if (!s_client) return -1;
 
     uint16_t bind_port = (port != 0) ? port : cfg.nodes[local_id].port;
-    if (tbft_node_init(s_client, local_id, cfg.f, cfg.num_nodes,
+    if (tbft_node_init(s_client, local_id, cfg.f, num_replicas, cfg.num_nodes,
                        cfg.mcast_ip,
                        (int64_t)cfg.auth_timeout_ms * 1000LL,
                        bind_port) != 0) {
@@ -512,6 +529,11 @@ int Byz_send_request(Byz_req *req, bool read_only)
 
     tbft_msg_digest(req->contents, (size_t)req->size, &rep->od);
 
+    /* Bounds check BEFORE computing total to avoid signed overflow UB. */
+    if (sizeof(*rep) + (size_t)req->size + TBFT_SIG_SIZE > TBFT_MAX_MESSAGE_SIZE) {
+        return -1;
+    }
+
     /* Set header size and timestamp BEFORE signing — the signature covers
      * the full header (including hdr.size) so it must have its final value. */
     int32_t total = (int32_t)(sizeof(*rep) + (size_t)req->size + TBFT_SIG_SIZE);
@@ -520,9 +542,6 @@ int Byz_send_request(Byz_req *req, bool read_only)
 
     /* Append command */
     uint8_t *cmd_ptr = out + sizeof(*rep);
-    if (sizeof(*rep) + (size_t)req->size + TBFT_SIG_SIZE > TBFT_MAX_MESSAGE_SIZE) {
-        return -1;
-    }
     memcpy(cmd_ptr, req->contents, (size_t)req->size);
 
     /* Sign */
@@ -623,14 +642,14 @@ int Byz_recv_reply(Byz_rep *rep)
         s_replies[rep_id].valid = true;
         s_reply_count++;
 
-        /* Count matching replies (same rid + payload digest).
-         * Do NOT filter on view: a replica may have moved to a later view
-         * but still produce a valid reply for our request id. */
+        /* Count matching replies: find the digest with the most votes.
+         * Use majority-vote rather than "first reply wins" — if the first
+         * stored reply is the outlier, the agreeing majority would never
+         * accumulate enough count with the old approach. O(n²) is fine
+         * because num_replicas ≤ TBFT_MAX_NUM_REPLICAS (≤ 4). */
         int match = 0;
         const uint8_t *winning_payload = NULL;
         int winning_payload_len = 0;
-        tbft_digest_t winning_digest;
-        bool first = true;
 
         for (int i = 0; i < num_replicas; i++) {
             if (!s_replies[i].valid) continue;
@@ -638,19 +657,37 @@ int Byz_recv_reply(Byz_rep *rep)
                 (const tbft_reply_rep_t *)s_replies[i].buf;
             if (ri->rid != r0->rid) continue;
             if (ri->reply_size != r0->reply_size) continue;
+            /* Validate reply_size is non-negative and fits within stored message.
+             * Check len >= sizeof(*ri) first to prevent unsigned underflow. */
+            if (ri->reply_size < 0 ||
+                (size_t)s_replies[i].len < sizeof(*ri) ||
+                (size_t)ri->reply_size > (size_t)s_replies[i].len - sizeof(*ri)) continue;
 
-            const uint8_t *payload = s_replies[i].buf + sizeof(*ri);
-            tbft_digest_t digest;
-            tbft_msg_digest(payload, (size_t)ri->reply_size, &digest);
+            const uint8_t *payload_i = s_replies[i].buf + sizeof(*ri);
+            tbft_digest_t digest_i;
+            tbft_msg_digest(payload_i, (size_t)ri->reply_size, &digest_i);
 
-            if (first) {
-                winning_payload = payload;
+            int cnt = 0;
+            for (int j = 0; j < num_replicas; j++) {
+                if (!s_replies[j].valid) continue;
+                const tbft_reply_rep_t *rj =
+                    (const tbft_reply_rep_t *)s_replies[j].buf;
+                if (rj->rid != r0->rid) continue;
+                if (rj->reply_size != ri->reply_size) continue;
+                /* Validate rj->reply_size before use */
+                if (rj->reply_size < 0 ||
+                    (size_t)s_replies[j].len < sizeof(*rj) ||
+                    (size_t)rj->reply_size > (size_t)s_replies[j].len - sizeof(*rj)) continue;
+                const uint8_t *payload_j = s_replies[j].buf + sizeof(*rj);
+                tbft_digest_t digest_j;
+                tbft_msg_digest(payload_j, (size_t)rj->reply_size, &digest_j);
+                if (memcmp(&digest_i, &digest_j, sizeof(digest_i)) == 0) cnt++;
+            }
+
+            if (cnt > match) {
+                match = cnt;
+                winning_payload = payload_i;
                 winning_payload_len = ri->reply_size;
-                winning_digest = digest;
-                match++;
-                first = false;
-            } else if (memcmp(&digest, &winning_digest, sizeof(digest)) == 0) {
-                match++;
             }
         }
 
@@ -672,6 +709,8 @@ int Byz_recv_reply(Byz_rep *rep)
 
     ESP_LOGW(TAG, "recv_reply timeout: got %d replies (needed=%d)",
              s_reply_count, needed);
+    memset(s_replies, 0, sizeof(s_replies));
+    s_reply_count = 0;
     return -1; /* timeout */
 }
 
@@ -768,8 +807,8 @@ int Byz_init_replica(const char *config_file, const char *priv_config,
         }
     }
 
-    /* Validate local_id: must be a replica slot (0..3f) in range */
-    int num_replicas = 3 * cfg.f + 1;
+    /* Validate local_id: must be a replica slot */
+    int num_replicas = cfg.num_replicas;
     if (local_id < 0 || local_id >= num_replicas) {
         ESP_LOGE(TAG, "local_id=%d out of replica range [0, %d)",
                  local_id, num_replicas);
@@ -793,7 +832,7 @@ int Byz_init_replica(const char *config_file, const char *priv_config,
     uint16_t bind_port = (port != 0) ? port : cfg.nodes[local_id].port;
 
     int ret = tbft_replica_init(
-        s_replica, local_id, cfg.f, cfg.num_nodes,
+        s_replica, local_id, cfg.f, num_replicas, cfg.num_nodes,
         cfg.mcast_ip,
         (int64_t)cfg.auth_timeout_ms * 1000LL,
         bind_port,
