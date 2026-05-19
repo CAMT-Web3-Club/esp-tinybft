@@ -6,6 +6,8 @@ This file provides guidance to AI agents (Claude Code, Gemini CLI, etc.) when wo
 
 This is an **ESP-IDF component** (not a standalone app). It is built as part of a host project that adds it as a managed component or local component.
 
+### Local IDF build
+
 ```bash
 # From a host ESP-IDF project that uses this component:
 idf.py build                   # full build
@@ -17,6 +19,44 @@ idf.py -p /dev/ttyUSB0 flash monitor  # with explicit port
 # Component-only sanity check (requires IDF env active):
 idf.py set-target esp32c3
 idf.py build
+```
+
+### Docker build (espressif/idf image)
+
+Use the Espressif Docker image when local IDF toolchain is unavailable. The image contains ESP-IDF, cross-compiler toolchains, CMake, Ninja, and all Python dependencies.
+
+```bash
+# One-time: create symlink so IDF finds the component
+mkdir -p examples/counter/components
+ln -sfn ../../.. examples/counter/components/esp-tinybft
+
+# Build the counter example (self-contained ESP-IDF project):
+docker run --rm \
+  -v $PWD:/project \
+  -w /project/examples/counter \
+  -e HOME=/tmp \
+  -e IDF_GIT_SAFE_DIR='/project' \
+  espressif/idf:v6.0.1 \
+  idf.py set-target esp32c3 && idf.py build
+
+# Quick check for compilation errors (component only, via example):
+docker run --rm -v $PWD:/project -w /project/examples/counter \
+  -e HOME=/tmp -e IDF_GIT_SAFE_DIR='/project' \
+  espressif/idf:v6.0.1 \
+  idf.py build 2>&1 | head -50
+```
+
+### After making changes
+
+Review build output before pushing. If Docker is unavailable locally, build errors will surface in CI.
+```bash
+# Full build check via Docker (counter example = most complex):
+cd examples/counter && bash memcalc.sh   # verify tbft_replica_t size
+docker run --rm -v $(git rev-parse --show-toplevel):/project \
+  -w /project/examples/counter -e HOME=/tmp \
+  -e IDF_GIT_SAFE_DIR='/project' \
+  espressif/idf:v6.0.1 \
+  idf.py build
 ```
 
 There is no dedicated test target or test suite yet. Runtime logging uses `ESP_LOGI/LOGE/LOGW` with per-file `TAG` constants, visible in `idf.py monitor`.

@@ -1040,6 +1040,9 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
              * The old code here called tbft_replica_send_view_change(r) which
              * computed target = r->node.view + 1 = V + 1, overshooting the
              * received view and triggering a cascade to ever-higher views. */
+            /* Sync vi state so subsequent New_view for this view validates */
+            r->vi.target_view = vc->v;
+            r->vi.in_progress = false;
         }
         return;
     }
@@ -1178,6 +1181,7 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
         r->node.cur_primary = tbft_node_primary(&r->node, r->node.view);
         r->seqno = nv->min + 1;
         if (nv->min > r->last_stable)   r->last_stable   = nv->min;
+        if (nv->min > r->state.last_stable) r->state.last_stable = nv->min;
         if (nv->min > r->last_executed) r->last_executed = nv->min;
         if (nv->min > r->last_prepared) r->last_prepared = nv->min;
         tbft_cr_truncate(&r->cr, nv->min);
@@ -1261,6 +1265,7 @@ void tbft_replica_handle_new_view(tbft_replica_t *r, const void *msg, int len)
      * with ar.head = nv->min + 1.  nv->min is the highest stable checkpoint
      * seqno proven by the view-change quorum, so advancing is safe. */
     if (nv->min > r->last_stable)   r->last_stable   = nv->min;
+    if (nv->min > r->state.last_stable) r->state.last_stable = nv->min;
     if (nv->min > r->last_executed) r->last_executed = nv->min;
     if (nv->min > r->last_prepared) r->last_prepared = nv->min;
     tbft_cr_truncate(&r->cr, nv->min);
@@ -1891,8 +1896,10 @@ void tbft_replica_mark_stable(tbft_replica_t *r, tbft_seqno_t seqno)
         if (!tbft_digest_equal(winning, local)) {
             ESP_LOGW(TAG, "stable ckpt digest mismatch at seqno=%lld — starting fetch",
                      (long long)seqno);
-            tbft_state_start_fetch(&r->state, seqno,
-                                   tbft_node_primary(&r->node, r->node.view));
+            if (!r->state.in_fetch) {
+                tbft_state_start_fetch(&r->state, seqno,
+                                        tbft_node_primary(&r->node, r->node.view));
+            }
             return;
         }
     }
@@ -2066,10 +2073,6 @@ void tbft_replica_send_new_key(tbft_replica_t *r)
             new_key = p->hmac_out_key;
         }
 
-        /* Store locally as the out-key for messages we send TO replica i */
-        tbft_principal_set_out_key(p, &new_key);
-        ESP_LOGI(TAG, "send_new_key: set out_key for replica %d (new=%d)", i, need_new_key);
-
         /* Encrypt the key under replica i's RSA public key */
         size_t enc_len = 0;
         int rc = tbft_principal_encrypt_new_key(p, &new_key,
@@ -2084,6 +2087,12 @@ void tbft_replica_send_new_key(tbft_replica_t *r)
              * recipient_id=0 which could confuse the recipient. */
             continue;
         }
+
+        /* Store locally as the out-key for messages we send TO replica i.
+         * Must happen AFTER successful encryption so peers that fail
+         * encryption don't get a stale out-key set locally. */
+        tbft_principal_set_out_key(p, &new_key);
+        ESP_LOGI(TAG, "send_new_key: set out_key for replica %d (new=%d)", i, need_new_key);
 
         slots[slot_idx].recipient_id = i;
         slot_idx++;
