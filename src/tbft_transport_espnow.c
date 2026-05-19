@@ -730,9 +730,11 @@ int tbft_transport_recv(tbft_transport_t *t, void *buf, size_t buf_len, tbft_nod
     if (!enow || enow->shutting_down) return -1;
 
     if (enow->reasm_stale_flag) {
-        enow->reasm_stale_flag = false;
         xSemaphoreTake(enow->lock, portMAX_DELAY);
-        reasm_clear_stale(enow);
+        if (enow->reasm_stale_flag) {
+            enow->reasm_stale_flag = false;
+            reasm_clear_stale(enow);
+        }
         xSemaphoreGive(enow->lock);
     }
 

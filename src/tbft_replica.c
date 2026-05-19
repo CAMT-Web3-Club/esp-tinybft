@@ -204,6 +204,8 @@ void tbft_replica_free(tbft_replica_t *r)
  * Message dispatch
  * -------------------------------------------------------------------------- */
 
+static void handle_status(tbft_replica_t *r, const void *msg, int len);
+
 void tbft_replica_run(tbft_replica_t *r)
 {
     r->running = true;
@@ -401,7 +403,7 @@ void tbft_replica_run(tbft_replica_t *r)
          * would either fail silently or corrupt state.  This prevents the
          * view-change cascade that occurs when nodes without keys exchange
          * view-change messages (which use RSA, not HMAC). */
-        if (hdr->tag != TBFT_MSG_NEW_KEY) {
+        if (hdr->tag != TBFT_MSG_NEW_KEY && hdr->tag != TBFT_MSG_STATUS) {
             int keys_ok = 0;
             for (int i = 0; i < r->node.num_replicas; i++) {
                 if (i == r->node.node_id) continue;
@@ -449,6 +451,9 @@ void tbft_replica_run(tbft_replica_t *r)
             break;
         case TBFT_MSG_NEW_KEY:
             tbft_replica_handle_new_key(r, r->node.recv_buf, n);
+            break;
+        case TBFT_MSG_STATUS:
+            handle_status(r, r->node.recv_buf, n);
             break;
         default:
             ESP_LOGD(TAG, "unknown message tag %d", hdr->tag);
@@ -1181,7 +1186,7 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
         r->node.cur_primary = tbft_node_primary(&r->node, r->node.view);
         r->seqno = nv->min + 1;
         if (nv->min > r->last_stable)   r->last_stable   = nv->min;
-        if (nv->min > r->state.last_stable) r->state.last_stable = nv->min;
+        tbft_state_mark_stable(&r->state, nv->min);
         if (nv->min > r->last_executed) r->last_executed = nv->min;
         if (nv->min > r->last_prepared) r->last_prepared = nv->min;
         tbft_cr_truncate(&r->cr, nv->min);
@@ -1204,7 +1209,7 @@ void tbft_replica_handle_new_view(tbft_replica_t *r, const void *msg, int len)
     const tbft_new_view_rep_t *nv = (const tbft_new_view_rep_t *)msg;
 
     /* Verify it's for the view we expect */
-    if (nv->v <= r->node.view) return;
+    if (nv->v < r->node.view) return;
 
     if (!tbft_vi_verify_nv(&r->vi, nv, len)) {
         ESP_LOGW(TAG, "new-view verification failed for v=%lld",
@@ -1265,7 +1270,7 @@ void tbft_replica_handle_new_view(tbft_replica_t *r, const void *msg, int len)
      * with ar.head = nv->min + 1.  nv->min is the highest stable checkpoint
      * seqno proven by the view-change quorum, so advancing is safe. */
     if (nv->min > r->last_stable)   r->last_stable   = nv->min;
-    if (nv->min > r->state.last_stable) r->state.last_stable = nv->min;
+    tbft_state_mark_stable(&r->state, nv->min);
     if (nv->min > r->last_executed) r->last_executed = nv->min;
     if (nv->min > r->last_prepared) r->last_prepared = nv->min;
     tbft_cr_truncate(&r->cr, nv->min);
@@ -1314,6 +1319,44 @@ void tbft_replica_handle_new_view(tbft_replica_t *r, const void *msg, int len)
 
     ESP_LOGI(TAG, "installed new view %lld, primary=%d",
              (long long)nv->v, r->node.cur_primary);
+}
+
+/* --------------------------------------------------------------------------
+ * Status handler
+ * --------------------------------------------------------------------------
+ * NOTE: STATUS messages carry NO authenticator (HMAC or signature).  An on-path
+ * attacker can inject spurious status messages to trigger unnecessary view
+ * changes or state fetches.  The protocol tolerates this — a spurious
+ * view-change that lacks quorum is harmless, and state-fetch targets are
+ * verified via Meta_data/Data digest checks so a wrong fetch can't corrupt
+ * local state.
+ * -------------------------------------------------------------------------- */
+
+static void handle_status(tbft_replica_t *r, const void *msg, int len)
+{
+    if (len < (int)sizeof(tbft_status_rep_t)) return;
+    const tbft_status_rep_t *st = (const tbft_status_rep_t *)msg;
+
+    if (st->id < 0 || st->id >= r->node.num_replicas) return;
+    if (st->id == r->node.node_id) return;
+
+    if (st->view < r->node.view) {
+        ESP_LOGW(TAG, "status from %d: sender view=%lld < local view=%lld",
+                 st->id, (long long)st->view, (long long)r->node.view);
+        return;
+    }
+
+    if (st->view > r->node.view && !r->vi.in_progress) {
+        r->node.view = st->view;
+        r->node.cur_primary = tbft_node_primary(&r->node, st->view);
+        tbft_replica_send_view_change(r);
+    }
+
+    if (st->last_executed > r->last_executed
+        && !r->state.in_fetch
+        && st->last_executed - r->last_executed > TBFT_CHECKPOINT_INTERVAL) {
+        tbft_state_start_fetch(&r->state, st->last_stable, st->id);
+    }
 }
 
 /* --------------------------------------------------------------------------

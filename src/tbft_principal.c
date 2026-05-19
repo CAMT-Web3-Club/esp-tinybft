@@ -48,6 +48,7 @@ static void ensure_psa_init(void)
         if (st == PSA_SUCCESS) {
             s_psa_init = true;
         } else {
+            portEXIT_CRITICAL(&s_psa_spinlock);
             abort();
         }
     }
