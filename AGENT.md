@@ -73,6 +73,8 @@ ESP-NOW v2.0 limits each packet to 1470 bytes. Messages exceeding this are autom
 
 #### Config file formats
 
+The config file has `num_nodes` entries which include both replicas and clients. Lines with hostname prefix `"node"` are counted as replicas; all others are clients. `TBFT_MAX_NUM_REPLICAS + TBFT_MAX_NUM_CLIENTS` (Kconfig, defaults 4+1) must be ≥ `num_nodes`.
+
 **UDP mode** (per node line):
 ```
 <hostname> <ip> <port> <pubkey_path>
@@ -167,14 +169,76 @@ Public keys are DER files on SPIFFS. Private key path is passed separately as `p
 
 **Note:** In the embedded context, `Byz_init_replica` cannot determine the local node's IP, so it defaults to `local_id = 0` with a warning log. The config parser matches hostnames against the local IP list, but falls back to node 0.
 
-### Key Kconfig constraints
+## Examples
+
+Two example applications live under `examples/`, each demonstrating a full replica + client setup.
+
+### examples/simple_wallet
+
+4 accounts, transfer between them. 4 nodes (3 replicas + 1 client, f=1).
+
+### examples/counter
+
+Single integer counter starting at 0, incremented by client requests. 8 nodes (7 replicas + 1 client, f=2).
+
+### Example structure (both follow the same pattern)
+
+```
+examples/<name>/
+├── CMakeLists.txt            # ESP-IDF project root
+├── main/
+│   ├── CMakeLists.txt        # registers main.c, embeds SPIFFS image
+│   ├── idf_component.yml     # depends on esp-tinybft (override_path: "../../..")
+│   ├── Kconfig.projbuild     # role select (replica/client), WiFi SSID/PS mode
+│   └── main.c                # app_state, exec_cb, wifi_init, replica_task, client_task
+├── sdkconfig.defaults         # TinyBFT Kconfig overrides (transport, sizes, window)
+├── partitions.csv             # custom partition table with SPIFFS
+├── gen_configs.sh             # generates RSA keys + config_udp.txt + config_espnow.txt
+├── spiffs_image/              # keys + config files — embedded into SPIFFS at build time
+│   ├── config_udp.txt
+│   └── config_espnow.txt
+└── memcalc.sh                 # (counter only) computes tbft_replica_t size from config
+```
+
+### Adding a new example
+
+1. Copy an existing example structure.
+2. Define the app state array, request/response structs, and `exec_cb`.
+3. Run `./gen_configs.sh` to generate RSA keys and config files.
+4. Edit `sdkconfig.defaults` with appropriate `TBFT_MAX_NUM_REPLICAS`, `TBFT_WINDOW_SIZE`, etc.
+5. The `memcalc.sh` script can estimate `tbft_replica_t` size before building — useful for checking DRAM fit on ESP32-C3 (~80 KB heap).
+
+### Memory sizing for ESP32-C3
+
+`tbft_replica_t` is statically allocated. Its size is driven primarily by:
+
+| Region | Key scaling factors |
+|--------|---------------------|
+| `ar` (agreement) | `WINDOW_SIZE × MAX_MESSAGE_SIZE × CERT_MAX_VALS` |
+| `cr` (checkpoint) | `MAX_NUM_REPLICAS² × CKPT_MSG_SIZE` |
+| `sr` (special) | `MAX_NUM_REPLICAS × MAX_MESSAGE_SIZE` (view_change) + `MAX_NUM_REPLICAS²` (vc_ack) |
+| `rqueues` (×2) | `2 × RQUEUE_MAX × MAX_MESSAGE_SIZE` |
+
+**New_key constrains `MAX_MESSAGE_SIZE`**: the message carries `(n-1)` RSA-encrypted HMAC keys plus an RSA signature:
+
+```
+New_key_bytes = sizeof(tbft_new_key_rep_t)               // 24
+              + (n - 1) × sizeof(tbft_new_key_slot_t)    // (n-1)×260
+              + TBFT_SIG_SIZE                            // 256
+```
+
+With n=7: `24 + 6×260 + 256 = 1840` — `out_buf` (sized to `TBFT_MAX_MESSAGE_SIZE`) must be ≥ this.
+
+**Typical ESP32-C3 allocation** (~80 KB free heap): with 7 replicas, keep `WINDOW_SIZE=4` and `MAX_MESSAGE_SIZE=2048` to stay under the limit. Run `memcalc.sh` to verify.
 
 `tbft_config.h` defines all constants from `CONFIG_TBFT_*` Kconfig values and enforces these `_Static_assert` checks:
 
 - `TBFT_BLOCK_SIZE` must be a power of 2.
 - `TBFT_WINDOW_SIZE` must be a power of 2 **and** > `TBFT_CHECKPOINT_INTERVAL`.
 - `TBFT_MAX_NUM_REPLICAS >= 4`.
+- `TBFT_MAX_NUM_REPLICAS <= 64` (bitmap is uint64_t).
 - `TBFT_MAX_REPLY_SIZE < TBFT_MAX_MESSAGE_SIZE`.
+- `TBFT_MAX_MESSAGE_SIZE % 8 == 0`.
 - `TBFT_P_LEVELS >= 2`.
 
 Derived constants: `TBFT_DIGEST_SIZE` (32), `TBFT_HMAC_SIZE` (32), `TBFT_SIG_SIZE` (256), `TBFT_AUTH_SIZE`, `TBFT_NUM_CKPT_SLOTS`, `TBFT_MAX_FAULTY`, `TBFT_CERT_MAX_VALS` (f+1), `TBFT_P_CHILDREN`.
