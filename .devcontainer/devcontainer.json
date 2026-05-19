@@ -1,0 +1,34 @@
+{
+    "name": "tinybft-ycsb (ESP-IDF v6.0.1)",
+    "build": {
+        "dockerfile": "Dockerfile",
+        "args": {
+            "DOCKER_TAG": "v6.0.1"
+        }
+    },
+    "customizations": {
+        "vscode": {
+            "settings": {
+                "terminal.integrated.defaultProfile.linux": "fish",
+                "terminal.integrated.shell.linux": "/usr/bin/fish",
+                "idf.espIdfPath": "/opt/esp/idf",
+                "idf.toolsPath": "/opt/esp",
+                "idf.gitPath": "/usr/bin/git"
+            },
+            "extensions": [
+                "espressif.esp-idf-extension",
+                "espressif.esp-idf-web"
+            ]
+        }
+    },
+    "runArgs": [
+        "--privileged",
+        "--userns=keep-id", // บังคับให้ UID/GID ในคอนเทนเนอร์ตรงกับ Host ของคุณภู
+        "--group-add=keep-groups" // ดึงสิทธิ์ Group (รวมถึง dialout) จาก Host เข้ามาในคอนเทนเนอร์
+    ],
+    "mounts": [
+        // เปลี่ยนจากการเมาท์ /dev ทั้งก้อน มาเป็นโฟลเดอร์ของอุปกรณ์ USB แทน
+        "type=bind,source=/dev/bus/usb,target=/dev/bus/usb",
+        "type=bind,source=/dev,target=/host-dev"
+    ]
+}

@@ -1,0 +1,4 @@
+dependencies:
+  phukrit7171/esp-tinybft:
+    version: "*"
+    override_path: "../../.."

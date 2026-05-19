@@ -1,0 +1,47 @@
+menu "Counter Example Configuration"
+
+    choice EXAMPLE_NODE_ROLE
+        prompt "Node role"
+        default EXAMPLE_ROLE_REPLICA
+        help
+            Select whether this node runs as a BFT replica or a client.
+
+        config EXAMPLE_ROLE_REPLICA
+            bool "Replica"
+        config EXAMPLE_ROLE_CLIENT
+            bool "Client"
+    endchoice
+
+    config EXAMPLE_WIFI_SSID
+        string "WiFi SSID"
+        default "myssid"
+        depends on TBFT_TRANSPORT_UDP
+        help
+            SSID of the AP to connect to when using UDP transport.
+
+    config EXAMPLE_WIFI_PASSWORD
+        string "WiFi Password"
+        default "mypassword"
+        depends on TBFT_TRANSPORT_UDP
+        help
+            Password of the AP. Leave empty for open networks.
+
+    choice EXAMPLE_WIFI_MODEM_PS
+        prompt "WiFi Modem Power Save (STA mode)"
+        default EXAMPLE_WIFI_PS_NONE
+        depends on TBFT_TRANSPORT_UDP
+        help
+            Controls modem-sleep (power save) behaviour. The default
+            (WIFI_PS_MIN_MODEM) may add DTIM-period latency (~100 ms).
+            Select "Disabled" (WIFI_PS_NONE) for lowest latency at the
+            cost of higher power consumption.
+
+        config EXAMPLE_WIFI_PS_NONE
+            bool "Disabled (WIFI_PS_NONE)"
+        config EXAMPLE_WIFI_PS_MIN_MODEM
+            bool "Minimum (WIFI_PS_MIN_MODEM)"
+        config EXAMPLE_WIFI_PS_MAX_MODEM
+            bool "Maximum (WIFI_PS_MAX_MODEM)"
+    endchoice
+
+endmenu
