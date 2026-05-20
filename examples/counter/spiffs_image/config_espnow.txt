@@ -14,5 +14,3 @@ client7 e8:3d:c1:8c:18:58 /spiffs/pub7.der
 60000
 5000
 10000
-
-

@@ -19,14 +19,14 @@ counter
 3000
 8
 239.0.0.1
-node0 127.0.0.1 5000 /spiffs/pub0.der
-node1 127.0.0.1 5001 /spiffs/pub1.der
-node2 127.0.0.1 5002 /spiffs/pub2.der
-node3 127.0.0.1 5003 /spiffs/pub3.der
-node4 127.0.0.1 5004 /spiffs/pub4.der
-node5 127.0.0.1 5005 /spiffs/pub5.der
-node6 127.0.0.1 5006 /spiffs/pub6.der
-client7 127.0.0.1 5007 /spiffs/pub7.der
+node0 192.168.100.109 5000 /spiffs/pub0.der
+node1 192.168.100.107 5000 /spiffs/pub1.der
+node2 192.168.100.106 5000 /spiffs/pub2.der
+node3 192.168.100.104 5000 /spiffs/pub3.der
+node4 192.168.100.108 5000 /spiffs/pub4.der
+node5 192.168.100.105 5000 /spiffs/pub5.der
+node6 192.168.100.194 5000 /spiffs/pub6.der
+client7 192.168.100.190 5000 /spiffs/pub7.der
 2000
 5000
 10000
