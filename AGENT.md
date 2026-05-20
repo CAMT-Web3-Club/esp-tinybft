@@ -25,26 +25,60 @@ idf.py build
 
 Use the Espressif Docker image when local IDF toolchain is unavailable. The image contains ESP-IDF, cross-compiler toolchains, CMake, Ninja, and all Python dependencies.
 
+**Standard Docker invocation pattern:**
+
+```bash
+docker run --rm -it \
+  -v $PWD:/esp-tinybft -w /esp-tinybft/examples/counter \
+  -u $(id -u) -e HOME=/tmp \
+  espressif/idf:v6.0.1 \
+  <idf.py command>
+```
+
+Key flags:
+- `-it` — interactive with colors and progress bars
+- `-u $(id -u)` — run as host user so build artifacts have correct ownership
+- Mount repo root at `/esp-tinybft` consistently
+
+**Common commands:**
+
 ```bash
 # One-time: create symlink so IDF finds the component
 mkdir -p examples/counter/components
 ln -sfn ../../.. examples/counter/components/esp-tinybft
 
-# Build the counter example (self-contained ESP-IDF project):
-docker run --rm \
-  -v $PWD:/project \
-  -w /project/examples/counter \
-  -e HOME=/tmp \
-  -e IDF_GIT_SAFE_DIR='/project' \
-  espressif/idf:v6.0.1 \
+# Clean + set target + build:
+docker run --rm -it -v $PWD:/esp-tinybft -w /esp-tinybft/examples/counter \
+  -u $(id -u) -e HOME=/tmp espressif/idf:v6.0.1 \
+  idf.py fullclean
+docker run --rm -it -v $PWD:/esp-tinybft -w /esp-tinybft/examples/counter \
+  -u $(id -u) -e HOME=/tmp espressif/idf:v6.0.1 \
   idf.py set-target esp32c3 && idf.py build
 
-# Quick check for compilation errors (component only, via example):
-docker run --rm -v $PWD:/project -w /project/examples/counter \
-  -e HOME=/tmp -e IDF_GIT_SAFE_DIR='/project' \
-  espressif/idf:v6.0.1 \
+# Quick build check (component only):
+docker run --rm -it -v $PWD:/esp-tinybft -w /esp-tinybft/examples/counter \
+  -u $(id -u) -e HOME=/tmp espressif/idf:v6.0.1 \
   idf.py build 2>&1 | head -50
+
+# Flash (requires --device for USB access):
+docker run --rm -it --device /dev/ttyACM0 \
+  -v $PWD:/esp-tinybft -w /esp-tinybft/examples/counter \
+  -u $(id -u) -e HOME=/tmp espressif/idf:v6.0.1 \
+  idf.py -p /dev/ttyACM0 flash
+
+# Serial monitor (user runs this directly):
+docker run --rm -it --device /dev/ttyACM0 \
+  -v $PWD:/esp-tinybft -w /esp-tinybft/examples/counter \
+  -u $(id -u) -e HOME=/tmp espressif/idf:v6.0.1 \
+  idf.py -p /dev/ttyACM0 monitor
+
+# Change role from replica to client (edit sdkconfig before build):
+sed -i "s/CONFIG_EXAMPLE_ROLE_REPLICA=y/CONFIG_EXAMPLE_ROLE_REPLICA=n/" /path/to/sdkconfig
+echo "CONFIG_EXAMPLE_ROLE_CLIENT=y" >> /path/to/sdkconfig
+# Then fullclean + set-target + build
 ```
+
+**Role switching:** The counter example supports replica and client roles via `CONFIG_EXAMPLE_ROLE`. The default (`sdkconfig.defaults`) is replica. To build the client, change `CONFIG_EXAMPLE_ROLE_REPLICA` to `n` and add `CONFIG_EXAMPLE_ROLE_CLIENT=y` in `sdkconfig`, then rebuild. `espflash` alone does NOT flash the SPIFFS image — use `idf.py flash` via Docker.
 
 ### After making changes
 
@@ -52,10 +86,8 @@ Review build output before pushing. If Docker is unavailable locally, build erro
 ```bash
 # Full build check via Docker (counter example = most complex):
 cd examples/counter && bash memcalc.sh   # verify tbft_replica_t size
-docker run --rm -v $(git rev-parse --show-toplevel):/project \
-  -w /project/examples/counter -e HOME=/tmp \
-  -e IDF_GIT_SAFE_DIR='/project' \
-  espressif/idf:v6.0.1 \
+docker run --rm -it -v $PWD:/esp-tinybft -w /esp-tinybft/examples/counter \
+  -u $(id -u) -e HOME=/tmp espressif/idf:v6.0.1 \
   idf.py build
 ```
 
