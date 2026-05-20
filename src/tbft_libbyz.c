@@ -517,6 +517,14 @@ int Byz_send_request(Byz_req *req, bool read_only)
 {
     if (!s_client) return -1;
 
+    /* Drain any stale replies or other messages in the transport queue */
+    if (!s_is_replica) {
+        static uint8_t dummy[TBFT_MAX_MESSAGE_SIZE];
+        while (tbft_node_recv(s_client, dummy, sizeof(dummy), NULL) > 0) {
+            /* discard */
+        }
+    }
+
     /* Build Request message. Use a static buffer to avoid stack overflow
      * on tasks with limited stack size (TBFT_MAX_MESSAGE_SIZE can be large). */
     static uint8_t out[TBFT_MAX_MESSAGE_SIZE];
@@ -549,9 +557,12 @@ int Byz_send_request(Byz_req *req, bool read_only)
     tbft_sig_t *sig = (tbft_sig_t *)(cmd_ptr + req->size);
     memset(sig->bytes, 0, sizeof(sig->bytes));
     if (s_client->local_principal && s_client->local_principal->has_priv_key) {
-        tbft_node_gen_sig(s_client, out,
-                          sizeof(*rep) + (size_t)req->size,
-                          sig);
+        int64_t t0 = esp_timer_get_time();
+        int sig_ret = tbft_node_gen_sig(s_client, out,
+                                        sizeof(*rep) + (size_t)req->size,
+                                        sig);
+        int64_t dt = esp_timer_get_time() - t0;
+        ESP_LOGI(TAG, "request RSA sign took %lld us (ret=%d)", (long long)dt, sig_ret);
     }
 
     /* Broadcast to all replicas — any replica that receives the request

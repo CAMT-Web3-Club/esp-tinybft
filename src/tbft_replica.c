@@ -513,13 +513,18 @@ void tbft_replica_handle_request(tbft_replica_t *r, const void *msg, int len)
      * received the request directly — this forward is a fallback in case
      * the client's direct send to the primary failed.  Unicasting (not
      * broadcasting) prevents the exponential forwarding storm that occurs
-     * when every replica re-broadcasts every forwarded request. */
+     * when every replica re-broadcasts every forwarded request.
+     *
+     * IMPORTANT: Do NOT restart the view-change timer here.  Restarting
+     * on every forwarding creates a livelock: if the client sends faster
+     * than the timer period, the timer never expires and the cluster
+     * is stuck with a faulty primary forever.  The timer is restarted
+     * when actual progress is observed (pre-prepare, checkpoint, etc.). */
     if (!tbft_replica_is_primary(r)) {
         int primary = tbft_node_primary(&r->node, r->node.view);
         ESP_LOGD(TAG, "forwarding request to primary %d (view=%lld)",
                  primary, (long long)r->node.view);
         tbft_node_send(&r->node, msg, (size_t)len, primary);
-        tbft_itimer_start(&r->vtimer, r->vtimer_period_us);
         return;
     }
 
@@ -1325,11 +1330,15 @@ void tbft_replica_handle_new_view(tbft_replica_t *r, const void *msg, int len)
  * Status handler
  * --------------------------------------------------------------------------
  * NOTE: STATUS messages carry NO authenticator (HMAC or signature).  An on-path
- * attacker can inject spurious status messages to trigger unnecessary view
- * changes or state fetches.  The protocol tolerates this — a spurious
- * view-change that lacks quorum is harmless, and state-fetch targets are
- * verified via Meta_data/Data digest checks so a wrong fetch can't corrupt
- * local state.
+ * attacker can inject spurious status messages to trigger unnecessary state
+ * fetches.  The protocol tolerates this — state-fetch targets are verified
+ * via Meta_data/Data digest checks so a wrong fetch can't corrupt local
+ * state.
+ *
+ * View advancement (st->view > local view): the replica catches up to the
+ * peer's view and restarts the vtimer.  No view-change is sent here — the
+ * vtimer will trigger a proper view-change if the new primary fails to
+ * make progress, following the normal view-change protocol.
  * -------------------------------------------------------------------------- */
 
 static void handle_status(tbft_replica_t *r, const void *msg, int len)
@@ -1346,10 +1355,23 @@ static void handle_status(tbft_replica_t *r, const void *msg, int len)
         return;
     }
 
-    if (st->view > r->node.view && !r->vi.in_progress) {
+    if (st->view > r->node.view) {
+        /* Catch up: advance to the peer's view and restart the vtimer.
+         * Do NOT call tbft_replica_send_view_change here — it would
+         * propose view+1 (leapfrogging past this view), leaving the
+         * replica out of sync with peers that are still at the current
+         * view.  Instead, advance the view, reset any in-progress
+         * view-change that may have been targeting an older view, and
+         * let the normal vtimer trigger a proper view-change if the
+         * new primary fails to make progress. */
         r->node.view = st->view;
         r->node.cur_primary = tbft_node_primary(&r->node, st->view);
-        tbft_replica_send_view_change(r);
+        if (r->vi.in_progress) {
+            tbft_vi_reset(&r->vi, st->view + 1);
+            r->vi.in_progress = false;
+        }
+        tbft_itimer_stop(&r->vtimer);
+        tbft_itimer_start(&r->vtimer, r->vtimer_period_us);
     }
 
     if (st->last_executed > r->last_executed
@@ -1820,7 +1842,11 @@ void tbft_replica_execute_committed(tbft_replica_t *r)
             const tbft_request_rep_t *req_rep =
                 (const tbft_request_rep_t *)req_bytes;
 
-            /* Use r->out_buf for reply; max reply payload fits inside */
+            /* Use r->out_buf for reply; max reply payload fits inside.
+             * Zero the buffer first so padding bytes between the reply
+             * payload and the aligned hdr.size do not leak stack/heap
+             * garbage into the RSA-signed data. */
+            memset(r->out_buf, 0, sizeof(r->out_buf));
             tbft_reply_rep_t *reply = (tbft_reply_rep_t *)r->out_buf;
             uint8_t *rep_payload    = r->out_buf + sizeof(*reply);
             int      rep_len        = 0;
@@ -1842,9 +1868,10 @@ void tbft_replica_execute_committed(tbft_replica_t *r)
                          (int)sizeof(*reply), rep_len, (int)TBFT_SIG_SIZE, sizeof(r->out_buf));
                 break;
             }
-                reply->hdr.tag    = TBFT_MSG_REPLY;
-                reply->hdr.extra  = 0;
-                reply->view       = r->node.view;
+                reply->hdr.tag          = TBFT_MSG_REPLY;
+                reply->hdr.extra        = 0;
+                reply->hdr.timestamp_us = 0;
+                reply->view             = r->node.view;
                 reply->seqno      = n;
                 reply->cid        = req_rep->cid;
                 reply->rid        = req_rep->rid;

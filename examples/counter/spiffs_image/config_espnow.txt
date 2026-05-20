@@ -3,14 +3,16 @@ counter
 60000
 8
 0.0.0.0
-node0 02:00:00:00:00:00 /spiffs/pub0.der
-node1 02:00:00:00:00:01 /spiffs/pub1.der
-node2 02:00:00:00:00:02 /spiffs/pub2.der
-node3 02:00:00:00:00:03 /spiffs/pub3.der
-node4 02:00:00:00:00:04 /spiffs/pub4.der
-node5 02:00:00:00:00:05 /spiffs/pub5.der
-node6 02:00:00:00:00:06 /spiffs/pub6.der
-client7 02:00:00:00:00:07 /spiffs/pub7.der
+node0 88:56:a6:5b:f2:f0 /spiffs/pub0.der
+node1 88:56:a6:5b:76:84 /spiffs/pub1.der
+node2 1c:db:d4:c6:40:98 /spiffs/pub2.der
+node3 1c:db:d4:c5:7f:20 /spiffs/pub3.der
+node4 1c:db:d4:c6:40:40 /spiffs/pub4.der
+node5 88:56:a6:5b:6b:2c /spiffs/pub5.der
+node6 88:56:a6:5b:78:dc /spiffs/pub6.der
+client7 e8:3d:c1:8c:18:58 /spiffs/pub7.der
 60000
 5000
 10000
+
+

@@ -4,6 +4,7 @@
  */
 
 #include "tbft_transport.h"
+#include "tbft_message.h"
 #include "esp_log.h"
 #include "esp_wifi.h"
 #include "esp_mac.h"
@@ -42,10 +43,10 @@ static const char *TAG = "tbft_espnow";
 #define REASM_TIMEOUT_MS    5000
 #define FRAG_INTER_DELAY_MS 20
 
-#define MSG_QUEUE_DEPTH     48
+#define MSG_QUEUE_DEPTH     16
 #define SEND_QUEUE_DEPTH    8
-#define SEND_TASK_PRIORITY  3
-#define SEND_TASK_STACK_SIZE 4096
+#define SEND_TASK_PRIORITY  7
+#define SEND_TASK_STACK_SIZE 8192
 #define SEND_TASK_RECV_TIMEOUT_MS  50
 #define RECV_TASK_TIMEOUT_MS  100
 #define SEND_QUEUE_TIMEOUT_MS 100
@@ -345,8 +346,13 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *
         xSemaphoreGive(enow->lock);
 
         if (xQueueSend(enow->msg_queue, &q_entry, 0) != pdTRUE) {
-            ESP_LOGW(TAG, "msg_queue full, dropping reassembled msg tag=%d len=%d",
-                     msg_tag, q_entry.buf_len);
+            if (enow->local_id >= enow->num_replicas && msg_tag == TBFT_MSG_REPLY) {
+                ESP_LOGD(TAG, "client msg_queue full, dropping unsolicited reply len=%d",
+                         q_entry.buf_len);
+            } else {
+                ESP_LOGW(TAG, "msg_queue full, dropping reassembled msg tag=%d len=%d",
+                         msg_tag, q_entry.buf_len);
+            }
         } else {
             ESP_LOGI(TAG, "recv: tag=%d len=%d from " MACSTR,
                      msg_tag, q_entry.buf_len, MAC2STR(src_mac));
