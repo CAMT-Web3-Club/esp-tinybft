@@ -336,7 +336,12 @@ void tbft_replica_run(tbft_replica_t *r)
                              (long long)r->node.view, keys_ok, r->node.threshold - 1);
                     tbft_replica_send_view_change(r);
                 } else if (bits & TBFT_EVT_VTIMER) {
-                    ESP_LOGD(TAG, "view-change suppressed: keys=%d/%d", keys_ok, r->node.threshold - 1);
+                    ESP_LOGD(TAG, "view-change suppressed: keys=%d/%d — re-arming",
+                             keys_ok, r->node.threshold - 1);
+                    /* Re-arm the one-shot timer so it fires again once keys
+                     * may be ready.  Without this, the timer stays stopped
+                     * forever after the first suppressed expiration. */
+                    tbft_itimer_start(&r->vtimer, r->vtimer_period_us);
                 }
             }
             if (bits & TBFT_EVT_STIMER) {
@@ -1053,6 +1058,12 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
             /* Sync vi state so subsequent New_view for this view validates */
             r->vi.target_view = vc->v;
             r->vi.in_progress = false;
+            /* Restart the vtimer to give the new primary (sender of vc->v)
+             * a full grace period.  Without this, the old timer's remaining
+             * time (possibly near-expiry from 2x backoff) would make us
+             * trigger a premature view-change for v+1. */
+            tbft_itimer_stop(&r->vtimer);
+            tbft_itimer_start(&r->vtimer, r->vtimer_period_us);
         }
         return;
     }
@@ -1370,6 +1381,13 @@ static void handle_status(tbft_replica_t *r, const void *msg, int len)
             tbft_vi_reset(&r->vi, st->view + 1);
             r->vi.in_progress = false;
         }
+        /* Re-initialise agreement and checkpoint regions for the new view.
+         * This mirrors the cleanup in handle_pre_prepare (lines 660-662).
+         * Without it, stale slice data from the old view could pollute
+         * certificate tracking in the new view. */
+        tbft_cr_truncate(&r->cr, r->last_stable);
+        tbft_ar_init(&r->ar, r->ar.prepare_threshold, r->ar.commit_threshold);
+        r->ar.head = r->last_stable + 1;
         tbft_itimer_stop(&r->vtimer);
         tbft_itimer_start(&r->vtimer, r->vtimer_period_us);
     }

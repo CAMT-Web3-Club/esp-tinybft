@@ -563,6 +563,7 @@ int Byz_send_request(Byz_req *req, bool read_only)
                                         sig);
         int64_t dt = esp_timer_get_time() - t0;
         ESP_LOGI(TAG, "request RSA sign took %lld us (ret=%d)", (long long)dt, sig_ret);
+        if (sig_ret != 0) return -1;
     }
 
     /* Broadcast to all replicas — any replica that receives the request
