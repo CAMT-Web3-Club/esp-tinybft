@@ -22,6 +22,7 @@
 typedef struct {
     tbft_prepared_cert_t  prepared_cert;
     tbft_commit_cert_t    commit_cert;
+    int64_t               commit_sent_us; /* Last time we transmitted our commit for this slice */
 } tbft_agreement_slice_t;
 
 /** The agreement region (statically allocated) */

@@ -839,6 +839,13 @@ void tbft_replica_handle_prepare(tbft_replica_t *r, const void *msg, int len)
         return;
     }
 
+    tbft_agreement_slice_t *sl = tbft_ar_slice(&r->ar, prep->seqno);
+    if (tbft_bitmap_test(&sl->prepared_cert.pc.bmap, sender)) {
+        ESP_LOGD(TAG, "prepare: duplicate from replica %d seqno=%lld",
+                 sender, (long long)prep->seqno);
+        return;
+    }
+
     bool accepted = tbft_ar_add_prepare(&r->ar, prep->seqno, msg, len, sender);
     if (!accepted) {
         ESP_LOGW(TAG, "prepare: rejected by agreement region seqno=%lld",
@@ -856,8 +863,8 @@ void tbft_replica_handle_prepare(tbft_replica_t *r, const void *msg, int len)
     ESP_LOGI(TAG, "prepare debug: seqno=%lld has_pp=%d prepared=%d",
              (long long)prep->seqno, pp2 ? 1 : 0, is_prep ? 1 : 0);
 
-    /* Check if prepared — if so, send commit */
-    if (is_prep) {
+    /* Check if prepared — if so, send commit (only if we haven't sent our commit for this seqno yet) */
+    if (is_prep && !tbft_bitmap_test(&sl->commit_cert.bmap, r->node.node_id)) {
         ESP_LOGI(TAG, "prepared seqno=%lld, sending commit",
                  (long long)prep->seqno);
         tbft_replica_send_commit(r, prep->seqno);
@@ -930,6 +937,13 @@ void tbft_replica_handle_commit(tbft_replica_t *r, const void *msg, int len)
         }
     }
 
+    tbft_agreement_slice_t *sl = tbft_ar_slice(&r->ar, cm->seqno);
+    if (tbft_bitmap_test(&sl->commit_cert.bmap, sender)) {
+        ESP_LOGD(TAG, "commit: duplicate from replica %d seqno=%lld",
+                 sender, (long long)cm->seqno);
+        return;
+    }
+
     bool accepted = tbft_ar_add_commit(&r->ar, cm->seqno, msg, len, sender);
     if (!accepted) {
         ESP_LOGW(TAG, "commit: rejected by agreement region seqno=%lld",
@@ -944,9 +958,17 @@ void tbft_replica_handle_commit(tbft_replica_t *r, const void *msg, int len)
      * Our commit may have been lost (UDP/ESP-NOW are unreliable), and
      * receiving another replica's commit signals the cluster is
      * approaching the committed state — re-sending ours helps close
-     * the gap and avoid a view-change timeout. */
-    if (tbft_ar_prepared(&r->ar, cm->seqno)) {
-        tbft_replica_send_commit(r, cm->seqno);
+     * the gap and avoid a view-change timeout.
+     *
+     * To prevent a massive broadcast storm / infinite loop, we only re-send if:
+     * 1. We are prepared, but NOT yet committed-local. (Once committed-local, we do not need to re-send).
+     * 2. At least 500ms has elapsed since the last time we sent/re-sent our commit for this seqno.
+     */
+    if (tbft_ar_prepared(&r->ar, cm->seqno) && !tbft_ar_committed(&r->ar, cm->seqno)) {
+        int64_t now = esp_timer_get_time();
+        if (now - sl->commit_sent_us >= 500000) { /* 500ms cooldown rate limit */
+            tbft_replica_send_commit(r, cm->seqno);
+        }
     }
 
     /* Check if committed-local */
@@ -1826,6 +1848,11 @@ void tbft_replica_send_commit(tbft_replica_t *r, tbft_seqno_t n)
 
     bool first_send = tbft_ar_add_my_commit(&r->ar, n, r->out_buf, cm->hdr.size,
                                             r->node.node_id);
+
+    if (tbft_ar_in_range(&r->ar, n)) {
+        tbft_agreement_slice_t *sl = tbft_ar_slice(&r->ar, n);
+        sl->commit_sent_us = esp_timer_get_time();
+    }
 
     tbft_node_send(&r->node, r->out_buf, (size_t)cm->hdr.size,
                    TBFT_ALL_REPLICAS);
