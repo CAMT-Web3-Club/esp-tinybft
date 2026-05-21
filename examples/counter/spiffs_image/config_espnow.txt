@@ -11,6 +11,6 @@ node4 1c:db:d4:c6:40:40 /spiffs/pub4.der
 node5 88:56:a6:5b:6b:2c /spiffs/pub5.der
 node6 88:56:a6:5b:78:dc /spiffs/pub6.der
 client7 e8:3d:c1:8c:18:58 /spiffs/pub7.der
-60000
+90000
 5000
 10000

@@ -306,7 +306,7 @@ void tbft_replica_run(tbft_replica_t *r)
                 }
             }
             TickType_t interval = (keys_ok >= r->node.threshold - 1)
-                ? pdMS_TO_TICKS(10000) : pdMS_TO_TICKS(2000);
+                ? pdMS_TO_TICKS(60000) : pdMS_TO_TICKS(5000);
             TickType_t now = xTaskGetTickCount();
             if (now - last_nk_send >= interval) {
                 tbft_replica_send_new_key(r);
