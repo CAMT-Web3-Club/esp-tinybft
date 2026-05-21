@@ -14,7 +14,7 @@ end
 
 # List of replica ports (/dev/ttyACM0 to /dev/ttyACM6)
 # /dev/ttyACM7 is excluded as it is the client node
-set replica_ports /dev/ttyACM7 /dev/ttyACM1 /dev/ttyACM2 /dev/ttyACM3 /dev/ttyACM4 /dev/ttyACM5 /dev/ttyACM6
+set replica_ports /dev/ttyACM0 /dev/ttyACM1 /dev/ttyACM2 /dev/ttyACM3 /dev/ttyACM4 /dev/ttyACM5 /dev/ttyACM6
 
 for port in $replica_ports
     if test -e $port
