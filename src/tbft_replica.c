@@ -34,6 +34,7 @@ static const char *TAG = "tbft_replica";
 #define TBFT_INIT_DRAIN_LIMIT     64   /* max messages to drain after New_key broadcast */
 #define TBFT_KEY_DRAIN_LIMIT      32   /* max messages to drain during key confirmation */
 #define TBFT_YIELD_THRESHOLD      16   /* message loop iterations before cooperative yield */
+#define TBFT_VC_BACKOFF_MAX_MULT  60   /* max multiplier for view-change timeout backoff */
 
 /* M2 FIX: Read-only request flag in hdr.extra field */
 #define TBFT_REQUEST_RO_FLAG      0x1
@@ -907,25 +908,25 @@ void tbft_replica_handle_commit(tbft_replica_t *r, const void *msg, int len)
     }
 
     /* If we have the PP, require cm->digest == pp->digest.  PBFT commits must
-     * be for the same value as the pre-prepare they follow; without this
-     * check, Byzantine replicas can push f+1 distinct-digest commits into
-     * the certificate and starve legitimate commits of value slots. */
+     * be for the same value as the pre-prepare they follow.
+     *
+     * If the PP has not arrived yet (network reordering or loss), store the
+     * commit now — the certificate's multi-value tracking (f+1 slots for f
+     * faulty replicas) ensures Byzantine commits with wrong digests cannot
+     * prevent the correct digest from reaching the 2f+1 quorum (pigeonhole
+     * principle).  Digest verification is repeated at execution time when
+     * the PP is guaranteed to be available. */
     {
         int pp_len = 0;
         const uint8_t *pp_bytes = tbft_ar_load_pp(&r->ar, cm->seqno, &pp_len);
-        if (!pp_bytes || pp_len < (int)sizeof(tbft_pre_prepare_rep_t)) {
-            /* Pre-prepare hasn't arrived yet — defer this commit.
-             * A valid commit must reference a pre-prepared value. */
-            ESP_LOGW(TAG, "commit: no pre-prepare for seqno=%lld from %d — deferring",
-                     (long long)cm->seqno, sender);
-            return;
-        }
-        const tbft_pre_prepare_rep_t *pp =
-            (const tbft_pre_prepare_rep_t *)pp_bytes;
-        if (!tbft_digest_equal(&pp->digest, &cm->digest)) {
-            ESP_LOGW(TAG, "commit: digest mismatch from %d seqno=%lld",
-                     sender, (long long)cm->seqno);
-            return;
+        if (pp_bytes && pp_len >= (int)sizeof(tbft_pre_prepare_rep_t)) {
+            const tbft_pre_prepare_rep_t *pp =
+                (const tbft_pre_prepare_rep_t *)pp_bytes;
+            if (!tbft_digest_equal(&pp->digest, &cm->digest)) {
+                ESP_LOGW(TAG, "commit: digest mismatch from %d seqno=%lld",
+                         sender, (long long)cm->seqno);
+                return;
+            }
         }
     }
 
@@ -938,6 +939,15 @@ void tbft_replica_handle_commit(tbft_replica_t *r, const void *msg, int len)
 
     ESP_LOGI(TAG, "commit accepted: seqno=%lld from replica %d",
              (long long)cm->seqno, sender);
+
+    /* If we are prepared for this seqno, re-broadcast our own commit.
+     * Our commit may have been lost (UDP/ESP-NOW are unreliable), and
+     * receiving another replica's commit signals the cluster is
+     * approaching the committed state — re-sending ours helps close
+     * the gap and avoid a view-change timeout. */
+    if (tbft_ar_prepared(&r->ar, cm->seqno)) {
+        tbft_replica_send_commit(r, cm->seqno);
+    }
 
     /* Check if committed-local */
     if (tbft_ar_committed(&r->ar, cm->seqno)) {
@@ -1814,14 +1824,13 @@ void tbft_replica_send_commit(tbft_replica_t *r, tbft_seqno_t n)
         (int32_t)(sizeof(*cm) + sizeof(tbft_auth_t)));
     tbft_node_gen_auth(&r->node, r->out_buf, sizeof(*cm), auth);
 
-    if (!tbft_ar_add_my_commit(&r->ar, n, r->out_buf, cm->hdr.size,
-                               r->node.node_id)) {
-        return; /* already sent commit for this seqno */
-    }
+    bool first_send = tbft_ar_add_my_commit(&r->ar, n, r->out_buf, cm->hdr.size,
+                                            r->node.node_id);
 
     tbft_node_send(&r->node, r->out_buf, (size_t)cm->hdr.size,
                    TBFT_ALL_REPLICAS);
-    ESP_LOGI(TAG, "sent commit seqno=%lld", (long long)n);
+    ESP_LOGI(TAG, "%s commit seqno=%lld",
+             first_send ? "sent" : "re-sent", (long long)n);
 }
 
 void tbft_replica_execute_committed(tbft_replica_t *r)
@@ -1847,6 +1856,30 @@ void tbft_replica_execute_committed(tbft_replica_t *r)
 
         const tbft_pre_prepare_rep_t *pp =
             (const tbft_pre_prepare_rep_t *)pp_buf;
+
+        /* Defence-in-depth: verify the commit quorum's winning digest
+         * matches the PP digest.  This catches Byzantine commits that
+         * were accepted before the PP arrived and happen to reach quorum
+         * with a wrong digest (impossible under pigeonhole with f+1
+         * slots and only f faulty replicas, but checked anyway).
+         * Poisoned seqnos are skipped; subsequent in-window seqnos
+         * can still execute. */
+        {
+            tbft_agreement_slice_t *sl = tbft_ar_slice(&r->ar, n);
+            const uint8_t *winning_cm =
+                tbft_commit_cert_cvalue(&sl->commit_cert);
+            if (winning_cm) {
+                const tbft_commit_rep_t *cm_win =
+                    (const tbft_commit_rep_t *)winning_cm;
+                if (!tbft_digest_equal(&pp->digest, &cm_win->digest)) {
+                    ESP_LOGW(TAG, "execute: commit digest mismatch for seqno=%lld — skipping",
+                             (long long)n);
+                    r->last_executed = n;
+                    continue;
+                }
+            }
+        }
+
         const uint8_t *req_bytes =
             (const uint8_t *)pp_buf + sizeof(*pp);
         int req_len   = pp->rset_size;
@@ -2104,7 +2137,11 @@ void tbft_replica_send_view_change(tbft_replica_t *r)
         tbft_vi_collect_vc(&r->vi, r->node.node_id, r->out_buf, total_size);
     }
 
-    tbft_itimer_start(&r->vtimer, r->vtimer_period_us * 2);
+    int64_t next_period = r->vtimer_period_us * 2;
+    if (next_period > r->vtimer_period_us * TBFT_VC_BACKOFF_MAX_MULT) {
+        next_period = r->vtimer_period_us * TBFT_VC_BACKOFF_MAX_MULT;
+    }
+    tbft_itimer_start(&r->vtimer, next_period);
 }
 
 /* --------------------------------------------------------------------------
