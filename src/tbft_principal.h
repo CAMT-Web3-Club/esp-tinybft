@@ -42,6 +42,12 @@ typedef struct {
 
     /* Monotonic timestamp of last successful MAC verification (anti-replay) */
     int64_t         last_auth_time_us;
+
+    /* Cache of the last successfully decrypted New_key ciphertext to skip redundant RSA operations */
+    uint8_t         last_new_key_ciphertext[TBFT_SIG_SIZE];
+
+    /* Cache of the last generated New_key ciphertext to avoid re-encrypting/re-generating on re-broadcasts */
+    uint8_t         last_sent_new_key_ciphertext[TBFT_SIG_SIZE];
 } tbft_principal_t;
 
 /* TBFT_ANTI_REPLAY_WINDOW_US is defined in tbft_config.h (sourced from Kconfig) */
