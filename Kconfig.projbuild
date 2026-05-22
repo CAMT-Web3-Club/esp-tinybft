@@ -156,6 +156,16 @@ menu "TinyBFT Configuration"
             Status messages help replicas catch up during state transfer.
             Default: 1s (1000000).
 
+    config TBFT_RECOVERY_TIMEOUT_US
+        int "Recovery/fetch timeout (microseconds)"
+        default 2500000
+        range 100000 30000000
+        help
+            Timeout period for state fetch/recovery in microseconds.
+            If a state block or metadata request doesn't arrive within this
+            window, the replica restarts fetching from a different peer.
+            Default: 2.5s (2500000).
+
     config TBFT_CLIENT_REPLY_TIMEOUT_MS
         int "Client reply timeout (milliseconds)"
         default 10000

@@ -873,6 +873,11 @@ int Byz_init_replica(const char *config_file, const char *priv_config,
     if (s_replica->vtimer_period_us <= 0) s_replica->vtimer_period_us = 5000000LL;
     if (s_replica->stimer_period_us <= 0) s_replica->stimer_period_us = 1000000LL;
 
+    s_replica->state.fetch_timeout_us = (int64_t)cfg.recovery_timeout_ms * 1000LL;
+    if (s_replica->state.fetch_timeout_us <= 0) {
+        s_replica->state.fetch_timeout_us = TBFT_RECOVERY_TIMEOUT_US;
+    }
+
     /* M4 FIX: Setup principals FIRST (including private keys and HMAC session
      * keys), then start timers. Starting the view-change timer before key
      * exchange completes could trigger spurious view-changes if the 3x grace

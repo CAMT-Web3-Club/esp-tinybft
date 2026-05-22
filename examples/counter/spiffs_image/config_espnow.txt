@@ -10,7 +10,7 @@ node3 1c:db:d4:c5:7f:20 /spiffs/pub3.der
 node4 1c:db:d4:c6:40:40 /spiffs/pub4.der
 node5 88:56:a6:5b:6b:2c /spiffs/pub5.der
 node6 88:56:a6:5b:78:dc /spiffs/pub6.der
-client7 e8:3d:c1:8c:18:58 /spiffs/pub7.der
+client7 40:22:d8:4f:0e:44 /spiffs/pub7.der
 90000
 5000
 10000

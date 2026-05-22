@@ -69,6 +69,7 @@ int tbft_state_init(tbft_state_t *state, void *mem, size_t size)
     state->mem       = (uint8_t *)mem;
     state->mem_size  = size;
     state->num_blocks = (int)(size / TBFT_BLOCK_SIZE);
+    state->fetch_timeout_us = TBFT_RECOVERY_TIMEOUT_US;
 
     if (state->num_blocks > TBFT_MAX_STATE_BLOCKS) {
         ESP_LOGE(TAG, "too many blocks: %d > %d",
@@ -294,7 +295,9 @@ void tbft_state_start_fetch(tbft_state_t *state, tbft_seqno_t seqno,
     state->fetch_replier    = replier;
     state->fetch_queue_len  = 0;
     state->n_data_pending   = 0;
-    state->fetch_timeout_us = 100000; /* 100 ms */
+    if (state->fetch_timeout_us <= 0) {
+        state->fetch_timeout_us = TBFT_RECOVERY_TIMEOUT_US;
+    }
     state->fetch_start_time_us = esp_timer_get_time();
     fetch_received_zero(state);
 
@@ -478,4 +481,19 @@ void tbft_state_fetch_complete(tbft_state_t *state)
     state->fetch_queue_len = 0;
     state->n_data_pending  = 0;
     fetch_received_zero(state);
+}
+
+bool tbft_state_get_checkpoint_digest(const tbft_state_t *state,
+                                      tbft_seqno_t seqno,
+                                      tbft_digest_t *digest_out)
+{
+    int slot = (int)((seqno / TBFT_CHECKPOINT_INTERVAL) % TBFT_NUM_CKPT_SLOTS);
+    const tbft_ckpt_record_t *rec = &state->ckpt_records[slot];
+    if (rec->valid && rec->seqno == seqno) {
+        if (digest_out) {
+            *digest_out = rec->root_digest;
+        }
+        return true;
+    }
+    return false;
 }

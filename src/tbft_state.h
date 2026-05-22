@@ -197,3 +197,14 @@ bool tbft_state_next_fetch_req(tbft_state_t *state,
  * Signals completion and exits fetch mode.
  */
 void tbft_state_fetch_complete(tbft_state_t *state);
+
+/**
+ * Retrieve the root state digest for a past checkpoint sequence number.
+ * @param state       State to query
+ * @param seqno       Sequence number of the checkpoint
+ * @param digest_out  Pointer to write the digest to (optional)
+ * @return true if a valid checkpoint record for this seqno was found, false otherwise
+ */
+bool tbft_state_get_checkpoint_digest(const tbft_state_t *state,
+                                      tbft_seqno_t seqno,
+                                      tbft_digest_t *digest_out);
