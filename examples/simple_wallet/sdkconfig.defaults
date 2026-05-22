@@ -42,3 +42,6 @@ CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
 # Enable IP fragmentation and reassembly for large UDP messages (e.g., New_key)
 CONFIG_LWIP_IP4_FRAG=y
 CONFIG_LWIP_IP4_REASSEMBLY=y
+
+# Enable unicast UDP mode by default to prevent Wi-Fi router multicast packet drops
+CONFIG_TBFT_DISABLE_MULTICAST=y

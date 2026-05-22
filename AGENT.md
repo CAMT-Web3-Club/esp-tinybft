@@ -82,7 +82,18 @@ echo "CONFIG_EXAMPLE_ROLE_CLIENT=y" >> /path/to/sdkconfig
 
 ### After making changes
 
-Review build output before pushing. If Docker is unavailable locally, build errors will surface in CI.
+Review build output before pushing. **First, attempt to verify using a local ESP-IDF installation.** If a local ESP-IDF toolchain is unavailable, fall back to the Docker environment.
+
+**Local verification (preferred):**
+```bash
+# Verify using local toolchain
+cd examples/counter
+# Activate your local IDF environment (e.g. . $IDF_PATH/export.sh or fish get_idf)
+idf.py build
+```
+
+**Docker verification (fallback):**
+If Docker is unavailable locally, build errors will surface in CI.
 ```bash
 # Full build check via Docker (counter example = most complex):
 cd examples/counter && bash memcalc.sh   # verify tbft_replica_t size
