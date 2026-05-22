@@ -48,7 +48,8 @@ static void ensure_psa_init(void)
         if (st == PSA_SUCCESS) {
             s_psa_init = true;
         } else {
-            ESP_LOGE(TAG, "psa_crypto_init failed: %d", (int)st);
+            portEXIT_CRITICAL(&s_psa_spinlock);
+            abort();
         }
     }
     portEXIT_CRITICAL(&s_psa_spinlock);
@@ -115,14 +116,6 @@ void tbft_principal_free(tbft_principal_t *p)
     mbedtls_pk_free(&p->pub_pk);
     mbedtls_pk_free(&p->priv_pk);
     memset(p, 0, sizeof(*p));
-}
-
-void tbft_principal_psa_deinit(void)
-{
-    portENTER_CRITICAL(&s_psa_spinlock);
-    mbedtls_psa_crypto_free();
-    s_psa_init = false;
-    portEXIT_CRITICAL(&s_psa_spinlock);
 }
 
 /* --------------------------------------------------------------------------
@@ -248,6 +241,7 @@ void tbft_principal_set_in_key(tbft_principal_t *p, const tbft_hmac_key_t *key)
         /* Self-test: compute MAC with temp key, verify with in_key */
         uint8_t test_msg[] = "test123";
         tbft_mac_t test_mac;
+        bool self_test_ok = false;
         mbedtls_svc_key_id_t kid = import_hmac_key(key, PSA_KEY_USAGE_SIGN_MESSAGE);
         if (kid != 0) {
             size_t mac_len = 0;
@@ -264,6 +258,7 @@ void tbft_principal_set_in_key(tbft_principal_t *p, const tbft_hmac_key_t *key)
                     ESP_LOGE(TAG, "set_in_key: self-test verify FAILED for id=%d (psa=%d)", (int)p->id, (int)st2);
                 } else {
                     ESP_LOGD(TAG, "set_in_key: self-test OK for id=%d", (int)p->id);
+                    self_test_ok = true;
                 }
             }
             psa_destroy_key(kid);
@@ -271,7 +266,7 @@ void tbft_principal_set_in_key(tbft_principal_t *p, const tbft_hmac_key_t *key)
             ESP_LOGE(TAG, "set_in_key: import_hmac_key sign FAILED for id=%d", (int)p->id);
         }
         /* Only mark keys fresh if self-test passed */
-        p->keys_fresh = (p->psa_hmac_in_id != 0);
+        p->keys_fresh = (p->psa_hmac_in_id != 0 && self_test_ok);
     }
 
     /* Reset the anti-replay watermark: old timestamps belong to the previous

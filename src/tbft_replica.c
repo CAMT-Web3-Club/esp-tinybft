@@ -34,6 +34,7 @@ static const char *TAG = "tbft_replica";
 #define TBFT_INIT_DRAIN_LIMIT     64   /* max messages to drain after New_key broadcast */
 #define TBFT_KEY_DRAIN_LIMIT      32   /* max messages to drain during key confirmation */
 #define TBFT_YIELD_THRESHOLD      16   /* message loop iterations before cooperative yield */
+#define TBFT_VC_BACKOFF_MAX_MULT  60   /* max multiplier for view-change timeout backoff */
 
 /* M2 FIX: Read-only request flag in hdr.extra field */
 #define TBFT_REQUEST_RO_FLAG      0x1
@@ -89,6 +90,34 @@ static void stimer_cb(void *arg)
     if (r->evt_group) {
         xEventGroupSetBits(r->evt_group, TBFT_EVT_STIMER);
     }
+}
+
+static void tbft_replica_reset_forwarded_requests(tbft_replica_t *r)
+{
+    for (int i = 0; i < r->node.num_principals; i++) {
+        r->last_forwarded_rid[i] = r->last_executed_rid[i];
+    }
+}
+
+bool tbft_replica_has_pending_requests(const tbft_replica_t *r)
+{
+    if (r->vi.in_progress) {
+        return true;
+    }
+    if (tbft_replica_is_primary(r)) {
+        for (int i = 0; i < r->node.num_principals; i++) {
+            if (r->last_received_rid[i] > r->last_executed_rid[i]) {
+                return true;
+            }
+        }
+    } else {
+        for (int i = 0; i < r->node.num_principals; i++) {
+            if (r->last_forwarded_rid[i] > r->last_executed_rid[i]) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 /* --------------------------------------------------------------------------
@@ -204,65 +233,64 @@ void tbft_replica_free(tbft_replica_t *r)
  * Message dispatch
  * -------------------------------------------------------------------------- */
 
+static void handle_status(tbft_replica_t *r, const void *msg, int len);
+
 void tbft_replica_run(tbft_replica_t *r)
 {
     r->running = true;
     ESP_LOGI(TAG, "replica %d starting event loop", r->node.node_id);
 
-    /* Broadcast fresh HMAC session keys to all peers.  Peers will also
-     * send their own New_key messages which we handle in the main loop.
-     * We do NOT block waiting for keys — boards may start at different
-     * times (e.g. sequential flashing), so we enter the main loop
-     * immediately and handle New_key asynchronously. */
+    /* Stagger initial New_key broadcast by node_id to reduce simultaneous
+     * fragmented UDP storms (New_key = 1840 bytes > 1500 MTU). */
+    vTaskDelay(pdMS_TO_TICKS(r->node.node_id * 300));
     tbft_replica_send_new_key(r);
 
-    /* Drain ALL messages that arrived during init.  This is critical —
-     * we cannot silently discard View_change, Prepare, Commit, Checkpoint
-     * or other messages.  Non-NEW_KEY messages are acknowledged with a log
-     * to catch unexpected early arrivals. */
-    int drained = 0;
-    while (drained < TBFT_INIT_DRAIN_LIMIT) {
-        tbft_node_id_t src_id = -1;
-        int n = tbft_node_recv(&r->node, r->node.recv_buf, sizeof(r->node.recv_buf), &src_id);
-        if (n < 0) break; /* transport error during drain */
-        if (n < (int)sizeof(tbft_msg_hdr_t)) break;
-        const tbft_msg_hdr_t *hdr = (const tbft_msg_hdr_t *)r->node.recv_buf;
-        if (n >= hdr->size && hdr->tag == TBFT_MSG_NEW_KEY) {
-            tbft_replica_handle_new_key(r, r->node.recv_buf, n);
-        }
-        drained++;
-    }
-
-    /* Key confirmation barrier: ensure we have in-keys from threshold-1
-     * peers before entering view 0.  Without this, a dropped New_key
-     * causes asymmetric HMAC state → one-way communication failure →
-     * protocol stall and infinite view-changes. */
+    /* Time-bounded key barrier: wait up to 60s for at least 2*f remote keys.
+     * To achieve a quorum of 2f+1 (including ourselves), we only need 2f remote
+     * keys ready. Requiring all n-1 keys would completely break f-fault tolerance
+     * if even a single node is offline or fails to complete key exchange. */
     {
+        const int needed = 2 * r->node.max_faulty;
+        TickType_t key_deadline = xTaskGetTickCount() + pdMS_TO_TICKS(60000);
+        TickType_t last_nk = xTaskGetTickCount();
+        ESP_LOGI(TAG, "waiting for at least %d HMAC keys to start consensus (timeout=60s)", needed);
+        while (xTaskGetTickCount() < key_deadline) {
+            int keys_ok = 0;
+            for (int i = 0; i < r->node.num_replicas; i++) {
+                if (i == r->node.node_id) continue;
+                if (r->node.principals[i] && r->node.principals[i]->keys_fresh)
+                    keys_ok++;
+            }
+            if (keys_ok >= needed) {
+                ESP_LOGI(TAG, "at least %d HMAC keys ready (%d total), breaking barrier early", needed, keys_ok);
+                break;
+            }
+            /* Drain any available NEW_KEY messages (batch of up to 16) */
+            for (int d = 0; d < 16; d++) {
+                tbft_node_id_t src_id = -1;
+                int n = tbft_node_recv(&r->node, r->node.recv_buf,
+                                       sizeof(r->node.recv_buf), &src_id);
+                if (n < (int)sizeof(tbft_msg_hdr_t)) break;
+                const tbft_msg_hdr_t *hdr =
+                    (const tbft_msg_hdr_t *)r->node.recv_buf;
+                if (n >= hdr->size && hdr->tag == TBFT_MSG_NEW_KEY)
+                    tbft_replica_handle_new_key(r, r->node.recv_buf, n);
+            }
+            /* Re-broadcast our own New_key every 3s */
+            if (xTaskGetTickCount() - last_nk >= pdMS_TO_TICKS(3000)) {
+                tbft_replica_send_new_key(r);
+                last_nk = xTaskGetTickCount();
+            }
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
         int keys_ok = 0;
         for (int i = 0; i < r->node.num_replicas; i++) {
             if (i == r->node.node_id) continue;
-            if (r->node.principals[i] && r->node.principals[i]->keys_fresh) {
+            if (r->node.principals[i] && r->node.principals[i]->keys_fresh)
                 keys_ok++;
-            }
         }
-        if (keys_ok < r->node.threshold - 1) {
-            ESP_LOGW(TAG, "only %d/%d HMAC keys ready after drain — retrying",
-                     keys_ok, r->node.threshold - 1);
-            tbft_replica_send_new_key(r);
-            vTaskDelay(pdMS_TO_TICKS(20));
-            drained = 0;
-            while (drained < TBFT_KEY_DRAIN_LIMIT) {
-                tbft_node_id_t src_id = -1;
-                int n = tbft_node_recv(&r->node, r->node.recv_buf, sizeof(r->node.recv_buf), &src_id);
-                if (n < 0) break; /* transport error during key drain */
-                if (n < (int)sizeof(tbft_msg_hdr_t)) break;
-                const tbft_msg_hdr_t *hdr = (const tbft_msg_hdr_t *)r->node.recv_buf;
-                if (n >= hdr->size && hdr->tag == TBFT_MSG_NEW_KEY) {
-                    tbft_replica_handle_new_key(r, r->node.recv_buf, n);
-                }
-                drained++;
-            }
-        }
+        ESP_LOGI(TAG, "key barrier complete: %d/%d keys ready",
+                 keys_ok, r->node.num_replicas - 1);
     }
     /* Subscribe this task to the task watchdog so we can periodically feed it.
      * The default timeout is CONFIG_ESP_TASK_WDT_TIMEOUT_S (typically 5s). */
@@ -303,7 +331,7 @@ void tbft_replica_run(tbft_replica_t *r)
                 }
             }
             TickType_t interval = (keys_ok >= r->node.threshold - 1)
-                ? pdMS_TO_TICKS(10000) : pdMS_TO_TICKS(2000);
+                ? pdMS_TO_TICKS(60000) : pdMS_TO_TICKS(5000);
             TickType_t now = xTaskGetTickCount();
             if (now - last_nk_send >= interval) {
                 tbft_replica_send_new_key(r);
@@ -334,7 +362,14 @@ void tbft_replica_run(tbft_replica_t *r)
                              (long long)r->node.view, keys_ok, r->node.threshold - 1);
                     tbft_replica_send_view_change(r);
                 } else if (bits & TBFT_EVT_VTIMER) {
-                    ESP_LOGD(TAG, "view-change suppressed: keys=%d/%d", keys_ok, r->node.threshold - 1);
+                    ESP_LOGD(TAG, "view-change suppressed: keys=%d/%d — re-arming",
+                             keys_ok, r->node.threshold - 1);
+                    /* Re-arm the one-shot timer if there are still pending requests. */
+                    if (tbft_replica_has_pending_requests(r)) {
+                        tbft_itimer_start(&r->vtimer, r->vtimer_period_us);
+                    } else {
+                        tbft_itimer_stop(&r->vtimer);
+                    }
                 }
             }
             if (bits & TBFT_EVT_STIMER) {
@@ -395,24 +430,50 @@ void tbft_replica_run(tbft_replica_t *r)
             continue;
         }
 
-        /* CRITICAL FIX: Until we have enough HMAC in-keys, only process
-         * New_key messages.  All other protocol messages (View_change,
-         * New_view, Prepare, Commit, etc.) require HMAC verification and
-         * would either fail silently or corrupt state.  This prevents the
-         * view-change cascade that occurs when nodes without keys exchange
-         * view-change messages (which use RSA, not HMAC). */
-        if (hdr->tag != TBFT_MSG_NEW_KEY) {
-            int keys_ok = 0;
-            for (int i = 0; i < r->node.num_replicas; i++) {
-                if (i == r->node.node_id) continue;
-                if (r->node.principals[i] && r->node.principals[i]->keys_fresh) {
-                    keys_ok++;
+        /* Until we have the sender's HMAC session key, only process non-HMAC messages.
+         * View_change and New_view use RSA signatures, so they can be processed immediately.
+         * Pre_prepare, Prepare, Commit, and Checkpoint use HMAC authenticators, so we must
+         * have the sender's session key before we can verify and accept them. This prevents
+         * both silent verification failure drops and state corruption. */
+        if (hdr->tag == TBFT_MSG_PRE_PREPARE) {
+            const tbft_pre_prepare_rep_t *pp = (const tbft_pre_prepare_rep_t *)r->node.recv_buf;
+            int primary_id = tbft_node_primary(&r->node, pp->view);
+            if (primary_id != r->node.node_id) {
+                tbft_principal_t *p = r->node.principals[primary_id];
+                if (!p || !p->keys_fresh) {
+                    ESP_LOGD(TAG, "dropping PP from primary %d: key not fresh", primary_id);
+                    continue;
                 }
             }
-            if (keys_ok < r->node.threshold - 1) {
-                ESP_LOGD(TAG, "dropping msg tag=%d: keys=%d/%d",
-                         hdr->tag, keys_ok, r->node.threshold - 1);
-                continue; /* drop until keys ready */
+        } else if (hdr->tag == TBFT_MSG_PREPARE) {
+            const tbft_prepare_rep_t *prep = (const tbft_prepare_rep_t *)r->node.recv_buf;
+            int sender_id = prep->id;
+            if (sender_id >= 0 && sender_id < r->node.num_replicas) {
+                tbft_principal_t *p = r->node.principals[sender_id];
+                if (!p || !p->keys_fresh) {
+                    ESP_LOGD(TAG, "dropping PREP from %d: key not fresh", sender_id);
+                    continue;
+                }
+            }
+        } else if (hdr->tag == TBFT_MSG_COMMIT) {
+            const tbft_commit_rep_t *cm = (const tbft_commit_rep_t *)r->node.recv_buf;
+            int sender_id = cm->id;
+            if (sender_id >= 0 && sender_id < r->node.num_replicas) {
+                tbft_principal_t *p = r->node.principals[sender_id];
+                if (!p || !p->keys_fresh) {
+                    ESP_LOGD(TAG, "dropping COMMIT from %d: key not fresh", sender_id);
+                    continue;
+                }
+            }
+        } else if (hdr->tag == TBFT_MSG_CHECKPOINT) {
+            const tbft_checkpoint_rep_t *ckpt = (const tbft_checkpoint_rep_t *)r->node.recv_buf;
+            int sender_id = ckpt->id;
+            if (sender_id >= 0 && sender_id < r->node.num_replicas) {
+                tbft_principal_t *p = r->node.principals[sender_id];
+                if (!p || !p->keys_fresh) {
+                    ESP_LOGD(TAG, "dropping CKPT from %d: key not fresh", sender_id);
+                    continue;
+                }
             }
         }
 
@@ -449,6 +510,9 @@ void tbft_replica_run(tbft_replica_t *r)
             break;
         case TBFT_MSG_NEW_KEY:
             tbft_replica_handle_new_key(r, r->node.recv_buf, n);
+            break;
+        case TBFT_MSG_STATUS:
+            handle_status(r, r->node.recv_buf, n);
             break;
         default:
             ESP_LOGD(TAG, "unknown message tag %d", hdr->tag);
@@ -503,18 +567,39 @@ void tbft_replica_handle_request(tbft_replica_t *r, const void *msg, int len)
         return;
     }
 
+    if (req->rid > r->last_received_rid[req->cid]) {
+        r->last_received_rid[req->cid] = req->rid;
+    }
+
     /* If we are not the primary, forward to the primary only (unicast).
      * The client already broadcasts to all replicas, so the primary likely
      * received the request directly — this forward is a fallback in case
      * the client's direct send to the primary failed.  Unicasting (not
      * broadcasting) prevents the exponential forwarding storm that occurs
-     * when every replica re-broadcasts every forwarded request. */
+     * when every replica re-broadcasts every forwarded request.
+     *
+     * IMPORTANT: Do NOT restart the view-change timer here.  Restarting
+     * on every forwarding creates a livelock: if the client sends faster
+     * than the timer period, the timer never expires and the cluster
+     * is stuck with a faulty primary forever.  The timer is restarted
+     * when actual progress is observed (pre-prepare, checkpoint, etc.). */
     if (!tbft_replica_is_primary(r)) {
         int primary = tbft_node_primary(&r->node, r->node.view);
         ESP_LOGD(TAG, "forwarding request to primary %d (view=%lld)",
                  primary, (long long)r->node.view);
         tbft_node_send(&r->node, msg, (size_t)len, primary);
-        tbft_itimer_start(&r->vtimer, r->vtimer_period_us);
+
+        if (req->rid > r->last_forwarded_rid[req->cid]) {
+            r->last_forwarded_rid[req->cid] = req->rid;
+        }
+
+        if (r->last_forwarded_rid[req->cid] > r->last_executed_rid[req->cid]) {
+            if (!tbft_itimer_is_running(&r->vtimer)) {
+                ESP_LOGI(TAG, "vtimer started on backup: pending request from cid=%d rid=%llu",
+                         req->cid, (unsigned long long)req->rid);
+                tbft_itimer_start(&r->vtimer, r->vtimer_period_us);
+            }
+        }
         return;
     }
 
@@ -633,19 +718,12 @@ void tbft_replica_handle_pre_prepare(tbft_replica_t *r, const void *msg, int len
     if (pp->view > r->node.view) {
         r->node.view = pp->view;
         r->node.cur_primary = tbft_node_primary(&r->node, r->node.view);
-        /* If we have no stable checkpoint, also reset last_executed/last_prepared
-         * so the new view's seqno=1 can be executed. Preserving last_executed
-         * without an anchoring checkpoint causes the execute loop
-         * (last_executed+1..last_prepared) to skip newly-committed seqnos in
-         * the new view — observed as "commit accepted" with no "executing". */
-        if (r->last_stable == 0) {
-            r->seqno         = 1;
-            r->last_prepared = 0;
-            r->last_executed = 0;
-        } else {
-            r->seqno         = r->last_stable + 1;
+        tbft_replica_reset_forwarded_requests(r);
+        if (r->last_prepared < r->last_stable) {
             r->last_prepared = r->last_stable;
-            /* last_executed preserved — safe because checkpoint anchors it */
+        }
+        if (r->last_executed < r->last_stable) {
+            r->last_executed = r->last_stable;
         }
         tbft_cr_truncate(&r->cr, r->last_stable);
         tbft_ar_init(&r->ar, r->ar.prepare_threshold, r->ar.commit_threshold);
@@ -653,7 +731,11 @@ void tbft_replica_handle_pre_prepare(tbft_replica_t *r, const void *msg, int len
         tbft_itimer_stop(&r->vtimer);
         tbft_vi_reset(&r->vi, r->node.view + 1);
         r->vi.in_progress = false;
-        tbft_itimer_start(&r->vtimer, r->vtimer_period_us);
+        if (tbft_replica_has_pending_requests(r)) {
+            tbft_itimer_start(&r->vtimer, r->vtimer_period_us);
+        } else {
+            tbft_itimer_stop(&r->vtimer);
+        }
     }
 
     /* Reject empty request sets.  A zero rset_size would bypass the
@@ -723,6 +805,9 @@ void tbft_replica_handle_pre_prepare(tbft_replica_t *r, const void *msg, int len
                      (int)ereq->cid);
             return;
         }
+        if (ereq->rid > r->last_received_rid[ereq->cid]) {
+            r->last_received_rid[ereq->cid] = ereq->rid;
+        }
     }
 
     /* Store in agreement region */
@@ -744,6 +829,13 @@ void tbft_replica_handle_pre_prepare(tbft_replica_t *r, const void *msg, int len
     /* Update last_prepared if needed */
     if (pp->seqno > r->last_prepared) {
         r->last_prepared = pp->seqno;
+    }
+
+    /* Keep sequence numbers monotonic with the accepted pre-prepare sequence number.
+     * Since the primary has proposed pp->seqno, the next sequence number to propose
+     * must be at least pp->seqno + 1. */
+    if (r->seqno < pp->seqno + 1) {
+        r->seqno = pp->seqno + 1;
     }
 
     /* Send prepare */
@@ -823,6 +915,13 @@ void tbft_replica_handle_prepare(tbft_replica_t *r, const void *msg, int len)
         return;
     }
 
+    tbft_agreement_slice_t *sl = tbft_ar_slice(&r->ar, prep->seqno);
+    if (tbft_bitmap_test(&sl->prepared_cert.pc.bmap, sender)) {
+        ESP_LOGD(TAG, "prepare: duplicate from replica %d seqno=%lld",
+                 sender, (long long)prep->seqno);
+        return;
+    }
+
     bool accepted = tbft_ar_add_prepare(&r->ar, prep->seqno, msg, len, sender);
     if (!accepted) {
         ESP_LOGW(TAG, "prepare: rejected by agreement region seqno=%lld",
@@ -840,8 +939,8 @@ void tbft_replica_handle_prepare(tbft_replica_t *r, const void *msg, int len)
     ESP_LOGI(TAG, "prepare debug: seqno=%lld has_pp=%d prepared=%d",
              (long long)prep->seqno, pp2 ? 1 : 0, is_prep ? 1 : 0);
 
-    /* Check if prepared — if so, send commit */
-    if (is_prep) {
+    /* Check if prepared — if so, send commit (only if we haven't sent our commit for this seqno yet) */
+    if (is_prep && !tbft_bitmap_test(&sl->commit_cert.bmap, r->node.node_id)) {
         ESP_LOGI(TAG, "prepared seqno=%lld, sending commit",
                  (long long)prep->seqno);
         tbft_replica_send_commit(r, prep->seqno);
@@ -892,26 +991,33 @@ void tbft_replica_handle_commit(tbft_replica_t *r, const void *msg, int len)
     }
 
     /* If we have the PP, require cm->digest == pp->digest.  PBFT commits must
-     * be for the same value as the pre-prepare they follow; without this
-     * check, Byzantine replicas can push f+1 distinct-digest commits into
-     * the certificate and starve legitimate commits of value slots. */
+     * be for the same value as the pre-prepare they follow.
+     *
+     * If the PP has not arrived yet (network reordering or loss), store the
+     * commit now — the certificate's multi-value tracking (f+1 slots for f
+     * faulty replicas) ensures Byzantine commits with wrong digests cannot
+     * prevent the correct digest from reaching the 2f+1 quorum (pigeonhole
+     * principle).  Digest verification is repeated at execution time when
+     * the PP is guaranteed to be available. */
     {
         int pp_len = 0;
         const uint8_t *pp_bytes = tbft_ar_load_pp(&r->ar, cm->seqno, &pp_len);
-        if (!pp_bytes || pp_len < (int)sizeof(tbft_pre_prepare_rep_t)) {
-            /* Pre-prepare hasn't arrived yet — defer this commit.
-             * A valid commit must reference a pre-prepared value. */
-            ESP_LOGW(TAG, "commit: no pre-prepare for seqno=%lld from %d — deferring",
-                     (long long)cm->seqno, sender);
-            return;
+        if (pp_bytes && pp_len >= (int)sizeof(tbft_pre_prepare_rep_t)) {
+            const tbft_pre_prepare_rep_t *pp =
+                (const tbft_pre_prepare_rep_t *)pp_bytes;
+            if (!tbft_digest_equal(&pp->digest, &cm->digest)) {
+                ESP_LOGW(TAG, "commit: digest mismatch from %d seqno=%lld",
+                         sender, (long long)cm->seqno);
+                return;
+            }
         }
-        const tbft_pre_prepare_rep_t *pp =
-            (const tbft_pre_prepare_rep_t *)pp_bytes;
-        if (!tbft_digest_equal(&pp->digest, &cm->digest)) {
-            ESP_LOGW(TAG, "commit: digest mismatch from %d seqno=%lld",
-                     sender, (long long)cm->seqno);
-            return;
-        }
+    }
+
+    tbft_agreement_slice_t *sl = tbft_ar_slice(&r->ar, cm->seqno);
+    if (tbft_bitmap_test(&sl->commit_cert.bmap, sender)) {
+        ESP_LOGD(TAG, "commit: duplicate from replica %d seqno=%lld",
+                 sender, (long long)cm->seqno);
+        return;
     }
 
     bool accepted = tbft_ar_add_commit(&r->ar, cm->seqno, msg, len, sender);
@@ -923,6 +1029,23 @@ void tbft_replica_handle_commit(tbft_replica_t *r, const void *msg, int len)
 
     ESP_LOGI(TAG, "commit accepted: seqno=%lld from replica %d",
              (long long)cm->seqno, sender);
+
+    /* If we are prepared for this seqno, re-broadcast our own commit.
+     * Our commit may have been lost (UDP/ESP-NOW are unreliable), and
+     * receiving another replica's commit signals the cluster is
+     * approaching the committed state — re-sending ours helps close
+     * the gap and avoid a view-change timeout.
+     *
+     * To prevent a massive broadcast storm / infinite loop, we only re-send if:
+     * 1. We are prepared, but NOT yet committed-local. (Once committed-local, we do not need to re-send).
+     * 2. At least 500ms has elapsed since the last time we sent/re-sent our commit for this seqno.
+     */
+    if (tbft_ar_prepared(&r->ar, cm->seqno) && !tbft_ar_committed(&r->ar, cm->seqno)) {
+        int64_t now = esp_timer_get_time();
+        if (now - sl->commit_sent_us >= 500000) { /* 500ms cooldown rate limit */
+            tbft_replica_send_commit(r, cm->seqno);
+        }
+    }
 
     /* Check if committed-local */
     if (tbft_ar_committed(&r->ar, cm->seqno)) {
@@ -1023,23 +1146,40 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
              * enough VCs) send the New_view message. */
             r->node.view = vc->v;
             r->node.cur_primary = tbft_node_primary(&r->node, vc->v);
-            if (r->last_stable == 0) {
-                r->seqno         = 1;
-                r->last_prepared = 0;
-                r->last_executed = 0;
-            } else {
-                r->seqno         = r->last_stable + 1;
+            tbft_replica_reset_forwarded_requests(r);
+            /* Keep sequence numbers contiguous and preserve executed/prepared progress */
+            tbft_seqno_t start_seq = r->last_stable;
+            if (r->last_prepared > start_seq) start_seq = r->last_prepared;
+            if (r->last_executed > start_seq) start_seq = r->last_executed;
+            if (r->seqno < start_seq + 1) {
+                r->seqno = start_seq + 1;
+            }
+            if (r->last_prepared < r->last_stable) {
                 r->last_prepared = r->last_stable;
+            }
+            if (r->last_executed < r->last_stable) {
+                r->last_executed = r->last_stable;
             }
             tbft_cr_truncate(&r->cr, r->last_stable);
             tbft_ar_init(&r->ar, r->ar.prepare_threshold, r->ar.commit_threshold);
             r->ar.head = r->last_stable + 1;
             ESP_LOGI(TAG, "sync view to %lld (from vc of %d), seqno reset to %lld",
-                     (long long)vc->v, sender_id, (long long)r->last_stable + 1);
+                     (long long)vc->v, sender_id, (long long)r->seqno);
             /* REMOVED: catch-up view-change cascade accelerator.
              * The old code here called tbft_replica_send_view_change(r) which
              * computed target = r->node.view + 1 = V + 1, overshooting the
              * received view and triggering a cascade to ever-higher views. */
+            /* Sync vi state so subsequent New_view for this view validates */
+            r->vi.target_view = vc->v;
+            r->vi.in_progress = false;
+            /* Restart the vtimer to give the new primary (sender of vc->v)
+             * a full grace period.  Without this, the old timer's remaining
+             * time (possibly near-expiry from 2x backoff) would make us
+             * trigger a premature view-change for v+1. */
+            tbft_itimer_stop(&r->vtimer);
+            if (tbft_replica_has_pending_requests(r)) {
+                tbft_itimer_start(&r->vtimer, r->vtimer_period_us);
+            }
         }
         return;
     }
@@ -1176,8 +1316,28 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
          * as primary even before loopback receipt. */
         r->node.view = r->vi.target_view;
         r->node.cur_primary = tbft_node_primary(&r->node, r->node.view);
-        r->seqno = nv->min + 1;
+        tbft_replica_reset_forwarded_requests(r);
+        /* Compute a monotonic seqno strictly inside the active window.
+         * nv->max = last_stable + WINDOW_SIZE (= upper window bound), so
+         * nv->max + 1 is OUTSIDE the window [last_stable+1, last_stable+WINDOW_SIZE].
+         * Instead, start from nv->min and advance past any prepared proofs
+         * or local progress to maintain linearizability. */
+        {
+            tbft_seqno_t start_seq = nv->min;
+            if (r->last_prepared > start_seq) start_seq = r->last_prepared;
+            if (r->last_executed > start_seq) start_seq = r->last_executed;
+            if (nv->n_prep > 0) {
+                const uint8_t *proofs_ptr = r->out_buf + sizeof(*nv);
+                for (int p = 0; p < nv->n_prep; p++) {
+                    const tbft_vc_req_info_t *proof =
+                        (const tbft_vc_req_info_t *)(proofs_ptr + p * sizeof(tbft_vc_req_info_t));
+                    if (proof->seqno > start_seq) start_seq = proof->seqno;
+                }
+            }
+            r->seqno = start_seq + 1;
+        }
         if (nv->min > r->last_stable)   r->last_stable   = nv->min;
+        tbft_state_mark_stable(&r->state, nv->min);
         if (nv->min > r->last_executed) r->last_executed = nv->min;
         if (nv->min > r->last_prepared) r->last_prepared = nv->min;
         tbft_cr_truncate(&r->cr, nv->min);
@@ -1186,7 +1346,11 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
         tbft_itimer_stop(&r->vtimer);
         tbft_vi_reset(&r->vi, r->node.view + 1);
         r->vi.in_progress = false;
-        tbft_itimer_start(&r->vtimer, r->vtimer_period_us);
+        if (tbft_replica_has_pending_requests(r)) {
+            tbft_itimer_start(&r->vtimer, r->vtimer_period_us);
+        } else {
+            tbft_itimer_stop(&r->vtimer);
+        }
     }
 }
 
@@ -1200,7 +1364,7 @@ void tbft_replica_handle_new_view(tbft_replica_t *r, const void *msg, int len)
     const tbft_new_view_rep_t *nv = (const tbft_new_view_rep_t *)msg;
 
     /* Verify it's for the view we expect */
-    if (nv->v <= r->node.view) return;
+    if (nv->v < r->node.view) return;
 
     if (!tbft_vi_verify_nv(&r->vi, nv, len)) {
         ESP_LOGW(TAG, "new-view verification failed for v=%lld",
@@ -1250,17 +1414,31 @@ void tbft_replica_handle_new_view(tbft_replica_t *r, const void *msg, int len)
     /* Install new view */
     r->node.view        = nv->v;
     r->node.cur_primary = tbft_node_primary(&r->node, nv->v);
+    tbft_replica_reset_forwarded_requests(r);
 
-    /* CRITICAL FIX: Reset seqno for ALL replicas, not just the new primary.
-     * During idle view-changes (no requests processed), seqno can drift
-     * past the window (e.g., seqno=9, last_stable=0, window=8). If only
-     * the primary resets seqno, non-primary replicas retain stale seqno
-     * values, causing out-of-window errors when they later become primary. */
-    r->seqno = nv->min + 1;
+    /* Compute a monotonic seqno strictly inside the active window.
+     * nv->max = last_stable + WINDOW_SIZE (= upper window bound), so
+     * nv->max + 1 is OUTSIDE the window.  Start from nv->min and
+     * advance past local progress and prepared proofs. */
+    {
+        tbft_seqno_t start_seq = nv->min;
+        if (r->last_prepared > start_seq) start_seq = r->last_prepared;
+        if (r->last_executed > start_seq) start_seq = r->last_executed;
+        if (nv->n_prep > 0) {
+            const uint8_t *proofs_ptr = (const uint8_t *)msg + sizeof(*nv);
+            for (int p = 0; p < nv->n_prep; p++) {
+                const tbft_vc_req_info_t *proof =
+                    (const tbft_vc_req_info_t *)(proofs_ptr + p * sizeof(tbft_vc_req_info_t));
+                if (proof->seqno > start_seq) start_seq = proof->seqno;
+            }
+        }
+        r->seqno = start_seq + 1;
+    }
     /* Advance local markers to nv->min so tbft_replica_in_window is consistent
      * with ar.head = nv->min + 1.  nv->min is the highest stable checkpoint
      * seqno proven by the view-change quorum, so advancing is safe. */
     if (nv->min > r->last_stable)   r->last_stable   = nv->min;
+    tbft_state_mark_stable(&r->state, nv->min);
     if (nv->min > r->last_executed) r->last_executed = nv->min;
     if (nv->min > r->last_prepared) r->last_prepared = nv->min;
     tbft_cr_truncate(&r->cr, nv->min);
@@ -1305,10 +1483,91 @@ void tbft_replica_handle_new_view(tbft_replica_t *r, const void *msg, int len)
     tbft_vi_reset(&r->vi, nv->v + 1);
     r->vi.in_progress = false;
 
-    tbft_itimer_start(&r->vtimer, r->vtimer_period_us);
+    if (tbft_replica_has_pending_requests(r)) {
+        tbft_itimer_start(&r->vtimer, r->vtimer_period_us);
+    } else {
+        tbft_itimer_stop(&r->vtimer);
+    }
 
     ESP_LOGI(TAG, "installed new view %lld, primary=%d",
              (long long)nv->v, r->node.cur_primary);
+}
+
+/* --------------------------------------------------------------------------
+ * Status handler
+ * --------------------------------------------------------------------------
+ * NOTE: STATUS messages carry NO authenticator (HMAC or signature).  An on-path
+ * attacker can inject spurious status messages to trigger unnecessary state
+ * fetches.  The protocol tolerates this — state-fetch targets are verified
+ * via Meta_data/Data digest checks so a wrong fetch can't corrupt local
+ * state.
+ *
+ * View advancement (st->view > local view): the replica catches up to the
+ * peer's view and restarts the vtimer.  No view-change is sent here — the
+ * vtimer will trigger a proper view-change if the new primary fails to
+ * make progress, following the normal view-change protocol.
+ * -------------------------------------------------------------------------- */
+
+static void handle_status(tbft_replica_t *r, const void *msg, int len)
+{
+    if (len < (int)sizeof(tbft_status_rep_t)) return;
+    const tbft_status_rep_t *st = (const tbft_status_rep_t *)msg;
+
+    if (st->id < 0 || st->id >= r->node.num_replicas) return;
+    if (st->id == r->node.node_id) return;
+
+    if (st->view < r->node.view) {
+        ESP_LOGW(TAG, "status from %d: sender view=%lld < local view=%lld",
+                 st->id, (long long)st->view, (long long)r->node.view);
+        return;
+    }
+
+    if (st->view > r->node.view) {
+        /* Catch up: advance to the peer's view and restart the vtimer.
+         * Do NOT call tbft_replica_send_view_change here — it would
+         * propose view+1 (leapfrogging past this view), leaving the
+         * replica out of sync with peers that are still at the current
+         * view.  Instead, advance the view, reset any in-progress
+         * view-change that may have been targeting an older view, and
+         * let the normal vtimer trigger a proper view-change if the
+         * new primary fails to make progress. */
+        r->node.view = st->view;
+        r->node.cur_primary = tbft_node_primary(&r->node, st->view);
+        tbft_replica_reset_forwarded_requests(r);
+        if (r->vi.in_progress) {
+            tbft_vi_reset(&r->vi, st->view + 1);
+            r->vi.in_progress = false;
+        }
+        /* Re-initialise agreement and checkpoint regions for the new view.
+         * This mirrors the cleanup in handle_pre_prepare (lines 660-662).
+         * Without it, stale slice data from the old view could pollute
+         * certificate tracking in the new view. */
+        tbft_cr_truncate(&r->cr, r->last_stable);
+        tbft_ar_init(&r->ar, r->ar.prepare_threshold, r->ar.commit_threshold);
+        r->ar.head = r->last_stable + 1;
+
+        /* Keep sequence numbers contiguous and preserve executed/prepared progress */
+        tbft_seqno_t start_seq = r->last_stable;
+        if (r->last_prepared > start_seq) start_seq = r->last_prepared;
+        if (r->last_executed > start_seq) start_seq = r->last_executed;
+        if (r->seqno < start_seq + 1) {
+            r->seqno = start_seq + 1;
+        }
+        ESP_LOGI(TAG, "status view catch-up to %lld, seqno reset to %lld",
+                 (long long)st->view, (long long)r->seqno);
+        tbft_itimer_stop(&r->vtimer);
+        if (tbft_replica_has_pending_requests(r)) {
+            tbft_itimer_start(&r->vtimer, r->vtimer_period_us);
+        } else {
+            tbft_itimer_stop(&r->vtimer);
+        }
+    }
+
+    if (st->last_executed > r->last_executed
+        && !r->state.in_fetch
+        && st->last_executed - r->last_executed > TBFT_CHECKPOINT_INTERVAL) {
+        tbft_state_start_fetch(&r->state, st->last_stable, st->id);
+    }
 }
 
 /* --------------------------------------------------------------------------
@@ -1467,7 +1726,7 @@ void tbft_replica_send_pre_prepare(tbft_replica_t *r)
             if (r->node.principals[i] && r->node.principals[i]->keys_fresh)
                 keys_ok++;
         }
-        if (keys_ok < r->node.threshold - 1) {
+        if (keys_ok < r->node.num_replicas - 1) {
             return;
         }
     }
@@ -1665,7 +1924,11 @@ void tbft_replica_send_pre_prepare(tbft_replica_t *r)
     r->seqno++;
 
     /* Reset view-change timer — primary is active */
-    tbft_itimer_start(&r->vtimer, r->vtimer_period_us);
+    if (tbft_replica_has_pending_requests(r)) {
+        tbft_itimer_start(&r->vtimer, r->vtimer_period_us);
+    } else {
+        tbft_itimer_stop(&r->vtimer);
+    }
 }
 
 void tbft_replica_send_prepare(tbft_replica_t *r, tbft_seqno_t n)
@@ -1726,14 +1989,18 @@ void tbft_replica_send_commit(tbft_replica_t *r, tbft_seqno_t n)
         (int32_t)(sizeof(*cm) + sizeof(tbft_auth_t)));
     tbft_node_gen_auth(&r->node, r->out_buf, sizeof(*cm), auth);
 
-    if (!tbft_ar_add_my_commit(&r->ar, n, r->out_buf, cm->hdr.size,
-                               r->node.node_id)) {
-        return; /* already sent commit for this seqno */
+    bool first_send = tbft_ar_add_my_commit(&r->ar, n, r->out_buf, cm->hdr.size,
+                                            r->node.node_id);
+
+    if (tbft_ar_in_range(&r->ar, n)) {
+        tbft_agreement_slice_t *sl = tbft_ar_slice(&r->ar, n);
+        sl->commit_sent_us = esp_timer_get_time();
     }
 
     tbft_node_send(&r->node, r->out_buf, (size_t)cm->hdr.size,
                    TBFT_ALL_REPLICAS);
-    ESP_LOGI(TAG, "sent commit seqno=%lld", (long long)n);
+    ESP_LOGI(TAG, "%s commit seqno=%lld",
+             first_send ? "sent" : "re-sent", (long long)n);
 }
 
 void tbft_replica_execute_committed(tbft_replica_t *r)
@@ -1759,6 +2026,30 @@ void tbft_replica_execute_committed(tbft_replica_t *r)
 
         const tbft_pre_prepare_rep_t *pp =
             (const tbft_pre_prepare_rep_t *)pp_buf;
+
+        /* Defence-in-depth: verify the commit quorum's winning digest
+         * matches the PP digest.  This catches Byzantine commits that
+         * were accepted before the PP arrived and happen to reach quorum
+         * with a wrong digest (impossible under pigeonhole with f+1
+         * slots and only f faulty replicas, but checked anyway).
+         * Poisoned seqnos are skipped; subsequent in-window seqnos
+         * can still execute. */
+        {
+            tbft_agreement_slice_t *sl = tbft_ar_slice(&r->ar, n);
+            const uint8_t *winning_cm =
+                tbft_commit_cert_cvalue(&sl->commit_cert);
+            if (winning_cm) {
+                const tbft_commit_rep_t *cm_win =
+                    (const tbft_commit_rep_t *)winning_cm;
+                if (!tbft_digest_equal(&pp->digest, &cm_win->digest)) {
+                    ESP_LOGW(TAG, "execute: commit digest mismatch for seqno=%lld — skipping",
+                             (long long)n);
+                    r->last_executed = n;
+                    continue;
+                }
+            }
+        }
+
         const uint8_t *req_bytes =
             (const uint8_t *)pp_buf + sizeof(*pp);
         int req_len   = pp->rset_size;
@@ -1772,7 +2063,11 @@ void tbft_replica_execute_committed(tbft_replica_t *r)
             const tbft_request_rep_t *req_rep =
                 (const tbft_request_rep_t *)req_bytes;
 
-            /* Use r->out_buf for reply; max reply payload fits inside */
+            /* Use r->out_buf for reply; max reply payload fits inside.
+             * Zero the buffer first so padding bytes between the reply
+             * payload and the aligned hdr.size do not leak stack/heap
+             * garbage into the RSA-signed data. */
+            memset(r->out_buf, 0, sizeof(r->out_buf));
             tbft_reply_rep_t *reply = (tbft_reply_rep_t *)r->out_buf;
             uint8_t *rep_payload    = r->out_buf + sizeof(*reply);
             int      rep_len        = 0;
@@ -1794,9 +2089,10 @@ void tbft_replica_execute_committed(tbft_replica_t *r)
                          (int)sizeof(*reply), rep_len, (int)TBFT_SIG_SIZE, sizeof(r->out_buf));
                 break;
             }
-                reply->hdr.tag    = TBFT_MSG_REPLY;
-                reply->hdr.extra  = 0;
-                reply->view       = r->node.view;
+                reply->hdr.tag          = TBFT_MSG_REPLY;
+                reply->hdr.extra        = 0;
+                reply->hdr.timestamp_us = 0;
+                reply->view             = r->node.view;
                 reply->seqno      = n;
                 reply->cid        = req_rep->cid;
                 reply->rid        = req_rep->rid;
@@ -1835,6 +2131,13 @@ void tbft_replica_execute_committed(tbft_replica_t *r)
         } else {
             ESP_LOGW(TAG, "execute: exec_cb=%p req_len=%d sizeof(req)=%d — skipping exec for seqno=%lld",
                      r->exec_cb, req_len, (int)sizeof(tbft_request_rep_t), (long long)n);
+        }
+
+        if (req_len >= (int)sizeof(tbft_request_rep_t)) {
+            const tbft_request_rep_t *req_rep = (const tbft_request_rep_t *)req_bytes;
+            if (req_rep->rid > r->last_executed_rid[req_rep->cid]) {
+                r->last_executed_rid[req_rep->cid] = req_rep->rid;
+            }
         }
 
         r->last_executed = n;
@@ -1879,6 +2182,11 @@ void tbft_replica_execute_committed(tbft_replica_t *r)
                      (long long)n);
         }
     }
+    if (tbft_replica_has_pending_requests(r)) {
+        tbft_itimer_start(&r->vtimer, r->vtimer_period_us);
+    } else {
+        tbft_itimer_stop(&r->vtimer);
+    }
 }
 
 void tbft_replica_mark_stable(tbft_replica_t *r, tbft_seqno_t seqno)
@@ -1891,8 +2199,10 @@ void tbft_replica_mark_stable(tbft_replica_t *r, tbft_seqno_t seqno)
         if (!tbft_digest_equal(winning, local)) {
             ESP_LOGW(TAG, "stable ckpt digest mismatch at seqno=%lld — starting fetch",
                      (long long)seqno);
-            tbft_state_start_fetch(&r->state, seqno,
-                                   tbft_node_primary(&r->node, r->node.view));
+            if (!r->state.in_fetch) {
+                tbft_state_start_fetch(&r->state, seqno,
+                                        tbft_node_primary(&r->node, r->node.view));
+            }
             return;
         }
     }
@@ -1905,7 +2215,11 @@ void tbft_replica_mark_stable(tbft_replica_t *r, tbft_seqno_t seqno)
     tbft_cr_truncate(&r->cr, seqno);
 
     /* Reset view-change timer — stable progress */
-    tbft_itimer_start(&r->vtimer, r->vtimer_period_us);
+    if (tbft_replica_has_pending_requests(r)) {
+        tbft_itimer_start(&r->vtimer, r->vtimer_period_us);
+    } else {
+        tbft_itimer_stop(&r->vtimer);
+    }
 
     ESP_LOGI(TAG, "marked stable seqno=%lld", (long long)seqno);
 }
@@ -2009,7 +2323,11 @@ void tbft_replica_send_view_change(tbft_replica_t *r)
         tbft_vi_collect_vc(&r->vi, r->node.node_id, r->out_buf, total_size);
     }
 
-    tbft_itimer_start(&r->vtimer, r->vtimer_period_us * 2);
+    int64_t next_period = r->vtimer_period_us * 2;
+    if (next_period > r->vtimer_period_us * TBFT_VC_BACKOFF_MAX_MULT) {
+        next_period = r->vtimer_period_us * TBFT_VC_BACKOFF_MAX_MULT;
+    }
+    tbft_itimer_start(&r->vtimer, next_period);
 }
 
 /* --------------------------------------------------------------------------
@@ -2062,28 +2380,33 @@ void tbft_replica_send_new_key(tbft_replica_t *r)
         }
         if (need_new_key) {
             esp_fill_random(new_key.bytes, sizeof(new_key.bytes));
+            /* Encrypt the key under replica i's RSA public key */
+            size_t enc_len = 0;
+            int rc = tbft_principal_encrypt_new_key(p, &new_key,
+                                                     slots[slot_idx].ciphertext,
+                                                     sizeof(slots[slot_idx].ciphertext),
+                                                     &enc_len);
+            if (rc != 0 || enc_len != TBFT_SIG_SIZE) {
+                ESP_LOGW(TAG, "send_new_key: encrypt for replica %d failed", i);
+                /* M3 FIX: Skip this slot entirely — don't zero or include it.
+                 * The slot_idx is NOT incremented, so this slot is excluded
+                 * from the final message. Zeroing it would leave garbage
+                 * recipient_id=0 which could confuse the recipient. */
+                continue;
+            }
+            /* Cache the generated ciphertext so future re-broadcasts send the exact same bytes */
+            memcpy(p->last_sent_new_key_ciphertext, slots[slot_idx].ciphertext, TBFT_SIG_SIZE);
         } else {
             new_key = p->hmac_out_key;
+            /* Copy the previously generated ciphertext to keep it byte-for-byte identical */
+            memcpy(slots[slot_idx].ciphertext, p->last_sent_new_key_ciphertext, TBFT_SIG_SIZE);
         }
 
-        /* Store locally as the out-key for messages we send TO replica i */
+        /* Store locally as the out-key for messages we send TO replica i.
+         * Must happen AFTER successful encryption so peers that fail
+         * encryption don't get a stale out-key set locally. */
         tbft_principal_set_out_key(p, &new_key);
         ESP_LOGI(TAG, "send_new_key: set out_key for replica %d (new=%d)", i, need_new_key);
-
-        /* Encrypt the key under replica i's RSA public key */
-        size_t enc_len = 0;
-        int rc = tbft_principal_encrypt_new_key(p, &new_key,
-                                                 slots[slot_idx].ciphertext,
-                                                 sizeof(slots[slot_idx].ciphertext),
-                                                 &enc_len);
-        if (rc != 0 || enc_len != TBFT_SIG_SIZE) {
-            ESP_LOGW(TAG, "send_new_key: encrypt for replica %d failed", i);
-            /* M3 FIX: Skip this slot entirely — don't zero or include it.
-             * The slot_idx is NOT incremented, so this slot is excluded
-             * from the final message. Zeroing it would leave garbage
-             * recipient_id=0 which could confuse the recipient. */
-            continue;
-        }
 
         slots[slot_idx].recipient_id = i;
         slot_idx++;
@@ -2125,9 +2448,42 @@ void tbft_replica_handle_new_key(tbft_replica_t *r, const void *msg, int len)
 
     if (nk->n_keys <= 0 || nk->n_keys > r->node.num_replicas) return;
 
-    /* CRITICAL FIX: Verify RSA signature on New_key messages.
-     * Without this, any network participant can inject arbitrary HMAC keys,
-     * completely bypassing the authentication system. */
+    tbft_principal_t *p = r->node.principals[sender_id];
+    if (!p) return;
+
+    int expected_len = (int)(sizeof(*nk)
+                             + (size_t)nk->n_keys * sizeof(tbft_new_key_slot_t));
+    if (len < expected_len) {
+        ESP_LOGW(TAG, "new_key from %d: message too short", sender_id);
+        return;
+    }
+
+    const tbft_new_key_slot_t *slots =
+        (const tbft_new_key_slot_t *)((const uint8_t *)msg + sizeof(*nk));
+
+    /* Find the slot addressed to us */
+    int our_slot_idx = -1;
+    for (int i = 0; i < nk->n_keys; i++) {
+        if (slots[i].recipient_id == r->node.node_id) {
+            our_slot_idx = i;
+            break;
+        }
+    }
+
+    if (our_slot_idx == -1) {
+        return; /* not addressed to us — ignore */
+    }
+
+    /* Fast path: check if this is a duplicate of the last successfully processed New_key.
+     * Since RSA-OAEP uses random padding, different sessions produce completely different
+     * ciphertexts. If the ciphertext is exactly identical, and our key is already fresh,
+     * we are guaranteed that the key hasn't changed. We can safely skip the extremely
+     * slow RSA signature verification (~800ms) and RSA decryption (~800ms). */
+    if (p->keys_fresh && memcmp(p->last_new_key_ciphertext, slots[our_slot_idx].ciphertext, TBFT_SIG_SIZE) == 0) {
+        return;
+    }
+
+    /* Slow path: verify RSA signature first to prevent authentication bypass. */
     int32_t body_size = nk->hdr.size;
     if (body_size < (int32_t)sizeof(tbft_new_key_rep_t) || body_size > len) {
         ESP_LOGW(TAG, "new_key from %d: invalid body_size %d", sender_id, (int)body_size);
@@ -2143,45 +2499,31 @@ void tbft_replica_handle_new_key(tbft_replica_t *r, const void *msg, int len)
         return;
     }
 
-    int expected_len = (int)(sizeof(*nk)
-                             + (size_t)nk->n_keys * sizeof(tbft_new_key_slot_t));
-    if (len < expected_len) {
-        ESP_LOGW(TAG, "new_key from %d: message too short", sender_id);
+    /* Decrypt with our RSA private key */
+    tbft_principal_t *local = r->node.local_principal;
+    if (!local) return;
+
+    tbft_hmac_key_t new_key;
+    int rc = tbft_principal_decrypt_new_key(local,
+                                             slots[our_slot_idx].ciphertext,
+                                             TBFT_SIG_SIZE,
+                                             &new_key);
+    if (rc != 0) {
+        ESP_LOGW(TAG, "new_key: decrypt from replica %d failed", sender_id);
         return;
     }
 
-    const tbft_new_key_slot_t *slots =
-        (const tbft_new_key_slot_t *)((const uint8_t *)msg + sizeof(*nk));
+    /* Install as the in-key for verifying messages FROM sender_id */
+    ESP_LOGI(TAG, "handle_new_key: from replica %d, decrypted key[0..3]=%02x%02x%02x%02x",
+             sender_id, new_key.bytes[0], new_key.bytes[1],
+             new_key.bytes[2], new_key.bytes[3]);
+    tbft_principal_set_in_key(p, &new_key);
+    
+    /* Save the ciphertext to skip duplicate processing in the future */
+    memcpy(p->last_new_key_ciphertext, slots[our_slot_idx].ciphertext, TBFT_SIG_SIZE);
 
-    for (int i = 0; i < nk->n_keys; i++) {
-        if (slots[i].recipient_id != r->node.node_id) continue;
+    ESP_LOGI(TAG, "installed HMAC in-key from replica %d", sender_id);
 
-        /* This slot is addressed to us — decrypt with our RSA private key */
-        tbft_principal_t *local = r->node.local_principal;
-        if (!local) return;
-
-        tbft_hmac_key_t new_key;
-        int rc = tbft_principal_decrypt_new_key(local,
-                                                 slots[i].ciphertext,
-                                                 TBFT_SIG_SIZE,
-                                                 &new_key);
-        if (rc != 0) {
-            ESP_LOGW(TAG, "new_key: decrypt from replica %d failed", sender_id);
-            return;
-        }
-
-        /* Install as the in-key for verifying messages FROM sender_id */
-        tbft_principal_t *p = r->node.principals[sender_id];
-        if (p) {
-            ESP_LOGI(TAG, "handle_new_key: from replica %d, decrypted key[0..3]=%02x%02x%02x%02x",
-                     sender_id, new_key.bytes[0], new_key.bytes[1],
-                     new_key.bytes[2], new_key.bytes[3]);
-            tbft_principal_set_in_key(p, &new_key);
-            ESP_LOGI(TAG, "installed HMAC in-key from replica %d", sender_id);
-        }
-
-        /* Explicit wipe of plaintext key after installation */
-        memset(&new_key, 0, sizeof(new_key));
-        return; /* only one slot per sender per message */
-    }
+    /* Explicit wipe of plaintext key after installation */
+    memset(&new_key, 0, sizeof(new_key));
 }

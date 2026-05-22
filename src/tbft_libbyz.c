@@ -517,8 +517,17 @@ int Byz_send_request(Byz_req *req, bool read_only)
 {
     if (!s_client) return -1;
 
-    /* Build Request message on stack */
-    uint8_t out[TBFT_MAX_MESSAGE_SIZE];
+    /* Drain any stale replies or other messages in the transport queue */
+    if (!s_is_replica) {
+        static uint8_t dummy[TBFT_MAX_MESSAGE_SIZE];
+        while (tbft_node_recv(s_client, dummy, sizeof(dummy), NULL) > 0) {
+            /* discard */
+        }
+    }
+
+    /* Build Request message. Use a static buffer to avoid stack overflow
+     * on tasks with limited stack size (TBFT_MAX_MESSAGE_SIZE can be large). */
+    static uint8_t out[TBFT_MAX_MESSAGE_SIZE];
     tbft_request_rep_t *rep = (tbft_request_rep_t *)out;
     rep->hdr.tag      = TBFT_MSG_REQUEST;
     rep->hdr.extra    = (int16_t)(read_only ? 1 : 0);
@@ -548,9 +557,13 @@ int Byz_send_request(Byz_req *req, bool read_only)
     tbft_sig_t *sig = (tbft_sig_t *)(cmd_ptr + req->size);
     memset(sig->bytes, 0, sizeof(sig->bytes));
     if (s_client->local_principal && s_client->local_principal->has_priv_key) {
-        tbft_node_gen_sig(s_client, out,
-                          sizeof(*rep) + (size_t)req->size,
-                          sig);
+        int64_t t0 = esp_timer_get_time();
+        int sig_ret = tbft_node_gen_sig(s_client, out,
+                                        sizeof(*rep) + (size_t)req->size,
+                                        sig);
+        int64_t dt = esp_timer_get_time() - t0;
+        ESP_LOGI(TAG, "request RSA sign took %lld us (ret=%d)", (long long)dt, sig_ret);
+        if (sig_ret != 0) return -1;
     }
 
     /* Broadcast to all replicas — any replica that receives the request
@@ -575,6 +588,7 @@ int Byz_recv_reply(Byz_rep *rep)
     int f = s_client->max_faulty;
     int needed = f + 1; /* f+1 matching replies from DISTINCT replicas */
     int num_replicas = s_client->num_replicas;
+    tbft_req_id_t expected_rid = ((tbft_req_id_t)(uint64_t)s_client->node_id << 48) | s_client->rid_counter;
     int64_t deadline_us = esp_timer_get_time()
         + (int64_t)TBFT_CLIENT_REPLY_TIMEOUT_MS * 1000LL;
 
@@ -593,6 +607,11 @@ int Byz_recv_reply(Byz_rep *rep)
         if (hdr->tag != TBFT_MSG_REPLY) continue;
 
         const tbft_reply_rep_t *r0 = (const tbft_reply_rep_t *)buf;
+        if (r0->cid != s_client->node_id || r0->rid != expected_rid) {
+            /* Ignore stale reply from previous request IDs or other clients */
+            continue;
+        }
+
         ESP_LOGI(TAG, "recv reply: cid=%d rid=%llu view=%lld seqno=%lld reply_size=%d",
                  r0->cid, (unsigned long long)r0->rid,
                  (long long)r0->view, (long long)r0->seqno, r0->reply_size);
@@ -872,7 +891,7 @@ int Byz_init_replica(const char *config_file, const char *priv_config,
      * the cluster to complete HMAC key exchange before triggering view-change. */
     tbft_itimer_stop(&s_replica->vtimer);
     tbft_itimer_stop(&s_replica->stimer);
-    tbft_itimer_start(&s_replica->vtimer, s_replica->vtimer_period_us * 3);
+    /* Do NOT start vtimer on boot. It will be armed when a client request is received. */
     tbft_itimer_start(&s_replica->stimer, s_replica->stimer_period_us);
 
     s_is_replica = true;

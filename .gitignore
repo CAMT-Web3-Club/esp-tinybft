@@ -34,5 +34,5 @@ examples/**/spiffs_image/pub*.der
 # Agent Coding
 .qwen/
 .claude/
-
+.antigravitycli
 gha-creds-*.json

@@ -6,6 +6,8 @@ This file provides guidance to AI agents (Claude Code, Gemini CLI, etc.) when wo
 
 This is an **ESP-IDF component** (not a standalone app). It is built as part of a host project that adds it as a managed component or local component.
 
+### Local IDF build
+
 ```bash
 # From a host ESP-IDF project that uses this component:
 idf.py build                   # full build
@@ -17,6 +19,87 @@ idf.py -p /dev/ttyUSB0 flash monitor  # with explicit port
 # Component-only sanity check (requires IDF env active):
 idf.py set-target esp32c3
 idf.py build
+```
+
+### Docker build (espressif/idf image)
+
+Use the Espressif Docker image when local IDF toolchain is unavailable. The image contains ESP-IDF, cross-compiler toolchains, CMake, Ninja, and all Python dependencies.
+
+**Standard Docker invocation pattern:**
+
+```bash
+docker run --rm -it \
+  -v $PWD:/esp-tinybft -w /esp-tinybft/examples/counter \
+  -u $(id -u) -e HOME=/tmp \
+  espressif/idf:v6.0.1 \
+  <idf.py command>
+```
+
+Key flags:
+- `-it` — interactive with colors and progress bars
+- `-u $(id -u)` — run as host user so build artifacts have correct ownership
+- Mount repo root at `/esp-tinybft` consistently
+
+**Common commands:**
+
+```bash
+# One-time: create symlink so IDF finds the component
+mkdir -p examples/counter/components
+ln -sfn ../../.. examples/counter/components/esp-tinybft
+
+# Clean + set target + build:
+docker run --rm -it -v $PWD:/esp-tinybft -w /esp-tinybft/examples/counter \
+  -u $(id -u) -e HOME=/tmp espressif/idf:v6.0.1 \
+  idf.py fullclean
+docker run --rm -it -v $PWD:/esp-tinybft -w /esp-tinybft/examples/counter \
+  -u $(id -u) -e HOME=/tmp espressif/idf:v6.0.1 \
+  idf.py set-target esp32c3 && idf.py build
+
+# Quick build check (component only):
+docker run --rm -it -v $PWD:/esp-tinybft -w /esp-tinybft/examples/counter \
+  -u $(id -u) -e HOME=/tmp espressif/idf:v6.0.1 \
+  idf.py build 2>&1 | head -50
+
+# Flash (requires --device for USB access):
+docker run --rm -it --device /dev/ttyACM0 \
+  -v $PWD:/esp-tinybft -w /esp-tinybft/examples/counter \
+  -u $(id -u) -e HOME=/tmp espressif/idf:v6.0.1 \
+  idf.py -p /dev/ttyACM0 flash
+
+# Serial monitor (user runs this directly):
+docker run --rm -it --device /dev/ttyACM0 \
+  -v $PWD:/esp-tinybft -w /esp-tinybft/examples/counter \
+  -u $(id -u) -e HOME=/tmp espressif/idf:v6.0.1 \
+  idf.py -p /dev/ttyACM0 monitor
+
+# Change role from replica to client (edit sdkconfig before build):
+sed -i "s/CONFIG_EXAMPLE_ROLE_REPLICA=y/CONFIG_EXAMPLE_ROLE_REPLICA=n/" /path/to/sdkconfig
+echo "CONFIG_EXAMPLE_ROLE_CLIENT=y" >> /path/to/sdkconfig
+# Then fullclean + set-target + build
+```
+
+**Role switching:** The counter example supports replica and client roles via `CONFIG_EXAMPLE_ROLE`. The default (`sdkconfig.defaults`) is replica. To build the client, change `CONFIG_EXAMPLE_ROLE_REPLICA` to `n` and add `CONFIG_EXAMPLE_ROLE_CLIENT=y` in `sdkconfig`, then rebuild. `espflash` alone does NOT flash the SPIFFS image — use `idf.py flash` via Docker.
+
+### After making changes
+
+Review build output before pushing. **First, attempt to verify using a local ESP-IDF installation.** If a local ESP-IDF toolchain is unavailable, fall back to the Docker environment.
+
+**Local verification (preferred):**
+```bash
+# Verify using local toolchain
+cd examples/counter
+# Activate your local IDF environment (e.g. . $IDF_PATH/export.sh or fish get_idf)
+idf.py build
+```
+
+**Docker verification (fallback):**
+If Docker is unavailable locally, build errors will surface in CI.
+```bash
+# Full build check via Docker (counter example = most complex):
+cd examples/counter && bash memcalc.sh   # verify tbft_replica_t size
+docker run --rm -it -v $PWD:/esp-tinybft -w /esp-tinybft/examples/counter \
+  -u $(id -u) -e HOME=/tmp espressif/idf:v6.0.1 \
+  idf.py build
 ```
 
 There is no dedicated test target or test suite yet. Runtime logging uses `ESP_LOGI/LOGE/LOGW` with per-file `TAG` constants, visible in `idf.py monitor`.
@@ -72,6 +155,8 @@ ESP-NOW v2.0 limits each packet to 1470 bytes. Messages exceeding this are autom
 `espnow_recv_cb` runs in the **WiFi task context** (not an ISR); standard task-context FreeRTOS APIs (`xSemaphoreTake`, `xQueueSend`) are used throughout.
 
 #### Config file formats
+
+The config file has `num_nodes` entries which include both replicas and clients. Lines with hostname prefix `"node"` are counted as replicas; all others are clients. `TBFT_MAX_NUM_REPLICAS + TBFT_MAX_NUM_CLIENTS` (Kconfig, defaults 4+1) must be ≥ `num_nodes`.
 
 **UDP mode** (per node line):
 ```
@@ -135,6 +220,20 @@ Additional important fields:
 - **Slow path** (Request, View_change, New_view): RSA-2048 signature via `tbft_principal_sign` / `tbft_principal_verify_sig`.
 - Session key rotation: `tbft_principal_encrypt_new_key` / `tbft_principal_decrypt_new_key` — imports RSA key into PSA, uses `psa_asymmetric_encrypt/decrypt` with PKCS#1 v1.5 to distribute fresh HMAC session keys.
 
+#### Anti-replay design (why timestamp checking is disabled)
+
+`tbft_principal_verify_mac_in_with_replay_check` intentionally skips the `timestamp_us` monotonicity check (`(void)msg_time_us; return true;`). This is by design, not an oversight:
+
+1. **Staggered boot problem**: ESP32 boards use `esp_timer_get_time()` which starts at 0 on each boot. When boards are flashed sequentially (minutes apart), their timers diverge — a freshly-booted board's timestamps appear "stale" (too far in the past) to boards that have been running longer. A 5-minute slack only helps in one direction; the lagging board's messages are always rejected.
+
+2. **Key rotation as replay protection**: Each `New_key` exchange generates fresh random HMAC session keys (`esp_fill_random`). Once keys rotate, any captured pre-rotation message fails HMAC verification under the new key — the attacker can't replay across key boundaries.
+
+3. **Sender bitmap as duplicate guard**: Each certificate (`tbft_certificate.c`) tracks per-sender contributions via `tbft_bitmap_t`. A replayed Prepare/Commit from the same sender for the same seqno is rejected as a duplicate sender. Cross-seqno replay fails because the HMAC covers the entire message including `seqno`.
+
+Together, key rotation + sender bitmap provide equivalent protection without requiring synchronized clocks across embedded devices.
+
+**Do not re-enable timestamp-based anti-replay** without solving the staggered-boot clock synchronization problem first.
+
 ### Configuration file format (section 12 of ARCHITECTURE.md)
 
 Read by `parse_config()` in `tbft_libbyz.c`. Plain text, line-based:
@@ -153,14 +252,76 @@ Public keys are DER files on SPIFFS. Private key path is passed separately as `p
 
 **Note:** In the embedded context, `Byz_init_replica` cannot determine the local node's IP, so it defaults to `local_id = 0` with a warning log. The config parser matches hostnames against the local IP list, but falls back to node 0.
 
-### Key Kconfig constraints
+## Examples
+
+Two example applications live under `examples/`, each demonstrating a full replica + client setup.
+
+### examples/simple_wallet
+
+4 accounts, transfer between them. 4 nodes (3 replicas + 1 client, f=1).
+
+### examples/counter
+
+Single integer counter starting at 0, incremented by client requests. 8 nodes (7 replicas + 1 client, f=2).
+
+### Example structure (both follow the same pattern)
+
+```
+examples/<name>/
+├── CMakeLists.txt            # ESP-IDF project root
+├── main/
+│   ├── CMakeLists.txt        # registers main.c, embeds SPIFFS image
+│   ├── idf_component.yml     # depends on esp-tinybft (override_path: "../../..")
+│   ├── Kconfig.projbuild     # role select (replica/client), WiFi SSID/PS mode
+│   └── main.c                # app_state, exec_cb, wifi_init, replica_task, client_task
+├── sdkconfig.defaults         # TinyBFT Kconfig overrides (transport, sizes, window)
+├── partitions.csv             # custom partition table with SPIFFS
+├── gen_configs.sh             # generates RSA keys + config_udp.txt + config_espnow.txt
+├── spiffs_image/              # keys + config files — embedded into SPIFFS at build time
+│   ├── config_udp.txt
+│   └── config_espnow.txt
+└── memcalc.sh                 # (counter only) computes tbft_replica_t size from config
+```
+
+### Adding a new example
+
+1. Copy an existing example structure.
+2. Define the app state array, request/response structs, and `exec_cb`.
+3. Run `./gen_configs.sh` to generate RSA keys and config files.
+4. Edit `sdkconfig.defaults` with appropriate `TBFT_MAX_NUM_REPLICAS`, `TBFT_WINDOW_SIZE`, etc.
+5. The `memcalc.sh` script can estimate `tbft_replica_t` size before building — useful for checking DRAM fit on ESP32-C3 (~80 KB heap).
+
+### Memory sizing for ESP32-C3
+
+`tbft_replica_t` is statically allocated. Its size is driven primarily by:
+
+| Region | Key scaling factors |
+|--------|---------------------|
+| `ar` (agreement) | `WINDOW_SIZE × MAX_MESSAGE_SIZE × CERT_MAX_VALS` |
+| `cr` (checkpoint) | `MAX_NUM_REPLICAS² × CKPT_MSG_SIZE` |
+| `sr` (special) | `MAX_NUM_REPLICAS × MAX_MESSAGE_SIZE` (view_change) + `MAX_NUM_REPLICAS²` (vc_ack) |
+| `rqueues` (×2) | `2 × RQUEUE_MAX × MAX_MESSAGE_SIZE` |
+
+**New_key constrains `MAX_MESSAGE_SIZE`**: the message carries `(n-1)` RSA-encrypted HMAC keys plus an RSA signature:
+
+```
+New_key_bytes = sizeof(tbft_new_key_rep_t)               // 24
+              + (n - 1) × sizeof(tbft_new_key_slot_t)    // (n-1)×260
+              + TBFT_SIG_SIZE                            // 256
+```
+
+With n=7: `24 + 6×260 + 256 = 1840` — `out_buf` (sized to `TBFT_MAX_MESSAGE_SIZE`) must be ≥ this.
+
+**Typical ESP32-C3 allocation** (~80 KB free heap): with 7 replicas, keep `WINDOW_SIZE=4` and `MAX_MESSAGE_SIZE=2048` to stay under the limit. Run `memcalc.sh` to verify.
 
 `tbft_config.h` defines all constants from `CONFIG_TBFT_*` Kconfig values and enforces these `_Static_assert` checks:
 
 - `TBFT_BLOCK_SIZE` must be a power of 2.
 - `TBFT_WINDOW_SIZE` must be a power of 2 **and** > `TBFT_CHECKPOINT_INTERVAL`.
 - `TBFT_MAX_NUM_REPLICAS >= 4`.
+- `TBFT_MAX_NUM_REPLICAS <= 64` (bitmap is uint64_t).
 - `TBFT_MAX_REPLY_SIZE < TBFT_MAX_MESSAGE_SIZE`.
+- `TBFT_MAX_MESSAGE_SIZE % 8 == 0`.
 - `TBFT_P_LEVELS >= 2`.
 
 Derived constants: `TBFT_DIGEST_SIZE` (32), `TBFT_HMAC_SIZE` (32), `TBFT_SIG_SIZE` (256), `TBFT_AUTH_SIZE`, `TBFT_NUM_CKPT_SLOTS`, `TBFT_MAX_FAULTY`, `TBFT_CERT_MAX_VALS` (f+1), `TBFT_P_CHILDREN`.

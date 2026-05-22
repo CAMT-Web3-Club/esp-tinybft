@@ -67,6 +67,11 @@ typedef struct {
     tbft_seqno_t  last_executed;          /* highest committed + executed */
     tbft_seqno_t  last_tentative_execute; /* highest tentatively executed */
 
+    /* Client request tracking for idle timer suppression */
+    tbft_req_id_t last_received_rid[TBFT_MAX_NUM_REPLICAS + TBFT_MAX_NUM_CLIENTS];
+    tbft_req_id_t last_executed_rid[TBFT_MAX_NUM_REPLICAS + TBFT_MAX_NUM_CLIENTS];
+    tbft_req_id_t last_forwarded_rid[TBFT_MAX_NUM_REPLICAS + TBFT_MAX_NUM_CLIENTS];
+
     /* Request queues */
     tbft_rqueue_t rqueue;    /* read-write requests */
     tbft_rqueue_t ro_rqueue; /* read-only requests */
@@ -216,6 +221,9 @@ void tbft_replica_mark_stable(tbft_replica_t *r, tbft_seqno_t seqno);
 
 /** Initiate a view change to view v+1 */
 void tbft_replica_send_view_change(tbft_replica_t *r);
+
+/** True if there is at least one verified client request pending execution */
+bool tbft_replica_has_pending_requests(const tbft_replica_t *r);
 
 /** True if @p seqno is within the current window */
 static inline bool tbft_replica_in_window(const tbft_replica_t *r,
