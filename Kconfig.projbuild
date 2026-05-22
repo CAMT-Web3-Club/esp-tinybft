@@ -113,6 +113,8 @@ menu "TinyBFT Configuration"
 
         config TBFT_TRANSPORT_UDP
             bool "UDP (lwIP sockets)"
+            select LWIP_IP4_REASSEMBLY
+            select LWIP_IP4_FRAG
             help
                 Standard UDP over IP. Requires WiFi/Ethernet network stack.
                 Supports multicast (unless TBFT_DISABLE_MULTICAST is set).

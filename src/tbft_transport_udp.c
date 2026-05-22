@@ -119,15 +119,38 @@ static int socket_open(uint16_t port, bool use_multicast,
             return -1;
         }
 
-        /* Join multicast group */
+        /* Get the local WiFi STA interface IP to bind multicast membership and outgoing IF */
+        struct in_addr local_sta_ip = { .s_addr = htonl(INADDR_ANY) };
+        esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+        if (netif) {
+            esp_netif_ip_info_t ip_info;
+            if (esp_netif_get_ip_info(netif, &ip_info) == ESP_OK) {
+                local_sta_ip.s_addr = ip_info.ip.addr;
+                char ip_str[16];
+                snprintf(ip_str, sizeof(ip_str), IPSTR, IP2STR(&ip_info.ip));
+                ESP_LOGI(TAG, "Multicast using WiFi STA IP: %s", ip_str);
+            } else {
+                ESP_LOGW(TAG, "Failed to get IP info for WIFI_STA_DEF, falling back to INADDR_ANY");
+            }
+        } else {
+            ESP_LOGW(TAG, "WIFI_STA_DEF netif not found, falling back to INADDR_ANY");
+        }
+
+        /* Join multicast group on the specific Wi-Fi Station interface */
         struct ip_mreq mreq;
         mreq.imr_multiaddr.s_addr = mcast_addr.s_addr;
-        mreq.imr_interface.s_addr = htonl(INADDR_ANY);
+        mreq.imr_interface.s_addr = local_sta_ip.s_addr;
         if (setsockopt(sock, IPPROTO_IP, IP_ADD_MEMBERSHIP,
                        &mreq, sizeof(mreq)) < 0) {
             ESP_LOGE(TAG, "IP_ADD_MEMBERSHIP failed: %d", errno);
             close(sock);
             return -1;
+        }
+
+        /* Explicitly set outgoing interface for multicast packets */
+        if (setsockopt(sock, IPPROTO_IP, IP_MULTICAST_IF,
+                       &local_sta_ip, sizeof(local_sta_ip)) < 0) {
+            ESP_LOGW(TAG, "setsockopt(IP_MULTICAST_IF) failed: %d", errno);
         }
 
         /* Set multicast TTL */
@@ -186,7 +209,10 @@ int tbft_transport_create(tbft_transport_t **out,
 #ifdef CONFIG_TBFT_DISABLE_MULTICAST
     udp->use_multicast = false;
 #else
-    udp->use_multicast = (mcast_ip != NULL);
+    udp->use_multicast = (mcast_ip != NULL &&
+                          strcmp(mcast_ip, "none") != 0 &&
+                          strcmp(mcast_ip, "off") != 0 &&
+                          strcmp(mcast_ip, "0.0.0.0") != 0);
 #endif
 
     udp->sock = socket_open(port, udp->use_multicast, mcast_ip,
@@ -213,6 +239,13 @@ void tbft_transport_free(tbft_transport_t *t)
             struct ip_mreq mreq;
             mreq.imr_multiaddr = udp->mcast_addr.sin_addr;
             mreq.imr_interface.s_addr = htonl(INADDR_ANY);
+            esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+            if (netif) {
+                esp_netif_ip_info_t ip_info;
+                if (esp_netif_get_ip_info(netif, &ip_info) == ESP_OK) {
+                    mreq.imr_interface.s_addr = ip_info.ip.addr;
+                }
+            }
             setsockopt(udp->sock, IPPROTO_IP, IP_DROP_MEMBERSHIP,
                        &mreq, sizeof(mreq));
         }
