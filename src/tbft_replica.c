@@ -719,10 +719,6 @@ void tbft_replica_handle_pre_prepare(tbft_replica_t *r, const void *msg, int len
         r->node.view = pp->view;
         r->node.cur_primary = tbft_node_primary(&r->node, r->node.view);
         tbft_replica_reset_forwarded_requests(r);
-        /* Keep sequence numbers monotonic and preserve executed/prepared progress */
-        if (r->seqno < pp->seqno) {
-            r->seqno = pp->seqno;
-        }
         if (r->last_prepared < r->last_stable) {
             r->last_prepared = r->last_stable;
         }
@@ -833,6 +829,13 @@ void tbft_replica_handle_pre_prepare(tbft_replica_t *r, const void *msg, int len
     /* Update last_prepared if needed */
     if (pp->seqno > r->last_prepared) {
         r->last_prepared = pp->seqno;
+    }
+
+    /* Keep sequence numbers monotonic with the accepted pre-prepare sequence number.
+     * Since the primary has proposed pp->seqno, the next sequence number to propose
+     * must be at least pp->seqno + 1. */
+    if (r->seqno < pp->seqno + 1) {
+        r->seqno = pp->seqno + 1;
     }
 
     /* Send prepare */
@@ -1145,8 +1148,11 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
             r->node.cur_primary = tbft_node_primary(&r->node, vc->v);
             tbft_replica_reset_forwarded_requests(r);
             /* Keep sequence numbers contiguous and preserve executed/prepared progress */
-            if (r->seqno < r->last_stable + 1) {
-                r->seqno = r->last_stable + 1;
+            tbft_seqno_t start_seq = r->last_stable;
+            if (r->last_prepared > start_seq) start_seq = r->last_prepared;
+            if (r->last_executed > start_seq) start_seq = r->last_executed;
+            if (r->seqno < start_seq + 1) {
+                r->seqno = start_seq + 1;
             }
             if (r->last_prepared < r->last_stable) {
                 r->last_prepared = r->last_stable;
@@ -1158,7 +1164,7 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
             tbft_ar_init(&r->ar, r->ar.prepare_threshold, r->ar.commit_threshold);
             r->ar.head = r->last_stable + 1;
             ESP_LOGI(TAG, "sync view to %lld (from vc of %d), seqno reset to %lld",
-                     (long long)vc->v, sender_id, (long long)r->last_stable + 1);
+                     (long long)vc->v, sender_id, (long long)r->seqno);
             /* REMOVED: catch-up view-change cascade accelerator.
              * The old code here called tbft_replica_send_view_change(r) which
              * computed target = r->node.view + 1 = V + 1, overshooting the
@@ -1539,6 +1545,16 @@ static void handle_status(tbft_replica_t *r, const void *msg, int len)
         tbft_cr_truncate(&r->cr, r->last_stable);
         tbft_ar_init(&r->ar, r->ar.prepare_threshold, r->ar.commit_threshold);
         r->ar.head = r->last_stable + 1;
+
+        /* Keep sequence numbers contiguous and preserve executed/prepared progress */
+        tbft_seqno_t start_seq = r->last_stable;
+        if (r->last_prepared > start_seq) start_seq = r->last_prepared;
+        if (r->last_executed > start_seq) start_seq = r->last_executed;
+        if (r->seqno < start_seq + 1) {
+            r->seqno = start_seq + 1;
+        }
+        ESP_LOGI(TAG, "status view catch-up to %lld, seqno reset to %lld",
+                 (long long)st->view, (long long)r->seqno);
         tbft_itimer_stop(&r->vtimer);
         if (tbft_replica_has_pending_requests(r)) {
             tbft_itimer_start(&r->vtimer, r->vtimer_period_us);
