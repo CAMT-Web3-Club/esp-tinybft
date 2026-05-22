@@ -374,6 +374,23 @@ HMAC operations use **persistent PSA key handles** (`psa_hmac_in_id`, `psa_hmac_
 
 The anti-replay check (`tbft_principal_verify_mac_in_with_replay_check`) was **disabled** in the hot path due to ESP32 boot-time clock skew making `esp_timer_get_time()` unreliable across nodes. Replay protection is provided instead by the HMAC key itself — old messages fail verification under a newly rotated key.
 
+### Session Key Exchange & Fast-Path Optimization
+
+Bootstrapping session keys in a Byzantine environment involves expensive asymmetric cryptographic operations:
+- A `New_key` message contains $N-1$ RSA-encrypted session key slots (one for each peer) and an RSA signature over the message.
+- Parsing a single `New_key` message requires:
+  1. RSA signature verification to authenticate the sender (~800ms).
+  2. RSA private-key decryption to extract the local node's shared HMAC key (~800ms).
+
+Because `New_key` messages are re-broadcasted periodically during bootstrapping to ensure all nodes receive them (guarding against packet drops), processing duplicate messages would consume 100% of CPU time and starve the event loop, causing consensus timeouts.
+
+To prevent this CPU starvation, a zero-overhead, cryptographically secure **Fast-Path Verification Bypass** is implemented:
+1. **Receiver-Side Ciphertext Cache**: Each `tbft_principal_t` stores the last successfully decrypted ciphertext block in `last_new_key_ciphertext`.
+2. **Fast-Path Check**: When a `New_key` message is received:
+   - The replica checks if the RSA-encrypted ciphertext slot for the local node exactly matches `last_new_key_ciphertext` and the shared HMAC session key is already fresh.
+   - If they match, the replica **bypasses both the RSA signature verification and the RSA private-key decryption**, instantly accepting the message with zero overhead.
+3. **Sender-Side Ciphertext Cache**: When a replica re-broadcasts its `New_key` message without rotating the session keys, it bypasses the slow RSA encryption function and copies the previously generated/cached ciphertext block byte-for-byte, avoiding sender-side RSA overhead.
+
 ## 7. Replica State Machine (tbft_replica_t)
 
 ### Struct Layout (src/tbft_replica.h)
@@ -469,11 +486,12 @@ case TBFT_MSG_NEW_KEY:     tbft_replica_handle_new_key(r, buf, n);    break;
 case TBFT_MSG_FETCH:       tbft_replica_handle_fetch(r, buf, n);      break;
 case TBFT_MSG_META_DATA:   tbft_replica_handle_meta_data(r, buf, n);  break;
 case TBFT_MSG_DATA:        tbft_replica_handle_data(r, buf, n);       break;
+case TBFT_MSG_STATUS:      handle_status(r, buf, n);                  break;
 default: /* ignored */
 }
 ```
 
-Messages received but not in this list (Reply, Status, View-change-ack, Query-stable, Reply-stable) are silently ignored. New-key (`TBFT_MSG_NEW_KEY`) **is** dispatched to `tbft_replica_handle_new_key`.
+Messages received but not in this list (Reply, View-change-ack, Query-stable, Reply-stable) are silently ignored. New-key (`TBFT_MSG_NEW_KEY`) **is** dispatched to `tbft_replica_handle_new_key`, and Status (`TBFT_MSG_STATUS`) **is** dispatched to `handle_status`.
 
 ### Event Group and Timer Dispatch
 
@@ -560,6 +578,43 @@ For each `n` from `last_executed + 1` upward while committed in AR:
 3. Broadcast to all replicas
 4. Collect own view-change into VI
 5. Restart vtimer with 2x period
+
+### Sequence Number Monotonicity & Synchronization
+
+PBFT replicas must keep their sequence numbers synchronized to avoid proposing requests with sequence numbers outside the active window `[last_stable + 1, last_stable + WINDOW_SIZE]`.
+
+In steady-state consensus:
+- The **Primary** proposes sequence numbers monotonically starting from `last_stable + 1`.
+- **Backups** do not propose requests, and thus do not increment `r->seqno` natively. They must keep their sequence trackers monotonically aligned with the progress of the primary to ensure that if they are later promoted to primary, they do not propose stale sequence numbers.
+
+The replica maintains monotonic sequence tracking through **three key synchronization points**:
+1. **Pre-Prepare Handler**:
+   - For every accepted Pre-Prepare proposed by the current primary, backups update their sequence tracker to prepare for proposing or expecting the next sequence number:
+     ```c
+     if (r->seqno < pp->seqno + 1) {
+         r->seqno = pp->seqno + 1;
+     }
+     ```
+2. **View Synchronization (`handle_view_change`)**:
+   - When a backup transitions to a new view and becomes the primary (or transitions to support a new primary), it resets `r->seqno` to ensure it is contiguous with all completed/prepared logs:
+     ```c
+     tbft_seqno_t start_seq = r->last_stable;
+     if (r->last_prepared > start_seq) start_seq = r->last_prepared;
+     if (r->last_executed > start_seq) start_seq = r->last_executed;
+     if (r->seqno < start_seq + 1) {
+         r->seqno = start_seq + 1;
+     }
+     ```
+3. **Silent Status Catch-up (`handle_status`)**:
+   - When a replica catches up to a higher view silently via peer `Status` messages, it resynchronizes its view, truncates its logs to `last_stable`, and advances `r->seqno` to prevent starting the new view with a sequence number that has already been stabilized, prepared, or executed:
+     ```c
+     tbft_seqno_t start_seq = r->last_stable;
+     if (r->last_prepared > start_seq) start_seq = r->last_prepared;
+     if (r->last_executed > start_seq) start_seq = r->last_executed;
+     if (r->seqno < start_seq + 1) {
+         r->seqno = start_seq + 1;
+     }
+     ```
 
 ## 8. Static Memory Regions
 
