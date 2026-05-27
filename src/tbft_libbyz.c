@@ -202,6 +202,12 @@ static int parse_config(const char *path, tbft_config_t *cfg)
                  cfg->num_replicas, 3 * cfg->f + 1,
                  cfg->num_replicas, (cfg->num_replicas - 1) / 3);
     }
+    if (cfg->num_replicas > TBFT_MAX_NUM_REPLICAS) {
+        ESP_LOGE(TAG, "num_replicas=%d exceeds compile-time cap %d"
+                 " (TBFT_MAX_NUM_REPLICAS)", cfg->num_replicas,
+                 TBFT_MAX_NUM_REPLICAS);
+        goto fail;
+    }
 
     if (fscanf(f, "%d", &cfg->vc_timeout_ms)       != 1) goto fail;
     if (fscanf(f, "%d", &cfg->status_timeout_ms)    != 1) goto fail;
@@ -294,6 +300,7 @@ fail:
  */
 static uint8_t *load_key_file(const char *path, size_t *len_out)
 {
+    if (!path) return NULL;
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
     fseek(f, 0, SEEK_END);

@@ -105,6 +105,16 @@ bool tbft_vi_verify_nv(const tbft_view_info_t *vi,
     if (nv->v != vi->target_view) return false;
     if (nv->min > nv->max) return false;
 
+    /* A New_view must be supported by a quorum (2f+1) of View_change
+     * messages.  Without enough VCs, compute_min_max produces lax bounds
+     * (min=0, max=WINDOW_SIZE), allowing a buggy or premature New_view
+     * to pass verification and corrupt the state machine. */
+    if (vi->n_received < vi->threshold) {
+        ESP_LOGW(TAG, "verify_nv: only %d VCs received (need %d)",
+                 vi->n_received, vi->threshold);
+        return false;
+    }
+
     tbft_seqno_t expected_min, expected_max;
     tbft_vi_compute_min_max(vi, &expected_min, &expected_max);
 

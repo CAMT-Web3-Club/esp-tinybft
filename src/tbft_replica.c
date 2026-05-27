@@ -1806,16 +1806,23 @@ void tbft_replica_handle_meta_data(tbft_replica_t *r, const void *msg, int len)
 
     /* If the root-level Meta_data showed all children's digests match,
      * no fetch requests were enqueued and the state is already in sync.
-     * When n_data_pending == 0 as well (no outstanding leaf fetches),
-     * the fetch is effectively complete. */
-    if (md->level == 0
-        && r->state.fetch_queue_len == 0
-        && r->state.n_data_pending == 0) {
-        tbft_state_fetch_complete(&r->state);
-        ESP_LOGI(TAG, "state fetch completed for seqno=%lld, marking stable",
-                 (long long)r->state.fetch_seqno);
-        tbft_replica_mark_stable(r, r->state.fetch_seqno);
-        return;
+     * Check that ALL queue entries are done (not just len==0 — the root
+     * entry stays in the queue with .done=true) and no Data is pending. */
+    if (md->level == 0 && r->state.n_data_pending == 0) {
+        bool all_done = true;
+        for (int i = 0; i < r->state.fetch_queue_len; i++) {
+            if (!r->state.fetch_queue[i].done) {
+                all_done = false;
+                break;
+            }
+        }
+        if (all_done) {
+            tbft_state_fetch_complete(&r->state);
+            ESP_LOGI(TAG, "state fetch completed for seqno=%lld, marking stable",
+                     (long long)r->state.fetch_seqno);
+            tbft_replica_mark_stable(r, r->state.fetch_seqno);
+            return;
+        }
     }
 
     /* Send next fetch requests */
@@ -2366,6 +2373,15 @@ void tbft_replica_mark_stable(tbft_replica_t *r, tbft_seqno_t seqno)
     tbft_state_mark_stable(&r->state, seqno);
     r->last_stable = seqno;
 
+    /* Advance execution and prepared markers to the stable checkpoint.
+     * After a state fetch, the application state matches this checkpoint
+     * but last_executed and last_prepared can lag behind (stuck at 0 on a
+     * freshly-booted node that jumped from seqno 0 to 1000).  Without this,
+     * the execution loop starts far below the agreement window head and
+     * either finds uncommitted gaps or falls permanently out of range. */
+    if (r->last_prepared < seqno) r->last_prepared = seqno;
+    if (r->last_executed < seqno) r->last_executed = seqno;
+
     /* Truncate static regions */
     tbft_ar_truncate(&r->ar, seqno + 1);
     tbft_cr_truncate(&r->cr, seqno);
@@ -2479,7 +2495,14 @@ void tbft_replica_send_view_change(tbft_replica_t *r)
         tbft_vi_collect_vc(&r->vi, r->node.node_id, r->out_buf, total_size);
     }
 
-    int64_t next_period = r->vtimer_period_us * 2;
+    /* Exponential backoff: each consecutive view change doubles the
+     * vtimer period relative to the base, capped at MAX_MULT.
+     * The shift is bounded by the view-gap so the timer grows with
+     * each successive failure rather than resetting to 2x every time. */
+    int shift = (int)(target - r->node.view);
+    if (shift < 1) shift = 1;
+    if (shift > 6) shift = 6;
+    int64_t next_period = r->vtimer_period_us * (1LL << shift);
     if (next_period > r->vtimer_period_us * TBFT_VC_BACKOFF_MAX_MULT) {
         next_period = r->vtimer_period_us * TBFT_VC_BACKOFF_MAX_MULT;
     }
