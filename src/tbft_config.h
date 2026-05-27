@@ -102,7 +102,7 @@
 
 /* Partition tree: children per internal node */
 #define TBFT_P_CHILDREN          \
-    ((TBFT_MAX_MESSAGE_SIZE - 32) / (TBFT_DIGEST_SIZE + sizeof(int32_t)))
+    ((TBFT_MAX_MESSAGE_SIZE - 40) / (TBFT_DIGEST_SIZE + sizeof(int32_t)))
 
 /* --------------------------------------------------------------------------
  * Static assertions (compile-time validation)

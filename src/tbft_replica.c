@@ -176,6 +176,8 @@ int tbft_replica_init(tbft_replica_t *r,
     /* Sequence number initialisation */
     r->seqno                    = 1;
     r->last_stable              = 0;
+    r->last_ckpt_throttle_us    = 0;
+    r->last_fetch_response_us   = 0;
     r->last_prepared            = 0;
     r->last_executed            = 0;
     r->last_tentative_execute   = 0;
@@ -1557,6 +1559,11 @@ static void handle_status(tbft_replica_t *r, const void *msg, int len)
     }
 
     if (st->view > r->node.view) {
+        ESP_LOGI(TAG, "status from %d: peer view=%lld last_stable=%lld last_exec=%lld"
+                 " | local view=%lld last_stable=%lld",
+                 st->id, (long long)st->view, (long long)st->last_stable,
+                 (long long)st->last_executed,
+                 (long long)r->node.view, (long long)r->last_stable);
         /* Catch up: advance to the peer's view and restart the vtimer.
          * Do NOT call tbft_replica_send_view_change here — it would
          * propose view+1 (leapfrogging past this view), leaving the
@@ -1590,6 +1597,19 @@ static void handle_status(tbft_replica_t *r, const void *msg, int len)
         }
         ESP_LOGI(TAG, "status view catch-up to %lld, seqno reset to %lld",
                  (long long)st->view, (long long)r->seqno);
+
+        /* If we're behind in state (e.g. freshly booted into a running
+         * cluster), immediately fetch so we can participate in consensus.
+         * Without this, a node with last_stable=0 catches up the view
+         * but never its state, and the in-order-execution requirement
+         * (execute: seqno=1 not committed yet) blocks all new requests. */
+        if (st->last_stable > r->last_stable && !r->state.in_fetch) {
+            int replier = tbft_node_primary(&r->node, st->view);
+            ESP_LOGI(TAG, "view catch-up triggered state fetch to seqno=%lld"
+                     " from primary %d", (long long)st->last_stable, replier);
+            tbft_replica_start_fetch(r, st->last_stable, replier);
+        }
+
         tbft_itimer_stop(&r->vtimer);
         if (tbft_replica_has_pending_requests(r)) {
             tbft_itimer_start(&r->vtimer, r->vtimer_period_us);
@@ -1605,7 +1625,17 @@ static void handle_status(tbft_replica_t *r, const void *msg, int len)
     }
 
     /* Check if peer B (st->id) is behind our execution or stable point.
-     * If so, send B our checkpoint messages for all checkpoints B is missing. */
+     * If so, send B our checkpoint messages for all checkpoints B is missing.
+     *
+     * Throttle: when every peer responds to the same Status broadcast in a
+     * burst, sending checkpoints to each one creates amplification.  Rate-
+     * limit to one batch per 500 ms to break the storm while still helping
+     * lagging replicas catch up within a few Status cycles. */
+    {
+        int64_t now_us = esp_timer_get_time();
+        if (now_us - r->last_ckpt_throttle_us < 500000LL) return;
+        r->last_ckpt_throttle_us = now_us;
+    }
     tbft_seqno_t start_seq = ((st->last_stable / TBFT_CHECKPOINT_INTERVAL) + 1) * TBFT_CHECKPOINT_INTERVAL;
     for (tbft_seqno_t seqno = start_seq;
          seqno <= r->last_executed;
@@ -1646,6 +1676,16 @@ void tbft_replica_handle_fetch(tbft_replica_t *r, const void *msg, int len)
         return;
     }
 
+    /* Rate-limit fetch responses.  When many replicas detect a checkpoint
+     * mismatch simultaneously, they all send Fetch to the same target.
+     * Responding to all of them in a burst floods the send queue and can
+     * prevent consensus messages from being delivered. */
+    {
+        int64_t now_us = esp_timer_get_time();
+        if (now_us - r->last_fetch_response_us < 500000LL) return;
+        r->last_fetch_response_us = now_us;
+    }
+
     /* Respond with Meta_data for the requested level/index */
     int level = fetch->level;
     int index = fetch->index;
@@ -1664,6 +1704,18 @@ void tbft_replica_handle_fetch(tbft_replica_t *r, const void *msg, int len)
     if (level == r->state.ptree.dims.p_levels - 1) {
         /* Send TBFT_MSG_DATA containing the requested block */
         if (index >= r->state.num_blocks) return;
+
+        /* Validate Data message fits in out_buf before construction.
+         * TBFT_BLOCK_SIZE is user-configurable and may exceed
+         * TBFT_MAX_MESSAGE_SIZE when combined with headers. */
+        {
+            size_t needed = sizeof(tbft_data_rep_t) + (size_t)TBFT_BLOCK_SIZE;
+            if (needed > sizeof(r->out_buf)) {
+                ESP_LOGE(TAG, "handle_fetch: Data response too large for out_buf"
+                         " (%zu > %zu)", needed, sizeof(r->out_buf));
+                return;
+            }
+        }
 
         tbft_data_rep_t *data_rep = (tbft_data_rep_t *)r->out_buf;
         data_rep->hdr.tag     = TBFT_MSG_DATA;
@@ -1690,6 +1742,18 @@ void tbft_replica_handle_fetch(tbft_replica_t *r, const void *msg, int len)
         count = n_children - first_child;
     }
     if (count <= 0) return;
+
+    /* Validate Meta_data message fits in out_buf before construction.
+     * Even with TBFT_P_CHILDREN tuned to avoid overflow, the dynamic
+     * count at sub-root levels can produce edge-case overruns. */
+    {
+        size_t needed = sizeof(tbft_meta_data_rep_t) + (size_t)count * sizeof(tbft_part_info_t);
+        if (needed > sizeof(r->out_buf)) {
+            ESP_LOGE(TAG, "handle_fetch: Meta_data response too large for out_buf"
+                     " (%zu > %zu)", needed, sizeof(r->out_buf));
+            return;
+        }
+    }
 
     /* Build Meta_data response */
     uint8_t *out = r->out_buf;
@@ -1739,6 +1803,20 @@ void tbft_replica_handle_meta_data(tbft_replica_t *r, const void *msg, int len)
         (const tbft_part_info_t *)((const uint8_t *)msg + sizeof(*md));
 
     tbft_state_handle_meta_data(&r->state, md, parts, md->n_parts);
+
+    /* If the root-level Meta_data showed all children's digests match,
+     * no fetch requests were enqueued and the state is already in sync.
+     * When n_data_pending == 0 as well (no outstanding leaf fetches),
+     * the fetch is effectively complete. */
+    if (md->level == 0
+        && r->state.fetch_queue_len == 0
+        && r->state.n_data_pending == 0) {
+        tbft_state_fetch_complete(&r->state);
+        ESP_LOGI(TAG, "state fetch completed for seqno=%lld, marking stable",
+                 (long long)r->state.fetch_seqno);
+        tbft_replica_mark_stable(r, r->state.fetch_seqno);
+        return;
+    }
 
     /* Send next fetch requests */
     int level, index;
@@ -2076,9 +2154,17 @@ void tbft_replica_execute_committed(tbft_replica_t *r)
          n <= r->last_prepared;
          n++) {
         if (!tbft_ar_committed(&r->ar, n)) {
-            ESP_LOGW(TAG, "execute: seqno=%lld not committed yet (last_executed=%lld, last_prepared=%lld) — break",
-                     (long long)n, (long long)r->last_executed, (long long)r->last_prepared);
-            break;
+            /* Seqno was skipped by a prior view-change (the new primary
+             * advanced past it after certifying f+1 replicas prepared it).
+             * The new-view should re-propose such seqnos, but the current
+             * implementation does not.  Continue past the gap rather than
+             * breaking, so later committed seqnos can execute and the
+             * cluster can form stable checkpoints. */
+            ESP_LOGI(TAG, "execute: seqno=%lld not committed (skipped by"
+                     " view-change), continuing to next",
+                     (long long)n);
+            r->last_executed = n;
+            continue;
         }
 
         int pp_len = 0;
@@ -2264,6 +2350,12 @@ void tbft_replica_mark_stable(tbft_replica_t *r, tbft_seqno_t seqno)
             ESP_LOGW(TAG, "stable ckpt digest mismatch at seqno=%lld — starting fetch",
                      (long long)seqno);
             if (!r->state.in_fetch || seqno > r->state.fetch_seqno) {
+                /* Fetch from the primary — it's the most likely to have the
+                 * correct state, having just proposed new-view checkpoints.
+                 * A 500ms response throttle in handle_fetch / handle_status
+                 * prevents the primary from being overwhelmed by simultaneous
+                 * fetch requests.  Timeout+retry with round-robin carries
+                 * the load to other replicas naturally. */
                 tbft_replica_start_fetch(r, seqno,
                                         tbft_node_primary(&r->node, r->node.view));
             }
