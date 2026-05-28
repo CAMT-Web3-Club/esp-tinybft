@@ -177,7 +177,7 @@ int tbft_replica_init(tbft_replica_t *r,
     r->seqno                    = 1;
     r->last_stable              = 0;
     r->last_ckpt_throttle_us    = 0;
-    r->last_fetch_response_us   = 0;
+    r->last_fetch_throttle_us    = 0;
     r->last_prepared            = 0;
     r->last_executed            = 0;
     r->last_tentative_execute   = 0;
@@ -1607,6 +1607,8 @@ static void handle_status(tbft_replica_t *r, const void *msg, int len)
             int replier = tbft_node_primary(&r->node, st->view);
             ESP_LOGI(TAG, "view catch-up triggered state fetch to seqno=%lld"
                      " from primary %d", (long long)st->last_stable, replier);
+            /* Stagger fetch starts to avoid all replicas fetching at once. */
+            r->last_fetch_throttle_us = esp_timer_get_time();
             tbft_replica_start_fetch(r, st->last_stable, replier);
         }
 
@@ -1621,7 +1623,12 @@ static void handle_status(tbft_replica_t *r, const void *msg, int len)
     if (st->last_executed > r->last_executed
         && (!r->state.in_fetch || st->last_stable > r->state.fetch_seqno)
         && st->last_executed - r->last_executed > TBFT_CHECKPOINT_INTERVAL) {
-        tbft_replica_start_fetch(r, st->last_stable, st->id);
+        /* Rate-limit fetch starts to avoid flooding. */
+        int64_t now = esp_timer_get_time();
+        if (now - r->last_fetch_throttle_us >= 500000LL) {
+            r->last_fetch_throttle_us = now;
+            tbft_replica_start_fetch(r, st->last_stable, st->id);
+        }
     }
 
     /* Check if peer B (st->id) is behind our execution or stable point.
@@ -1674,16 +1681,6 @@ void tbft_replica_handle_fetch(tbft_replica_t *r, const void *msg, int len)
     if (fetch->id < 0 || fetch->id >= r->node.num_replicas) {
         ESP_LOGW(TAG, "fetch: invalid sender id %d", fetch->id);
         return;
-    }
-
-    /* Rate-limit fetch responses.  When many replicas detect a checkpoint
-     * mismatch simultaneously, they all send Fetch to the same target.
-     * Responding to all of them in a burst floods the send queue and can
-     * prevent consensus messages from being delivered. */
-    {
-        int64_t now_us = esp_timer_get_time();
-        if (now_us - r->last_fetch_response_us < 500000LL) return;
-        r->last_fetch_response_us = now_us;
     }
 
     /* Respond with Meta_data for the requested level/index */
@@ -2357,12 +2354,17 @@ void tbft_replica_mark_stable(tbft_replica_t *r, tbft_seqno_t seqno)
             ESP_LOGW(TAG, "stable ckpt digest mismatch at seqno=%lld — starting fetch",
                      (long long)seqno);
             if (!r->state.in_fetch || seqno > r->state.fetch_seqno) {
-                /* Fetch from the primary — it's the most likely to have the
-                 * correct state, having just proposed new-view checkpoints.
-                 * A 500ms response throttle in handle_fetch / handle_status
-                 * prevents the primary from being overwhelmed by simultaneous
-                 * fetch requests.  Timeout+retry with round-robin carries
-                 * the load to other replicas naturally. */
+                /* Rate-limit fetch initiation to prevent a checkpoint
+                 * mismatch detected by all replicas simultaneously from
+                 * flooding the network.  The throttle is on the INITIATOR
+                 * side — the replica that needs data paces its requests
+                 * rather than silently dropping them at the responder.
+                 * 500ms between fetch starts gives the network time to
+                 * deliver the response before the next request. */
+                int64_t now_us = esp_timer_get_time();
+                if (now_us - r->last_fetch_throttle_us < 500000LL) return;
+                r->last_fetch_throttle_us = now_us;
+
                 tbft_replica_start_fetch(r, seqno,
                                         tbft_node_primary(&r->node, r->node.view));
             }
