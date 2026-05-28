@@ -1612,9 +1612,21 @@ static void handle_status(tbft_replica_t *r, const void *msg, int len)
             tbft_replica_start_fetch(r, st->last_stable, replier);
         }
 
+        /* Use exponential backoff so the view-change timer grows with each
+         * successive failure.  Without this, Status-based view catch-up
+         * resets the timer to 1× base every cycle, and the backoff in
+         * send_view_change never takes effect. */
+        int view_gap = (int)(st->view - r->node.view);
+        int shift = view_gap;
+        if (shift < 1) shift = 1;
+        if (shift > 6) shift = 6;
+        int64_t period = r->vtimer_period_us * (1LL << shift);
+        if (period > r->vtimer_period_us * TBFT_VC_BACKOFF_MAX_MULT) {
+            period = r->vtimer_period_us * TBFT_VC_BACKOFF_MAX_MULT;
+        }
         tbft_itimer_stop(&r->vtimer);
         if (tbft_replica_has_pending_requests(r)) {
-            tbft_itimer_start(&r->vtimer, r->vtimer_period_us);
+            tbft_itimer_start(&r->vtimer, period);
         } else {
             tbft_itimer_stop(&r->vtimer);
         }
