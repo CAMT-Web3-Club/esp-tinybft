@@ -1507,6 +1507,21 @@ void tbft_replica_handle_new_view(tbft_replica_t *r, const void *msg, int len)
      * Patching head after init is safe: all slices are clean. */
     tbft_ar_init(&r->ar, r->ar.prepare_threshold, r->ar.commit_threshold);
     r->ar.head = nv->min + 1;
+
+    /* When nv->min is 0 (no stable checkpoint) but nv->n_prep carries
+     * prepared seqnos from a prior view, r->seqno can land beyond the
+     * window [nv->min+1, nv->min+1+WINDOW_SIZE).  Advance the head so
+     * the primary can propose within range rather than being permanently
+     * blocked with "pre-prepare: seqno out of window". */
+    if (r->seqno >= r->ar.head + TBFT_WINDOW_SIZE) {
+        ESP_LOGI(TAG, "new-view: advancing window head from %lld"
+                 " to %lld for seqno coverage",
+                 (long long)r->ar.head, (long long)r->seqno);
+        tbft_ar_truncate(&r->ar, r->seqno);
+        r->last_stable   = r->seqno - 1;
+        r->last_executed = r->last_stable;
+        r->last_prepared = r->last_stable;
+    }
     r->last_prepared = r->last_executed;
     if (tbft_replica_is_primary(r)) {
         ESP_LOGI(TAG, "new primary: seqno reset to %lld", (long long)r->seqno);
