@@ -1508,6 +1508,30 @@ void tbft_replica_handle_new_view(tbft_replica_t *r, const void *msg, int len)
         }
         r->seqno = start_seq + 1;
     }
+
+    /* If prepared proofs from prior views pushed start_seq past our
+     * last_executed, those seqnos were certified as prepared by f+1
+     * replicas.  Advance last_executed so the execution loop doesn't
+     * encounter an uncommitted gap and break permanently — the proofs
+     * confirm these were handled in a prior view. */
+    if (nv->n_prep > 0) {
+        const uint8_t *proofs_ptr = (const uint8_t *)msg + sizeof(*nv);
+        for (int p = 0; p < nv->n_prep; p++) {
+            const tbft_vc_req_info_t *proof =
+                (const tbft_vc_req_info_t *)(proofs_ptr + p * sizeof(tbft_vc_req_info_t));
+            if (proof->seqno > r->last_executed) {
+                ESP_LOGI(TAG, "new-view: advancing last_executed from %lld"
+                         " to %lld (prepared proof from view %lld)",
+                         (long long)r->last_executed,
+                         (long long)proof->seqno,
+                         (long long)proof->last_view);
+                r->last_executed = proof->seqno;
+                if (r->last_prepared < proof->seqno)
+                    r->last_prepared = proof->seqno;
+            }
+        }
+    }
+
     /* Advance local markers to nv->min so tbft_replica_in_window is consistent
      * with ar.head = nv->min + 1.  nv->min is the highest stable checkpoint
      * seqno proven by the view-change quorum, so advancing is safe. */
@@ -2235,33 +2259,19 @@ void tbft_replica_execute_committed(tbft_replica_t *r)
          n <= r->last_prepared;
          n++) {
         if (!tbft_ar_committed(&r->ar, n)) {
-            /* Seqno was skipped by a prior view-change (the new primary
-             * advanced past it after certifying f+1 replicas prepared it).
-             * The new-view should re-propose such seqnos, but the current
-             * implementation does not.  Continue past the gap rather than
-             * breaking, so later committed seqnos can execute and the
-             * cluster can form stable checkpoints. */
-            ESP_LOGI(TAG, "execute: seqno=%lld not committed (skipped by"
-                     " view-change), continuing to next",
-                     (long long)n);
-            r->last_executed = n;
-            continue;
+            ESP_LOGW(TAG, "execute: seqno=%lld not committed yet"
+                     " (last_executed=%lld, last_prepared=%lld) — break",
+                     (long long)n, (long long)r->last_executed,
+                     (long long)r->last_prepared);
+            break;
         }
 
         int pp_len = 0;
         const uint8_t *pp_buf = tbft_ar_load_pp(&r->ar, n, &pp_len);
         if (!pp_buf) {
-            /* UDP transport can drop the pre-prepare (592B) while
-             * smaller Prepare/Commit (264B) messages arrive and form
-             * a commit quorum.  Without the pre-prepare we can't
-             * execute, but continuing (instead of breaking) lets
-             * later seqnos with intact pre-prepares execute.
-             * The missing seqno's state will be corrected at the
-             * next stable checkpoint via fetch. */
-            ESP_LOGW(TAG, "execute: no pre-prepare for seqno=%lld"
-                     " — continuing", (long long)n);
-            r->last_executed = n;
-            continue;
+            ESP_LOGW(TAG, "execute: no pre-prepare for seqno=%lld — break",
+                     (long long)n);
+            break;
         }
 
         const tbft_pre_prepare_rep_t *pp =
