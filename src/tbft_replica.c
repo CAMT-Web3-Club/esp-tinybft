@@ -72,6 +72,13 @@ static void rqueue_pop(tbft_rqueue_t *q) {
     q->count--;
 }
 
+static void rqueue_clear(tbft_rqueue_t *q) {
+    memset(q->entries, 0, sizeof(q->entries));
+    q->head  = 0;
+    q->tail  = 0;
+    q->count = 0;
+}
+
 /* --------------------------------------------------------------------------
  * Timer callbacks
  * -------------------------------------------------------------------------- */
@@ -97,6 +104,12 @@ static void tbft_replica_reset_forwarded_requests(tbft_replica_t *r)
     for (int i = 0; i < r->node.num_principals; i++) {
         r->last_forwarded_rid[i] = r->last_executed_rid[i];
     }
+    /* Clear the request queue so stale entries from prior views
+     * don't block fresh client requests.  Without this, a queue
+     * full of orphaned-forwards prevents new requests from
+     * reaching the front, producing infinite client timeouts. */
+    rqueue_clear(&r->rqueue);
+    rqueue_clear(&r->ro_rqueue);
 }
 
 bool tbft_replica_has_pending_requests(const tbft_replica_t *r)
