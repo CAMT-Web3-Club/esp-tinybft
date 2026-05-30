@@ -2223,8 +2223,17 @@ void tbft_replica_execute_committed(tbft_replica_t *r)
         int pp_len = 0;
         const uint8_t *pp_buf = tbft_ar_load_pp(&r->ar, n, &pp_len);
         if (!pp_buf) {
-            ESP_LOGW(TAG, "execute: no pre-prepare for seqno=%lld — break", (long long)n);
-            break;
+            /* UDP transport can drop the pre-prepare (592B) while
+             * smaller Prepare/Commit (264B) messages arrive and form
+             * a commit quorum.  Without the pre-prepare we can't
+             * execute, but continuing (instead of breaking) lets
+             * later seqnos with intact pre-prepares execute.
+             * The missing seqno's state will be corrected at the
+             * next stable checkpoint via fetch. */
+            ESP_LOGW(TAG, "execute: no pre-prepare for seqno=%lld"
+                     " — continuing", (long long)n);
+            r->last_executed = n;
+            continue;
         }
 
         const tbft_pre_prepare_rep_t *pp =
