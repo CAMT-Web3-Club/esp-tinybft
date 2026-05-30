@@ -1203,16 +1203,42 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
              * The old code here called tbft_replica_send_view_change(r) which
              * computed target = r->node.view + 1 = V + 1, overshooting the
              * received view and triggering a cascade to ever-higher views. */
+            /* Restart the vtimer with backoff to give the new primary
+             * for this view a fair chance without resetting to 1×. */
+            tbft_itimer_stop(&r->vtimer);
+            if (tbft_replica_has_pending_requests(r)) {
+                int shift = (int)(vc->v - r->node.view);
+                if (shift < 1) shift = 1;
+                if (shift > 6) shift = 6;
+                int64_t period = r->vtimer_period_us * (1LL << shift);
+                if (period > r->vtimer_period_us * TBFT_VC_BACKOFF_MAX_MULT) {
+                    period = r->vtimer_period_us * TBFT_VC_BACKOFF_MAX_MULT;
+                }
+                tbft_itimer_start(&r->vtimer, period);
+            }
+        }
+        return;
+    }
+
+    if (vc->v > r->vi.target_view) {
+        tbft_vi_reset(&r->vi, vc->v);
+        tbft_vi_collect_vc(&r->vi, vc->id, msg, len);
+        if (vc->v == r->vi.target_view && tbft_vi_has_quorum(&r->vi)) {
             /* Sync vi state so subsequent New_view for this view validates */
             r->vi.target_view = vc->v;
             r->vi.in_progress = false;
-            /* Restart the vtimer to give the new primary (sender of vc->v)
-             * a full grace period.  Without this, the old timer's remaining
-             * time (possibly near-expiry from 2x backoff) would make us
-             * trigger a premature view-change for v+1. */
+            /* Restart the vtimer with backoff to give the new primary
+             * for this view a fair chance without resetting to 1×. */
             tbft_itimer_stop(&r->vtimer);
             if (tbft_replica_has_pending_requests(r)) {
-                tbft_itimer_start(&r->vtimer, r->vtimer_period_us);
+                int shift = (int)(vc->v - r->node.view);
+                if (shift < 1) shift = 1;
+                if (shift > 6) shift = 6;
+                int64_t period = r->vtimer_period_us * (1LL << shift);
+                if (period > r->vtimer_period_us * TBFT_VC_BACKOFF_MAX_MULT) {
+                    period = r->vtimer_period_us * TBFT_VC_BACKOFF_MAX_MULT;
+                }
+                tbft_itimer_start(&r->vtimer, period);
             }
         }
         return;
@@ -1514,13 +1540,24 @@ void tbft_replica_handle_new_view(tbft_replica_t *r, const void *msg, int len)
         }
     }
 
-    /* Stop view-change timer and restart it */
+    /* Stop view-change timer and restart it with backoff.
+     * The base-period restart from the old code (vtimer_period_us)
+     * defeated the exponential backoff — every new-view install
+     * reset the timer to 1×, so send_view_change's doubled period
+     * never survived more than one view. */
     tbft_itimer_stop(&r->vtimer);
     tbft_vi_reset(&r->vi, nv->v + 1);
     r->vi.in_progress = false;
 
     if (tbft_replica_has_pending_requests(r)) {
-        tbft_itimer_start(&r->vtimer, r->vtimer_period_us);
+        int shift = (int)(nv->v - r->node.view);
+        if (shift < 1) shift = 1;
+        if (shift > 6) shift = 6;
+        int64_t period = r->vtimer_period_us * (1LL << shift);
+        if (period > r->vtimer_period_us * TBFT_VC_BACKOFF_MAX_MULT) {
+            period = r->vtimer_period_us * TBFT_VC_BACKOFF_MAX_MULT;
+        }
+        tbft_itimer_start(&r->vtimer, period);
     } else {
         tbft_itimer_stop(&r->vtimer);
     }
