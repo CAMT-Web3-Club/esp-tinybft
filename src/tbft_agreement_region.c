@@ -119,11 +119,13 @@ void tbft_ar_truncate(tbft_agreement_region_t *ar, tbft_seqno_t new_head)
 {
     if (new_head <= ar->head) return;
 
-    /* M1 FIX: Cap delta to TBFT_WINDOW_SIZE to prevent a large new_head
-     * jump from iterating billions of times (freezing the replica). The
-     * circular buffer only has TBFT_WINDOW_SIZE slots; advancing beyond
-     * that wraps around multiple times, clearing the same slots repeatedly. */
-    tbft_seqno_t delta = new_head - ar->head;
+    tbft_seqno_t old_head   = ar->head;
+    tbft_seqno_t full_delta = new_head - old_head;
+
+    /* Cap the CLEAR loop to WINDOW_SIZE to prevent iterating billions
+     * of times on a large fetch jump.  The circular buffer only has
+     * WINDOW_SIZE slots, so clearing all of them is sufficient. */
+    tbft_seqno_t delta = full_delta;
     if (delta > TBFT_WINDOW_SIZE) delta = TBFT_WINDOW_SIZE;
 
     for (tbft_seqno_t i = 0; i < delta; i++) {
@@ -132,6 +134,12 @@ void tbft_ar_truncate(tbft_agreement_region_t *ar, tbft_seqno_t new_head)
         tbft_commit_cert_clear(&ar->slices[idx].commit_cert);
         ar->slices[idx].commit_sent_us = 0;
     }
-    ar->head_idx = (int)((ar->head_idx + (int)delta) & ar->mask);
-    ar->head = ar->head + delta;
+
+    /* Advance the circular pointer by the FULL jump so the head lands
+     * at new_head.  Using the capped delta here (ar->head + delta)
+     * would leave the head far behind new_head when the jump exceeds
+     * the window, causing tbft_ar_in_range() to permanently reject all
+     * consensus messages. */
+    ar->head_idx = (int)((ar->head_idx + (int)full_delta) & ar->mask);
+    ar->head     = new_head;
 }

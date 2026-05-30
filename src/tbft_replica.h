@@ -63,6 +63,8 @@ typedef struct {
     int           last_assigned_cid;      /* last cid assigned a seqno (dedup) */
     tbft_req_id_t last_assigned_rid;      /* last rid assigned a seqno (dedup) */
     tbft_seqno_t  last_stable;            /* last stable checkpoint seqno */
+    int64_t       last_ckpt_throttle_us;   /* last time we sent catch-up checkpoints */
+    int64_t       last_fetch_throttle_us;   /* last time we initiated a state fetch */
     tbft_seqno_t  last_prepared;          /* highest prepared seqno */
     tbft_seqno_t  last_executed;          /* highest committed + executed */
     tbft_seqno_t  last_tentative_execute; /* highest tentatively executed */

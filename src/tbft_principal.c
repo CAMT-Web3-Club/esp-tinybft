@@ -42,17 +42,28 @@ static portMUX_TYPE s_psa_spinlock = portMUX_INITIALIZER_UNLOCKED;
 static void ensure_psa_init(void)
 {
     if (s_psa_init) return;
+
+    /* Claim the init responsibility under spinlock so only one caller
+     * proceeds, but release before calling psa_crypto_init() — that
+     * routine may allocate heap or take OS objects and must NOT run
+     * inside a critical section (interrupts disabled). */
+    bool do_init = false;
     portENTER_CRITICAL(&s_psa_spinlock);
     if (!s_psa_init) {
+        do_init = true;
+    }
+    portEXIT_CRITICAL(&s_psa_spinlock);
+
+    if (do_init) {
         psa_status_t st = psa_crypto_init();
         if (st == PSA_SUCCESS) {
+            portENTER_CRITICAL(&s_psa_spinlock);
             s_psa_init = true;
-        } else {
             portEXIT_CRITICAL(&s_psa_spinlock);
+        } else {
             abort();
         }
     }
-    portEXIT_CRITICAL(&s_psa_spinlock);
 }
 
 void tbft_principal_ensure_psa(void)

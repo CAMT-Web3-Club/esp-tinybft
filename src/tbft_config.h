@@ -65,6 +65,14 @@
 #define TBFT_STATUS_TIMEOUT_US       CONFIG_TBFT_STATUS_TIMEOUT_US
 #endif
 
+#ifndef TBFT_RECOVERY_TIMEOUT_US
+#ifdef CONFIG_TBFT_RECOVERY_TIMEOUT_US
+#define TBFT_RECOVERY_TIMEOUT_US     CONFIG_TBFT_RECOVERY_TIMEOUT_US
+#else
+#define TBFT_RECOVERY_TIMEOUT_US     2500000LL
+#endif
+#endif
+
 #ifndef TBFT_CLIENT_REPLY_TIMEOUT_MS
 #define TBFT_CLIENT_REPLY_TIMEOUT_MS  CONFIG_TBFT_CLIENT_REPLY_TIMEOUT_MS
 #endif
@@ -94,7 +102,7 @@
 
 /* Partition tree: children per internal node */
 #define TBFT_P_CHILDREN          \
-    ((TBFT_MAX_MESSAGE_SIZE - 32) / (TBFT_DIGEST_SIZE + sizeof(int32_t)))
+    ((TBFT_MAX_MESSAGE_SIZE - 40) / (TBFT_DIGEST_SIZE + sizeof(int32_t)))
 
 /* --------------------------------------------------------------------------
  * Static assertions (compile-time validation)
