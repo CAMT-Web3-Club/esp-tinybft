@@ -386,14 +386,9 @@ static int espnow_do_send(tbft_espnow_t *enow, tbft_node_id_t dest_id, uint16_t 
 
     const uint8_t *ap_mac = enow->peer_ap_mac[dest_id];
 
-    /* CRITICAL FIX: Add per-fragment retry with exponential backoff.
-     * Without this, a single ESP-NOW send failure causes complete message
-     * loss, triggering unnecessary view-changes in the BFT protocol. */
     const int MAX_RETRIES = 3;
     const TickType_t credit_timeout = pdMS_TO_TICKS(ESPNOW_CREDIT_TIMEOUT_MS);
 
-    /* Use stack buffer for packet assembly. Safe because send_task is
-     * the sole caller and this function does not yield. */
     uint8_t pkt[sizeof(frag_hdr_t) + FRAG_MAX_PAYLOAD] __attribute__((aligned(4)));
 
     if (len + sizeof(frag_hdr_t) <= ESPNOW_MAX_DATA_LEN) {
@@ -429,6 +424,18 @@ static int espnow_do_send(tbft_espnow_t *enow, tbft_node_id_t dest_id, uint16_t 
 
     frag_hdr_t fhdr = { .msg_id = msg_id, .frag_total = frag_total };
 
+    int credits_held = 0;
+    for (int j = 0; j < frag_total; j++) {
+        if (xSemaphoreTake(enow->send_credit_sem, credit_timeout) != pdTRUE) {
+            for (int k = 0; k < j; k++)
+                xSemaphoreGive(enow->send_credit_sem);
+            ESP_LOGW(TAG, "espnow_do_send: cannot pre-acquire %d credits (got %d/%d)",
+                     frag_total, j, frag_total);
+            return -1;
+        }
+        credits_held++;
+    }
+
     while (remaining > 0) {
         fhdr.frag_idx = frag_idx;
         size_t chunk = remaining > FRAG_MAX_PAYLOAD ? FRAG_MAX_PAYLOAD : remaining;
@@ -438,14 +445,7 @@ static int espnow_do_send(tbft_espnow_t *enow, tbft_node_id_t dest_id, uint16_t 
 
         int retries = 0;
         while (retries < MAX_RETRIES) {
-            if (xSemaphoreTake(enow->send_credit_sem, credit_timeout) != pdTRUE) {
-                ESP_LOGW(TAG, "espnow_do_send: no send credit after %dms (frag %d/%d), dropping",
-                         ESPNOW_CREDIT_TIMEOUT_MS,
-                         frag_idx + 1, frag_total);
-                return -1;
-            }
             if (esp_now_send(ap_mac, pkt, chunk + sizeof(fhdr)) == ESP_OK) break;
-            xSemaphoreGive(enow->send_credit_sem);
             retries++;
             if (retries < MAX_RETRIES) {
                 vTaskDelay(pdMS_TO_TICKS(FRAG_INTER_DELAY_MS * retries));
@@ -454,12 +454,15 @@ static int espnow_do_send(tbft_espnow_t *enow, tbft_node_id_t dest_id, uint16_t 
         if (retries == MAX_RETRIES) {
             ESP_LOGW(TAG, "espnow_do_send: fragment %d/%d failed after %d retries",
                      frag_idx + 1, frag_total, MAX_RETRIES);
+            for (int j = 0; j < credits_held; j++)
+                xSemaphoreGive(enow->send_credit_sem);
             return -1;
         }
 
         src += chunk;
         remaining -= chunk;
         frag_idx++;
+        credits_held--;
     }
     return (int)len;
 }
