@@ -400,7 +400,8 @@ static int espnow_do_send(tbft_espnow_t *enow, tbft_node_id_t dest_id, uint16_t 
         int retries = 0;
         while (retries < MAX_RETRIES) {
             if (xSemaphoreTake(enow->send_credit_sem, credit_timeout) != pdTRUE) {
-                ESP_LOGW(TAG, "espnow_do_send: no send credit after 100ms, dropping");
+                ESP_LOGW(TAG, "espnow_do_send: no send credit after %dms, dropping",
+                         ESPNOW_CREDIT_TIMEOUT_MS);
                 return -1;
             }
             if (esp_now_send(ap_mac, pkt, len + sizeof(fhdr)) == ESP_OK) break;
@@ -434,7 +435,8 @@ static int espnow_do_send(tbft_espnow_t *enow, tbft_node_id_t dest_id, uint16_t 
         int retries = 0;
         while (retries < MAX_RETRIES) {
             if (xSemaphoreTake(enow->send_credit_sem, credit_timeout) != pdTRUE) {
-                ESP_LOGW(TAG, "espnow_do_send: no send credit after 100ms (frag %d/%d), dropping",
+                ESP_LOGW(TAG, "espnow_do_send: no send credit after %dms (frag %d/%d), dropping",
+                         ESPNOW_CREDIT_TIMEOUT_MS,
                          frag_idx + 1, frag_total);
                 return -1;
             }
