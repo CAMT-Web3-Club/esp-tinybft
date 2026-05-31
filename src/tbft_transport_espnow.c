@@ -45,7 +45,7 @@ static const char *TAG = "tbft_espnow";
 
 #define MSG_QUEUE_DEPTH     16
 #define SEND_QUEUE_DEPTH    8
-#define SEND_TASK_PRIORITY  7
+#define SEND_TASK_PRIORITY  5
 #define SEND_TASK_STACK_SIZE 8192
 #define SEND_TASK_RECV_TIMEOUT_MS  50
 #define RECV_TASK_TIMEOUT_MS  100
@@ -518,6 +518,7 @@ static void espnow_send_task(void *pvParameters) {
                     ESP_LOGW(TAG, "send: skipping broadcast to node %d — peer not registered", i);
                 }
             }
+            taskYIELD();
         } else if (entry.dest >= 0 && entry.dest < enow->num_nodes) {
             xSemaphoreTake(enow->lock, portMAX_DELAY);
             bool valid = enow->peer_valid[entry.dest];
@@ -532,6 +533,7 @@ static void espnow_send_task(void *pvParameters) {
             } else {
                 ESP_LOGW(TAG, "send: skipping unicast to node %d — peer not registered", entry.dest);
             }
+            taskYIELD();
         }
     }
 }
