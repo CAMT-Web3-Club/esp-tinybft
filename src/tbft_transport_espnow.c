@@ -51,7 +51,13 @@ static const char *TAG = "tbft_espnow";
 #define RECV_TASK_TIMEOUT_MS  100
 #define SEND_QUEUE_TIMEOUT_MS 100
 #define SHUTDOWN_DRAIN_MS     200
-#define ESPNOW_TX_CREDITS     4    /* ESP-NOW internal TX queue ~6; credit-based flow control */
+/* ESP-NOW credits = peers per broadcast, capped at empirically-determined TX queue depth.
+ * ESP-NOW driver is a precompiled blob; internal queue size is not documented.
+ * The cap of 6 was determined by observation: >6 outstanding sends causes silent drops. */
+#define ESPNOW_CREDITS_PER_CLUSTER  ((TBFT_MAX_NUM_REPLICAS - 1U))
+#define ESPNOW_CREDITS_CAP          6
+#define ESPNOW_TX_CREDITS           ((ESPNOW_CREDITS_PER_CLUSTER) < (ESPNOW_CREDITS_CAP) ? (ESPNOW_CREDITS_PER_CLUSTER) : (ESPNOW_CREDITS_CAP))
+#define ESPNOW_CREDIT_TIMEOUT_MS    250
 
 #define SEND_TASK_SHUTDOWN  -999
 _Static_assert(SEND_TASK_SHUTDOWN < 0, "SEND_TASK_SHUTDOWN must be negative");
@@ -380,7 +386,7 @@ static int espnow_do_send(tbft_espnow_t *enow, tbft_node_id_t dest_id, uint16_t 
      * Without this, a single ESP-NOW send failure causes complete message
      * loss, triggering unnecessary view-changes in the BFT protocol. */
     const int MAX_RETRIES = 3;
-    const TickType_t credit_timeout = pdMS_TO_TICKS(100);
+    const TickType_t credit_timeout = pdMS_TO_TICKS(ESPNOW_CREDIT_TIMEOUT_MS);
 
     /* Use stack buffer for packet assembly. Safe because send_task is
      * the sole caller and this function does not yield. */
