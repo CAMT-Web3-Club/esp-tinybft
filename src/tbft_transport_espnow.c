@@ -68,7 +68,7 @@ static const char *TAG = "tbft_espnow";
 #define ESPNOW_CREDITS_CAP          CONFIG_TBFT_ESPNOW_TX_CREDITS
 #endif
 #define ESPNOW_TX_CREDITS           ((ESPNOW_CREDITS_PER_CLUSTER) < (ESPNOW_CREDITS_CAP) ? (ESPNOW_CREDITS_PER_CLUSTER) : (ESPNOW_CREDITS_CAP))
-#define ESPNOW_CREDIT_TIMEOUT_MS    250
+#define ESPNOW_CREDIT_TIMEOUT_MS    100
 
 #define SEND_TASK_SHUTDOWN  -999
 _Static_assert(SEND_TASK_SHUTDOWN < 0, "SEND_TASK_SHUTDOWN must be negative");
@@ -393,7 +393,7 @@ static int espnow_do_send(tbft_espnow_t *enow, tbft_node_id_t dest_id, uint16_t 
 
     const uint8_t *ap_mac = enow->peer_ap_mac[dest_id];
 
-    const int MAX_RETRIES = 3;
+    const int MAX_RETRIES = 2;
     const TickType_t credit_timeout = pdMS_TO_TICKS(ESPNOW_CREDIT_TIMEOUT_MS);
 
     uint8_t pkt[sizeof(frag_hdr_t) + FRAG_MAX_PAYLOAD] __attribute__((aligned(4)));
@@ -521,13 +521,6 @@ static void espnow_send_task(void *pvParameters) {
                     ESP_LOGI(TAG, "send_task: broadcast to node %d → %s (rc=%d)", i, rc > 0 ? "OK" : "FAIL", rc);
                 } else {
                     ESP_LOGW(TAG, "send: skipping broadcast to node %d — peer not registered", i);
-                }
-
-                /* Drain credits between peers: let WiFi task process TX callbacks
-                 * so the ESP-NOW driver's internal queue never exceeds ~2 in-flight
-                 * sends, avoiding silent drops when credit cap > 6. */
-                if (i != limit - 1 && valid) {
-                    vTaskDelay(pdMS_TO_TICKS(10));
                 }
             }
             taskYIELD();
