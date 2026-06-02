@@ -427,6 +427,7 @@ typedef struct {
     tbft_seqno_t  last_prepared;
     tbft_seqno_t  last_executed;
     tbft_seqno_t  last_tentative_execute;
+    tbft_seqno_t  pending_fill_seqno;     /* 0 = none; otherwise request fill PP for this seqno from primary */
 
     /* Request queues */
     tbft_rqueue_t rqueue;     /* read-write */
@@ -487,6 +488,7 @@ case TBFT_MSG_FETCH:       tbft_replica_handle_fetch(r, buf, n);      break;
 case TBFT_MSG_META_DATA:   tbft_replica_handle_meta_data(r, buf, n);  break;
 case TBFT_MSG_DATA:        tbft_replica_handle_data(r, buf, n);       break;
 case TBFT_MSG_STATUS:      handle_status(r, buf, n);                  break;
+case TBFT_MSG_FILL_REQUEST: tbft_replica_handle_fill_request(r, buf, n); break;
 default: /* ignored */
 }
 ```
@@ -551,19 +553,21 @@ Every message handler performs bounds and identity checks before touching protoc
 | `handle_view_change` | `sender_id >= 0 && sender_id < num_replicas`; `body_size >= sizeof(tbft_view_change_rep_t)` and `body_size <= len` |
 | `handle_fetch` | `fetch->id >= 0 && fetch->id < num_replicas` |
 | `handle_meta_data` | `n_parts >= 0 && n_parts <= TBFT_P_CHILDREN`; then size arithmetic `sizeof(rep) + n_parts * sizeof(tbft_part_info_t) <= len` |
+| `handle_fill_request` | `len >= sizeof(tbft_fill_request_rep_t)`; `fr->view == r->node.view`; `tbft_node_primary(fr->view) == node_id` (must be primary); `fr->id in [0, num_replicas)` and `fr->id != node_id`; HMAC verify via `tbft_principal_verify_mac_in` |
 | `send_pre_prepare` | `aligned_needed <= sizeof(r->out_buf)` guard before writing Pre-prepare to `out_buf` |
 
 ### execute_committed Flow
 
-For each `n` from `last_executed + 1` upward while committed in AR:
-1. Load Pre-prepare from AR
-2. Extract request bytes, non-det bytes from Pre-prepare
-3. Call `exec_cb` with request, reply buffer, non-det, client ID, read-only flag
-4. If exec succeeds, build Reply message (with view, seqno, cid, rid, reply payload)
-5. Send Reply to client (via `tbft_node_send` to client's principal index)
-6. Call `recv_reply_cb` if set
-7. Update `last_executed = n`
-8. If `n % TBFT_CHECKPOINT_INTERVAL == 0`: call `state_checkpoint`, build and broadcast Checkpoint message
+For each `n` from `last_executed + 1` upward:
+1. **Gap-stall guard:** if `!tbft_ar_committed(&r->ar, n)` or no pre-prepare stored for `n`, set `r->pending_fill_seqno = n`, log a warning, and break. The main loop will send a `Fill_request` to the primary (rate-limited 500ms per-slice) to re-send the missing pre-prepare. The natural prepare/commit flow then closes the gap.
+2. Load Pre-prepare from AR
+3. Extract request bytes, non-det bytes from Pre-prepare
+4. Call `exec_cb` with request, reply buffer, non-det, client ID, read-only flag
+5. If exec succeeds, build Reply message (with view, seqno, cid, rid, reply payload)
+6. Send Reply to client (via `tbft_node_send` to client's principal index)
+7. Call `recv_reply_cb` if set
+8. Update `last_executed = n`. Clear `pending_fill_seqno` if it equals `n` (gap closed).
+9. If `n % TBFT_CHECKPOINT_INTERVAL == 0`: call `state_checkpoint`, build and broadcast Checkpoint message
 
 ### mark_stable Flow
 
@@ -794,7 +798,7 @@ Complete when ALL of:
 
 ## 10. Message Types
 
-All 17 message tags defined in `src/tbft_message.h`:
+All 18 message tags defined in `src/tbft_message.h`:
 
 | Tag | Value | Struct | Direction | Auth |
 |---|---|---|---|---|
@@ -815,6 +819,7 @@ All 17 message tags defined in `src/tbft_message.h`:
 | `TBFT_MSG_FETCH` | 15 | `tbft_fetch_rep_t` | Fetching -> Replier | None |
 | `TBFT_MSG_QUERY_STABLE` | 16 | `tbft_query_stable_rep_t` | Replica -> All | None |
 | `TBFT_MSG_REPLY_STABLE` | 17 | `tbft_reply_stable_rep_t` | Replica -> Querier | None |
+| `TBFT_MSG_FILL_REQUEST` | 18 | `tbft_fill_request_rep_t` | Backup -> Primary | HMAC |
 
 ### Common Header
 

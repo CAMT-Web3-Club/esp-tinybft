@@ -195,6 +195,10 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for full documentation covering
 
 ## Changelog
 
+### v0.2.13
+
+- **Gap-fill (`Fill_request`):** Replicas can request a re-sent pre-prepare from the primary when commits arrive out of order. Closes the gap-stall bug where `seqno N+1` would commit before `N`, causing the execution loop to freeze for minutes until a view-change. The new `TBFT_MSG_FILL_REQUEST` (tag 18) is a 72-byte HMAC-authenticated unicast; the primary re-sends the original stored pre-prepare bytes (still HMAC-valid), letting the backup run the normal prepare/commit flow and close the gap. No protocol correctness regression.
+
 ### v0.2.0
 
 All core PBFT protocol bugs fixed — system now reaches consensus end-to-end:
