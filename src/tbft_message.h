@@ -26,6 +26,7 @@ typedef enum {
     TBFT_MSG_FETCH           = 15,
     TBFT_MSG_QUERY_STABLE    = 16,
     TBFT_MSG_REPLY_STABLE    = 17,
+    TBFT_MSG_FILL_REQUEST    = 18, /* backup → primary: resend pre-prepare for seqno */
 } tbft_msg_tag_t;
 
 /* --------------------------------------------------------------------------
@@ -305,6 +306,28 @@ typedef struct __attribute__((packed)) {
     int32_t         id;
     int32_t         _pad;
 } tbft_reply_stable_rep_t;
+
+/* --------------------------------------------------------------------------
+ * Fill_request  (tag = 18)  Replica → Primary
+ * Wire: [hdr][Fill_request_rep][mac]
+ *
+ * Backup asks the primary to re-send the pre-prepare it previously broadcast
+ * for `seqno`.  This is used to recover from out-of-order message delivery:
+ * if a commit for seqno N+1 is received but seqno N is not, the backup has
+ * likely lost the original pre-prepare for N — without it, N is never
+ * prepared, never committed, and the execution loop stalls.  The primary
+ * responds by re-sending the stored pre-prepare bytes (still HMAC-valid),
+ * which lets the backup run the normal prepare/commit flow and close the gap.
+ * -------------------------------------------------------------------------- */
+
+typedef struct __attribute__((packed)) {
+    tbft_msg_hdr_t  hdr;
+    tbft_view_t     view;    /* view the missing PP belongs to */
+    tbft_seqno_t    seqno;   /* the missing seqno */
+    int32_t         id;      /* requester's replica id */
+    int32_t         _pad;
+    tbft_mac_t      mac;     /* HMAC slot for the primary */
+} tbft_fill_request_rep_t;
 
 /* --------------------------------------------------------------------------
  * Generic message wrapper (for in-memory manipulation)

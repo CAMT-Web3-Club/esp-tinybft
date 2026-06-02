@@ -14,7 +14,7 @@ end
 
 # List of replica ports (/dev/ttyACM0 to /dev/ttyACM6)
 # /dev/ttyACM7 is excluded as it is the client node
-set replica_ports /dev/ttyACM0 /dev/ttyACM1 /dev/ttyACM2 /dev/ttyACM7 /dev/ttyACM4 /dev/ttyACM5 /dev/ttyACM6
+set replica_ports /dev/ttyACM3 /dev/ttyACM1 /dev/ttyACM2 /dev/ttyACM7 /dev/ttyACM4 /dev/ttyACM5 /dev/ttyACM6
 
 # Create log directory inside build
 mkdir -p build/flash_logs
@@ -25,7 +25,7 @@ for port in $replica_ports
     if test -e $port
         set -l port_name (basename $port)
         set -l log_file "build/flash_logs/$port_name.log"
-        
+
         # Run flashing in parallel
         begin
             echo "[$port] Flashing started..."
@@ -35,7 +35,7 @@ for port in $replica_ports
                 echo "[$port] FAILED: Flashing failed. See $log_file for details."
             end
         end &
-        
+
         set active_jobs (math $active_jobs + 1)
     else
         echo "Skip: Port $port not found/connected."

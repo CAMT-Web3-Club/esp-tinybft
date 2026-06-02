@@ -45,12 +45,30 @@ static const char *TAG = "tbft_espnow";
 
 #define MSG_QUEUE_DEPTH     16
 #define SEND_QUEUE_DEPTH    8
-#define SEND_TASK_PRIORITY  7
+#ifndef CONFIG_TBFT_ESPNOW_SEND_TASK_PRIORITY
+#define SEND_TASK_PRIORITY  5
+#else
+#define SEND_TASK_PRIORITY  CONFIG_TBFT_ESPNOW_SEND_TASK_PRIORITY
+#endif
 #define SEND_TASK_STACK_SIZE 8192
 #define SEND_TASK_RECV_TIMEOUT_MS  50
 #define RECV_TASK_TIMEOUT_MS  100
 #define SEND_QUEUE_TIMEOUT_MS 100
 #define SHUTDOWN_DRAIN_MS     200
+/* ESP-NOW credits = peers per broadcast, capped at empirically-determined TX queue depth.
+ * ESP-NOW driver is a precompiled blob; internal queue size is not documented.
+ * Cap of 6 keeps the driver below its undocumented internal limit (values >6 cause
+ * silent drops or explicit esp_now_send failures for fragment retries).
+ * Multi-fragment sends acquire/release one credit per fragment (not pre-acquire all),
+ * so 6 credits are sufficient even for 2-fragment broadcasts to 6 peers. */
+#define ESPNOW_CREDITS_PER_CLUSTER  ((TBFT_MAX_NUM_REPLICAS - 1U))
+#ifndef CONFIG_TBFT_ESPNOW_TX_CREDITS
+#define ESPNOW_CREDITS_CAP          6
+#else
+#define ESPNOW_CREDITS_CAP          CONFIG_TBFT_ESPNOW_TX_CREDITS
+#endif
+#define ESPNOW_TX_CREDITS           ((ESPNOW_CREDITS_PER_CLUSTER) < (ESPNOW_CREDITS_CAP) ? (ESPNOW_CREDITS_PER_CLUSTER) : (ESPNOW_CREDITS_CAP))
+#define ESPNOW_CREDIT_TIMEOUT_MS    100
 
 #define SEND_TASK_SHUTDOWN  -999
 _Static_assert(SEND_TASK_SHUTDOWN < 0, "SEND_TASK_SHUTDOWN must be negative");
@@ -119,6 +137,7 @@ typedef struct tbft_espnow {
     SemaphoreHandle_t lock;
     volatile bool reasm_stale_flag;
     volatile bool shutting_down;
+    SemaphoreHandle_t send_credit_sem;
 } tbft_espnow_t;
 
 static tbft_espnow_t *g_espnow_ctx = NULL;
@@ -286,6 +305,9 @@ static void espnow_send_cb(const esp_now_send_info_t *tx_info, esp_now_send_stat
     if (status != ESP_NOW_SEND_SUCCESS) {
         ESP_LOGW(TAG, "esp_now_send to " MACSTR " failed: %d", MAC2STR(tx_info->des_addr), (int)status);
     }
+    if (g_espnow_ctx) {
+        xSemaphoreGive(g_espnow_ctx->send_credit_sem);
+    }
 }
 
 static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *data, int data_len) {
@@ -371,24 +393,25 @@ static int espnow_do_send(tbft_espnow_t *enow, tbft_node_id_t dest_id, uint16_t 
 
     const uint8_t *ap_mac = enow->peer_ap_mac[dest_id];
 
-    /* CRITICAL FIX: Add per-fragment retry with exponential backoff.
-     * Without this, a single ESP-NOW send failure causes complete message
-     * loss, triggering unnecessary view-changes in the BFT protocol. */
-    const int MAX_RETRIES = 3;
+    const int MAX_RETRIES = 2;
+    const TickType_t credit_timeout = pdMS_TO_TICKS(ESPNOW_CREDIT_TIMEOUT_MS);
 
-    /* Use stack buffer for packet assembly. Safe because send_task is
-     * the sole caller and this function does not yield. */
     uint8_t pkt[sizeof(frag_hdr_t) + FRAG_MAX_PAYLOAD] __attribute__((aligned(4)));
 
     if (len + sizeof(frag_hdr_t) <= ESPNOW_MAX_DATA_LEN) {
         frag_hdr_t fhdr = { .msg_id = msg_id, .frag_total = 1, .frag_idx = 0 };
-        /* Reuse static pkt buffer (M5 FIX) — single-fragment path */
         memcpy(pkt, &fhdr, sizeof(fhdr));
         memcpy(pkt + sizeof(fhdr), buf, len);
 
         int retries = 0;
         while (retries < MAX_RETRIES) {
+            if (xSemaphoreTake(enow->send_credit_sem, credit_timeout) != pdTRUE) {
+                ESP_LOGW(TAG, "espnow_do_send: no send credit after %dms, dropping",
+                         ESPNOW_CREDIT_TIMEOUT_MS);
+                return -1;
+            }
             if (esp_now_send(ap_mac, pkt, len + sizeof(fhdr)) == ESP_OK) break;
+            xSemaphoreGive(enow->send_credit_sem);
             retries++;
             if (retries < MAX_RETRIES) {
                 vTaskDelay(pdMS_TO_TICKS(FRAG_INTER_DELAY_MS * retries));
@@ -398,7 +421,6 @@ static int espnow_do_send(tbft_espnow_t *enow, tbft_node_id_t dest_id, uint16_t 
             ESP_LOGW(TAG, "espnow_do_send: single-fragment failed after %d retries", MAX_RETRIES);
             return -1;
         }
-        vTaskDelay(pdMS_TO_TICKS(FRAG_INTER_DELAY_MS));
         return (int)len;
     }
 
@@ -408,7 +430,6 @@ static int espnow_do_send(tbft_espnow_t *enow, tbft_node_id_t dest_id, uint16_t 
     uint8_t frag_idx = 0;
 
     frag_hdr_t fhdr = { .msg_id = msg_id, .frag_total = frag_total };
-    /* Reuse static pkt buffer declared above (M5 FIX) */
 
     while (remaining > 0) {
         fhdr.frag_idx = frag_idx;
@@ -419,7 +440,13 @@ static int espnow_do_send(tbft_espnow_t *enow, tbft_node_id_t dest_id, uint16_t 
 
         int retries = 0;
         while (retries < MAX_RETRIES) {
+            if (xSemaphoreTake(enow->send_credit_sem, credit_timeout) != pdTRUE) {
+                ESP_LOGW(TAG, "espnow_do_send: no send credit after %dms for frag %d/%d",
+                         ESPNOW_CREDIT_TIMEOUT_MS, frag_idx + 1, frag_total);
+                return -1;
+            }
             if (esp_now_send(ap_mac, pkt, chunk + sizeof(fhdr)) == ESP_OK) break;
+            xSemaphoreGive(enow->send_credit_sem);
             retries++;
             if (retries < MAX_RETRIES) {
                 vTaskDelay(pdMS_TO_TICKS(FRAG_INTER_DELAY_MS * retries));
@@ -430,7 +457,6 @@ static int espnow_do_send(tbft_espnow_t *enow, tbft_node_id_t dest_id, uint16_t 
                      frag_idx + 1, frag_total, MAX_RETRIES);
             return -1;
         }
-        vTaskDelay(pdMS_TO_TICKS(FRAG_INTER_DELAY_MS));
 
         src += chunk;
         remaining -= chunk;
@@ -493,17 +519,11 @@ static void espnow_send_task(void *pvParameters) {
                 if (valid) {
                     int rc = espnow_do_send(enow, i, this_msg_id, entry.buf, (size_t)entry.len);
                     ESP_LOGI(TAG, "send_task: broadcast to node %d → %s (rc=%d)", i, rc > 0 ? "OK" : "FAIL", rc);
-                    /* Delay between individual peer sends — ESP-NOW in softAP mode
-                     * needs time to complete each transmission before the next. */
-                    vTaskDelay(pdMS_TO_TICKS(20));
                 } else {
                     ESP_LOGW(TAG, "send: skipping broadcast to node %d — peer not registered", i);
                 }
             }
-            /* Inter-message delay to prevent ESP-NOW transmit queue overflow.
-             * ESP-NOW has a small internal TX queue (~6 packets). Without this
-             * delay, rapid broadcasts silently drop packets. */
-            vTaskDelay(pdMS_TO_TICKS(50));
+            taskYIELD();
         } else if (entry.dest >= 0 && entry.dest < enow->num_nodes) {
             xSemaphoreTake(enow->lock, portMAX_DELAY);
             bool valid = enow->peer_valid[entry.dest];
@@ -518,8 +538,7 @@ static void espnow_send_task(void *pvParameters) {
             } else {
                 ESP_LOGW(TAG, "send: skipping unicast to node %d — peer not registered", entry.dest);
             }
-            /* Inter-message delay to prevent ESP-NOW transmit queue overflow */
-            vTaskDelay(pdMS_TO_TICKS(10));
+            taskYIELD();
         }
     }
 }
@@ -574,11 +593,13 @@ int tbft_transport_create(tbft_transport_t **out, tbft_transport_type_t type, in
     enow->task_exit_sem = xSemaphoreCreateBinary();
     enow->msg_queue = xQueueCreate(MSG_QUEUE_DEPTH, sizeof(recv_entry_t));
     enow->send_queue = xQueueCreate(SEND_QUEUE_DEPTH, sizeof(send_entry_t));
+    enow->send_credit_sem = xSemaphoreCreateCounting(ESPNOW_TX_CREDITS, ESPNOW_TX_CREDITS);
 
-    if (!enow->lock || !enow->task_exit_sem || !enow->msg_queue || !enow->send_queue) {
+    if (!enow->lock || !enow->task_exit_sem || !enow->msg_queue || !enow->send_queue || !enow->send_credit_sem) {
         ESP_LOGE(TAG, "queue/sem alloc failed: lock=%p sem=%p msg_q=%p send_q=%p free_heap=%u",
                  enow->lock, enow->task_exit_sem, enow->msg_queue, enow->send_queue,
                  (unsigned)esp_get_free_heap_size());
+        if (enow->send_credit_sem) vSemaphoreDelete(enow->send_credit_sem);
         if (enow->send_queue) vQueueDelete(enow->send_queue);
         if (enow->msg_queue) vQueueDelete(enow->msg_queue);
         if (enow->task_exit_sem) vSemaphoreDelete(enow->task_exit_sem);
@@ -618,6 +639,7 @@ init_error:
     g_espnow_ctx = NULL;
     esp_now_unregister_recv_cb();
     esp_now_unregister_send_cb();
+    if (enow->send_credit_sem) vSemaphoreDelete(enow->send_credit_sem);
     if (enow->send_queue) vQueueDelete(enow->send_queue);
     if (enow->msg_queue) vQueueDelete(enow->msg_queue);
     if (enow->task_exit_sem) vSemaphoreDelete(enow->task_exit_sem);
@@ -653,6 +675,7 @@ void tbft_transport_free(tbft_transport_t *t) {
     if (enow->send_queue) vQueueDelete(enow->send_queue);
     if (enow->msg_queue) vQueueDelete(enow->msg_queue);
     if (enow->task_exit_sem) vSemaphoreDelete(enow->task_exit_sem);
+    if (enow->send_credit_sem) vSemaphoreDelete(enow->send_credit_sem);
     if (enow->lock) vSemaphoreDelete(enow->lock);
     free(enow);
 }

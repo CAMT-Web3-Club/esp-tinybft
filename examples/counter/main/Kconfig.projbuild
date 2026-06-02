@@ -44,4 +44,13 @@ menu "Counter Example Configuration"
             bool "Maximum (WIFI_PS_MAX_MODEM)"
     endchoice
 
+    config EXAMPLE_CLIENT_REQUEST_INTERVAL_S
+        int "Client request interval (seconds)"
+        default 30
+        range 1 3600
+        depends on EXAMPLE_ROLE_CLIENT
+        help
+            Interval in seconds between consecutive counter increment
+            requests sent by the client node.
+
 endmenu

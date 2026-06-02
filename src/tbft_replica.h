@@ -69,6 +69,11 @@ typedef struct {
     tbft_seqno_t  last_executed;          /* highest committed + executed */
     tbft_seqno_t  last_tentative_execute; /* highest tentatively executed */
 
+    /* Gap-fill: if non-zero, the next run-loop iteration will send a
+     * Fill_request to the primary for this seqno's pre-prepare. Cleared
+     * when the seqno is committed/executed or leaves the window. */
+    tbft_seqno_t  pending_fill_seqno;
+
     /* Client request tracking for idle timer suppression */
     tbft_req_id_t last_received_rid[TBFT_MAX_NUM_REPLICAS + TBFT_MAX_NUM_CLIENTS];
     tbft_req_id_t last_executed_rid[TBFT_MAX_NUM_REPLICAS + TBFT_MAX_NUM_CLIENTS];
@@ -198,6 +203,8 @@ void tbft_replica_handle_data(tbft_replica_t *r,
                               const void *msg, int len);
 void tbft_replica_handle_new_key(tbft_replica_t *r,
                                  const void *msg, int len);
+void tbft_replica_handle_fill_request(tbft_replica_t *r,
+                                      const void *msg, int len);
 
 /* --------------------------------------------------------------------------
  * Protocol actions

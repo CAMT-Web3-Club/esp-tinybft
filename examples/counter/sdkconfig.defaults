@@ -47,7 +47,8 @@ CONFIG_TBFT_VIEW_CHANGE_TIMEOUT_US=15000000
 CONFIG_LWIP_IP4_FRAG=y
 CONFIG_LWIP_IP4_REASSEMBLY=y
 
-# Enable unicast UDP mode by default to prevent Wi-Fi router multicast packet drops
-CONFIG_TBFT_DISABLE_MULTICAST=y
+# Multicast is enabled by default (Kconfig default: n).
+# If your Wi-Fi router silently drops multicast packets, enable this:
+# CONFIG_TBFT_DISABLE_MULTICAST=y
 
 

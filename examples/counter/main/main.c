@@ -230,7 +230,7 @@ static void client_task(void *arg) {
         }
 
         Byz_free_request(&req);
-        for (int i = 0; i < 30; i++) {
+        for (int i = 0; i < CONFIG_EXAMPLE_CLIENT_REQUEST_INTERVAL_S; i++) {
             vTaskDelay(pdMS_TO_TICKS(1000));
 #if CONFIG_ESP_TASK_WDT_EN
             esp_task_wdt_reset();
