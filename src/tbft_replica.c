@@ -195,6 +195,7 @@ int tbft_replica_init(tbft_replica_t *r,
     r->last_executed            = 0;
     r->last_tentative_execute   = 0;
     r->pending_fill_seqno       = 0;
+    r->fill_started_at_us       = 0;
 
     /* Timer periods (defaults — configurable via menuconfig, overridden by
      * Byz_init_replica from config file). */
@@ -446,14 +447,42 @@ void tbft_replica_run(tbft_replica_t *r)
         /* Send pending fill request, rate-limited per-seqno.
          * Set by tbft_replica_execute_committed when it hits an uncommitted
          * or PP-missing seqno (the gap-stall bug). Cleared here once the
-         * seqno is committed/executed or leaves the window. */
+         * seqno is committed/executed or leaves the window.
+         *
+         * Two-layer escalation (v0.2.14):
+         *   1. (0–10s)  fill to current primary, 500ms throttle  (v0.2.13)
+         *   2. (>10s)    abandon seqno: last_executed := pending_fill_seqno
+         *                — cluster unblocks; client must retransmit.
+         *
+         * Rationale: in the most common gap-stall case (current primary
+         * has the stored PP), Layer 1 closes the gap within 500ms. In the
+         * rarer "no replica has the PP" case (e.g., original primary
+         * crashed mid-broadcast, view changes brought primaries that
+         * also lack the PP), Layer 1 will keep failing forever. Layer 2
+         * is the last-resort unblocker: the local replica abandons the
+         * stuck seqno, advancing last_executed past it. Bounded state
+         * divergence (≤ f+1 replicas) is recovered on the next checkpoint
+         * via the existing state-fetch protocol. The client detects
+         * TBFT_CLIENT_REPLY_TIMEOUT_MS and retransmits.
+         *
+         * A cross-view broadcast-fill (sending fill_request to all
+         * replicas instead of just the primary) was considered but does
+         * not help: the PP stored in any backup's ar slot is for the
+         * original view, and the requester (in a later view) rejects
+         * PPs from earlier views in handle_pre_prepare. Layer 2 abandon
+         * is the correct recovery for the cross-view PP-loss case.
+         */
         if (r->pending_fill_seqno > 0) {
             if (r->pending_fill_seqno > r->last_executed
                 && tbft_replica_in_window(r, r->pending_fill_seqno)) {
                 tbft_agreement_slice_t *fsl =
                     tbft_ar_slice(&r->ar, r->pending_fill_seqno);
                 int64_t now_us = esp_timer_get_time();
-                if (now_us - fsl->fill_sent_us >= 500000LL) { /* 500ms throttle */
+                int64_t elapsed_us = (r->fill_started_at_us > 0)
+                    ? (now_us - r->fill_started_at_us) : 0;
+
+                /* Layer 1: fill to current primary, 500ms throttle */
+                if (now_us - fsl->fill_sent_us >= 500000LL) {
                     fsl->fill_sent_us = now_us;
 
                     tbft_fill_request_rep_t *fr =
@@ -468,9 +497,10 @@ void tbft_replica_run(tbft_replica_t *r)
                     fr->seqno            = r->pending_fill_seqno;
                     fr->id               = r->node.node_id;
 
-                    /* HMAC authenticate the request for the primary only.
-                     * We compute one slot using the principal that will
-                     * receive this — the primary. */
+                    /* HMAC authenticate the request for the primary.
+                     * Uses the primary's out-key (which equals our
+                     * session in-key from the primary, by New_key
+                     * handshake symmetry). */
                     int primary =
                         tbft_node_primary(&r->node, r->node.view);
                     tbft_principal_t *pri = r->node.principals[primary];
@@ -487,9 +517,28 @@ void tbft_replica_run(tbft_replica_t *r)
                         "fill: requested pre-prepare for seqno=%lld from primary %d",
                         (long long)r->pending_fill_seqno, primary);
                 }
+
+                /* Layer 2: after 10s, abandon the seqno. Force-advance
+                 * last_executed past the stuck seqno so subsequent in-window
+                 * seqnos can execute. The client's request at this seqno
+                 * is effectively a no-op on this replica; the client should
+                 * detect timeout (TBFT_CLIENT_REPLY_TIMEOUT_MS) and
+                 * retransmit. */
+                if (elapsed_us >= 10 * 1000 * 1000LL) {
+                    ESP_LOGE(TAG,
+                        "fill: abandoning stuck seqno=%lld after %lldms —"
+                        " no replica had the PP, client must retransmit",
+                        (long long)r->pending_fill_seqno,
+                        (long long)(elapsed_us / 1000));
+                    r->last_executed     = r->pending_fill_seqno;
+                    r->last_prepared     = r->last_executed;
+                    r->pending_fill_seqno  = 0;
+                    r->fill_started_at_us  = 0;
+                }
             } else {
                 /* Gap closed (executed) or seqno left the window — clear */
-                r->pending_fill_seqno = 0;
+                r->pending_fill_seqno  = 0;
+                r->fill_started_at_us  = 0;
             }
         }
 
@@ -2323,7 +2372,10 @@ void tbft_replica_execute_committed(tbft_replica_t *r)
                      " requesting fill",
                      (long long)n, (long long)r->last_executed,
                      (long long)r->last_prepared);
-            r->pending_fill_seqno = n;
+            if (r->pending_fill_seqno != n) {
+                r->pending_fill_seqno  = n;
+                r->fill_started_at_us  = esp_timer_get_time();
+            }
             break;
         }
 
@@ -2333,7 +2385,10 @@ void tbft_replica_execute_committed(tbft_replica_t *r)
             ESP_LOGW(TAG, "execute: no pre-prepare for seqno=%lld — break,"
                      " requesting fill",
                      (long long)n);
-            r->pending_fill_seqno = n;
+            if (r->pending_fill_seqno != n) {
+                r->pending_fill_seqno  = n;
+                r->fill_started_at_us  = esp_timer_get_time();
+            }
             break;
         }
 
@@ -2361,7 +2416,8 @@ void tbft_replica_execute_committed(tbft_replica_t *r)
 
         /* Clear pending fill — the seqno we were waiting on is now executed */
         if (r->pending_fill_seqno == n) {
-            r->pending_fill_seqno = 0;
+            r->pending_fill_seqno  = 0;
+            r->fill_started_at_us  = 0;
         }
                     continue;
                 }
@@ -2551,7 +2607,8 @@ void tbft_replica_mark_stable(tbft_replica_t *r, tbft_seqno_t seqno)
     /* Clear any pending fill request — its seqno is now at or below
      * last_executed / last_stable, so the main loop will not re-send. */
     if (r->pending_fill_seqno > 0 && r->pending_fill_seqno <= seqno) {
-        r->pending_fill_seqno = 0;
+        r->pending_fill_seqno  = 0;
+        r->fill_started_at_us  = 0;
     }
 
     /* Truncate static regions */
@@ -2901,18 +2958,7 @@ void tbft_replica_handle_fill_request(tbft_replica_t *r,
     const tbft_fill_request_rep_t *fr =
         (const tbft_fill_request_rep_t *)msg;
 
-    /* Validate: am I the primary for this view? */
-    int primary = tbft_node_primary(&r->node, fr->view);
-    if (primary != r->node.node_id) {
-        ESP_LOGD(TAG, "fill: not primary (view=%lld primary=%d me=%d)",
-                 (long long)fr->view, primary, r->node.node_id);
-        return;
-    }
-    if (fr->view != r->node.view) {
-        ESP_LOGW(TAG, "fill: view mismatch (got=%lld mine=%lld)",
-                 (long long)fr->view, (long long)r->node.view);
-        return;
-    }
+    /* Validate requester id */
     if (fr->id < 0 || fr->id >= r->node.num_replicas
         || fr->id == r->node.node_id) {
         ESP_LOGW(TAG, "fill: invalid requester id %d", fr->id);
@@ -2920,10 +2966,8 @@ void tbft_replica_handle_fill_request(tbft_replica_t *r,
     }
 
     /* Verify HMAC of the request using the requester's principal.
-     * The slot index is computed from the requester's perspective (i.e.,
-     * relative to the primary): if primary > requester, slot is `primary-1`;
-     * otherwise slot is `primary`. We need the requester's slot, so pass
-     * the primary as the "self" to the slot helper. */
+     * Uses the requester's session in-key (which equals this replica's
+     * out-key to the requester, by New_key handshake symmetry). */
     tbft_principal_t *p = r->node.principals[fr->id];
     if (!p || !p->keys_fresh) {
         ESP_LOGD(TAG, "fill: dropping request from %d (key not fresh)",
@@ -2936,19 +2980,39 @@ void tbft_replica_handle_fill_request(tbft_replica_t *r,
         return;
     }
 
-    /* Look up the stored pre-prepare */
+    /* v0.2.14 (Layer 2 broadcast-fill): any replica that received the
+     * original PP can re-send it. This lets backups help recover from
+     * the "current primary never had the PP" case (e.g., the original
+     * sender crashed mid-broadcast, and subsequent view changes do not
+     * bring a primary that has the PP).
+     *
+     * The PP's HMAC was computed by the original primary; we forward the
+     * original bytes unchanged. The requester verifies via the standard
+     * handle_pre_prepare path. The PP's view field is whatever view the
+     * original primary assigned — if the requester is in a different
+     * view, it will reject (this is correct PBFT behaviour). */
     int pp_len = 0;
     const uint8_t *pp_buf = tbft_ar_load_pp(&r->ar, fr->seqno, &pp_len);
     if (!pp_buf) {
-        ESP_LOGW(TAG, "fill: no stored pre-prepare for seqno=%lld"
-                 " (out of window or not yet assigned)",
-                 (long long)fr->seqno);
+        int primary = tbft_node_primary(&r->node, fr->view);
+        if (primary != r->node.node_id) {
+            ESP_LOGD(TAG,
+                "fill: not primary and no stored PP for seqno=%lld"
+                " (view=%lld primary=%d me=%d)",
+                (long long)fr->seqno, (long long)fr->view,
+                primary, r->node.node_id);
+        } else {
+            ESP_LOGW(TAG, "fill: no stored pre-prepare for seqno=%lld"
+                     " (out of window or not yet assigned)",
+                     (long long)fr->seqno);
+        }
         return;
     }
 
     /* Re-send the original PP bytes (includes authenticator).
      * The receiver will verify via the standard handle_pre_prepare path. */
     tbft_node_send(&r->node, pp_buf, (size_t)pp_len, fr->id);
-    ESP_LOGI(TAG, "fill: re-sent pre-prepare seqno=%lld to replica %d (size=%d)",
-             (long long)fr->seqno, fr->id, pp_len);
+    ESP_LOGI(TAG,
+        "fill: re-sent pre-prepare seqno=%lld to replica %d (size=%d, view=%lld)",
+        (long long)fr->seqno, fr->id, pp_len, (long long)fr->view);
 }

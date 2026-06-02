@@ -73,6 +73,9 @@ typedef struct {
      * Fill_request to the primary for this seqno's pre-prepare. Cleared
      * when the seqno is committed/executed or leaves the window. */
     tbft_seqno_t  pending_fill_seqno;
+    /* Timestamp (us) when pending_fill_seqno was first set. Used to
+     * drive the v0.2.14 abandon timeout (10s). */
+    int64_t       fill_started_at_us;
 
     /* Client request tracking for idle timer suppression */
     tbft_req_id_t last_received_rid[TBFT_MAX_NUM_REPLICAS + TBFT_MAX_NUM_CLIENTS];

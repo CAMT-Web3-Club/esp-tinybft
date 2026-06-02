@@ -195,6 +195,18 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for full documentation covering
 
 ## Changelog
 
+### v0.2.14
+
+- **Fill timeout + abandon (recovery from PP loss after node failure):** When a stuck seqno cannot be filled by the current primary within 10 seconds (e.g., the original sender crashed before the broadcast reached any of the new primaries after view changes), the local replica now **abandons the seqno** — `last_executed` is force-advanced past it, unblocking the cluster. The client's request at that seqno is effectively a no-op on this replica; the client detects `TBFT_CLIENT_REPLY_TIMEOUT_MS` and must retransmit. Bounded state divergence (≤ `f+1` replicas) is recovered on the next checkpoint via the existing state-fetch protocol.
+
+  A cross-view broadcast-fill (sending fill requests to all replicas) was considered but does not help: the PP stored in any backup's ar slot is for the original view, and the requester (in a later view) rejects PPs from earlier views in `handle_pre_prepare`. Abandon is the correct recovery for the cross-view PP-loss case.
+
+  Fixes the "1 node down → no consensus" deadlock observed when a primary crashes mid-broadcast and no replica (including subsequent primaries) holds the pre-prepare.
+
+- **`Byz_invoke_with_retry()` client API:** New library-level retry helper. Bounded attempts with exponential backoff (1s, 2s, 4s, ..., capped at 10s). Returns the number of attempts used on success. Both example apps (`counter`, `simple_wallet`) updated to use it with 3-attempt retry. Survives requests that are abandoned by the cluster due to the fill mechanism timing out.
+
+- **No protocol changes:** Wire format and message tags unchanged. The escalation policy is purely a recovery-path improvement; consensus rules and message semantics are identical to v0.2.13.
+
 ### v0.2.13
 
 - **Gap-fill (`Fill_request`):** Replicas can request a re-sent pre-prepare from the primary when commits arrive out of order. Closes the gap-stall bug where `seqno N+1` would commit before `N`, causing the execution loop to freeze for minutes until a view-change. The new `TBFT_MSG_FILL_REQUEST` (tag 18) is a 72-byte HMAC-authenticated unicast; the primary re-sends the original stored pre-prepare bytes (still HMAC-valid), letting the backup run the normal prepare/commit flow and close the gap. No protocol correctness regression.

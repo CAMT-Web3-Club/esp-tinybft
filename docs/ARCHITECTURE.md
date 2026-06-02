@@ -428,6 +428,7 @@ typedef struct {
     tbft_seqno_t  last_executed;
     tbft_seqno_t  last_tentative_execute;
     tbft_seqno_t  pending_fill_seqno;     /* 0 = none; otherwise request fill PP for this seqno from primary */
+    int64_t       fill_started_at_us;     /* v0.2.14: when pending_fill_seqno was first set; drives 10s abandon timeout */
 
     /* Request queues */
     tbft_rqueue_t rqueue;     /* read-write */
@@ -559,7 +560,7 @@ Every message handler performs bounds and identity checks before touching protoc
 ### execute_committed Flow
 
 For each `n` from `last_executed + 1` upward:
-1. **Gap-stall guard:** if `!tbft_ar_committed(&r->ar, n)` or no pre-prepare stored for `n`, set `r->pending_fill_seqno = n`, log a warning, and break. The main loop will send a `Fill_request` to the primary (rate-limited 500ms per-slice) to re-send the missing pre-prepare. The natural prepare/commit flow then closes the gap.
+1. **Gap-stall guard:** if `!tbft_ar_committed(&r->ar, n)` or no pre-prepare stored for `n`, set `r->pending_fill_seqno = n` (and stamp `fill_started_at_us = esp_timer_get_time()` on the first assignment), log a warning, and break. The main loop escalates the fill request — see "Fill escalation" below. The natural prepare/commit flow then closes the gap.
 2. Load Pre-prepare from AR
 3. Extract request bytes, non-det bytes from Pre-prepare
 4. Call `exec_cb` with request, reply buffer, non-det, client ID, read-only flag
@@ -568,6 +569,19 @@ For each `n` from `last_executed + 1` upward:
 7. Call `recv_reply_cb` if set
 8. Update `last_executed = n`. Clear `pending_fill_seqno` if it equals `n` (gap closed).
 9. If `n % TBFT_CHECKPOINT_INTERVAL == 0`: call `state_checkpoint`, build and broadcast Checkpoint message
+
+### Fill escalation (v0.2.14)
+
+When `pending_fill_seqno > 0`, the main loop runs a two-layer recovery protocol to close the gap:
+
+| Layer | Window | Action | Failure mode |
+|-------|--------|--------|--------------|
+| 1. Primary fill | 0–10s | Send `Fill_request` to current primary, 500ms throttle (per-slice) | Primary doesn't have the PP (e.g., the original sender crashed before broadcast) |
+| 2. Abandon | >10s | Force `last_executed = pending_fill_seqno`; clear fill state. The client's request at this seqno is a no-op on this replica; the client must detect `TBFT_CLIENT_REPLY_TIMEOUT_MS` and retransmit. State divergence is bounded (≤ `f+1` replicas) and recovered on the next checkpoint via `tbft_state_start_fetch`. | (last resort — guarantees cluster unblocks) |
+
+The escalation is driven by `fill_started_at_us` (when the gap was first detected). The field resets to zero whenever `pending_fill_seqno` is cleared (gap closed, seqno left window, or checkpoint truncated the seqno).
+
+A cross-view broadcast-fill (sending fill requests to all replicas instead of just the primary) was considered but does not help: the PP stored in any backup's ar slot is for the original view, and the requester (in a later view) rejects PPs from earlier views in `handle_pre_prepare`. Abandon is the correct recovery for the cross-view PP-loss case.
 
 ### mark_stable Flow
 

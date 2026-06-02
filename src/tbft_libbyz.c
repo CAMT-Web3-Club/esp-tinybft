@@ -747,6 +747,44 @@ int Byz_invoke(Byz_req *req, Byz_rep *rep, bool read_only)
     return Byz_recv_reply(rep);
 }
 
+int Byz_invoke_with_retry(Byz_req *req, Byz_rep *rep, bool read_only,
+                          int max_attempts)
+{
+    if (max_attempts < 1) return -1;
+    int delay_ms = 1000;
+    const int delay_cap_ms = 10000;
+    for (int attempt = 1; attempt <= max_attempts; attempt++) {
+        int ret = Byz_invoke(req, rep, read_only);
+        if (ret == 0) {
+            if (attempt > 1) {
+                ESP_LOGI(TAG, "invoke_with_retry: succeeded on attempt %d/%d",
+                         attempt, max_attempts);
+            }
+            return attempt;
+        }
+        if (attempt == max_attempts) {
+            ESP_LOGW(TAG, "invoke_with_retry: giving up after %d attempts",
+                     max_attempts);
+            return -1;
+        }
+        ESP_LOGW(TAG, "invoke_with_retry: attempt %d/%d failed,"
+                 " retrying in %dms",
+                 attempt, max_attempts, delay_ms);
+        /* Cooperative sleep — feed the task watchdog so we don't get
+         * killed while waiting. */
+        int slept = 0;
+        while (slept < delay_ms) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+#if CONFIG_ESP_TASK_WDT_EN
+            esp_task_wdt_reset();
+#endif
+            slept += 100;
+        }
+        delay_ms = (delay_ms * 2 < delay_cap_ms) ? delay_ms * 2 : delay_cap_ms;
+    }
+    return -1;
+}
+
 void Byz_free_request(Byz_req *req)
 {
     if (req && req->contents) {
