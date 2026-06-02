@@ -142,6 +142,20 @@ menu "TinyBFT Configuration"
             Byz_replica_run() or Byz_init_client() — otherwise the
             send task can starve the consensus loop, or vice versa.
 
+    config TBFT_ESPNOW_TX_CREDITS
+        int "ESP-NOW TX credit cap"
+        default 6
+        range 2 12
+        depends on TBFT_TRANSPORT_ESPNOW
+        help
+            Maximum number of concurrent ESP-NOW sends (credits).
+            Each fragment requires one credit. Multi-fragment sends
+            acquire/release one credit per fragment (no pre-acquisition),
+            so 6 credits suffice for 2-fragment broadcasts to 6 peers
+            when combined with the 10ms inter-peer drain delay.
+            Values above 12 overload the ESP-NOW driver (fragment
+            send failures).
+
     config TBFT_PRINT_STATS
         bool "Enable performance statistics"
         default n

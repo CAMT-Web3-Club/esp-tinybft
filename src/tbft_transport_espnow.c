@@ -57,9 +57,16 @@ static const char *TAG = "tbft_espnow";
 #define SHUTDOWN_DRAIN_MS     200
 /* ESP-NOW credits = peers per broadcast, capped at empirically-determined TX queue depth.
  * ESP-NOW driver is a precompiled blob; internal queue size is not documented.
- * The cap of 6 was determined by observation: >6 outstanding sends causes silent drops. */
+ * Cap of 6 keeps the driver below its undocumented internal limit (values >6 cause
+ * silent drops or explicit esp_now_send failures for fragment retries).
+ * Multi-fragment sends acquire/release one credit per fragment (not pre-acquire all),
+ * so 6 credits are sufficient even for 2-fragment broadcasts to 6 peers. */
 #define ESPNOW_CREDITS_PER_CLUSTER  ((TBFT_MAX_NUM_REPLICAS - 1U))
+#ifndef CONFIG_TBFT_ESPNOW_TX_CREDITS
 #define ESPNOW_CREDITS_CAP          6
+#else
+#define ESPNOW_CREDITS_CAP          CONFIG_TBFT_ESPNOW_TX_CREDITS
+#endif
 #define ESPNOW_TX_CREDITS           ((ESPNOW_CREDITS_PER_CLUSTER) < (ESPNOW_CREDITS_CAP) ? (ESPNOW_CREDITS_PER_CLUSTER) : (ESPNOW_CREDITS_CAP))
 #define ESPNOW_CREDIT_TIMEOUT_MS    250
 
@@ -424,18 +431,6 @@ static int espnow_do_send(tbft_espnow_t *enow, tbft_node_id_t dest_id, uint16_t 
 
     frag_hdr_t fhdr = { .msg_id = msg_id, .frag_total = frag_total };
 
-    int credits_held = 0;
-    for (int j = 0; j < frag_total; j++) {
-        if (xSemaphoreTake(enow->send_credit_sem, credit_timeout) != pdTRUE) {
-            for (int k = 0; k < j; k++)
-                xSemaphoreGive(enow->send_credit_sem);
-            ESP_LOGW(TAG, "espnow_do_send: cannot pre-acquire %d credits (got %d/%d)",
-                     frag_total, j, frag_total);
-            return -1;
-        }
-        credits_held++;
-    }
-
     while (remaining > 0) {
         fhdr.frag_idx = frag_idx;
         size_t chunk = remaining > FRAG_MAX_PAYLOAD ? FRAG_MAX_PAYLOAD : remaining;
@@ -445,7 +440,13 @@ static int espnow_do_send(tbft_espnow_t *enow, tbft_node_id_t dest_id, uint16_t 
 
         int retries = 0;
         while (retries < MAX_RETRIES) {
+            if (xSemaphoreTake(enow->send_credit_sem, credit_timeout) != pdTRUE) {
+                ESP_LOGW(TAG, "espnow_do_send: no send credit after %dms for frag %d/%d",
+                         ESPNOW_CREDIT_TIMEOUT_MS, frag_idx + 1, frag_total);
+                return -1;
+            }
             if (esp_now_send(ap_mac, pkt, chunk + sizeof(fhdr)) == ESP_OK) break;
+            xSemaphoreGive(enow->send_credit_sem);
             retries++;
             if (retries < MAX_RETRIES) {
                 vTaskDelay(pdMS_TO_TICKS(FRAG_INTER_DELAY_MS * retries));
@@ -454,15 +455,12 @@ static int espnow_do_send(tbft_espnow_t *enow, tbft_node_id_t dest_id, uint16_t 
         if (retries == MAX_RETRIES) {
             ESP_LOGW(TAG, "espnow_do_send: fragment %d/%d failed after %d retries",
                      frag_idx + 1, frag_total, MAX_RETRIES);
-            for (int j = 0; j < credits_held; j++)
-                xSemaphoreGive(enow->send_credit_sem);
             return -1;
         }
 
         src += chunk;
         remaining -= chunk;
         frag_idx++;
-        credits_held--;
     }
     return (int)len;
 }
@@ -523,6 +521,13 @@ static void espnow_send_task(void *pvParameters) {
                     ESP_LOGI(TAG, "send_task: broadcast to node %d → %s (rc=%d)", i, rc > 0 ? "OK" : "FAIL", rc);
                 } else {
                     ESP_LOGW(TAG, "send: skipping broadcast to node %d — peer not registered", i);
+                }
+
+                /* Drain credits between peers: let WiFi task process TX callbacks
+                 * so the ESP-NOW driver's internal queue never exceeds ~2 in-flight
+                 * sends, avoiding silent drops when credit cap > 6. */
+                if (i != limit - 1 && valid) {
+                    vTaskDelay(pdMS_TO_TICKS(10));
                 }
             }
             taskYIELD();
