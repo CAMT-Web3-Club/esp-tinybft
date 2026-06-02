@@ -194,6 +194,7 @@ int tbft_replica_init(tbft_replica_t *r,
     r->last_prepared            = 0;
     r->last_executed            = 0;
     r->last_tentative_execute   = 0;
+    r->pending_fill_seqno       = 0;
 
     /* Timer periods (defaults — configurable via menuconfig, overridden by
      * Byz_init_replica from config file). */
@@ -442,6 +443,56 @@ void tbft_replica_run(tbft_replica_t *r)
             tbft_replica_start_fetch(r, r->state.fetch_seqno, new_replier);
         }
 
+        /* Send pending fill request, rate-limited per-seqno.
+         * Set by tbft_replica_execute_committed when it hits an uncommitted
+         * or PP-missing seqno (the gap-stall bug). Cleared here once the
+         * seqno is committed/executed or leaves the window. */
+        if (r->pending_fill_seqno > 0) {
+            if (r->pending_fill_seqno > r->last_executed
+                && tbft_replica_in_window(r, r->pending_fill_seqno)) {
+                tbft_agreement_slice_t *fsl =
+                    tbft_ar_slice(&r->ar, r->pending_fill_seqno);
+                int64_t now_us = esp_timer_get_time();
+                if (now_us - fsl->fill_sent_us >= 500000LL) { /* 500ms throttle */
+                    fsl->fill_sent_us = now_us;
+
+                    tbft_fill_request_rep_t *fr =
+                        (tbft_fill_request_rep_t *)r->out_buf;
+                    memset(fr, 0, sizeof(*fr));
+                    fr->hdr.tag          = TBFT_MSG_FILL_REQUEST;
+                    fr->hdr.extra        = 0;
+                    fr->hdr.size         =
+                        tbft_msg_align((int32_t)sizeof(*fr));
+                    fr->hdr.timestamp_us = now_us;
+                    fr->view             = r->node.view;
+                    fr->seqno            = r->pending_fill_seqno;
+                    fr->id               = r->node.node_id;
+
+                    /* HMAC authenticate the request for the primary only.
+                     * We compute one slot using the principal that will
+                     * receive this — the primary. */
+                    int primary =
+                        tbft_node_primary(&r->node, r->node.view);
+                    tbft_principal_t *pri = r->node.principals[primary];
+                    if (pri) {
+                        int32_t body_len =
+                            (int32_t)(sizeof(*fr) - sizeof(tbft_mac_t));
+                        tbft_principal_gen_mac_out(pri,
+                            r->out_buf, (size_t)body_len, &fr->mac);
+                    }
+
+                    tbft_node_send(&r->node, r->out_buf,
+                                   (size_t)fr->hdr.size, primary);
+                    ESP_LOGI(TAG,
+                        "fill: requested pre-prepare for seqno=%lld from primary %d",
+                        (long long)r->pending_fill_seqno, primary);
+                }
+            } else {
+                /* Gap closed (executed) or seqno left the window — clear */
+                r->pending_fill_seqno = 0;
+            }
+        }
+
         tbft_node_id_t src_id = -1;
         int n = tbft_node_recv(&r->node, r->node.recv_buf, sizeof(r->node.recv_buf), &src_id);
         if (n < 0) {
@@ -512,6 +563,11 @@ void tbft_replica_run(tbft_replica_t *r)
                     continue;
                 }
             }
+        } else if (hdr->tag == TBFT_MSG_FILL_REQUEST) {
+            /* The primary must have a fresh HMAC key for the requester in
+             * order to verify the request. We don't know the requester yet
+             * (it's inside the message), so defer the freshness check to
+             * tbft_replica_handle_fill_request. */
         }
 
         switch ((tbft_msg_tag_t)hdr->tag) {
@@ -550,6 +606,9 @@ void tbft_replica_run(tbft_replica_t *r)
             break;
         case TBFT_MSG_STATUS:
             handle_status(r, r->node.recv_buf, n);
+            break;
+        case TBFT_MSG_FILL_REQUEST:
+            tbft_replica_handle_fill_request(r, r->node.recv_buf, n);
             break;
         default:
             ESP_LOGD(TAG, "unknown message tag %d", hdr->tag);
@@ -2260,17 +2319,21 @@ void tbft_replica_execute_committed(tbft_replica_t *r)
          n++) {
         if (!tbft_ar_committed(&r->ar, n)) {
             ESP_LOGW(TAG, "execute: seqno=%lld not committed yet"
-                     " (last_executed=%lld, last_prepared=%lld) — break",
+                     " (last_executed=%lld, last_prepared=%lld) — break,"
+                     " requesting fill",
                      (long long)n, (long long)r->last_executed,
                      (long long)r->last_prepared);
+            r->pending_fill_seqno = n;
             break;
         }
 
         int pp_len = 0;
         const uint8_t *pp_buf = tbft_ar_load_pp(&r->ar, n, &pp_len);
         if (!pp_buf) {
-            ESP_LOGW(TAG, "execute: no pre-prepare for seqno=%lld — break",
+            ESP_LOGW(TAG, "execute: no pre-prepare for seqno=%lld — break,"
+                     " requesting fill",
                      (long long)n);
+            r->pending_fill_seqno = n;
             break;
         }
 
@@ -2294,7 +2357,12 @@ void tbft_replica_execute_committed(tbft_replica_t *r)
                 if (!tbft_digest_equal(&pp->digest, &cm_win->digest)) {
                     ESP_LOGW(TAG, "execute: commit digest mismatch for seqno=%lld — skipping",
                              (long long)n);
-                    r->last_executed = n;
+        r->last_executed = n;
+
+        /* Clear pending fill — the seqno we were waiting on is now executed */
+        if (r->pending_fill_seqno == n) {
+            r->pending_fill_seqno = 0;
+        }
                     continue;
                 }
             }
@@ -2479,6 +2547,12 @@ void tbft_replica_mark_stable(tbft_replica_t *r, tbft_seqno_t seqno)
      * either finds uncommitted gaps or falls permanently out of range. */
     if (r->last_prepared < seqno) r->last_prepared = seqno;
     if (r->last_executed < seqno) r->last_executed = seqno;
+
+    /* Clear any pending fill request — its seqno is now at or below
+     * last_executed / last_stable, so the main loop will not re-send. */
+    if (r->pending_fill_seqno > 0 && r->pending_fill_seqno <= seqno) {
+        r->pending_fill_seqno = 0;
+    }
 
     /* Truncate static regions */
     tbft_ar_truncate(&r->ar, seqno + 1);
@@ -2803,4 +2877,78 @@ void tbft_replica_handle_new_key(tbft_replica_t *r, const void *msg, int len)
 
     /* Explicit wipe of plaintext key after installation */
     memset(&new_key, 0, sizeof(new_key));
+}
+
+/* --------------------------------------------------------------------------
+ * Fill_request handler
+ *
+ * A backup asks the primary to re-send the pre-prepare it previously
+ * broadcast for `seqno`.  This is the recovery path for the gap-stall bug:
+ * when commits arrive out of order (e.g., seqno N+1 commits before N), the
+ * execution loop breaks on N and never advances.  By re-sending the stored
+ * pre-prepare, the primary lets the backup run the normal prepare/commit
+ * flow and close the gap without a view-change.
+ * -------------------------------------------------------------------------- */
+
+void tbft_replica_handle_fill_request(tbft_replica_t *r,
+                                      const void *msg, int len)
+{
+    if (len < (int)sizeof(tbft_fill_request_rep_t)) {
+        ESP_LOGW(TAG, "fill: message too short (%d < %d)",
+                 len, (int)sizeof(tbft_fill_request_rep_t));
+        return;
+    }
+    const tbft_fill_request_rep_t *fr =
+        (const tbft_fill_request_rep_t *)msg;
+
+    /* Validate: am I the primary for this view? */
+    int primary = tbft_node_primary(&r->node, fr->view);
+    if (primary != r->node.node_id) {
+        ESP_LOGD(TAG, "fill: not primary (view=%lld primary=%d me=%d)",
+                 (long long)fr->view, primary, r->node.node_id);
+        return;
+    }
+    if (fr->view != r->node.view) {
+        ESP_LOGW(TAG, "fill: view mismatch (got=%lld mine=%lld)",
+                 (long long)fr->view, (long long)r->node.view);
+        return;
+    }
+    if (fr->id < 0 || fr->id >= r->node.num_replicas
+        || fr->id == r->node.node_id) {
+        ESP_LOGW(TAG, "fill: invalid requester id %d", fr->id);
+        return;
+    }
+
+    /* Verify HMAC of the request using the requester's principal.
+     * The slot index is computed from the requester's perspective (i.e.,
+     * relative to the primary): if primary > requester, slot is `primary-1`;
+     * otherwise slot is `primary`. We need the requester's slot, so pass
+     * the primary as the "self" to the slot helper. */
+    tbft_principal_t *p = r->node.principals[fr->id];
+    if (!p || !p->keys_fresh) {
+        ESP_LOGD(TAG, "fill: dropping request from %d (key not fresh)",
+                 fr->id);
+        return;
+    }
+    int32_t body_len = (int32_t)(sizeof(*fr) - sizeof(tbft_mac_t));
+    if (!tbft_principal_verify_mac_in(p, msg, (size_t)body_len, &fr->mac)) {
+        ESP_LOGW(TAG, "fill: HMAC verify failed from replica %d", fr->id);
+        return;
+    }
+
+    /* Look up the stored pre-prepare */
+    int pp_len = 0;
+    const uint8_t *pp_buf = tbft_ar_load_pp(&r->ar, fr->seqno, &pp_len);
+    if (!pp_buf) {
+        ESP_LOGW(TAG, "fill: no stored pre-prepare for seqno=%lld"
+                 " (out of window or not yet assigned)",
+                 (long long)fr->seqno);
+        return;
+    }
+
+    /* Re-send the original PP bytes (includes authenticator).
+     * The receiver will verify via the standard handle_pre_prepare path. */
+    tbft_node_send(&r->node, pp_buf, (size_t)pp_len, fr->id);
+    ESP_LOGI(TAG, "fill: re-sent pre-prepare seqno=%lld to replica %d (size=%d)",
+             (long long)fr->seqno, fr->id, pp_len);
 }
