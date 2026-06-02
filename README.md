@@ -195,6 +195,12 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for full documentation covering
 
 ## Changelog
 
+### v0.2.15
+
+- **Fill short-circuit when PP is already stored:** When the fill mechanism's `pending_fill_seqno` slot already contains a pre-prepare, the Layer-1 fill request is now skipped — the gap is about missing commit certificates, not the PP itself. Previously the fill block re-requested the same PP every 500ms for 10 seconds, hitting `tbft_prepared_cert_add_pp`'s "slot occupied" check and wasting bandwidth, before the abandon log message misleadingly said "no replica had the PP" when the local replica had stored it on the first reception. The backup now waits passively for the missing commits; the 10-second abandon still fires as a last-resort fallback.
+- **More accurate abandon log message:** When the fill mechanism's 10s abandon fires, the log now distinguishes between "PP stored but commit quorum not reached" (the most common case in production, likely network drop or Byzantine withholding) and "no replica had the PP" (the original gap-stall case from v0.2.14). The text shown on the operator's serial console is now actionable.
+- **No protocol changes:** Wire format and message tags unchanged. This is a behaviour refinement to the v0.2.14 fill/abandon mechanism.
+
 ### v0.2.14
 
 - **Fill timeout + abandon (recovery from PP loss after node failure):** When a stuck seqno cannot be filled by the current primary within 10 seconds (e.g., the original sender crashed before the broadcast reached any of the new primaries after view changes), the local replica now **abandons the seqno** — `last_executed` is force-advanced past it, unblocking the cluster. The client's request at that seqno is effectively a no-op on this replica; the client detects `TBFT_CLIENT_REPLY_TIMEOUT_MS` and must retransmit. Bounded state divergence (≤ `f+1` replicas) is recovered on the next checkpoint via the existing state-fetch protocol.

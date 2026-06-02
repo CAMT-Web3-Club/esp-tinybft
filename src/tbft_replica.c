@@ -471,6 +471,17 @@ void tbft_replica_run(tbft_replica_t *r)
          * original view, and the requester (in a later view) rejects
          * PPs from earlier views in handle_pre_prepare. Layer 2 abandon
          * is the correct recovery for the cross-view PP-loss case.
+         *
+         * v0.2.15 addition: Layer 1 short-circuits when the PP is
+         * already stored in the agreement region slice.  In that case
+         * the gap is about missing commit certificates, not the PP
+         * itself — re-sending fill requests would hit
+         * `tbft_prepared_cert_add_pp`'s "slot occupied" check every
+         * 500ms and waste bandwidth, and the abandon log message would
+         * misleadingly say "no replica had the PP" when one clearly
+         * did (the local replica, which stored it on the first
+         * reception).  Skipping the redundant request lets the backup
+         * wait passively for the missing commits to arrive.
          */
         if (r->pending_fill_seqno > 0) {
             if (r->pending_fill_seqno > r->last_executed
@@ -481,8 +492,19 @@ void tbft_replica_run(tbft_replica_t *r)
                 int64_t elapsed_us = (r->fill_started_at_us > 0)
                     ? (now_us - r->fill_started_at_us) : 0;
 
+                /* Check whether the PP is already in the slice.  If so,
+                 * the gap is about missing commit certificates, not the
+                 * PP itself; skip Layer 1's redundant fill request and
+                 * rely on commits arriving to close the gap. */
+                int pp_len_check = 0;
+                const uint8_t *pp_already =
+                    tbft_ar_load_pp(&r->ar, r->pending_fill_seqno,
+                                    &pp_len_check);
+                bool pp_stored = (pp_already != NULL && pp_len_check > 0);
+
                 /* Layer 1: fill to current primary, 500ms throttle */
-                if (now_us - fsl->fill_sent_us >= 500000LL) {
+                if (!pp_stored
+                    && now_us - fsl->fill_sent_us >= 500000LL) {
                     fsl->fill_sent_us = now_us;
 
                     tbft_fill_request_rep_t *fr =
@@ -525,11 +547,21 @@ void tbft_replica_run(tbft_replica_t *r)
                  * detect timeout (TBFT_CLIENT_REPLY_TIMEOUT_MS) and
                  * retransmit. */
                 if (elapsed_us >= 10 * 1000 * 1000LL) {
-                    ESP_LOGE(TAG,
-                        "fill: abandoning stuck seqno=%lld after %lldms —"
-                        " no replica had the PP, client must retransmit",
-                        (long long)r->pending_fill_seqno,
-                        (long long)(elapsed_us / 1000));
+                    if (pp_stored) {
+                        ESP_LOGE(TAG,
+                            "fill: abandoning stuck seqno=%lld after %lldms —"
+                            " PP stored but commit quorum not reached"
+                            " (likely network drop or Byzantine),"
+                            " client must retransmit",
+                            (long long)r->pending_fill_seqno,
+                            (long long)(elapsed_us / 1000));
+                    } else {
+                        ESP_LOGE(TAG,
+                            "fill: abandoning stuck seqno=%lld after %lldms —"
+                            " no replica had the PP, client must retransmit",
+                            (long long)r->pending_fill_seqno,
+                            (long long)(elapsed_us / 1000));
+                    }
                     r->last_executed     = r->pending_fill_seqno;
                     r->last_prepared     = r->last_executed;
                     r->pending_fill_seqno  = 0;

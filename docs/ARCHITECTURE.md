@@ -570,14 +570,14 @@ For each `n` from `last_executed + 1` upward:
 8. Update `last_executed = n`. Clear `pending_fill_seqno` if it equals `n` (gap closed).
 9. If `n % TBFT_CHECKPOINT_INTERVAL == 0`: call `state_checkpoint`, build and broadcast Checkpoint message
 
-### Fill escalation (v0.2.14)
+### Fill escalation (v0.2.14, refined v0.2.15)
 
 When `pending_fill_seqno > 0`, the main loop runs a two-layer recovery protocol to close the gap:
 
 | Layer | Window | Action | Failure mode |
 |-------|--------|--------|--------------|
-| 1. Primary fill | 0–10s | Send `Fill_request` to current primary, 500ms throttle (per-slice) | Primary doesn't have the PP (e.g., the original sender crashed before broadcast) |
-| 2. Abandon | >10s | Force `last_executed = pending_fill_seqno`; clear fill state. The client's request at this seqno is a no-op on this replica; the client must detect `TBFT_CLIENT_REPLY_TIMEOUT_MS` and retransmit. State divergence is bounded (≤ `f+1` replicas) and recovered on the next checkpoint via `tbft_state_start_fetch`. | (last resort — guarantees cluster unblocks) |
+| 1. Primary fill | 0–10s | Send `Fill_request` to current primary, 500ms throttle (per-slice) — **v0.2.15: skipped if the slice already has a stored PP** (the gap is then about missing commit certs, not the PP itself) | Primary doesn't have the PP (e.g., the original sender crashed before broadcast) |
+| 2. Abandon | >10s | Force `last_executed = pending_fill_seqno`; clear fill state. The client's request at this seqno is a no-op on this replica; the client must detect `TBFT_CLIENT_REPLY_TIMEOUT_MS` and retransmit. State divergence is bounded (≤ `f+1` replicas) and recovered on the next checkpoint via `tbft_state_start_fetch`. **v0.2.15: log message distinguishes "PP stored but commit quorum not reached" from "no replica had the PP"** so the operator can tell network drops apart from Byzantine PP withholding. | (last resort — guarantees cluster unblocks) |
 
 The escalation is driven by `fill_started_at_us` (when the gap was first detected). The field resets to zero whenever `pending_fill_seqno` is cleared (gap closed, seqno left window, or checkpoint truncated the seqno).
 
