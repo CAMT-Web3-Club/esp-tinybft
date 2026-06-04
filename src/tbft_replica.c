@@ -559,9 +559,42 @@ void tbft_replica_run(tbft_replica_t *r)
                  * seqnos can execute. The client's request at this seqno
                  * is effectively a no-op on this replica; the client should
                  * detect timeout (TBFT_CLIENT_REPLY_TIMEOUT_MS) and
-                 * retransmit. */
+                 * retransmit.
+                 *
+                 * After 10 s the fill attempt is considered failed.  The
+                 * recovery strategy depends on whether a prepare quorum
+                 * already exists for this seqno:
+                 *
+                 *   prepare ok, commit missing  → trigger view-change
+                 *     The request IS certified (2f+1 matching prepares).
+                 *     Only commits are missing (network drops).  A view
+                 *     change resolves this deterministically: the new
+                 *     primary collects prepared state from all replicas
+                 *     via VC messages and every node arrives at the same
+                 *     commit/execute decision.  Abandoning would create
+                 *     permanent state divergence (some nodes committed,
+                 *     some did not) that blocks all future checkpoints.
+                 *
+                 *   no prepare quorum  → abandon (safe)
+                 *     Nobody certified this request.  Dropping it creates
+                 *     no state divergence.  The client detects
+                 *     TBFT_CLIENT_REPLY_TIMEOUT_MS and retransmits. */
                 if (elapsed_us >= 10 * 1000 * 1000LL) {
-                    if (pp_stored) {
+                    bool prepared_gap =
+                        tbft_ar_prepared(&r->ar, r->pending_fill_seqno);
+
+                    if (prepared_gap) {
+                        ESP_LOGW(TAG,
+                            "fill: prepare ok but commit missing at seqno=%lld"
+                            " after %lldms — triggering view change",
+                            (long long)r->pending_fill_seqno,
+                            (long long)(elapsed_us / 1000));
+                        r->pending_fill_seqno  = 0;
+                        r->fill_started_at_us  = 0;
+                        if (!r->vi.in_progress) {
+                            tbft_replica_send_view_change(r);
+                        }
+                    } else if (pp_stored) {
                         ESP_LOGE(TAG,
                             "fill: abandoning stuck seqno=%lld after %lldms —"
                             " PP stored but commit quorum not reached"
@@ -569,17 +602,21 @@ void tbft_replica_run(tbft_replica_t *r)
                             " client must retransmit",
                             (long long)r->pending_fill_seqno,
                             (long long)(elapsed_us / 1000));
+                        r->last_executed     = r->pending_fill_seqno;
+                        r->last_prepared     = r->last_executed;
+                        r->pending_fill_seqno  = 0;
+                        r->fill_started_at_us  = 0;
                     } else {
                         ESP_LOGE(TAG,
                             "fill: abandoning stuck seqno=%lld after %lldms —"
                             " no replica had the PP, client must retransmit",
                             (long long)r->pending_fill_seqno,
                             (long long)(elapsed_us / 1000));
+                        r->last_executed     = r->pending_fill_seqno;
+                        r->last_prepared     = r->last_executed;
+                        r->pending_fill_seqno  = 0;
+                        r->fill_started_at_us  = 0;
                     }
-                    r->last_executed     = r->pending_fill_seqno;
-                    r->last_prepared     = r->last_executed;
-                    r->pending_fill_seqno  = 0;
-                    r->fill_started_at_us  = 0;
                 }
             } else {
                 /* Gap closed (executed) or seqno left the window — clear */

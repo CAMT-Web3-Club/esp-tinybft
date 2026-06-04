@@ -195,6 +195,10 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for full documentation covering
 
 ## Changelog
 
+### v0.3.1 — Deterministic commit-gap recovery
+
+- **Replace abandon with view-change when prepare quorum exists:** Commit gaps where a prepare quorum (2f+1 matching Prepares) already formed can no longer be abandoned — the request IS certified, only commits are missing due to network drops. Abandoning would create permanent state divergence (some nodes committed, some abandoned) that blocks all future checkpoints. Now triggers a view change instead: the new primary collects prepared state from all replicas via VC messages, and every node reaches the same commit/execute decision deterministically. Trivial gaps (no PP, or PP stored but no prepare quorum) are still abandoned safely since nobody has certified state.
+
 ### v0.3.0 — Security audit fixes
 
 - **Fix #1 (Critical) — OOB bounds check in `handle_new_view`:** Added proof-size validation before reading `n_prep` entries. A malicious primary with `hdr.size == sizeof(*nv)` but `n_prep == WINDOW_SIZE` would cause out-of-bounds reads in the proof loops. Now `body_size >= sizeof(*nv) + n_prep * sizeof(tbft_vc_req_info_t)` is enforced.
