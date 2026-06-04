@@ -195,6 +195,11 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for full documentation covering
 
 ## Changelog
 
+### v0.2.16
+
+- **Prevent infinite state-fetch loop after node reboot:** Added `st->last_stable > r->last_stable` guard to the `handle_status` Path B fetch trigger (which already checked `st->last_executed > r->last_executed` and execution gap > `CHECKPOINT_INTERVAL`). After a rebooted node marks a stable checkpoint, Path B would previously re-fetch the same `last_stable` seqno whenever a peer had higher `last_executed` — a no-op that never advances the node. The guard aligns Path B with Path A (view catch-up), which already had this check.
+- **Diagnostic logging for post-fetch digest mismatch:** Enhanced the `mark_stable` log message when a checkpoint digest mismatch is detected after a completed state fetch. The log now prints the first 8 bytes + last byte of both the winning checkpoint digest and the local ptree root digest, plus the `in_fetch` flag and `fetch_seqno`. This provides evidence to determine whether the mismatch is caused by stale checkpoint data in the CR (fixable by clearing CR) or a genuine state reconstruction bug in the ptree.
+
 ### v0.2.15
 
 - **Fill short-circuit when PP is already stored:** When the fill mechanism's `pending_fill_seqno` slot already contains a pre-prepare, the Layer-1 fill request is now skipped — the gap is about missing commit certificates, not the PP itself. Previously the fill block re-requested the same PP every 500ms for 10 seconds, hitting `tbft_prepared_cert_add_pp`'s "slot occupied" check and wasting bandwidth, before the abandon log message misleadingly said "no replica had the PP" when the local replica had stored it on the first reception. The backup now waits passively for the missing commits; the 10-second abandon still fires as a last-resort fallback.

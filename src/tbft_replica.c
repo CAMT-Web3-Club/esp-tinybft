@@ -1862,6 +1862,7 @@ static void handle_status(tbft_replica_t *r, const void *msg, int len)
     }
 
     if (st->last_executed > r->last_executed
+        && st->last_stable > r->last_stable
         && (!r->state.in_fetch || st->last_stable > r->state.fetch_seqno)
         && st->last_executed - r->last_executed > TBFT_CHECKPOINT_INTERVAL) {
         /* Rate-limit fetch starts to avoid flooding. */
@@ -2603,8 +2604,23 @@ void tbft_replica_mark_stable(tbft_replica_t *r, tbft_seqno_t seqno)
     if (winning) {
         const tbft_digest_t *local = tbft_state_root_digest(&r->state);
         if (!tbft_digest_equal(winning, local)) {
-            ESP_LOGW(TAG, "stable ckpt digest mismatch at seqno=%lld — starting fetch",
-                     (long long)seqno);
+            ESP_LOGW(TAG, "stable ckpt digest mismatch at seqno=%lld "
+                     "winning=%02x%02x%02x%02x%02x%02x%02x%02x...%02x "
+                     "local=%02x%02x%02x%02x%02x%02x%02x%02x...%02x "
+                     "in_fetch=%d fetch_seqno=%lld",
+                     (long long)seqno,
+                     winning->bytes[0], winning->bytes[1],
+                     winning->bytes[2], winning->bytes[3],
+                     winning->bytes[4], winning->bytes[5],
+                     winning->bytes[6], winning->bytes[7],
+                     winning->bytes[TBFT_DIGEST_SIZE - 1],
+                     local->bytes[0], local->bytes[1],
+                     local->bytes[2], local->bytes[3],
+                     local->bytes[4], local->bytes[5],
+                     local->bytes[6], local->bytes[7],
+                     local->bytes[TBFT_DIGEST_SIZE - 1],
+                     (int)r->state.in_fetch,
+                     (long long)r->state.fetch_seqno);
             if (!r->state.in_fetch || seqno > r->state.fetch_seqno) {
                 /* Rate-limit fetch initiation to prevent a checkpoint
                  * mismatch detected by all replicas simultaneously from
