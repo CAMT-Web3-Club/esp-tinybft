@@ -1642,18 +1642,9 @@ void tbft_replica_handle_new_view(tbft_replica_t *r, const void *msg, int len)
     /* Verify it's for the view we expect */
     if (nv->v < r->node.view) return;
 
-    if (!tbft_vi_verify_nv(&r->vi, nv, len)) {
-        ESP_LOGW(TAG, "new-view verification failed for v=%lld",
-                 (long long)nv->v);
-        return;
-    }
-
-    /* Signature is mandatory — an unsigned or malformed New_view would let
-     * any attacker drive our view and primary.  The signature covers the
-     * full body (hdr.size bytes, including any prepared-entries) so an
-     * attacker cannot mutate the trailing payload without invalidating it.
-     * hdr.size is the body length; the sig is appended but NOT included in
-     * hdr.size, so total wire = hdr.size + TBFT_SIG_SIZE. */
+    /* Signature is mandatory — check BEFORE verify_nv so an attacker
+     * cannot force body processing (proof iteration) without a valid
+     * signature.  The signature covers the full body including proofs. */
     if (!nv->has_sig) {
         ESP_LOGW(TAG, "new-view: unsigned message rejected (v=%lld)",
                  (long long)nv->v);
@@ -1678,6 +1669,15 @@ void tbft_replica_handle_new_view(tbft_replica_t *r, const void *msg, int len)
                               msg, (size_t)body_size, sig)) {
         ESP_LOGW(TAG, "new-view: signature verification failed (v=%lld primary=%d)",
                  (long long)nv->v, new_primary);
+        return;
+    }
+
+    /* Validate body content against collected VCs.  By this point the
+     * RSA signature has authenticated the message — an attacker cannot
+     * inject fake proofs to trigger the proof-verification loop. */
+    if (!tbft_vi_verify_nv(&r->vi, nv, len)) {
+        ESP_LOGW(TAG, "new-view verification failed for v=%lld",
+                 (long long)nv->v);
         return;
     }
 
@@ -1983,7 +1983,9 @@ static void handle_status(tbft_replica_t *r, const void *msg, int len)
         if (now_us - r->last_ckpt_throttle_us < 500000LL) return;
         r->last_ckpt_throttle_us = now_us;
     }
-    tbft_seqno_t start_seq = ((st->last_stable / TBFT_CHECKPOINT_INTERVAL) + 1) * TBFT_CHECKPOINT_INTERVAL;
+    tbft_seqno_t start_seq;
+    if (st->last_stable < 0) return;
+    start_seq = ((st->last_stable / TBFT_CHECKPOINT_INTERVAL) + 1) * TBFT_CHECKPOINT_INTERVAL;
     for (tbft_seqno_t seqno = start_seq;
          seqno <= r->last_executed;
          seqno += TBFT_CHECKPOINT_INTERVAL) {
@@ -2593,10 +2595,18 @@ void tbft_replica_execute_committed(tbft_replica_t *r)
                 break;
             }
 
-            /* Validate reply length AFTER exec_cb has set it */
-            if (rep_len < 0 || sizeof(*reply) + (size_t)rep_len + TBFT_SIG_SIZE > sizeof(r->out_buf)) {
-                ESP_LOGE(TAG, "reply too large for out_buf (%d + %d + %d > %zu)",
-                         (int)sizeof(*reply), rep_len, (int)TBFT_SIG_SIZE, sizeof(r->out_buf));
+            /* Validate reply length AFTER exec_cb has set it.
+             * Account for alignment padding: tbft_msg_align can add up
+             * to 7 bytes, and the raw check below does not include it. */
+            if (rep_len < 0) {
+                ESP_LOGE(TAG, "reply: negative rep_len=%d", rep_len);
+                break;
+            }
+            int32_t body_sz = (int32_t)(sizeof(*reply) + (size_t)rep_len);
+            int32_t aligned = tbft_msg_align(body_sz);
+            if ((size_t)aligned + TBFT_SIG_SIZE > sizeof(r->out_buf)) {
+                ESP_LOGE(TAG, "reply too large for out_buf (aligned=%d + %d > %zu)",
+                         (int)aligned, (int)TBFT_SIG_SIZE, sizeof(r->out_buf));
                 break;
             }
                 reply->hdr.tag          = TBFT_MSG_REPLY;
@@ -2607,8 +2617,6 @@ void tbft_replica_execute_committed(tbft_replica_t *r)
                 reply->cid        = req_rep->cid;
                 reply->rid        = req_rep->rid;
                 reply->reply_size = rep_len;
-
-                int32_t body_sz = (int32_t)(sizeof(*reply) + (size_t)rep_len);
                 reply->hdr.size = tbft_msg_align(body_sz);
 
                 /* Sign the reply so the client can verify authenticity */
@@ -3048,6 +3056,17 @@ void tbft_replica_handle_new_key(tbft_replica_t *r, const void *msg, int len)
         return; /* not addressed to us — ignore */
     }
 
+    /* Replay guard: New_key messages carry hdr.timestamp_us set by the
+     * sender at generation time.  An old (replayed) message has a
+     * timestamp ≤ the last one we installed.  Since RSA-OAEP random
+     * padding guarantees different ciphertexts across sessions, the
+     * fast-path dedup below handles same-session duplicates; this
+     * guard blocks cross-session replay without changing the wire
+     * format. */
+    if (nk->hdr.timestamp_us <= p->last_key_install_time) {
+        return;
+    }
+
     /* Fast path: check if this is a duplicate of the last successfully processed New_key.
      * Since RSA-OAEP uses random padding, different sessions produce completely different
      * ciphertexts. If the ciphertext is exactly identical, and our key is already fresh,
@@ -3092,7 +3111,8 @@ void tbft_replica_handle_new_key(tbft_replica_t *r, const void *msg, int len)
              sender_id, new_key.bytes[0], new_key.bytes[1],
              new_key.bytes[2], new_key.bytes[3]);
     tbft_principal_set_in_key(p, &new_key);
-    
+    p->last_key_install_time = nk->hdr.timestamp_us;
+
     /* Save the ciphertext to skip duplicate processing in the future */
     memcpy(p->last_new_key_ciphertext, slots[our_slot_idx].ciphertext, TBFT_SIG_SIZE);
 

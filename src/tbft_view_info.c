@@ -148,7 +148,7 @@ bool tbft_vi_verify_nv(const tbft_view_info_t *vi,
 
             int attestations = 0;
             for (int r = 0; r < vi->num_replicas
-                 && attestations < vi->threshold - 1; r++) {
+                 && attestations < (vi->threshold / 2) + 1; r++) {
                 if (!vi->received[r]) continue;
                 int vc_len = 0;
                 const uint8_t *vc_buf = tbft_sr_load_vc(vi->sr, r, &vc_len);
@@ -179,10 +179,10 @@ bool tbft_vi_verify_nv(const tbft_view_info_t *vi,
                     }
                 }
             }
-            if (attestations < vi->threshold - 1) {
+            if (attestations < (vi->threshold / 2) + 1) {
                 ESP_LOGW(TAG, "verify_nv: proof seqno=%lld has %d attestations (need %d)",
                          (long long)proof->seqno,
-                         attestations, vi->threshold - 1);
+                         attestations, (vi->threshold / 2) + 1);
                 return false;
             }
         }
