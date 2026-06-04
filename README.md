@@ -195,6 +195,10 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for full documentation covering
 
 ## Changelog
 
+### v0.2.18
+
+- **Primary must not self-trigger view-change:** The primary's own vtimer could fire during a commit gap, call `send_view_change`, set `vi.in_progress = true`, and block `send_pre_prepare` (line 2124). This created a self-sustaining deadlock: blocked PP generation → request queue fills → `has_pending_requests` returns true (because of `vi.in_progress`) → vtimer re-armed → fires again. The fix: the primary's vtimer handler now stops the vtimer silently instead of initiating a view-change to replace itself. Backups detect lack-of-progress independently and initiate view changes if the primary is genuinely stuck.
+
 ### v0.2.17
 
 - **Commit re-broadcast during fill gap:** When the fill mechanism detects a stuck seqno where the pre-prepare is stored and prepare quorum is reached but commit quorum is not, it now **actively re-broadcasts the local commit** every 500ms (Layer 1.5). Previously the replica waited passively for commits to arrive during the 10-second fill window; with exactly 2f+1 live replicas, a single commit packet dropped by an unreliable transport (ESP-NOW `no send credit`, UDP loss) could block consensus until the Layer-2 abandon fired. Each re-send may trigger `handle_commit` on other replicas, which re-send their own commits — closing the gap through a chain reaction. Rate-limited to 500ms and gated on `tbft_ar_prepared` + `!tbft_ar_committed` (same guards as the existing `handle_commit` re-send path).

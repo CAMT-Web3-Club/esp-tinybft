@@ -397,9 +397,20 @@ void tbft_replica_run(tbft_replica_t *r)
                     }
                 }
                 if (keys_ok >= r->node.threshold - 1 && (bits & TBFT_EVT_VTIMER)) {
-                    ESP_LOGW(TAG, "view-change timeout in view %lld (keys=%d/%d)",
-                             (long long)r->node.view, keys_ok, r->node.threshold - 1);
-                    tbft_replica_send_view_change(r);
+                    if (!tbft_replica_is_primary(r)) {
+                        ESP_LOGW(TAG, "view-change timeout in view %lld (keys=%d/%d)",
+                                 (long long)r->node.view, keys_ok, r->node.threshold - 1);
+                        tbft_replica_send_view_change(r);
+                    } else {
+                        /* The primary must not initiate a view-change to
+                         * replace itself.  Blocking send_pre_prepare while
+                         * vi.in_progress is true would cause the request
+                         * queue to fill and drop client requests.  Backups
+                         * detect lack-of-progress independently — if the
+                         * primary genuinely cannot make progress, the
+                         * backups will initiate a view-change. */
+                        tbft_itimer_stop(&r->vtimer);
+                    }
                 } else if (bits & TBFT_EVT_VTIMER) {
                     ESP_LOGD(TAG, "view-change suppressed: keys=%d/%d — re-arming",
                              keys_ok, r->node.threshold - 1);
