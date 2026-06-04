@@ -195,6 +195,20 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for full documentation covering
 
 ## Changelog
 
+### v0.3.6 — Missing timestamp write in send_new_key
+
+- **Fix v0.3.5 regression:** The M1 New_key replay guard reads `hdr.timestamp_us` but `send_new_key` never wrote it — the field was always 0. `last_key_install_time` starts at 0, so `0 <= 0` rejected every New_key silently → no HMAC keys installed → universal MAC failure → cluster dead. Added `nk->hdr.timestamp_us = esp_timer_get_time()` in `send_new_key`.
+
+### v0.3.5 — Fix 7 audit findings
+
+- **H1**: Guard against negative `st->last_stable` in Status → checkpoint-send loop.
+- **M1**: New_key replay guard via `hdr.timestamp_us` stored in `tbft_principal_t.last_key_install_time`.
+- **M2**: Reorder New_view handler — RSA signature verification before body processing (`tbft_vi_verify_nv`).
+- **M3**: Fix proof attestation threshold from `threshold-1` (2f) to `threshold/2+1` (f+1) matching standard PBFT.
+- **L1**: SR_STORE macro: add `(mlen) < 0` guard before `memcpy`.
+- **L2**: Reply alignment: account for `tbft_msg_align` padding (up to 7 bytes) in `out_buf` check.
+- **L3**: Zero digest on hash failure: use `0xFF` instead of `0` to prevent false match.
+
 ### v0.3.4 — Suppress fill re-detection during view-change
 
 - **Prevent `execute_committed` from re-starting fill while `vi.in_progress`:** When v0.3.1 triggers a view change for a prepared-but-uncommitted seqno, `execute_committed` runs on the next main-loop iteration and re-detects the same gap — setting `pending_fill_seqno` again and starting a competing 10-second fill timer. If the view change takes longer than 10 seconds (common with ESP-NOW congestion), the fill timer fires, finds the PP was disposed by the view change, and abandons the seqno anyway. Now `execute_committed` skips fill initiation while a view change is in progress — the VC is already handling the gap.

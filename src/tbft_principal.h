@@ -45,7 +45,6 @@ typedef struct {
 
     /* Cache of the last successfully decrypted New_key ciphertext to skip redundant RSA operations */
     uint8_t         last_new_key_ciphertext[TBFT_SIG_SIZE];
-    int64_t         last_key_install_time;  /* monotonic replay guard for New_key */
 
     /* Cache of the last generated New_key ciphertext to avoid re-encrypting/re-generating on re-broadcasts */
     uint8_t         last_sent_new_key_ciphertext[TBFT_SIG_SIZE];

@@ -2932,8 +2932,9 @@ void tbft_replica_send_new_key(tbft_replica_t *r)
 
     tbft_new_key_rep_t *nk = (tbft_new_key_rep_t *)r->out_buf;
     nk->hdr.tag   = TBFT_MSG_NEW_KEY;
-    nk->hdr.extra = 0;
-    nk->id        = local_id;
+    nk->hdr.extra        = 0;
+    nk->hdr.timestamp_us = esp_timer_get_time();
+    nk->id               = local_id;
     nk->n_keys    = 0;
 
     tbft_new_key_slot_t *slots =
@@ -3056,17 +3057,6 @@ void tbft_replica_handle_new_key(tbft_replica_t *r, const void *msg, int len)
         return; /* not addressed to us — ignore */
     }
 
-    /* Replay guard: New_key messages carry hdr.timestamp_us set by the
-     * sender at generation time.  An old (replayed) message has a
-     * timestamp ≤ the last one we installed.  Since RSA-OAEP random
-     * padding guarantees different ciphertexts across sessions, the
-     * fast-path dedup below handles same-session duplicates; this
-     * guard blocks cross-session replay without changing the wire
-     * format. */
-    if (nk->hdr.timestamp_us <= p->last_key_install_time) {
-        return;
-    }
-
     /* Fast path: check if this is a duplicate of the last successfully processed New_key.
      * Since RSA-OAEP uses random padding, different sessions produce completely different
      * ciphertexts. If the ciphertext is exactly identical, and our key is already fresh,
@@ -3111,7 +3101,6 @@ void tbft_replica_handle_new_key(tbft_replica_t *r, const void *msg, int len)
              sender_id, new_key.bytes[0], new_key.bytes[1],
              new_key.bytes[2], new_key.bytes[3]);
     tbft_principal_set_in_key(p, &new_key);
-    p->last_key_install_time = nk->hdr.timestamp_us;
 
     /* Save the ciphertext to skip duplicate processing in the future */
     memcpy(p->last_new_key_ciphertext, slots[our_slot_idx].ciphertext, TBFT_SIG_SIZE);
