@@ -195,6 +195,10 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for full documentation covering
 
 ## Changelog
 
+### v0.2.17
+
+- **Commit re-broadcast during fill gap:** When the fill mechanism detects a stuck seqno where the pre-prepare is stored and prepare quorum is reached but commit quorum is not, it now **actively re-broadcasts the local commit** every 500ms (Layer 1.5). Previously the replica waited passively for commits to arrive during the 10-second fill window; with exactly 2f+1 live replicas, a single commit packet dropped by an unreliable transport (ESP-NOW `no send credit`, UDP loss) could block consensus until the Layer-2 abandon fired. Each re-send may trigger `handle_commit` on other replicas, which re-send their own commits — closing the gap through a chain reaction. Rate-limited to 500ms and gated on `tbft_ar_prepared` + `!tbft_ar_committed` (same guards as the existing `handle_commit` re-send path).
+
 ### v0.2.16
 
 - **Prevent infinite state-fetch loop after node reboot:** Added `st->last_stable > r->last_stable` guard to the `handle_status` Path B fetch trigger (which already checked `st->last_executed > r->last_executed` and execution gap > `CHECKPOINT_INTERVAL`). After a rebooted node marks a stable checkpoint, Path B would previously re-fetch the same `last_stable` seqno whenever a peer had higher `last_executed` — a no-op that never advances the node. The guard aligns Path B with Path A (view catch-up), which already had this check.

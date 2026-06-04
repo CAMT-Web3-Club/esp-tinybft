@@ -540,6 +540,20 @@ void tbft_replica_run(tbft_replica_t *r)
                         (long long)r->pending_fill_seqno, primary);
                 }
 
+                /* Layer 1.5: when the PP is stored and we have reached
+                 * prepare quorum but not commit quorum, periodically
+                 * re-broadcast our commit to help close the gap.  Each
+                 * re-send may trigger a chain reaction through other
+                 * replicas (handle_commit receives it and re-sends their
+                 * own commit).  Rate-limited to 500ms, matching Layer 1
+                 * and the handle_commit cooldown. */
+                if (pp_stored
+                    && tbft_ar_prepared(&r->ar, r->pending_fill_seqno)
+                    && !tbft_ar_committed(&r->ar, r->pending_fill_seqno)
+                    && now_us - fsl->commit_sent_us >= 500000LL) {
+                    tbft_replica_send_commit(r, r->pending_fill_seqno);
+                }
+
                 /* Layer 2: after 10s, abandon the seqno. Force-advance
                  * last_executed past the stuck seqno so subsequent in-window
                  * seqnos can execute. The client's request at this seqno
