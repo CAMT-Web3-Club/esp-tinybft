@@ -305,7 +305,7 @@ static void espnow_send_cb(const esp_now_send_info_t *tx_info, esp_now_send_stat
     if (status != ESP_NOW_SEND_SUCCESS) {
         ESP_LOGW(TAG, "esp_now_send to " MACSTR " failed: %d", MAC2STR(tx_info->des_addr), (int)status);
     }
-    if (g_espnow_ctx) {
+    if (g_espnow_ctx && !g_espnow_ctx->shutting_down) {
         xSemaphoreGive(g_espnow_ctx->send_credit_sem);
     }
 }

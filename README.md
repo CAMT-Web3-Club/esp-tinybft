@@ -195,6 +195,18 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for full documentation covering
 
 ## Changelog
 
+### v0.3.0 — Security audit fixes
+
+- **Fix #1 (Critical) — OOB bounds check in `handle_new_view`:** Added proof-size validation before reading `n_prep` entries. A malicious primary with `hdr.size == sizeof(*nv)` but `n_prep == WINDOW_SIZE` would cause out-of-bounds reads in the proof loops. Now `body_size >= sizeof(*nv) + n_prep * sizeof(tbft_vc_req_info_t)` is enforced.
+- **Fix #2 (High) — Exponential backoff shift always computed as 0:** At three sites (`handle_view_change`, `handle_new_view`, `handle_status`), `r->node.view` was overwritten before computing the view-gap for the vtimer backoff period. The gap was always 0, clamping the shift to 1 and preventing exponential growth. Now captures `old_view` before the overwrite.
+- **Fix #3 (High) — Per-proof verification in `tbft_vi_verify_nv`:** The New_view message's `n_prep` proofs were accepted without verification against collected View_change messages. A Byzantine primary could inject arbitrary proofs to advance `last_executed`. Now each proof must be attested by at least `f+1` collected VCs.
+- **Fix #4 (High) — `last_stable` set without checkpoint quorum:** The window-head advance path in `handle_new_view` set `r->last_stable = r->seqno - 1` without any checkpoint quorum proof. Now only the window head advances; `last_stable` stays at the verified `nv->min`.
+- **Fix #5 (Medium) — ESP-NOW shutdown semaphore race:** The `espnow_send_cb` could attempt `xSemaphoreGive` on a deleted semaphore during shutdown. Added `shutting_down` flag check before the semaphore operation.
+- **Fix #6/#7 (Medium) — vtimer backoff wiped on progress:** Marking a stable checkpoint or sending a pre-prepare reset the vtimer to the base period, discarding any accumulated exponential backoff from prior view-change turbulence. Now uses half the current backoff period as the floor (`max(base, period/2)`).
+- **Fix #8 (Low) — `fill_sent_us` not cleared on truncate:** `tbft_ar_truncate` cleared `commit_sent_us` but not `fill_sent_us`. When a slice was reused after window wrap, a stale `fill_sent_us` could bypass the fill throttle. Now both fields are cleared.
+- **Fix #9 (Low) — Stale-view fill requests:** `handle_fill_request` now drops requests whose `fr->view != r->node.view`, avoiding wasted HMAC verification and PP re-transmission for old-view fills.
+- **Fix #11 (Low) — Misleading comment:** Corrected a comment claiming fill responses could come from "any replica" — the HMAC keys restrict it to the primary.
+
 ### v0.2.19
 
 - **Revert v0.2.18 primary-vtimer-suppress:** Preventing the primary from calling `send_view_change` on its own vtimer (v0.2.18) proved to be a regression — the primary must participate in the view-change protocol to contribute its prepared certificates. Without the primary's view-change message the new primary may lack complete prepare state, causing cascading incomplete view changes.

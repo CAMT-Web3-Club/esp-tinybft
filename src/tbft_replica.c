@@ -1344,6 +1344,8 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
         return;
     }
 
+    tbft_view_t old_view = r->node.view;
+
     bool collected = tbft_vi_collect_vc(&r->vi, sender_id, msg, len);
     if (!collected) {
         if (vc->v > r->node.view) {
@@ -1382,7 +1384,7 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
              * for this view a fair chance without resetting to 1×. */
             tbft_itimer_stop(&r->vtimer);
             if (tbft_replica_has_pending_requests(r)) {
-                int shift = (int)(vc->v - r->node.view);
+                int shift = (int)(vc->v - old_view);
                 if (shift < 1) shift = 1;
                 if (shift > 6) shift = 6;
                 int64_t period = r->vtimer_period_us * (1LL << shift);
@@ -1406,7 +1408,7 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
              * for this view a fair chance without resetting to 1×. */
             tbft_itimer_stop(&r->vtimer);
             if (tbft_replica_has_pending_requests(r)) {
-                int shift = (int)(vc->v - r->node.view);
+                int shift = (int)(vc->v - old_view);
                 if (shift < 1) shift = 1;
                 if (shift > 6) shift = 6;
                 int64_t period = r->vtimer_period_us * (1LL << shift);
@@ -1641,11 +1643,28 @@ void tbft_replica_handle_new_view(tbft_replica_t *r, const void *msg, int len)
         return;
     }
 
+    /* Validate that the message body is large enough to hold n_prep
+     * proofs.  n_prep is attacker-controlled; without this check the
+     * proof-read loops at lines below would read past end-of-message.
+     * int32_t overflow: n_prep <= TBFT_WINDOW_SIZE (≤ 256), so
+     * n_prep * sizeof(tbft_vc_req_info_t) cannot overflow int32_t. */
+    int32_t proofs_size = (int32_t)(nv->n_prep * sizeof(tbft_vc_req_info_t));
+    int32_t header_size = (int32_t)sizeof(tbft_new_view_rep_t);
+    if (proofs_size > 0 && body_size < header_size + proofs_size) {
+        ESP_LOGW(TAG, "new-view: body too short for n_prep=%d"
+                 " (body=%d need=%d)",
+                 nv->n_prep, (int)body_size,
+                 (int)(header_size + proofs_size));
+        return;
+    }
+
     /* Validate n_prep bounds before processing prepared proofs. */
     if (nv->n_prep < 0 || nv->n_prep > TBFT_WINDOW_SIZE) {
         ESP_LOGW(TAG, "new-view: invalid n_prep=%d", nv->n_prep);
         return;
     }
+
+    tbft_view_t old_view = r->node.view;
 
     /* Install new view */
     r->node.view        = nv->v;
@@ -1711,15 +1730,14 @@ void tbft_replica_handle_new_view(tbft_replica_t *r, const void *msg, int len)
      * prepared seqnos from a prior view, r->seqno can land beyond the
      * window [nv->min+1, nv->min+1+WINDOW_SIZE).  Advance the head so
      * the primary can propose within range rather than being permanently
-     * blocked with "pre-prepare: seqno out of window". */
+     * blocked with "pre-prepare: seqno out of window".  Only advance
+     * the window head; last_stable stays at the verified nv->min
+     * (set above) — a proper checkpoint quorum must advance it. */
     if (r->seqno >= r->ar.head + TBFT_WINDOW_SIZE) {
         ESP_LOGI(TAG, "new-view: advancing window head from %lld"
                  " to %lld for seqno coverage",
                  (long long)r->ar.head, (long long)r->seqno);
         tbft_ar_truncate(&r->ar, r->seqno);
-        r->last_stable   = r->seqno - 1;
-        r->last_executed = r->last_stable;
-        r->last_prepared = r->last_stable;
     }
     r->last_prepared = r->last_executed;
     if (tbft_replica_is_primary(r)) {
@@ -1764,7 +1782,7 @@ void tbft_replica_handle_new_view(tbft_replica_t *r, const void *msg, int len)
     r->vi.in_progress = false;
 
     if (tbft_replica_has_pending_requests(r)) {
-        int shift = (int)(nv->v - r->node.view);
+        int shift = (int)(nv->v - old_view);
         if (shift < 1) shift = 1;
         if (shift > 6) shift = 6;
         int64_t period = r->vtimer_period_us * (1LL << shift);
@@ -1823,6 +1841,7 @@ static void handle_status(tbft_replica_t *r, const void *msg, int len)
          * view-change that may have been targeting an older view, and
          * let the normal vtimer trigger a proper view-change if the
          * new primary fails to make progress. */
+        tbft_view_t old_view = r->node.view;
         r->node.view = st->view;
         r->node.cur_primary = tbft_node_primary(&r->node, st->view);
         tbft_replica_reset_forwarded_requests(r);
@@ -1867,7 +1886,7 @@ static void handle_status(tbft_replica_t *r, const void *msg, int len)
          * successive failure.  Without this, Status-based view catch-up
          * resets the timer to 1× base every cycle, and the backoff in
          * send_view_change never takes effect. */
-        int view_gap = (int)(st->view - r->node.view);
+        int view_gap = (int)(st->view - old_view);
         int shift = view_gap;
         if (shift < 1) shift = 1;
         if (shift > 6) shift = 6;
@@ -2162,8 +2181,13 @@ void tbft_replica_send_pre_prepare(tbft_replica_t *r)
         return;
     }
 
-    /* Restart the vtimer now that we're actively working on a request. */
-    tbft_itimer_start(&r->vtimer, r->vtimer_period_us);
+    /* Restart the vtimer now that we're actively working on a request.
+     * Use half-backoff so prior view-change turbulence decays. */
+    {
+        int64_t half = r->vtimer.period_us / 2;
+        if (half < r->vtimer_period_us) half = r->vtimer_period_us;
+        tbft_itimer_start(&r->vtimer, half);
+    }
 
     /* CRITICAL FIX: Dedup by request ID.  The same request can arrive
      * multiple times: once from the client's broadcast, then forwarded
@@ -2685,9 +2709,14 @@ void tbft_replica_mark_stable(tbft_replica_t *r, tbft_seqno_t seqno)
     tbft_ar_truncate(&r->ar, seqno + 1);
     tbft_cr_truncate(&r->cr, seqno);
 
-    /* Reset view-change timer — stable progress */
+    /* Reset view-change timer — stable progress.
+     * Use half the current backoff period so accumulated backoff
+     * from prior view-change turbulence decays instead of resetting
+     * to base immediately. */
     if (tbft_replica_has_pending_requests(r)) {
-        tbft_itimer_start(&r->vtimer, r->vtimer_period_us);
+        int64_t half = r->vtimer.period_us / 2;
+        if (half < r->vtimer_period_us) half = r->vtimer_period_us;
+        tbft_itimer_start(&r->vtimer, half);
     } else {
         tbft_itimer_stop(&r->vtimer);
     }
@@ -3028,6 +3057,11 @@ void tbft_replica_handle_fill_request(tbft_replica_t *r,
     const tbft_fill_request_rep_t *fr =
         (const tbft_fill_request_rep_t *)msg;
 
+    /* Drop fill requests from a stale view — the PP they carry is for
+     * a view that pre-dates our current one and would be rejected by
+     * handle_pre_prepare anyway. */
+    if (fr->view != r->node.view) return;
+
     /* Validate requester id */
     if (fr->id < 0 || fr->id >= r->node.num_replicas
         || fr->id == r->node.node_id) {
@@ -3050,11 +3084,11 @@ void tbft_replica_handle_fill_request(tbft_replica_t *r,
         return;
     }
 
-    /* v0.2.14 (Layer 2 broadcast-fill): any replica that received the
-     * original PP can re-send it. This lets backups help recover from
-     * the "current primary never had the PP" case (e.g., the original
-     * sender crashed mid-broadcast, and subsequent view changes do not
-     * bring a primary that has the PP).
+    /* v0.2.14 (Layer 2 broadcast-fill): the primary that received the
+     * original PP can re-send it. This helps recover from the "current
+     * primary never had the PP" case (e.g., the original sender crashed
+     * mid-broadcast, and subsequent view changes do not bring a primary
+     * that has the PP).
      *
      * The PP's HMAC was computed by the original primary; we forward the
      * original bytes unchanged. The requester verifies via the standard

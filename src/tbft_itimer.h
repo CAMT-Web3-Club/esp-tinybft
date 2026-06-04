@@ -23,6 +23,7 @@ typedef struct {
     tbft_timer_cb_t     cb;
     void               *arg;
     volatile bool       running;
+    int64_t             period_us;   /* last-started timeout */
 } tbft_itimer_t;
 
 /**
