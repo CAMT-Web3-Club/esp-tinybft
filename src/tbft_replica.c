@@ -2548,16 +2548,14 @@ void tbft_replica_execute_committed(tbft_replica_t *r)
                 const tbft_commit_rep_t *cm_win =
                     (const tbft_commit_rep_t *)winning_cm;
                 if (!tbft_digest_equal(&pp->digest, &cm_win->digest)) {
-                    ESP_LOGW(TAG, "execute: commit digest mismatch for seqno=%lld — skipping",
+                    ESP_LOGW(TAG, "execute: commit digest mismatch for seqno=%lld — "
+                             "breaking, requesting fill",
                              (long long)n);
-        r->last_executed = n;
-
-        /* Clear pending fill — the seqno we were waiting on is now executed */
-        if (r->pending_fill_seqno == n) {
-            r->pending_fill_seqno  = 0;
-            r->fill_started_at_us  = 0;
-        }
-                    continue;
+                    if (!r->vi.in_progress && r->pending_fill_seqno != n) {
+                        r->pending_fill_seqno  = n;
+                        r->fill_started_at_us  = esp_timer_get_time();
+                    }
+                    break;
                 }
             }
         }

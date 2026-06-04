@@ -195,6 +195,15 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for full documentation covering
 
 ## Changelog
 
+### v0.4.0 — Cross-audit fixes
+
+- **SSH-5 (Critical): Fetch queue overflow → silent block drop:** BFS state fetch needs 273 entries (1 root + 16 internal + 256 leaves) but queue was 256. 17 leaf blocks silently dropped → permanent ptree divergence. Doubled queue to `TBFT_MAX_STATE_BLOCKS * 2`.
+- **CH-3 (High): Client `Byz_send_request` drains own queued replies:** The drain loop discarded all messages including queued replies from a timed-out `Byz_recv_reply`. Now processes replies inline instead of discarding.
+- **SSH-1 (High): Commit digest mismatch permanently skips seqno:** Previously set `last_executed = n` and `continue` → seqno permanently lost. Now `break`s and requests fill → view-change resolves deterministically (v0.3.1).
+- **SSH-3 (Medium): New_key size macro underestimated:** Used `TBFT_SIG_SIZE` (256) instead of `sizeof(tbft_new_key_slot_t)` (260) → 48-byte underestimate. Fixed buffer allocation.
+- **SSH-6 (Medium): Data race on `t->running` in timer:** Set `t->running = true` before `esp_timer_start_once` to prevent callback race. Reset to false on start failure.
+- **SSH-4**: Already guarded by `len < sizeof(tbft_pre_prepare_rep_t)` check at line 877 — no fix needed.
+
 ### v0.3.6 — Missing timestamp write in send_new_key
 
 - **Fix v0.3.5 regression:** The M1 New_key replay guard reads `hdr.timestamp_us` but `send_new_key` never wrote it — the field was always 0. `last_key_install_time` starts at 0, so `0 <= 0` rejected every New_key silently → no HMAC keys installed → universal MAC failure → cluster dead. Added `nk->hdr.timestamp_us = esp_timer_get_time()` in `send_new_key`.

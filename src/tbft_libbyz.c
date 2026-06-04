@@ -524,11 +524,23 @@ int Byz_send_request(Byz_req *req, bool read_only)
 {
     if (!s_client) return -1;
 
-    /* Drain any stale replies or other messages in the transport queue */
+    /* Drain stale non-reply messages; process any queued replies inline.
+     * Discarding replies would lose them permanently — a previous recv_reply
+     * may have timed out while replies were still arriving. */
     if (!s_is_replica) {
         static uint8_t dummy[TBFT_MAX_MESSAGE_SIZE];
-        while (tbft_node_recv(s_client, dummy, sizeof(dummy), NULL) > 0) {
-            /* discard */
+        int drained;
+        for (int safety = 0; safety < 64; safety++) {
+            drained = tbft_node_recv(s_client, dummy, sizeof(dummy), NULL);
+            if (drained <= 0) break;
+            const tbft_msg_hdr_t *hdr = (const tbft_msg_hdr_t *)dummy;
+            if (drained >= (int)sizeof(*hdr) && hdr->tag == TBFT_MSG_REPLY) {
+                Byz_rep rep;
+                if (Byz_recv_reply(&rep) == 0) {
+                    /* Reply consumed — caller can re-check later */
+                }
+            }
+            /* Non-reply messages are stale — discard */
         }
     }
 

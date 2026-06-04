@@ -307,7 +307,7 @@ void tbft_state_start_fetch(tbft_state_t *state, tbft_seqno_t seqno,
      * block so state transfer can proceed. */
     if (state->ptree.dims.p_levels == 1) {
         for (int i = 0; i < state->num_blocks; i++) {
-            if (state->fetch_queue_len >= TBFT_MAX_STATE_BLOCKS) break;
+            if (state->fetch_queue_len >= (TBFT_MAX_STATE_BLOCKS * 2)) break;
             state->fetch_queue[state->fetch_queue_len].level = 0;
             state->fetch_queue[state->fetch_queue_len].index = i;
             state->fetch_queue[state->fetch_queue_len].done  = false;
@@ -381,7 +381,7 @@ void tbft_state_handle_meta_data(tbft_state_t *state,
         const tbft_digest_t *local =
             &state->ptree.ptree[child_level][child_idx].digest;
         if (!tbft_digest_equal(local, &parts[i].digest)) {
-            if (state->fetch_queue_len < TBFT_MAX_STATE_BLOCKS) {
+            if (state->fetch_queue_len < (TBFT_MAX_STATE_BLOCKS * 2)) {
                 tbft_fetch_req_t *req =
                     &state->fetch_queue[state->fetch_queue_len++];
                 req->level = child_level;
@@ -390,7 +390,7 @@ void tbft_state_handle_meta_data(tbft_state_t *state,
             } else {
                 ESP_LOGW(TAG, "meta_data: fetch queue full, dropping "
                          "child level=%d idx=%d (max=%d)",
-                         child_level, child_idx, TBFT_MAX_STATE_BLOCKS);
+                         child_level, child_idx, (TBFT_MAX_STATE_BLOCKS * 2));
             }
         }
     }
