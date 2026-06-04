@@ -397,20 +397,9 @@ void tbft_replica_run(tbft_replica_t *r)
                     }
                 }
                 if (keys_ok >= r->node.threshold - 1 && (bits & TBFT_EVT_VTIMER)) {
-                    if (!tbft_replica_is_primary(r)) {
-                        ESP_LOGW(TAG, "view-change timeout in view %lld (keys=%d/%d)",
-                                 (long long)r->node.view, keys_ok, r->node.threshold - 1);
-                        tbft_replica_send_view_change(r);
-                    } else {
-                        /* The primary must not initiate a view-change to
-                         * replace itself.  Blocking send_pre_prepare while
-                         * vi.in_progress is true would cause the request
-                         * queue to fill and drop client requests.  Backups
-                         * detect lack-of-progress independently — if the
-                         * primary genuinely cannot make progress, the
-                         * backups will initiate a view-change. */
-                        tbft_itimer_stop(&r->vtimer);
-                    }
+                    ESP_LOGW(TAG, "view-change timeout in view %lld (keys=%d/%d)",
+                             (long long)r->node.view, keys_ok, r->node.threshold - 1);
+                    tbft_replica_send_view_change(r);
                 } else if (bits & TBFT_EVT_VTIMER) {
                     ESP_LOGD(TAG, "view-change suppressed: keys=%d/%d — re-arming",
                              keys_ok, r->node.threshold - 1);
@@ -804,6 +793,14 @@ void tbft_replica_handle_request(tbft_replica_t *r, const void *msg, int len)
         }
         return;
     }
+
+    /* Skip enqueue during a view-change: send_pre_prepare returns
+     * immediately when vi.in_progress is true (line 2124), so any
+     * queued request would just sit and fill the queue.  The client
+     * retries with exponential backoff — by the next retry the view
+     * change should be complete and the request will reach the
+     * correct primary. */
+    if (r->vi.in_progress) return;
 
     /* Primary: deduplicate by (cid, rid) before enqueuing.
      * Multiple copies of the same request can arrive — once from the

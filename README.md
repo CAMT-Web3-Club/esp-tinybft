@@ -195,9 +195,10 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for full documentation covering
 
 ## Changelog
 
-### v0.2.18
+### v0.2.19
 
-- **Primary must not self-trigger view-change:** The primary's own vtimer could fire during a commit gap, call `send_view_change`, set `vi.in_progress = true`, and block `send_pre_prepare` (line 2124). This created a self-sustaining deadlock: blocked PP generation → request queue fills → `has_pending_requests` returns true (because of `vi.in_progress`) → vtimer re-armed → fires again. The fix: the primary's vtimer handler now stops the vtimer silently instead of initiating a view-change to replace itself. Backups detect lack-of-progress independently and initiate view changes if the primary is genuinely stuck.
+- **Revert v0.2.18 primary-vtimer-suppress:** Preventing the primary from calling `send_view_change` on its own vtimer (v0.2.18) proved to be a regression — the primary must participate in the view-change protocol to contribute its prepared certificates. Without the primary's view-change message the new primary may lack complete prepare state, causing cascading incomplete view changes.
+- **Skip enqueue during view-change instead:** The correct fix for the request-queue-full problem is to skip enqueuing client requests on the primary while `vi.in_progress` is true.  `send_pre_prepare` returns immediately in that state (line 2124), so any queued request would just sit, fill the queue, and get dropped with log spam.  Silently returning lets the client retry with exponential backoff; by the next attempt the view change will normally be complete and the correct primary handles the request.
 
 ### v0.2.17
 
