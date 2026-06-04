@@ -195,6 +195,10 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for full documentation covering
 
 ## Changelog
 
+### v0.3.4 — Suppress fill re-detection during view-change
+
+- **Prevent `execute_committed` from re-starting fill while `vi.in_progress`:** When v0.3.1 triggers a view change for a prepared-but-uncommitted seqno, `execute_committed` runs on the next main-loop iteration and re-detects the same gap — setting `pending_fill_seqno` again and starting a competing 10-second fill timer. If the view change takes longer than 10 seconds (common with ESP-NOW congestion), the fill timer fires, finds the PP was disposed by the view change, and abandons the seqno anyway. Now `execute_committed` skips fill initiation while a view change is in progress — the VC is already handling the gap.
+
 ### v0.3.3 — Fallback fetch target when cluster has no genuine checkpoints
 
 - **Fix catch-up deadlock with `quorum_last_stable`:** v0.3.2 introduced `quorum_last_stable` which correctly prevents fetch-derived state from blocking checkpoint quorum, but broke fresh-node catch-up when the entire cluster lacked genuine checkpoints (all nodes report `quorum_last_stable==0`). Path A and Path B both compared `st->last_stable` against `r->last_stable` — both zero → no fetch ever triggered. Now both paths compute a fallback fetch target from `st->last_executed` (nearest checkpoint boundary below the peer's execution point) when `st->last_stable==0`, ensuring newly booted nodes can always catch up.

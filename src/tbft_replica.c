@@ -2508,7 +2508,7 @@ void tbft_replica_execute_committed(tbft_replica_t *r)
                      " requesting fill",
                      (long long)n, (long long)r->last_executed,
                      (long long)r->last_prepared);
-            if (r->pending_fill_seqno != n) {
+            if (!r->vi.in_progress && r->pending_fill_seqno != n) {
                 r->pending_fill_seqno  = n;
                 r->fill_started_at_us  = esp_timer_get_time();
             }
@@ -2521,7 +2521,7 @@ void tbft_replica_execute_committed(tbft_replica_t *r)
             ESP_LOGW(TAG, "execute: no pre-prepare for seqno=%lld — break,"
                      " requesting fill",
                      (long long)n);
-            if (r->pending_fill_seqno != n) {
+            if (!r->vi.in_progress && r->pending_fill_seqno != n) {
                 r->pending_fill_seqno  = n;
                 r->fill_started_at_us  = esp_timer_get_time();
             }
