@@ -195,6 +195,10 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for full documentation covering
 
 ## Changelog
 
+### v0.3.3 — Fallback fetch target when cluster has no genuine checkpoints
+
+- **Fix catch-up deadlock with `quorum_last_stable`:** v0.3.2 introduced `quorum_last_stable` which correctly prevents fetch-derived state from blocking checkpoint quorum, but broke fresh-node catch-up when the entire cluster lacked genuine checkpoints (all nodes report `quorum_last_stable==0`). Path A and Path B both compared `st->last_stable` against `r->last_stable` — both zero → no fetch ever triggered. Now both paths compute a fallback fetch target from `st->last_executed` (nearest checkpoint boundary below the peer's execution point) when `st->last_stable==0`, ensuring newly booted nodes can always catch up.
+
 ### v0.3.2 — Prevent fetch-derived state from blocking checkpoint quorum
 
 - **Separate `quorum_last_stable` from fetch-derived `last_stable`:** A node that boots late and fetches state marks its `last_stable` to the fetched seqno, causing Status messages to report "I'm stable at N". Peers stop sending their checkpoints for N — but the fetched node's ptree root digest may differ from the cluster consensus. When the cluster later tries to checkpoint at N+2, the digest mismatch prevents quorum from ever forming, deadlocking the window and triggering a view-change loop. The fix: `r->quorum_last_stable` (new field) is only advanced by genuine checkpoint quorums (winning digest matched). Status messages report `quorum_last_stable` instead of `last_stable` — a fetched node reports 0 until a genuine quorum forms, so peers keep sending checkpoints until consensus is reached.

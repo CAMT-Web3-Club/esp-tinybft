@@ -1910,14 +1910,24 @@ static void handle_status(tbft_replica_t *r, const void *msg, int len)
          * cluster), immediately fetch so we can participate in consensus.
          * Without this, a node with last_stable=0 catches up the view
          * but never its state, and the in-order-execution requirement
-         * (execute: seqno=1 not committed yet) blocks all new requests. */
-        if (st->last_stable > r->last_stable && !r->state.in_fetch) {
+         * (execute: seqno=1 not committed yet) blocks all new requests.
+         *
+         * When the cluster has no genuine checkpoints (all nodes report
+         * quorum_last_stable==0), fall back to the nearest checkpoint
+         * below the peer's last_executed as fetch target. */
+        tbft_seqno_t fetch_target = st->last_stable;
+        if (fetch_target == 0 && st->last_executed > 0) {
+            fetch_target = (st->last_executed / TBFT_CHECKPOINT_INTERVAL)
+                         * TBFT_CHECKPOINT_INTERVAL;
+            if (fetch_target == 0) fetch_target = TBFT_CHECKPOINT_INTERVAL;
+        }
+        if (fetch_target > r->last_stable && !r->state.in_fetch) {
             int replier = tbft_node_primary(&r->node, st->view);
             ESP_LOGI(TAG, "view catch-up triggered state fetch to seqno=%lld"
-                     " from primary %d", (long long)st->last_stable, replier);
+                     " from primary %d", (long long)fetch_target, replier);
             /* Stagger fetch starts to avoid all replicas fetching at once. */
             r->last_fetch_throttle_us = esp_timer_get_time();
-            tbft_replica_start_fetch(r, st->last_stable, replier);
+            tbft_replica_start_fetch(r, fetch_target, replier);
         }
 
         /* Use exponential backoff so the view-change timer grows with each
@@ -1940,15 +1950,24 @@ static void handle_status(tbft_replica_t *r, const void *msg, int len)
         }
     }
 
+    /* When the cluster has no genuine checkpoints (all nodes report
+     * quorum_last_stable==0), compute a fetch target from the peer's
+     * last_executed as fallback. */
+    tbft_seqno_t fetch_target = st->last_stable;
+    if (fetch_target == 0 && st->last_executed > 0) {
+        fetch_target = (st->last_executed / TBFT_CHECKPOINT_INTERVAL)
+                     * TBFT_CHECKPOINT_INTERVAL;
+        if (fetch_target == 0) fetch_target = TBFT_CHECKPOINT_INTERVAL;
+    }
     if (st->last_executed > r->last_executed
-        && st->last_stable > r->last_stable
-        && (!r->state.in_fetch || st->last_stable > r->state.fetch_seqno)
+        && fetch_target > r->last_stable
+        && (!r->state.in_fetch || fetch_target > r->state.fetch_seqno)
         && st->last_executed - r->last_executed > TBFT_CHECKPOINT_INTERVAL) {
         /* Rate-limit fetch starts to avoid flooding. */
         int64_t now = esp_timer_get_time();
         if (now - r->last_fetch_throttle_us >= 500000LL) {
             r->last_fetch_throttle_us = now;
-            tbft_replica_start_fetch(r, st->last_stable, st->id);
+            tbft_replica_start_fetch(r, fetch_target, st->id);
         }
     }
 
