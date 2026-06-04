@@ -195,6 +195,10 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for full documentation covering
 
 ## Changelog
 
+### v0.3.2 — Prevent fetch-derived state from blocking checkpoint quorum
+
+- **Separate `quorum_last_stable` from fetch-derived `last_stable`:** A node that boots late and fetches state marks its `last_stable` to the fetched seqno, causing Status messages to report "I'm stable at N". Peers stop sending their checkpoints for N — but the fetched node's ptree root digest may differ from the cluster consensus. When the cluster later tries to checkpoint at N+2, the digest mismatch prevents quorum from ever forming, deadlocking the window and triggering a view-change loop. The fix: `r->quorum_last_stable` (new field) is only advanced by genuine checkpoint quorums (winning digest matched). Status messages report `quorum_last_stable` instead of `last_stable` — a fetched node reports 0 until a genuine quorum forms, so peers keep sending checkpoints until consensus is reached.
+
 ### v0.3.1 — Deterministic commit-gap recovery
 
 - **Replace abandon with view-change when prepare quorum exists:** Commit gaps where a prepare quorum (2f+1 matching Prepares) already formed can no longer be abandoned — the request IS certified, only commits are missing due to network drops. Abandoning would create permanent state divergence (some nodes committed, some abandoned) that blocks all future checkpoints. Now triggers a view change instead: the new primary collects prepared state from all replicas via VC messages, and every node reaches the same commit/execute decision deterministically. Trivial gaps (no PP, or PP stored but no prepare quorum) are still abandoned safely since nobody has certified state.

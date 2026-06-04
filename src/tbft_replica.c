@@ -189,6 +189,7 @@ int tbft_replica_init(tbft_replica_t *r,
     /* Sequence number initialisation */
     r->seqno                    = 1;
     r->last_stable              = 0;
+    r->quorum_last_stable       = 0;
     r->last_ckpt_throttle_us    = 0;
     r->last_fetch_throttle_us    = 0;
     r->last_prepared            = 0;
@@ -418,7 +419,7 @@ void tbft_replica_run(tbft_replica_t *r)
                 st->hdr.extra         = 0;
                 st->hdr.size          = tbft_msg_align((int32_t)sizeof(*st));
                 st->view              = r->node.view;
-                st->last_stable       = r->last_stable;
+                st->last_stable       = r->quorum_last_stable;
                 st->last_prepared     = r->last_prepared;
                 st->last_executed     = r->last_executed;
                 st->id                = r->node.node_id;
@@ -2725,6 +2726,16 @@ void tbft_replica_mark_stable(tbft_replica_t *r, tbft_seqno_t seqno)
 
     tbft_state_mark_stable(&r->state, seqno);
     r->last_stable = seqno;
+
+    /* Only advance quorum_last_stable when a genuine checkpoint
+     * quorum confirmed this seqno (winning != NULL and digest matched).
+     * Fetch-based mark_stable calls arrive with winning == NULL —
+     * the fetched state must not pollute the consensus-backed value
+     * reported in Status messages, or peers will stop sending
+     * checkpoints and a permanent quorum deadlock results. */
+    if (winning) {
+        r->quorum_last_stable = seqno;
+    }
 
     /* Advance execution and prepared markers to the stable checkpoint.
      * After a state fetch, the application state matches this checkpoint
