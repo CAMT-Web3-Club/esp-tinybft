@@ -1758,11 +1758,9 @@ void tbft_replica_handle_new_view(tbft_replica_t *r, const void *msg, int len)
                  r->node.node_id, (long long)r->seqno, (long long)nv->v);
     }
 
-    /* Process prepared proofs from New_view to recover unexecuted requests.
-     * PBFT requires the new primary to prove which requests were prepared
-     * in the previous view. We log the proofs for observability; the new
-     * primary will re-send pre-prepares for unexecuted seqnos via normal
-     * operation once it starts. */
+    /* Process prepared proofs from the New_view.  If we are the new primary,
+     * repropose each prepared-but-unexecuted seqno so the cluster can reach
+     * commit quorum in this view.  Backups just log the proofs. */
     if (nv->n_prep > 0) {
         const uint8_t *proofs = (const uint8_t *)msg + sizeof(*nv);
         int n_prep = nv->n_prep;
@@ -1779,6 +1777,72 @@ void tbft_replica_handle_new_view(tbft_replica_t *r, const void *msg, int len)
                 ESP_LOGI(TAG, "new-view: prepared seqno=%lld digest=[...%02x] from view %lld",
                          (long long)proof->seqno, proof->digest.bytes[0],
                          (long long)proof->last_view);
+
+                if (tbft_replica_is_primary(r)) {
+                    /* Reproposed: rebuild PP for this seqno in the new view */
+                    int pp_len = 0;
+                    const uint8_t *old_pp = tbft_ar_load_pp(&r->ar, proof->seqno, &pp_len);
+                    if (old_pp && pp_len >= (int)sizeof(tbft_pre_prepare_rep_t)) {
+                        const tbft_pre_prepare_rep_t *old =
+                            (const tbft_pre_prepare_rep_t *)old_pp;
+                        size_t rset_size = (size_t)old->rset_size;
+                        size_t ndet_size = (size_t)old->non_det_size;
+                        size_t body_off  = sizeof(*old) + rset_size + ndet_size;
+                        int32_t new_size = tbft_msg_align(
+                            (int32_t)(body_off + sizeof(tbft_auth_t)));
+
+                        if (new_size <= (int32_t)sizeof(r->out_buf)) {
+                            memcpy(r->out_buf, old_pp, (size_t)pp_len);
+                            tbft_pre_prepare_rep_t *new_pp =
+                                (tbft_pre_prepare_rep_t *)r->out_buf;
+                            new_pp->view = r->node.view;
+                            new_pp->hdr.timestamp_us = esp_timer_get_time();
+                            new_pp->hdr.size = new_size;
+
+                            tbft_auth_t *auth =
+                                (tbft_auth_t *)(r->out_buf + body_off);
+                            tbft_node_gen_auth(&r->node, r->out_buf, body_off, auth);
+
+                            tbft_ar_store_pp(&r->ar, proof->seqno, r->out_buf, new_size);
+                            tbft_node_send(&r->node, r->out_buf, (size_t)new_size,
+                                           TBFT_ALL_REPLICAS);
+                            ESP_LOGI(TAG, "new-view: reproposed seqno=%lld view=%lld",
+                                     (long long)proof->seqno, (long long)r->node.view);
+
+                            /* Self-prepare for the reproposed seqno */
+                            {
+                                tbft_prepare_rep_t *prep =
+                                    (tbft_prepare_rep_t *)r->out_buf;
+                                memset(r->out_buf, 0, sizeof(*prep) + sizeof(tbft_auth_t));
+                                prep->hdr.tag   = TBFT_MSG_PREPARE;
+                                prep->hdr.extra = 0;
+                                prep->hdr.timestamp_us = esp_timer_get_time();
+                                prep->view      = r->node.view;
+                                prep->seqno     = proof->seqno;
+                                prep->digest    = old->digest;
+                                prep->id        = r->node.node_id;
+                                tbft_auth_t *a2 =
+                                    (tbft_auth_t *)(r->out_buf + sizeof(*prep));
+                                prep->hdr.size = tbft_msg_align(
+                                    (int32_t)(sizeof(*prep) + sizeof(tbft_auth_t)));
+                                tbft_node_gen_auth(&r->node, r->out_buf,
+                                                   sizeof(*prep), a2);
+                                tbft_ar_add_my_prepare(&r->ar, proof->seqno,
+                                                       r->out_buf, prep->hdr.size,
+                                                       r->node.node_id);
+                                tbft_node_send(&r->node, r->out_buf,
+                                               (size_t)prep->hdr.size,
+                                               TBFT_ALL_REPLICAS);
+                            }
+                        } else {
+                            ESP_LOGE(TAG, "new-view: out_buf too small for seqno=%lld reproposal",
+                                     (long long)proof->seqno);
+                        }
+                    } else {
+                        ESP_LOGW(TAG, "new-view: no stored PP for prepared seqno=%lld,"
+                                 " cannot repropose", (long long)proof->seqno);
+                    }
+                }
             }
         }
     }
@@ -1958,8 +2022,14 @@ static void handle_status(tbft_replica_t *r, const void *msg, int len)
 
     /* Help B catch up on missing Pre_prepare and Commit messages if B is in
      * the same view but slightly behind in execution.  Rate-limited to
-     * avoid flooding the transport tx queue. */
-    if (st->view == r->node.view && st->last_executed < r->last_executed) {
+     * avoid flooding the transport tx queue.
+     *
+     * Skip if B is severely behind (> 4 windows): individual per-seqno
+     * replay would flood B's recv queue with hundreds of messages.  B
+     * needs a state-fetch (triggered by the view-catch-up path above). */
+    if (st->view == r->node.view
+        && st->last_executed < r->last_executed
+        && st->last_executed + TBFT_WINDOW_SIZE * 4 >= r->last_executed) {
         int64_t now_us = esp_timer_get_time();
         int64_t threshold_us = (st->last_executed + 1 == r->last_executed)
             ? 200000LL : 500000LL;

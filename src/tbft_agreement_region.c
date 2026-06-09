@@ -167,8 +167,17 @@ void tbft_ar_reset_for_new_view(tbft_agreement_region_t *ar,
             
             sl->commit_sent_us = 0;
             sl->fill_sent_us   = 0;
+        } else if (tbft_prepared_cert_is_complete(&sl->prepared_cert)) {
+            /* Prepared but not yet executed: preserve PP body for reproposal
+             * in the new view.  Clear old-view signatures/certificates only. */
+            int prep_thr = ar->prepare_threshold;
+            tbft_prepare_cert_init(&sl->prepared_cert.pc, prep_thr);
+            int commit_thr = ar->commit_threshold;
+            tbft_commit_cert_init(&sl->commit_cert, commit_thr);
+            sl->commit_sent_us = 0;
+            sl->fill_sent_us   = 0;
         } else {
-            /* Unexecuted sequence: clear everything to accept new primary's proposals */
+            /* Not prepared, not executed: clear everything */
             tbft_prepared_cert_clear(&sl->prepared_cert);
             tbft_commit_cert_clear(&sl->commit_cert);
             sl->commit_sent_us = 0;
