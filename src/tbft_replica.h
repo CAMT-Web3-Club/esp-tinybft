@@ -128,6 +128,12 @@ typedef struct {
      * Reset to 0 on replica restart to avoid stale values. */
     int yield_counter;
 
+    /* Consecutive MAC verification failures.  When a node boots and
+     * misses a session-key rotation, all incoming messages fail HMAC
+     * verification.  After THRESHOLD consecutive failures, request a
+     * key re-exchange instead of triggering a doomed view change. */
+    int consecutive_mac_failures;
+
     /* Event group for decoupling timer callbacks from heavy processing */
     EventGroupHandle_t evt_group;
 } tbft_replica_t;

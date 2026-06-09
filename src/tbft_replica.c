@@ -585,15 +585,29 @@ void tbft_replica_run(tbft_replica_t *r)
                         tbft_ar_prepared(&r->ar, r->pending_fill_seqno);
 
                     if (prepared_gap) {
-                        ESP_LOGW(TAG,
-                            "fill: prepare ok but commit missing at seqno=%lld"
-                            " after %lldms — triggering view change",
-                            (long long)r->pending_fill_seqno,
-                            (long long)(elapsed_us / 1000));
-                        r->pending_fill_seqno  = 0;
-                        r->fill_started_at_us  = 0;
-                        if (!r->vi.in_progress) {
-                            tbft_replica_send_view_change(r);
+                        /* If we're getting persistent MAC failures, the session
+                         * keys are stale.  Request re-exchange instead of
+                         * triggering a doomed view change. */
+                        if (r->consecutive_mac_failures >= 20) {
+                            ESP_LOGW(TAG,
+                                "fill: suppressing view-change — %d consecutive "
+                                "MAC failures, re-exchanging keys instead",
+                                r->consecutive_mac_failures);
+                            tbft_replica_send_new_key(r);
+                            r->consecutive_mac_failures = 0;
+                            r->pending_fill_seqno  = 0;
+                            r->fill_started_at_us  = 0;
+                        } else {
+                            ESP_LOGW(TAG,
+                                "fill: prepare ok but commit missing at seqno=%lld"
+                                " after %lldms — triggering view change",
+                                (long long)r->pending_fill_seqno,
+                                (long long)(elapsed_us / 1000));
+                            r->pending_fill_seqno  = 0;
+                            r->fill_started_at_us  = 0;
+                            if (!r->vi.in_progress) {
+                                tbft_replica_send_view_change(r);
+                            }
                         }
                     } else if (pp_stored) {
                         ESP_LOGE(TAG,
@@ -942,14 +956,17 @@ void tbft_replica_handle_pre_prepare(tbft_replica_t *r, const void *msg, int len
                  ((uint8_t*)msg)[0], ((uint8_t*)msg)[1], ((uint8_t*)msg)[2], ((uint8_t*)msg)[3],
                  ((uint8_t*)msg)[4], ((uint8_t*)msg)[5], ((uint8_t*)msg)[6], ((uint8_t*)msg)[7]);
         if (!tbft_node_verify_auth(&r->node, expected_primary, msg,
-                                   (size_t)auth_offset,
-                                   &auth->slots[slot],
-                                   pp->hdr.timestamp_us)) {
+                                    (size_t)auth_offset,
+                                    &auth->slots[slot],
+                                    pp->hdr.timestamp_us)) {
             ESP_LOGW(TAG, "pp: MAC verification failed from primary %d",
                      expected_primary);
+            r->consecutive_mac_failures++;
             return;
         }
     }
+
+    r->consecutive_mac_failures = 0;
 
     /* Only advance view after successful sender and MAC verification */
     if (pp->view > r->node.view) {
@@ -1118,10 +1135,12 @@ void tbft_replica_handle_prepare(tbft_replica_t *r, const void *msg, int len)
     const tbft_msg_hdr_t *hdr = (const tbft_msg_hdr_t *)msg;
     const tbft_auth_t *auth = (const tbft_auth_t *)((const uint8_t *)msg + sizeof(*prep));
     if (!tbft_node_verify_auth(&r->node, sender, msg, sizeof(*prep),
-                               &auth->slots[slot], hdr->timestamp_us)) {
+                                &auth->slots[slot], hdr->timestamp_us)) {
         ESP_LOGW(TAG, "prepare: MAC verification failed from %d", sender);
+        r->consecutive_mac_failures++;
         return;
     }
+    r->consecutive_mac_failures = 0;
 
     /* If we already have the corresponding Pre_prepare, require the Prepare's
      * digest to match it — otherwise this Prepare is either for a different
@@ -1230,10 +1249,12 @@ void tbft_replica_handle_commit(tbft_replica_t *r, const void *msg, int len)
     const tbft_msg_hdr_t *hdr = (const tbft_msg_hdr_t *)msg;
     const tbft_auth_t *auth = (const tbft_auth_t *)((const uint8_t *)msg + sizeof(*cm));
     if (!tbft_node_verify_auth(&r->node, sender, msg, sizeof(*cm),
-                               &auth->slots[slot], hdr->timestamp_us)) {
+                                &auth->slots[slot], hdr->timestamp_us)) {
         ESP_LOGW(TAG, "commit: MAC verification failed from %d", sender);
+        r->consecutive_mac_failures++;
         return;
     }
+    r->consecutive_mac_failures = 0;
 
     /* If we have the PP, require cm->digest == pp->digest.  PBFT commits must
      * be for the same value as the pre-prepare they follow.
@@ -1335,10 +1356,12 @@ void tbft_replica_handle_checkpoint(tbft_replica_t *r, const void *msg, int len)
     /* The MAC was computed over the checkpoint body only (not the auth),
      * so verify over sizeof(*ckpt), not hdr->size which includes auth. */
     if (!tbft_node_verify_auth(&r->node, sender, msg, sizeof(*ckpt),
-                               &auth->slots[slot], hdr->timestamp_us)) {
+                                &auth->slots[slot], hdr->timestamp_us)) {
         ESP_LOGW(TAG, "checkpoint: MAC verification failed from %d", sender);
+        r->consecutive_mac_failures++;
         return;
     }
+    r->consecutive_mac_failures = 0;
 
     bool stable = tbft_cr_store(&r->cr, ckpt->seqno, sender, msg, len);
 
@@ -2873,6 +2896,19 @@ void tbft_replica_mark_stable(tbft_replica_t *r, tbft_seqno_t seqno)
 
 void tbft_replica_send_view_change(tbft_replica_t *r)
 {
+    /* Suppress view-change if we have persistent MAC verification failures.
+     * The session keys are stale — a view change with stale keys guarantees
+     * failure because we cannot validate messages from any replica.
+     * Request key re-exchange and back off instead. */
+    if (r->consecutive_mac_failures >= 20) {
+        ESP_LOGW(TAG, "send_view_change: suppressing — %d consecutive MAC failures,"
+                 " re-exchanging keys", r->consecutive_mac_failures);
+        tbft_replica_send_new_key(r);
+        r->consecutive_mac_failures = 0;
+        tbft_itimer_start(&r->vtimer, r->vtimer_period_us * 4);
+        return;
+    }
+
     tbft_view_t target = r->node.view + 1;
     if (r->vi.target_view > target) {
         target = r->vi.target_view;
