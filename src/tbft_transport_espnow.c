@@ -138,6 +138,7 @@ typedef struct tbft_espnow {
     volatile bool reasm_stale_flag;
     volatile bool shutting_down;
     SemaphoreHandle_t send_credit_sem;
+    TickType_t last_fail_tick[TBFT_MAX_NUM_REPLICAS + TBFT_MAX_NUM_CLIENTS];
 } tbft_espnow_t;
 
 static tbft_espnow_t *g_espnow_ctx = NULL;
@@ -297,6 +298,21 @@ static bool reasm_feed(tbft_espnow_t *enow, reasm_slot_t *s, const uint8_t *data
     return false;
 }
 
+static tbft_node_id_t find_node_by_mac_lockless(tbft_espnow_t *enow, const uint8_t *mac) {
+    tbft_node_id_t result = -1;
+    uint8_t base[6];
+    get_base_mac(mac, base);
+    for (int i = 0; i < enow->num_nodes; i++) {
+        if (!enow->peer_valid[i]) continue;
+
+        if (memcmp(enow->peers[i].u.mac.bytes, base, 6) == 0) {
+            result = (tbft_node_id_t)i;
+            break;
+        }
+    }
+    return result;
+}
+
 /* --------------------------------------------------------------------------
  * Callback ฝั่ง รับ-ส่ง (WiFi Context)
  * -------------------------------------------------------------------------- */
@@ -306,6 +322,14 @@ static void espnow_send_cb(const esp_now_send_info_t *tx_info, esp_now_send_stat
         ESP_LOGW(TAG, "esp_now_send to " MACSTR " failed: %d", MAC2STR(tx_info->des_addr), (int)status);
     }
     if (g_espnow_ctx && !g_espnow_ctx->shutting_down) {
+        tbft_node_id_t node_id = find_node_by_mac_lockless(g_espnow_ctx, tx_info->des_addr);
+        if (node_id >= 0 && node_id < g_espnow_ctx->num_nodes) {
+            if (status != ESP_NOW_SEND_SUCCESS) {
+                g_espnow_ctx->last_fail_tick[node_id] = xTaskGetTickCount();
+            } else {
+                g_espnow_ctx->last_fail_tick[node_id] = 0;
+            }
+        }
         xSemaphoreGive(g_espnow_ctx->send_credit_sem);
     }
 }
@@ -390,6 +414,15 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *
 
 static int espnow_do_send(tbft_espnow_t *enow, tbft_node_id_t dest_id, uint16_t msg_id, const uint8_t *buf, size_t len) {
     if (dest_id < 0 || dest_id >= enow->num_nodes || !buf || len == 0) return -1;
+
+    TickType_t last_fail = enow->last_fail_tick[dest_id];
+    if (last_fail != 0) {
+        TickType_t now = xTaskGetTickCount();
+        if ((now - last_fail) < pdMS_TO_TICKS(1000)) {
+            ESP_LOGD(TAG, "do_send: node %d is marked offline (cooldown), dropping packet", dest_id);
+            return -1;
+        }
+    }
 
     const uint8_t *ap_mac = enow->peer_ap_mac[dest_id];
 

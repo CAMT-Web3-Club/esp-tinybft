@@ -223,8 +223,8 @@ void tbft_replica_send_pre_prepare(tbft_replica_t *r);
 /** Broadcast Prepare for sequence number @p n */
 void tbft_replica_send_prepare(tbft_replica_t *r, tbft_seqno_t n);
 
-/** Broadcast Commit for sequence number @p n */
-void tbft_replica_send_commit(tbft_replica_t *r, tbft_seqno_t n);
+/** Broadcast or unicast Commit for sequence number @p n */
+void tbft_replica_send_commit(tbft_replica_t *r, tbft_seqno_t n, int dest);
 
 /** Execute all committed-but-unexecuted requests in order */
 void tbft_replica_execute_committed(tbft_replica_t *r);

@@ -552,7 +552,7 @@ void tbft_replica_run(tbft_replica_t *r)
                     && tbft_ar_prepared(&r->ar, r->pending_fill_seqno)
                     && !tbft_ar_committed(&r->ar, r->pending_fill_seqno)
                     && now_us - fsl->commit_sent_us >= 500000LL) {
-                    tbft_replica_send_commit(r, r->pending_fill_seqno);
+                    tbft_replica_send_commit(r, r->pending_fill_seqno, TBFT_ALL_REPLICAS);
                 }
 
                 /* Layer 2: after 10s, abandon the seqno. Force-advance
@@ -883,8 +883,8 @@ void tbft_replica_handle_pre_prepare(tbft_replica_t *r, const void *msg, int len
     /* Determine expected primary for this view BEFORE any state changes. */
     int expected_primary = tbft_node_primary(&r->node, pp->view);
 
-    /* Reject if wrong view — but note if the pre-prepare is from a
-     * higher view (primary is ahead of this replica). */
+    /* Reject if wrong view — higher view triggers view-advance after auth
+     * check; stale (lower) view pre-prepares are dropped per PBFT spec. */
     if (pp->view != r->node.view) {
         if (pp->view > r->node.view) {
             ESP_LOGI(TAG, "pp: higher view %lld (current=%lld), will advance after auth check",
@@ -896,8 +896,8 @@ void tbft_replica_handle_pre_prepare(tbft_replica_t *r, const void *msg, int len
         }
     }
 
-    /* Must come from current primary */
-    if (r->node.node_id == expected_primary) return; /* primary ignores own PP */
+    /* Must come from the primary of the PP's view (primary ignores own PP in current view) */
+    if (pp->view == r->node.view && r->node.node_id == expected_primary) return;
 
     /* Check sequence number is in window */
     if (!tbft_replica_in_window(r, pp->seqno)) {
@@ -963,8 +963,7 @@ void tbft_replica_handle_pre_prepare(tbft_replica_t *r, const void *msg, int len
             r->last_executed = r->last_stable;
         }
         tbft_cr_truncate(&r->cr, r->last_stable);
-        tbft_ar_init(&r->ar, r->ar.prepare_threshold, r->ar.commit_threshold);
-        r->ar.head = r->last_stable + 1;
+        tbft_ar_reset_for_new_view(&r->ar, r->last_stable + 1, r->last_executed);
         r->last_prepared = r->last_executed;
         tbft_itimer_stop(&r->vtimer);
         tbft_vi_reset(&r->vi, r->node.view + 1);
@@ -1183,7 +1182,7 @@ void tbft_replica_handle_prepare(tbft_replica_t *r, const void *msg, int len)
         if (!tbft_bitmap_test(&sl->commit_cert.bmap, r->node.node_id)) {
             ESP_LOGI(TAG, "prepared seqno=%lld, sending commit",
                      (long long)prep->seqno);
-            tbft_replica_send_commit(r, prep->seqno);
+            tbft_replica_send_commit(r, prep->seqno, TBFT_ALL_REPLICAS);
         }
         if (tbft_ar_committed(&r->ar, prep->seqno)) {
             ESP_LOGI(TAG, "prepared and committed seqno=%lld, executing",
@@ -1289,7 +1288,7 @@ void tbft_replica_handle_commit(tbft_replica_t *r, const void *msg, int len)
     if (tbft_ar_prepared(&r->ar, cm->seqno) && !tbft_ar_committed(&r->ar, cm->seqno)) {
         int64_t now = esp_timer_get_time();
         if (now - sl->commit_sent_us >= 500000) { /* 500ms cooldown rate limit */
-            tbft_replica_send_commit(r, cm->seqno);
+            tbft_replica_send_commit(r, cm->seqno, TBFT_ALL_REPLICAS);
         }
     }
 
@@ -1409,8 +1408,7 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
                 r->last_executed = r->last_stable;
             }
             tbft_cr_truncate(&r->cr, r->last_stable);
-            tbft_ar_init(&r->ar, r->ar.prepare_threshold, r->ar.commit_threshold);
-            r->ar.head = r->last_stable + 1;
+            tbft_ar_reset_for_new_view(&r->ar, r->last_stable + 1, r->last_executed);
             r->last_prepared = r->last_executed;
             ESP_LOGI(TAG, "sync view to %lld (from vc of %d), seqno reset to %lld",
                      (long long)vc->v, sender_id, (long long)r->seqno);
@@ -1553,7 +1551,8 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
         /* Append prepared proofs with quorum.
          * Guard each iteration: writing past body_end would overflow out_buf. */
         for (int k = 0; k < n_counts; k++) {
-            if (counts[k].count >= r->node.threshold) {
+            int f = (r->node.num_replicas - 1) / 3;
+            if (counts[k].count >= f + 1) {
                 if (body_ptr + sizeof(tbft_vc_req_info_t) > body_end) {
                     ESP_LOGE(TAG, "new-view: out_buf full, truncating proofs at %d", n_proofs);
                     break;
@@ -1616,8 +1615,7 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
         if (nv->min > r->last_executed) r->last_executed = nv->min;
         if (nv->min > r->last_prepared) r->last_prepared = nv->min;
         tbft_cr_truncate(&r->cr, nv->min);
-        tbft_ar_init(&r->ar, r->ar.prepare_threshold, r->ar.commit_threshold);
-        r->ar.head = nv->min + 1;
+        tbft_ar_reset_for_new_view(&r->ar, nv->min + 1, r->last_executed);
         r->last_prepared = r->last_executed;
         tbft_itimer_stop(&r->vtimer);
         tbft_vi_reset(&r->vi, r->node.view + 1);
@@ -1728,29 +1726,6 @@ void tbft_replica_handle_new_view(tbft_replica_t *r, const void *msg, int len)
         r->seqno = start_seq + 1;
     }
 
-    /* If prepared proofs from prior views pushed start_seq past our
-     * last_executed, those seqnos were certified as prepared by f+1
-     * replicas.  Advance last_executed so the execution loop doesn't
-     * encounter an uncommitted gap and break permanently — the proofs
-     * confirm these were handled in a prior view. */
-    if (nv->n_prep > 0) {
-        const uint8_t *proofs_ptr = (const uint8_t *)msg + sizeof(*nv);
-        for (int p = 0; p < nv->n_prep; p++) {
-            const tbft_vc_req_info_t *proof =
-                (const tbft_vc_req_info_t *)(proofs_ptr + p * sizeof(tbft_vc_req_info_t));
-            if (proof->seqno > r->last_executed) {
-                ESP_LOGI(TAG, "new-view: advancing last_executed from %lld"
-                         " to %lld (prepared proof from view %lld)",
-                         (long long)r->last_executed,
-                         (long long)proof->seqno,
-                         (long long)proof->last_view);
-                r->last_executed = proof->seqno;
-                if (r->last_prepared < proof->seqno)
-                    r->last_prepared = proof->seqno;
-            }
-        }
-    }
-
     /* Advance local markers to nv->min so tbft_replica_in_window is consistent
      * with ar.head = nv->min + 1.  nv->min is the highest stable checkpoint
      * seqno proven by the view-change quorum, so advancing is safe. */
@@ -1759,10 +1734,9 @@ void tbft_replica_handle_new_view(tbft_replica_t *r, const void *msg, int len)
     if (nv->min > r->last_executed) r->last_executed = nv->min;
     if (nv->min > r->last_prepared) r->last_prepared = nv->min;
     tbft_cr_truncate(&r->cr, nv->min);
-    /* Re-init clears all slice bitmaps/hashes from the old view.
-     * Patching head after init is safe: all slices are clean. */
-    tbft_ar_init(&r->ar, r->ar.prepare_threshold, r->ar.commit_threshold);
-    r->ar.head = nv->min + 1;
+    /* Clear and re-align agreement region for the new view, keeping Pre_prepares for already executed requests */
+    tbft_ar_reset_for_new_view(&r->ar, nv->min + 1, r->last_executed);
+
 
     /* When nv->min is 0 (no stable checkpoint) but nv->n_prep carries
      * prepared seqnos from a prior view, r->seqno can land beyond the
@@ -1772,8 +1746,7 @@ void tbft_replica_handle_new_view(tbft_replica_t *r, const void *msg, int len)
      * the window head; last_stable stays at the verified nv->min
      * (set above) — a proper checkpoint quorum must advance it. */
     if (r->seqno >= r->ar.head + TBFT_WINDOW_SIZE) {
-        ESP_LOGI(TAG, "new-view: advancing window head from %lld"
-                 " to %lld for seqno coverage",
+        ESP_LOGI(TAG, "new-view: advancing window head from %lld to %lld for seqno coverage",
                  (long long)r->ar.head, (long long)r->seqno);
         tbft_ar_truncate(&r->ar, r->seqno);
     }
@@ -1892,8 +1865,7 @@ static void handle_status(tbft_replica_t *r, const void *msg, int len)
          * Without it, stale slice data from the old view could pollute
          * certificate tracking in the new view. */
         tbft_cr_truncate(&r->cr, r->last_stable);
-        tbft_ar_init(&r->ar, r->ar.prepare_threshold, r->ar.commit_threshold);
-        r->ar.head = r->last_stable + 1;
+        tbft_ar_reset_for_new_view(&r->ar, r->last_stable + 1, r->last_executed);
         r->last_prepared = r->last_executed;
 
         /* Keep sequence numbers contiguous and preserve executed/prepared progress */
@@ -1983,6 +1955,32 @@ static void handle_status(tbft_replica_t *r, const void *msg, int len)
         if (now_us - r->last_ckpt_throttle_us < 500000LL) return;
         r->last_ckpt_throttle_us = now_us;
     }
+
+    /* Help B catch up on missing Pre_prepare and Commit messages if B is in
+     * the same view but slightly behind in execution.  Rate-limited to
+     * avoid flooding the transport tx queue. */
+    if (st->view == r->node.view && st->last_executed < r->last_executed) {
+        int64_t now_us = esp_timer_get_time();
+        int64_t threshold_us = (st->last_executed + 1 == r->last_executed)
+            ? 200000LL : 500000LL;
+        static int64_t last_catchup_us = 0;
+        if (now_us - last_catchup_us >= threshold_us) {
+            last_catchup_us = now_us;
+            for (tbft_seqno_t seqno = st->last_executed + 1;
+                 seqno <= r->last_executed;
+                 seqno++) {
+                if (tbft_replica_in_window(r, seqno)) {
+                    int pp_len = 0;
+                    const uint8_t *pp_bytes = tbft_ar_load_pp(&r->ar, seqno, &pp_len);
+                    if (pp_bytes && pp_len > 0) {
+                        tbft_node_send(&r->node, pp_bytes, (size_t)pp_len, st->id);
+                    }
+                    tbft_replica_send_commit(r, seqno, st->id);
+                }
+            }
+        }
+    }
+
     tbft_seqno_t start_seq;
     if (st->last_stable < 0) return;
     start_seq = ((st->last_stable / TBFT_CHECKPOINT_INTERVAL) + 1) * TBFT_CHECKPOINT_INTERVAL;
@@ -2460,7 +2458,7 @@ void tbft_replica_send_prepare(tbft_replica_t *r, tbft_seqno_t n)
     ESP_LOGI(TAG, "sent prepare seqno=%lld", (long long)n);
 }
 
-void tbft_replica_send_commit(tbft_replica_t *r, tbft_seqno_t n)
+void tbft_replica_send_commit(tbft_replica_t *r, tbft_seqno_t n, int dest)
 {
     /* Get the digest from the stored pre-prepare */
     int pp_len = 0;
@@ -2490,10 +2488,14 @@ void tbft_replica_send_commit(tbft_replica_t *r, tbft_seqno_t n)
         sl->commit_sent_us = esp_timer_get_time();
     }
 
-    tbft_node_send(&r->node, r->out_buf, (size_t)cm->hdr.size,
-                   TBFT_ALL_REPLICAS);
-    ESP_LOGI(TAG, "%s commit seqno=%lld",
-             first_send ? "sent" : "re-sent", (long long)n);
+    tbft_node_send(&r->node, r->out_buf, (size_t)cm->hdr.size, dest);
+    if (dest == TBFT_ALL_REPLICAS) {
+        ESP_LOGI(TAG, "%s commit seqno=%lld",
+                 first_send ? "sent" : "re-sent", (long long)n);
+    } else {
+        ESP_LOGI(TAG, "%s commit seqno=%lld to lagging replica %d",
+                 first_send ? "sent" : "re-sent", (long long)n, dest);
+    }
 }
 
 void tbft_replica_execute_committed(tbft_replica_t *r)
@@ -2596,17 +2598,20 @@ void tbft_replica_execute_committed(tbft_replica_t *r)
             /* Validate reply length AFTER exec_cb has set it.
              * Account for alignment padding: tbft_msg_align can add up
              * to 7 bytes, and the raw check below does not include it. */
+            bool reply_ok = true;
             if (rep_len < 0) {
                 ESP_LOGE(TAG, "reply: negative rep_len=%d", rep_len);
-                break;
+                reply_ok = false;
             }
             int32_t body_sz = (int32_t)(sizeof(*reply) + (size_t)rep_len);
             int32_t aligned = tbft_msg_align(body_sz);
-            if ((size_t)aligned + TBFT_SIG_SIZE > sizeof(r->out_buf)) {
+            if (reply_ok && (size_t)aligned + TBFT_SIG_SIZE > sizeof(r->out_buf)) {
                 ESP_LOGE(TAG, "reply too large for out_buf (aligned=%d + %d > %zu)",
                          (int)aligned, (int)TBFT_SIG_SIZE, sizeof(r->out_buf));
-                break;
+                reply_ok = false;
             }
+
+            if (reply_ok) {
                 reply->hdr.tag          = TBFT_MSG_REPLY;
                 reply->hdr.extra        = 0;
                 reply->hdr.timestamp_us = 0;
@@ -2625,25 +2630,24 @@ void tbft_replica_execute_committed(tbft_replica_t *r)
                     if (tbft_node_gen_sig(&r->node, r->out_buf,
                                           (size_t)reply->hdr.size, sig) == 0) {
                         total = reply->hdr.size + (int32_t)sizeof(tbft_sig_t);
+                        
+                        ESP_LOGI(TAG, "sending reply: cid=%d rid=%llu seqno=%lld size=%d",
+                                 req_rep->cid, (unsigned long long)req_rep->rid,
+                                 (long long)n, total);
+
+                        if (r->recv_reply_cb) {
+                            r->recv_reply_cb(r->out_buf, total, req_rep->cid);
+                        }
+                        tbft_node_send(&r->node, r->out_buf, (size_t)total,
+                                       req_rep->cid);
                     } else {
                         ESP_LOGE(TAG, "reply signing failed for seqno=%lld — dropping reply",
                                  (long long)n);
-                        break;
                     }
                 } else {
-                    ESP_LOGE(TAG, "reply exceeds buffer after signing — dropping");
-                    break;
+                    ESP_LOGE(TAG, "reply exceeds buffer after signing — dropping reply");
                 }
-
-                ESP_LOGI(TAG, "sending reply: cid=%d rid=%llu seqno=%lld size=%d",
-                         req_rep->cid, (unsigned long long)req_rep->rid,
-                         (long long)n, total);
-
-                if (r->recv_reply_cb) {
-                    r->recv_reply_cb(r->out_buf, total, req_rep->cid);
-                }
-                tbft_node_send(&r->node, r->out_buf, (size_t)total,
-                               req_rep->cid);
+            }
         } else {
             ESP_LOGW(TAG, "execute: exec_cb=%p req_len=%d sizeof(req)=%d — skipping exec for seqno=%lld",
                      r->exec_cb, req_len, (int)sizeof(tbft_request_rep_t), (long long)n);
