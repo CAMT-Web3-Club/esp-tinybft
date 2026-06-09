@@ -43,7 +43,7 @@ static const char *TAG = "tbft_espnow";
 #define REASM_TIMEOUT_MS    5000
 #define FRAG_INTER_DELAY_MS 20
 
-#define MSG_QUEUE_DEPTH     32
+#define MSG_QUEUE_DEPTH     24
 #define SEND_QUEUE_DEPTH    8
 #ifndef CONFIG_TBFT_ESPNOW_SEND_TASK_PRIORITY
 #define SEND_TASK_PRIORITY  5
@@ -622,10 +622,12 @@ int tbft_transport_create(tbft_transport_t **out, tbft_transport_type_t type, in
     enow->num_replicas = num_replicas;
     enow->next_msg_id  = 1;
 
-    enow->lock = xSemaphoreCreateMutex();
-    enow->task_exit_sem = xSemaphoreCreateBinary();
+    /* Allocate the largest objects FIRST before heap fragmentation from
+     * small semaphore allocations prevents a contiguous block. */
     enow->msg_queue = xQueueCreate(MSG_QUEUE_DEPTH, sizeof(recv_entry_t));
     enow->send_queue = xQueueCreate(SEND_QUEUE_DEPTH, sizeof(send_entry_t));
+    enow->lock = xSemaphoreCreateMutex();
+    enow->task_exit_sem = xSemaphoreCreateBinary();
     enow->send_credit_sem = xSemaphoreCreateCounting(ESPNOW_TX_CREDITS, ESPNOW_TX_CREDITS);
 
     if (!enow->lock || !enow->task_exit_sem || !enow->msg_queue || !enow->send_queue || !enow->send_credit_sem) {
