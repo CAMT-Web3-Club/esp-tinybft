@@ -1639,6 +1639,12 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
         if (nv->min > r->last_prepared) r->last_prepared = nv->min;
         tbft_cr_truncate(&r->cr, nv->min);
         tbft_ar_reset_for_new_view(&r->ar, nv->min + 1, r->last_executed);
+        if (r->seqno >= r->ar.head + TBFT_WINDOW_SIZE) {
+            ESP_LOGI(TAG, "new-view: advancing window head from %lld to %lld"
+                     " for seqno coverage",
+                     (long long)r->ar.head, (long long)r->seqno);
+            tbft_ar_truncate(&r->ar, r->seqno);
+        }
         r->last_prepared = r->last_executed;
         tbft_itimer_stop(&r->vtimer);
         tbft_vi_reset(&r->vi, r->node.view + 1);
