@@ -2915,6 +2915,23 @@ void tbft_replica_send_view_change(tbft_replica_t *r)
         return;
     }
 
+    /* Suppress view-change on fresh boot.  After a mass reboot every node
+     * starts in view=0 with last_stable=0.  The Status exchange needs time
+     * to synchronise all nodes to the same highest view.  If the vtimer
+     * fires first, each node sends a VC independently and the cluster
+     * splinters into multiple views that can never form a quorum.
+     * Back off with a long delay to let Status catch-up win the race. */
+    if (r->last_stable == 0 && r->last_executed == 0 && r->node.view < 3) {
+        ESP_LOGW(TAG, "send_view_change: suppressing — fresh boot"
+                 " (view=%lld, stable=%lld, exec=%lld),"
+                 " waiting for Status catch-up",
+                 (long long)r->node.view,
+                 (long long)r->last_stable,
+                 (long long)r->last_executed);
+        tbft_itimer_start(&r->vtimer, r->vtimer_period_us * 8);
+        return;
+    }
+
     tbft_view_t target = r->node.view + 1;
     if (r->vi.target_view > target) {
         target = r->vi.target_view;
