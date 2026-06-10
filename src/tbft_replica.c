@@ -104,12 +104,11 @@ static void tbft_replica_reset_forwarded_requests(tbft_replica_t *r)
     for (int i = 0; i < r->node.num_principals; i++) {
         r->last_forwarded_rid[i] = r->last_executed_rid[i];
     }
-    /* Clear the request queue so stale entries from prior views
-     * don't block fresh client requests.  Without this, a queue
-     * full of orphaned-forwards prevents new requests from
-     * reaching the front, producing infinite client timeouts. */
-    rqueue_clear(&r->rqueue);
-    rqueue_clear(&r->ro_rqueue);
+    /* Preserve pending requests across view changes so the new primary
+     * has work to do immediately.  send_pre_prepare deduplicates via
+     * last_assigned_cid/rid, so stale entries are popped harmlessly.
+     * Clearing the queue on every view change starves each new primary
+     * and produces cascading dead-primary false positives. */
 }
 
 bool tbft_replica_has_pending_requests(const tbft_replica_t *r)
