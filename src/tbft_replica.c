@@ -380,6 +380,22 @@ void tbft_replica_run(tbft_replica_t *r)
         }
 
         if (r->evt_group) {
+            /* Dead-primary detection: if we are a backup and have received
+             * no PP from the current primary within 30 s of view install,
+             * the primary is dead or stuck.  Trigger accelerated view-change
+             * instead of waiting for the full vtimer (3+ minutes). */
+            if (!tbft_replica_is_primary(r) && !r->vi.in_progress) {
+                int64_t now = esp_timer_get_time();
+                if (now - r->view_installed_us > 30 * 1000 * 1000LL) {
+                    ESP_LOGW(TAG, "dead primary: no PP in %lld s,"
+                             " accelerating view-change (view=%lld, primary=%d)",
+                             (long long)((now - r->view_installed_us) / 1000000),
+                             (long long)r->node.view,
+                             r->node.cur_primary);
+                    tbft_replica_send_view_change(r);
+                }
+            }
+
             EventBits_t bits = xEventGroupWaitBits(
                 r->evt_group,
                 TBFT_EVT_VTIMER | TBFT_EVT_STIMER,
@@ -971,6 +987,7 @@ void tbft_replica_handle_pre_prepare(tbft_replica_t *r, const void *msg, int len
     /* Only advance view after successful sender and MAC verification */
     if (pp->view > r->node.view) {
         r->node.view = pp->view;
+        r->view_installed_us = esp_timer_get_time();
         r->node.cur_primary = tbft_node_primary(&r->node, r->node.view);
         tbft_replica_reset_forwarded_requests(r);
         if (r->last_prepared < r->last_stable) {
@@ -1415,6 +1432,7 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
              * etc. Just update our view and let the new primary (if we have
              * enough VCs) send the New_view message. */
             r->node.view = vc->v;
+            r->view_installed_us = esp_timer_get_time();
             r->node.cur_primary = tbft_node_primary(&r->node, vc->v);
             tbft_replica_reset_forwarded_requests(r);
             /* Keep sequence numbers contiguous and preserve executed/prepared progress */
@@ -1612,6 +1630,7 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
         /* Install the new view locally immediately so we can start acting
          * as primary even before loopback receipt. */
         r->node.view = r->vi.target_view;
+        r->view_installed_us = esp_timer_get_time();
         r->node.cur_primary = tbft_node_primary(&r->node, r->node.view);
         tbft_replica_reset_forwarded_requests(r);
         /* Compute a monotonic seqno strictly inside the active window.
@@ -1733,6 +1752,7 @@ void tbft_replica_handle_new_view(tbft_replica_t *r, const void *msg, int len)
 
     /* Install new view */
     r->node.view        = nv->v;
+    r->view_installed_us = esp_timer_get_time();
     r->node.cur_primary = tbft_node_primary(&r->node, nv->v);
     tbft_replica_reset_forwarded_requests(r);
 
@@ -1947,6 +1967,7 @@ static void handle_status(tbft_replica_t *r, const void *msg, int len)
          * new primary fails to make progress. */
         tbft_view_t old_view = r->node.view;
         r->node.view = st->view;
+        r->view_installed_us = esp_timer_get_time();
         r->node.cur_primary = tbft_node_primary(&r->node, st->view);
         tbft_replica_reset_forwarded_requests(r);
         if (r->vi.in_progress) {

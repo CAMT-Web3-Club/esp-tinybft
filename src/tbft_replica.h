@@ -134,6 +134,11 @@ typedef struct {
      * key re-exchange instead of triggering a doomed view change. */
     int consecutive_mac_failures;
 
+    /* When the current view was installed.  Used to detect dead primaries:
+     * if a backup receives no PP from the primary within 30 s, trigger
+     * accelerated view-change instead of waiting for the full vtimer. */
+    int64_t view_installed_us;
+
     /* Event group for decoupling timer callbacks from heavy processing */
     EventGroupHandle_t evt_group;
 } tbft_replica_t;
