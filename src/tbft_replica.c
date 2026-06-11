@@ -1672,6 +1672,14 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
             tbft_state_mark_stable(&r->state, rescue_stable);
             tbft_cr_truncate(&r->cr, rescue_stable);
         }
+        /* The new primary's first proposal is at least nv->max + 1.
+         * The agreement window covers [head, head+WINDOW_SIZE).  Since
+         * max = min + WINDOW_SIZE and head = min + 1, max+1 sits exactly
+         * at the upper bound and is rejected by backups.  Advance head
+         * by one to cover the primary's next seqno. */
+        if (nv->max + 1 >= r->ar.head + TBFT_WINDOW_SIZE) {
+            tbft_ar_truncate(&r->ar, nv->max + 1);
+        }
         r->last_prepared = r->last_executed;
         tbft_itimer_stop(&r->vtimer);
         tbft_vi_reset(&r->vi, r->node.view + 1);
@@ -1819,6 +1827,12 @@ void tbft_replica_handle_new_view(tbft_replica_t *r, const void *msg, int len)
         r->last_stable = rescue_stable;
         tbft_state_mark_stable(&r->state, rescue_stable);
         tbft_cr_truncate(&r->cr, rescue_stable);
+    }
+    /* The new primary's first proposal is at least nv->max + 1.
+     * Ensure the window covers it (same off-by-one as the view-change
+     * handler's local-install path). */
+    if (nv->max + 1 >= r->ar.head + TBFT_WINDOW_SIZE) {
+        tbft_ar_truncate(&r->ar, nv->max + 1);
     }
     r->last_prepared = r->last_executed;
     if (tbft_replica_is_primary(r)) {
