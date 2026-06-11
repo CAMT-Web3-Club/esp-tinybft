@@ -1663,6 +1663,15 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
                      (long long)r->ar.head, (long long)r->seqno);
             tbft_ar_truncate(&r->ar, r->seqno);
         }
+        if (r->last_executed > r->last_stable + TBFT_WINDOW_SIZE) {
+            tbft_seqno_t rescue_stable = r->last_executed - TBFT_WINDOW_SIZE;
+            ESP_LOGW(TAG, "new-view: checkpoint stuck — advancing last_stable"
+                     " from %lld to %lld to unfreeze window",
+                     (long long)r->last_stable, (long long)rescue_stable);
+            r->last_stable = rescue_stable;
+            tbft_state_mark_stable(&r->state, rescue_stable);
+            tbft_cr_truncate(&r->cr, rescue_stable);
+        }
         r->last_prepared = r->last_executed;
         tbft_itimer_stop(&r->vtimer);
         tbft_vi_reset(&r->vi, r->node.view + 1);
@@ -1797,6 +1806,19 @@ void tbft_replica_handle_new_view(tbft_replica_t *r, const void *msg, int len)
         ESP_LOGI(TAG, "new-view: advancing window head from %lld to %lld for seqno coverage",
                  (long long)r->ar.head, (long long)r->seqno);
         tbft_ar_truncate(&r->ar, r->seqno);
+    }
+    /* Self-rescue: if we've executed seqnos far past the stable checkpoint
+     * (checkpoint quorum never formed due to lagging replicas), advance
+     * last_stable so the agreement window covers our progress.  Without
+     * this the window is permanently frozen at an old stable seqno. */
+    if (r->last_executed > r->last_stable + TBFT_WINDOW_SIZE) {
+        tbft_seqno_t rescue_stable = r->last_executed - TBFT_WINDOW_SIZE;
+        ESP_LOGW(TAG, "new-view: checkpoint stuck — advancing last_stable"
+                 " from %lld to %lld to unfreeze window",
+                 (long long)r->last_stable, (long long)rescue_stable);
+        r->last_stable = rescue_stable;
+        tbft_state_mark_stable(&r->state, rescue_stable);
+        tbft_cr_truncate(&r->cr, rescue_stable);
     }
     r->last_prepared = r->last_executed;
     if (tbft_replica_is_primary(r)) {
@@ -2976,6 +2998,14 @@ void tbft_replica_send_view_change(tbft_replica_t *r)
     vc->hdr.extra = 0;
     vc->v         = target;
     vc->ls        = r->last_stable;
+    /* Self-rescue: if we've executed seqnos far past the last stable
+     * checkpoint, report a higher ls so the new primary's window covers
+     * our executed range.  Without this, a stuck checkpoint (e.g. due
+     * to 2 lagging replicas) permanently freezes the window at an old
+     * stable seqno and no primary can propose new seqnos. */
+    if (r->last_executed > vc->ls + TBFT_WINDOW_SIZE) {
+        vc->ls = r->last_executed - TBFT_WINDOW_SIZE;
+    }
     vc->id        = r->node.node_id;
 
     ptr += sizeof(*vc);
