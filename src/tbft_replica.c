@@ -1685,6 +1685,48 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
         tbft_itimer_stop(&r->vtimer);
         tbft_vi_reset(&r->vi, r->node.view + 1);
         r->vi.in_progress = false;
+
+        /* Reproposed prepared seqnos from the new-view proofs.  Same
+         * logic as handle_new_view — rebuild PPs with new view number
+         * and re-broadcast so the cluster can reach commit quorum. */
+        if (n_proofs > 0) {
+            const uint8_t *proofs = body_ptr - n_proofs * sizeof(tbft_vc_req_info_t);
+            for (int p = 0; p < n_proofs; p++) {
+                const tbft_vc_req_info_t *proof =
+                    (const tbft_vc_req_info_t *)(proofs + p * sizeof(tbft_vc_req_info_t));
+                if (proof->seqno > r->last_executed && proof->seqno <= nv->max) {
+                    int pp_len = 0;
+                    const uint8_t *old_pp =
+                        tbft_ar_load_pp(&r->ar, proof->seqno, &pp_len);
+                    if (old_pp && pp_len >= (int)sizeof(tbft_pre_prepare_rep_t)) {
+                        const tbft_pre_prepare_rep_t *old =
+                            (const tbft_pre_prepare_rep_t *)old_pp;
+                        size_t rs = (size_t)old->rset_size;
+                        size_t ns = (size_t)old->non_det_size;
+                        size_t bo = sizeof(*old) + rs + ns;
+                        int32_t nsz = tbft_msg_align(
+                            (int32_t)(bo + sizeof(tbft_auth_t)));
+                        if (nsz <= (int32_t)sizeof(r->out_buf)) {
+                            memcpy(r->out_buf, old_pp, (size_t)pp_len);
+                            tbft_pre_prepare_rep_t *np =
+                                (tbft_pre_prepare_rep_t *)r->out_buf;
+                            np->view = r->node.view;
+                            np->hdr.timestamp_us = esp_timer_get_time();
+                            np->hdr.size = nsz;
+                            tbft_auth_t *a =
+                                (tbft_auth_t *)(r->out_buf + bo);
+                            tbft_node_gen_auth(&r->node, r->out_buf, bo, a);
+                            tbft_ar_store_pp(&r->ar, proof->seqno, r->out_buf, nsz);
+                            tbft_node_send(&r->node, r->out_buf, (size_t)nsz,
+                                           TBFT_ALL_REPLICAS);
+                            ESP_LOGI(TAG, "new-view: reproposed seqno=%lld view=%lld",
+                                     (long long)proof->seqno, (long long)r->node.view);
+                        }
+                    }
+                }
+            }
+        }
+
         if (tbft_replica_has_pending_requests(r)) {
             tbft_itimer_start(&r->vtimer, r->vtimer_period_us);
         } else {
@@ -3028,14 +3070,25 @@ void tbft_replica_send_view_change(tbft_replica_t *r)
      * splinters into multiple views that can never form a quorum.
      * Back off with a long delay to let Status catch-up win the race. */
     if (r->last_stable == 0 && r->last_executed == 0 && r->node.view < 3) {
-        ESP_LOGW(TAG, "send_view_change: suppressing — fresh boot"
-                 " (view=%lld, stable=%lld, exec=%lld),"
-                 " waiting for Status catch-up",
-                 (long long)r->node.view,
-                 (long long)r->last_stable,
-                 (long long)r->last_executed);
-        tbft_itimer_start(&r->vtimer, r->vtimer_period_us * 8);
-        return;
+        /* Honour the fresh-boot guard for a bounded time.  If we have
+         * been stuck at view 0-2 with no checkpoint for >90 s, allow
+         * the view-change — the cluster has deadlocked and waiting
+         * longer won't help.  The checkpoint isn't coming. */
+        int64_t stuck_sec = (esp_timer_get_time() - r->view_installed_us) / 1000000;
+        if (stuck_sec < 90) {
+            ESP_LOGW(TAG, "send_view_change: suppressing — fresh boot"
+                     " (view=%lld, stable=%lld, exec=%lld, stuck=%llds),"
+                     " waiting for Status catch-up",
+                     (long long)r->node.view,
+                     (long long)r->last_stable,
+                     (long long)r->last_executed,
+                     (long long)stuck_sec);
+            tbft_itimer_start(&r->vtimer, r->vtimer_period_us * 8);
+            return;
+        }
+        ESP_LOGW(TAG, "send_view_change: fresh-boot timeout after %llds — "
+                 "allowing view-change despite no checkpoint",
+                 (long long)stuck_sec);
     }
 
     tbft_view_t target = r->node.view + 1;
