@@ -1991,6 +1991,23 @@ static void handle_status(tbft_replica_t *r, const void *msg, int len)
     }
 
     if (st->view > r->node.view) {
+        /* Guard against cross-session stale Status.  A peer reporting a
+         * view far ahead of ours (e.g. view=70 when we are at view=0) is
+         * either from a prior test run with stale NVS state, or Byzantine.
+         * Legitimate clusters advance at most a few views between Status
+         * intervals.  Reject unless the delta is small or the peer's
+         * last_stable matches ours (same session, just view-jumped). */
+        if (st->view - r->node.view > 10 &&
+            st->last_stable < r->last_stable + TBFT_WINDOW_SIZE) {
+            ESP_LOGW(TAG, "status from %d: peer view=%lld is %lld views ahead"
+                     " of local view=%lld with different stable=%lld — "
+                     "rejecting as cross-session stale state",
+                     st->id, (long long)st->view,
+                     (long long)(st->view - r->node.view),
+                     (long long)r->node.view,
+                     (long long)st->last_stable);
+            return;
+        }
         ESP_LOGI(TAG, "status from %d: peer view=%lld last_stable=%lld last_exec=%lld"
                  " | local view=%lld last_stable=%lld",
                  st->id, (long long)st->view, (long long)st->last_stable,
@@ -2313,10 +2330,24 @@ void tbft_replica_handle_meta_data(tbft_replica_t *r, const void *msg, int len)
             }
         }
         if (all_done) {
+            tbft_seqno_t fetched = r->state.fetch_seqno;
+            /* Safety: a state fetch from a single peer must not advance
+             * last_stable by more than 4×WINDOW_SIZE.  Larger jumps are
+             * cross-session stale state (e.g. from a node with old NVS). */
+            if (fetched > r->last_stable + TBFT_WINDOW_SIZE * 4) {
+                ESP_LOGW(TAG, "state fetch: rejecting fetched seqno=%lld — "
+                         "too far ahead of last_stable=%lld (max jump=%d)",
+                         (long long)fetched, (long long)r->last_stable,
+                         TBFT_WINDOW_SIZE * 4);
+                tbft_state_fetch_complete(&r->state);
+                return;
+            }
             tbft_state_fetch_complete(&r->state);
             ESP_LOGI(TAG, "state fetch completed for seqno=%lld, marking stable",
-                     (long long)r->state.fetch_seqno);
-            tbft_replica_mark_stable(r, r->state.fetch_seqno);
+                     (long long)fetched);
+            tbft_replica_mark_stable(r, fetched);
+            /* Advance seqno past the newly-stable checkpoint */
+            if (r->seqno <= fetched) r->seqno = fetched + 1;
             return;
         }
     }
@@ -2352,8 +2383,17 @@ void tbft_replica_handle_data(tbft_replica_t *r, const void *msg, int len)
     tbft_state_handle_data(&r->state, data_rep, block_data);
 
     if (!tbft_state_in_fetch(&r->state)) {
-        ESP_LOGI(TAG, "state fetch completed for seqno=%lld, marking stable", (long long)fetch_seqno);
-        tbft_replica_mark_stable(r, fetch_seqno);
+        if (fetch_seqno > r->last_stable + TBFT_WINDOW_SIZE * 4) {
+            ESP_LOGW(TAG, "state fetch: rejecting fetched seqno=%lld — "
+                     "too far ahead of last_stable=%lld (max jump=%d)",
+                     (long long)fetch_seqno, (long long)r->last_stable,
+                     TBFT_WINDOW_SIZE * 4);
+        } else {
+            ESP_LOGI(TAG, "state fetch completed for seqno=%lld, marking stable",
+                     (long long)fetch_seqno);
+            tbft_replica_mark_stable(r, fetch_seqno);
+            if (r->seqno <= fetch_seqno) r->seqno = fetch_seqno + 1;
+        }
     }
 }
 
