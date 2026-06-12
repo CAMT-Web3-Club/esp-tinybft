@@ -632,8 +632,6 @@ void tbft_replica_run(tbft_replica_t *r)
                             " client must retransmit",
                             (long long)r->pending_fill_seqno,
                             (long long)(elapsed_us / 1000));
-                        r->last_executed     = r->pending_fill_seqno;
-                        r->last_prepared     = r->last_executed;
                         r->pending_fill_seqno  = 0;
                         r->fill_started_at_us  = 0;
                     } else {
@@ -642,8 +640,6 @@ void tbft_replica_run(tbft_replica_t *r)
                             " no replica had the PP, client must retransmit",
                             (long long)r->pending_fill_seqno,
                             (long long)(elapsed_us / 1000));
-                        r->last_executed     = r->pending_fill_seqno;
-                        r->last_prepared     = r->last_executed;
                         r->pending_fill_seqno  = 0;
                         r->fill_started_at_us  = 0;
                     }
