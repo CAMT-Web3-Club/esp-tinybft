@@ -1678,8 +1678,9 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
          * at the upper bound and is rejected by backups.  Advance head
          * by ONE so the window becomes [head+1, head+WINDOW_SIZE+1)
          * covering max+1. */
-        if (nv->max + 1 >= r->ar.head + TBFT_WINDOW_SIZE) {
+         if (nv->max + 1 >= r->ar.head + TBFT_WINDOW_SIZE) {
             tbft_ar_truncate(&r->ar, r->ar.head + 1);
+            if (r->seqno < r->ar.head) r->seqno = r->ar.head;
         }
         r->last_prepared = r->last_executed;
         tbft_itimer_stop(&r->vtimer);
@@ -1879,6 +1880,7 @@ void tbft_replica_handle_new_view(tbft_replica_t *r, const void *msg, int len)
      * covering max+1. */
     if (nv->max + 1 >= r->ar.head + TBFT_WINDOW_SIZE) {
         tbft_ar_truncate(&r->ar, r->ar.head + 1);
+        if (r->seqno < r->ar.head) r->seqno = r->ar.head;
     }
     r->last_prepared = r->last_executed;
     if (tbft_replica_is_primary(r)) {
