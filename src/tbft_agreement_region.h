@@ -152,11 +152,3 @@ bool tbft_ar_committed(const tbft_agreement_region_t *ar, tbft_seqno_t seqno);
  */
 void tbft_ar_truncate(tbft_agreement_region_t *ar, tbft_seqno_t new_head);
 
-/**
- * Reset the agreement region for a new view. Clears certificates for all slices
- * in the new window, keeping Pre-prepare request bodies for already-executed requests.
- */
-void tbft_ar_reset_for_new_view(tbft_agreement_region_t *ar,
-                                tbft_seqno_t new_head,
-                                tbft_seqno_t last_executed);
-

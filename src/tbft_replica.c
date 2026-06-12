@@ -996,7 +996,8 @@ void tbft_replica_handle_pre_prepare(tbft_replica_t *r, const void *msg, int len
             r->last_executed = r->last_stable;
         }
         tbft_cr_truncate(&r->cr, r->last_stable);
-        tbft_ar_reset_for_new_view(&r->ar, r->last_stable + 1, r->last_executed);
+        tbft_ar_init(&r->ar, r->ar.prepare_threshold, r->ar.commit_threshold);
+        r->ar.head = r->last_stable + 1;
         r->last_prepared = r->last_executed;
         tbft_itimer_stop(&r->vtimer);
         tbft_vi_reset(&r->vi, r->node.view + 1);
@@ -1447,9 +1448,10 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
             if (r->last_executed < r->last_stable) {
                 r->last_executed = r->last_stable;
             }
-            tbft_cr_truncate(&r->cr, r->last_stable);
-            tbft_ar_reset_for_new_view(&r->ar, r->last_stable + 1, r->last_executed);
-            r->last_prepared = r->last_executed;
+        tbft_cr_truncate(&r->cr, r->last_stable);
+        tbft_ar_init(&r->ar, r->ar.prepare_threshold, r->ar.commit_threshold);
+        r->ar.head = r->last_stable + 1;
+        r->last_prepared = r->last_executed;
             ESP_LOGI(TAG, "sync view to %lld (from vc of %d), seqno reset to %lld",
                      (long long)vc->v, sender_id, (long long)r->seqno);
             /* REMOVED: catch-up view-change cascade accelerator.
@@ -1656,78 +1658,17 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
         if (nv->min > r->last_executed) r->last_executed = nv->min;
         if (nv->min > r->last_prepared) r->last_prepared = nv->min;
         tbft_cr_truncate(&r->cr, nv->min);
-        tbft_ar_reset_for_new_view(&r->ar, nv->min + 1, r->last_executed);
+        tbft_ar_init(&r->ar, r->ar.prepare_threshold, r->ar.commit_threshold);
+        r->ar.head = nv->min + 1;
         if (r->seqno >= r->ar.head + TBFT_WINDOW_SIZE) {
-            ESP_LOGI(TAG, "new-view: advancing window head from %lld to %lld"
-                     " for seqno coverage",
+            ESP_LOGI(TAG, "new-view: advancing window head from %lld to %lld",
                      (long long)r->ar.head, (long long)r->seqno);
             tbft_ar_truncate(&r->ar, r->seqno);
-        }
-        if (r->last_executed > r->last_stable + TBFT_WINDOW_SIZE) {
-            tbft_seqno_t rescue_stable = r->last_executed - TBFT_WINDOW_SIZE;
-            ESP_LOGW(TAG, "new-view: checkpoint stuck — advancing last_stable"
-                     " from %lld to %lld to unfreeze window",
-                     (long long)r->last_stable, (long long)rescue_stable);
-            r->last_stable = rescue_stable;
-            tbft_state_mark_stable(&r->state, rescue_stable);
-            tbft_cr_truncate(&r->cr, rescue_stable);
-        }
-        /* The new primary's first proposal is at least nv->max + 1.
-         * The agreement window covers [head, head+WINDOW_SIZE).  Since
-         * max = min + WINDOW_SIZE and head = min + 1, max+1 sits exactly
-         * at the upper bound and is rejected by backups.  Advance head
-         * by ONE so the window becomes [head+1, head+WINDOW_SIZE+1)
-         * covering max+1. */
-         if (nv->max + 1 >= r->ar.head + TBFT_WINDOW_SIZE) {
-            tbft_ar_truncate(&r->ar, r->ar.head + 1);
-            if (r->seqno < r->ar.head) r->seqno = r->ar.head;
         }
         r->last_prepared = r->last_executed;
         tbft_itimer_stop(&r->vtimer);
         tbft_vi_reset(&r->vi, r->node.view + 1);
         r->vi.in_progress = false;
-
-        /* Reproposed prepared seqnos from the new-view proofs.  Same
-         * logic as handle_new_view — rebuild PPs with new view number
-         * and re-broadcast so the cluster can reach commit quorum. */
-        if (n_proofs > 0) {
-            const uint8_t *proofs = body_ptr - n_proofs * sizeof(tbft_vc_req_info_t);
-            for (int p = 0; p < n_proofs; p++) {
-                const tbft_vc_req_info_t *proof =
-                    (const tbft_vc_req_info_t *)(proofs + p * sizeof(tbft_vc_req_info_t));
-                if (proof->seqno > r->last_executed && proof->seqno <= nv->max) {
-                    int pp_len = 0;
-                    const uint8_t *old_pp =
-                        tbft_ar_load_pp(&r->ar, proof->seqno, &pp_len);
-                    if (old_pp && pp_len >= (int)sizeof(tbft_pre_prepare_rep_t)) {
-                        const tbft_pre_prepare_rep_t *old =
-                            (const tbft_pre_prepare_rep_t *)old_pp;
-                        size_t rs = (size_t)old->rset_size;
-                        size_t ns = (size_t)old->non_det_size;
-                        size_t bo = sizeof(*old) + rs + ns;
-                        int32_t nsz = tbft_msg_align(
-                            (int32_t)(bo + sizeof(tbft_auth_t)));
-                        if (nsz <= (int32_t)sizeof(r->out_buf)) {
-                            memcpy(r->out_buf, old_pp, (size_t)pp_len);
-                            tbft_pre_prepare_rep_t *np =
-                                (tbft_pre_prepare_rep_t *)r->out_buf;
-                            np->view = r->node.view;
-                            np->hdr.timestamp_us = esp_timer_get_time();
-                            np->hdr.size = nsz;
-                            tbft_auth_t *a =
-                                (tbft_auth_t *)(r->out_buf + bo);
-                            tbft_node_gen_auth(&r->node, r->out_buf, bo, a);
-                            tbft_ar_store_pp(&r->ar, proof->seqno, r->out_buf, nsz);
-                            tbft_node_send(&r->node, r->out_buf, (size_t)nsz,
-                                           TBFT_ALL_REPLICAS);
-                            ESP_LOGI(TAG, "new-view: reproposed seqno=%lld view=%lld",
-                                     (long long)proof->seqno, (long long)r->node.view);
-                        }
-                    }
-                }
-            }
-        }
-
         if (tbft_replica_has_pending_requests(r)) {
             tbft_itimer_start(&r->vtimer, r->vtimer_period_us);
         } else {
@@ -1843,44 +1784,18 @@ void tbft_replica_handle_new_view(tbft_replica_t *r, const void *msg, int len)
     if (nv->min > r->last_executed) r->last_executed = nv->min;
     if (nv->min > r->last_prepared) r->last_prepared = nv->min;
     tbft_cr_truncate(&r->cr, nv->min);
-    /* Clear and re-align agreement region for the new view, keeping Pre_prepares for already executed requests */
-    tbft_ar_reset_for_new_view(&r->ar, nv->min + 1, r->last_executed);
-
+    /* Fresh init: clear all agreement region state for the new view.
+     * Prepared seqnos from prior views will be re-fetched via fill. */
+    tbft_ar_init(&r->ar, r->ar.prepare_threshold, r->ar.commit_threshold);
+    r->ar.head = nv->min + 1;
 
     /* When nv->min is 0 (no stable checkpoint) but nv->n_prep carries
      * prepared seqnos from a prior view, r->seqno can land beyond the
-     * window [nv->min+1, nv->min+1+WINDOW_SIZE).  Advance the head so
-     * the primary can propose within range rather than being permanently
-     * blocked with "pre-prepare: seqno out of window".  Only advance
-     * the window head; last_stable stays at the verified nv->min
-     * (set above) — a proper checkpoint quorum must advance it. */
+     * window.  Advance the head so the primary can propose. */
     if (r->seqno >= r->ar.head + TBFT_WINDOW_SIZE) {
-        ESP_LOGI(TAG, "new-view: advancing window head from %lld to %lld for seqno coverage",
+        ESP_LOGI(TAG, "new-view: advancing window head from %lld to %lld",
                  (long long)r->ar.head, (long long)r->seqno);
         tbft_ar_truncate(&r->ar, r->seqno);
-    }
-    /* Self-rescue: if we've executed seqnos far past the stable checkpoint
-     * (checkpoint quorum never formed due to lagging replicas), advance
-     * last_stable so the agreement window covers our progress.  Without
-     * this the window is permanently frozen at an old stable seqno. */
-    if (r->last_executed > r->last_stable + TBFT_WINDOW_SIZE) {
-        tbft_seqno_t rescue_stable = r->last_executed - TBFT_WINDOW_SIZE;
-        ESP_LOGW(TAG, "new-view: checkpoint stuck — advancing last_stable"
-                 " from %lld to %lld to unfreeze window",
-                 (long long)r->last_stable, (long long)rescue_stable);
-        r->last_stable = rescue_stable;
-        tbft_state_mark_stable(&r->state, rescue_stable);
-        tbft_cr_truncate(&r->cr, rescue_stable);
-    }
-    /* The new primary's first proposal is at least nv->max + 1.
-     * The agreement window covers [head, head+WINDOW_SIZE).  Since
-     * max = min + WINDOW_SIZE and head = min + 1, max+1 sits exactly
-     * at the upper bound and is rejected by backups.  Advance head
-     * by ONE so the window becomes [head+1, head+WINDOW_SIZE+1)
-     * covering max+1. */
-    if (nv->max + 1 >= r->ar.head + TBFT_WINDOW_SIZE) {
-        tbft_ar_truncate(&r->ar, r->ar.head + 1);
-        if (r->seqno < r->ar.head) r->seqno = r->ar.head;
     }
     r->last_prepared = r->last_executed;
     if (tbft_replica_is_primary(r)) {
@@ -1890,90 +1805,21 @@ void tbft_replica_handle_new_view(tbft_replica_t *r, const void *msg, int len)
                  r->node.node_id, (long long)r->seqno, (long long)nv->v);
     }
 
-    /* Process prepared proofs from the New_view.  If we are the new primary,
-     * repropose each prepared-but-unexecuted seqno so the cluster can reach
-     * commit quorum in this view.  Backups just log the proofs. */
+    /* Log prepared proofs for observability.  Prepared seqnos will be
+     * re-fetched via the fill mechanism when execution hits the gap. */
     if (nv->n_prep > 0) {
         const uint8_t *proofs = (const uint8_t *)msg + sizeof(*nv);
         int n_prep = nv->n_prep;
         size_t proofs_size = (size_t)n_prep * sizeof(tbft_vc_req_info_t);
-        if ((size_t)len < sizeof(*nv) + proofs_size) {
-            ESP_LOGW(TAG, "new-view: message too short for n_prep=%d (len=%d)", n_prep, len);
-            return;
-        }
-        for (int p = 0; p < n_prep; p++) {
-            const tbft_vc_req_info_t *proof =
-                (const tbft_vc_req_info_t *)(proofs + p * sizeof(tbft_vc_req_info_t));
-            if (proof->seqno > r->last_executed &&
-                proof->seqno <= nv->max) {
-                ESP_LOGI(TAG, "new-view: prepared seqno=%lld digest=[...%02x] from view %lld",
-                         (long long)proof->seqno, proof->digest.bytes[0],
-                         (long long)proof->last_view);
-
-                if (tbft_replica_is_primary(r)) {
-                    /* Reproposed: rebuild PP for this seqno in the new view */
-                    int pp_len = 0;
-                    const uint8_t *old_pp = tbft_ar_load_pp(&r->ar, proof->seqno, &pp_len);
-                    if (old_pp && pp_len >= (int)sizeof(tbft_pre_prepare_rep_t)) {
-                        const tbft_pre_prepare_rep_t *old =
-                            (const tbft_pre_prepare_rep_t *)old_pp;
-                        size_t rset_size = (size_t)old->rset_size;
-                        size_t ndet_size = (size_t)old->non_det_size;
-                        size_t body_off  = sizeof(*old) + rset_size + ndet_size;
-                        int32_t new_size = tbft_msg_align(
-                            (int32_t)(body_off + sizeof(tbft_auth_t)));
-
-                        if (new_size <= (int32_t)sizeof(r->out_buf)) {
-                            memcpy(r->out_buf, old_pp, (size_t)pp_len);
-                            tbft_pre_prepare_rep_t *new_pp =
-                                (tbft_pre_prepare_rep_t *)r->out_buf;
-                            new_pp->view = r->node.view;
-                            new_pp->hdr.timestamp_us = esp_timer_get_time();
-                            new_pp->hdr.size = new_size;
-
-                            tbft_auth_t *auth =
-                                (tbft_auth_t *)(r->out_buf + body_off);
-                            tbft_node_gen_auth(&r->node, r->out_buf, body_off, auth);
-
-                            tbft_ar_store_pp(&r->ar, proof->seqno, r->out_buf, new_size);
-                            tbft_node_send(&r->node, r->out_buf, (size_t)new_size,
-                                           TBFT_ALL_REPLICAS);
-                            ESP_LOGI(TAG, "new-view: reproposed seqno=%lld view=%lld",
-                                     (long long)proof->seqno, (long long)r->node.view);
-
-                            /* Self-prepare for the reproposed seqno */
-                            {
-                                tbft_prepare_rep_t *prep =
-                                    (tbft_prepare_rep_t *)r->out_buf;
-                                memset(r->out_buf, 0, sizeof(*prep) + sizeof(tbft_auth_t));
-                                prep->hdr.tag   = TBFT_MSG_PREPARE;
-                                prep->hdr.extra = 0;
-                                prep->hdr.timestamp_us = esp_timer_get_time();
-                                prep->view      = r->node.view;
-                                prep->seqno     = proof->seqno;
-                                prep->digest    = old->digest;
-                                prep->id        = r->node.node_id;
-                                tbft_auth_t *a2 =
-                                    (tbft_auth_t *)(r->out_buf + sizeof(*prep));
-                                prep->hdr.size = tbft_msg_align(
-                                    (int32_t)(sizeof(*prep) + sizeof(tbft_auth_t)));
-                                tbft_node_gen_auth(&r->node, r->out_buf,
-                                                   sizeof(*prep), a2);
-                                tbft_ar_add_my_prepare(&r->ar, proof->seqno,
-                                                       r->out_buf, prep->hdr.size,
-                                                       r->node.node_id);
-                                tbft_node_send(&r->node, r->out_buf,
-                                               (size_t)prep->hdr.size,
-                                               TBFT_ALL_REPLICAS);
-                            }
-                        } else {
-                            ESP_LOGE(TAG, "new-view: out_buf too small for seqno=%lld reproposal",
-                                     (long long)proof->seqno);
-                        }
-                    } else {
-                        ESP_LOGW(TAG, "new-view: no stored PP for prepared seqno=%lld,"
-                                 " cannot repropose", (long long)proof->seqno);
-                    }
+        if ((size_t)len >= sizeof(*nv) + proofs_size) {
+            for (int p = 0; p < n_prep; p++) {
+                const tbft_vc_req_info_t *proof =
+                    (const tbft_vc_req_info_t *)(proofs + p * sizeof(tbft_vc_req_info_t));
+                if (proof->seqno > r->last_executed && proof->seqno <= nv->max) {
+                    ESP_LOGI(TAG, "new-view: prepared seqno=%lld digest=[...%02x] from view %lld"
+                             " — will fill if needed",
+                             (long long)proof->seqno, proof->digest.bytes[0],
+                             (long long)proof->last_view);
                 }
             }
         }
@@ -2079,7 +1925,8 @@ static void handle_status(tbft_replica_t *r, const void *msg, int len)
          * Without it, stale slice data from the old view could pollute
          * certificate tracking in the new view. */
         tbft_cr_truncate(&r->cr, r->last_stable);
-        tbft_ar_reset_for_new_view(&r->ar, r->last_stable + 1, r->last_executed);
+        tbft_ar_init(&r->ar, r->ar.prepare_threshold, r->ar.commit_threshold);
+        r->ar.head = r->last_stable + 1;
         r->last_prepared = r->last_executed;
 
         /* Keep sequence numbers contiguous and preserve executed/prepared progress */
