@@ -23,17 +23,23 @@ bool tbft_prepared_cert_add_pp(tbft_prepared_cert_t *cert,
                                const void *pp_buf, int pp_len)
 {
     if (cert->pp_len > 0) {
-        /* Already have a PP stored.  Accept re-proposal from a new view
-         * if the request-set digest matches — same request, new view. */
         const tbft_pre_prepare_rep_t *old =
             (const tbft_pre_prepare_rep_t *)cert->pp_buf;
         const tbft_pre_prepare_rep_t *new_pp =
             (const tbft_pre_prepare_rep_t *)pp_buf;
+        /* Different seqno means the circular buffer slot was recycled
+         * by window advancement.  The old PP is from a previous window
+         * cycle — unconditionally overwrite. */
+        if (old->seqno != new_pp->seqno) {
+            memcpy(cert->pp_buf, pp_buf, (size_t)pp_len);
+            cert->pp_len    = pp_len;
+            cert->t_sent_us = esp_timer_get_time();
+            return true;
+        }
+        /* Same seqno: accept re-proposal if same request, new view. */
         if (pp_len >= (int)sizeof(tbft_pre_prepare_rep_t) &&
-            old->seqno == new_pp->seqno &&
             tbft_digest_equal(&old->digest, &new_pp->digest) &&
             new_pp->view > old->view) {
-            /* Accept re-proposal: overwrite with new view's PP */
             memcpy(cert->pp_buf, pp_buf, (size_t)pp_len);
             cert->pp_len    = pp_len;
             cert->t_sent_us = esp_timer_get_time();
