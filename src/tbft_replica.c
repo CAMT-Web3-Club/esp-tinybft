@@ -1676,9 +1676,10 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
          * The agreement window covers [head, head+WINDOW_SIZE).  Since
          * max = min + WINDOW_SIZE and head = min + 1, max+1 sits exactly
          * at the upper bound and is rejected by backups.  Advance head
-         * by one to cover the primary's next seqno. */
+         * by ONE so the window becomes [head+1, head+WINDOW_SIZE+1)
+         * covering max+1. */
         if (nv->max + 1 >= r->ar.head + TBFT_WINDOW_SIZE) {
-            tbft_ar_truncate(&r->ar, nv->max + 1);
+            tbft_ar_truncate(&r->ar, r->ar.head + 1);
         }
         r->last_prepared = r->last_executed;
         tbft_itimer_stop(&r->vtimer);
@@ -1829,10 +1830,13 @@ void tbft_replica_handle_new_view(tbft_replica_t *r, const void *msg, int len)
         tbft_cr_truncate(&r->cr, rescue_stable);
     }
     /* The new primary's first proposal is at least nv->max + 1.
-     * Ensure the window covers it (same off-by-one as the view-change
-     * handler's local-install path). */
+     * The agreement window covers [head, head+WINDOW_SIZE).  Since
+     * max = min + WINDOW_SIZE and head = min + 1, max+1 sits exactly
+     * at the upper bound and is rejected by backups.  Advance head
+     * by ONE so the window becomes [head+1, head+WINDOW_SIZE+1)
+     * covering max+1. */
     if (nv->max + 1 >= r->ar.head + TBFT_WINDOW_SIZE) {
-        tbft_ar_truncate(&r->ar, nv->max + 1);
+        tbft_ar_truncate(&r->ar, r->ar.head + 1);
     }
     r->last_prepared = r->last_executed;
     if (tbft_replica_is_primary(r)) {
@@ -2517,7 +2521,13 @@ void tbft_replica_send_pre_prepare(tbft_replica_t *r)
     ptr += sizeof(tbft_auth_t);
 
     /* Store in agreement region */
-    tbft_ar_store_pp(&r->ar, r->seqno, r->out_buf, pp->hdr.size);
+    if (!tbft_ar_store_pp(&r->ar, r->seqno, r->out_buf, pp->hdr.size)) {
+        ESP_LOGW(TAG, "pre-prepare: failed to store in own agreement region seqno=%lld"
+                 " — slot occupied, skipping broadcast", (long long)r->seqno);
+        rqueue_pop(src_queue);
+        r->last_assigned_cid = -1; /* allow re-assignment on next attempt */
+        return;
+    }
 
     /* Broadcast */
     tbft_node_send(&r->node, r->out_buf, (size_t)pp->hdr.size,
