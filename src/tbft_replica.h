@@ -125,6 +125,13 @@ typedef struct {
     uint8_t  last_new_key_buf[128 + (size_t)TBFT_SIG_SIZE];
     int32_t  last_new_key_len;
 
+    /* Incremental key rotation: derive one peer's key per main-loop
+     * iteration to avoid 1,000ms blind spots that overflow the
+     * ESP-NOW message queue.  new_key_peer_idx == -1 means idle. */
+    int      new_key_peer_idx;
+    uint8_t  new_key_nonce[32];
+    int32_t  new_key_msg_len;
+
     /* Running flag */
     volatile bool  running;
 

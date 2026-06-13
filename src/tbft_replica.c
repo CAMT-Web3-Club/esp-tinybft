@@ -140,6 +140,7 @@ int tbft_replica_init(tbft_replica_t *r,
                       tbft_recv_reply_cb_t recv_reply_cb)
 {
     memset(r, 0, sizeof(*r));
+    r->new_key_peer_idx = -1;
 
     /* Init base node */
     if (tbft_node_init(&r->node, node_id, f, num_replicas, num_nodes,
@@ -245,6 +246,7 @@ void tbft_replica_free(tbft_replica_t *r)
 
 static void handle_status(tbft_replica_t *r, const void *msg, int len);
 static void tbft_replica_start_fetch(tbft_replica_t *r, tbft_seqno_t seqno, int replier);
+static void tbft_replica_rotate_key_tick(tbft_replica_t *r);
 
 static void tbft_replica_start_fetch(tbft_replica_t *r, tbft_seqno_t seqno, int replier)
 {
@@ -312,6 +314,8 @@ void tbft_replica_run(tbft_replica_t *r)
                 if (n >= hdr->size && hdr->tag == TBFT_MSG_NEW_KEY)
                     tbft_replica_handle_new_key(r, r->node.recv_buf, n);
             }
+            /* Advance incremental key rotation during bootstrap */
+            tbft_replica_rotate_key_tick(r);
             /* Re-broadcast our own New_key every 3s */
             if (xTaskGetTickCount() - last_nk >= pdMS_TO_TICKS(3000)) {
                 tbft_replica_send_new_key(r);
@@ -648,6 +652,11 @@ void tbft_replica_run(tbft_replica_t *r)
                 r->fill_started_at_us  = 0;
             }
         }
+
+        /* Incremental key rotation: derive one peer's key per iteration.
+         * This avoids the 500-1000ms blind spot that overflows the
+         * ESP-NOW msg_queue when all 6 peers are derived atomically. */
+        tbft_replica_rotate_key_tick(r);
 
 #define TBFT_BATCH_DRAIN_MAX  16
 
@@ -3071,70 +3080,111 @@ void tbft_replica_send_view_change(tbft_replica_t *r)
  * Session key exchange (New_key)
  * -------------------------------------------------------------------------- */
 
-void tbft_replica_send_new_key(tbft_replica_t *r)
+/* Incremental key rotation: derive one peer's key per main-loop
+ * iteration so the batch drain can process messages between each derivation.
+ * Without this, doing all 6 peers in a tight loop blocks the main thread
+ * for ~500-1000ms and the ESP-NOW message queue overflows.
+ *
+ * Tick is called once per main-loop iteration.  It derives one peer's key,
+ * then yields back to the batch drain.  When all peers are done it
+ * broadcasts the New_key and goes idle (new_key_peer_idx = -1). */
+
+void tbft_replica_rotate_key_tick(tbft_replica_t *r)
 {
-    int n        = r->node.num_replicas;
+    if (r->new_key_peer_idx < 0) return;
+    if (r->new_key_peer_idx >= r->node.num_replicas) {
+        /* All peers done — reset to idle.  This also covers the
+         * degenerate case where a restart cleared the idx. */
+        r->new_key_peer_idx = -1;
+        return;
+    }
+
     int local_id = r->node.node_id;
 
-    tbft_new_key_rep_t *nk = (tbft_new_key_rep_t *)r->out_buf;
-    nk->hdr.tag   = TBFT_MSG_NEW_KEY;
-    nk->hdr.extra        = 0;
-    nk->hdr.timestamp_us = esp_timer_get_time();
-    nk->id               = local_id;
+    /* Phase 1: build and sign the New_key message (once per rotation) */
+    if (r->new_key_peer_idx == 0) {
+        tbft_new_key_rep_t *nk = (tbft_new_key_rep_t *)r->out_buf;
+        nk->hdr.tag          = TBFT_MSG_NEW_KEY;
+        nk->hdr.extra        = 0;
+        nk->hdr.timestamp_us = esp_timer_get_time();
+        nk->id               = local_id;
+        esp_fill_random(nk->nonce, sizeof(nk->nonce));
+        memcpy(r->new_key_nonce, nk->nonce, sizeof(nk->nonce));
 
-    /* Generate fresh random nonce (salt) for ECDH key derivation */
-    esp_fill_random(nk->nonce, sizeof(nk->nonce));
+        int32_t body = tbft_msg_align((int32_t)sizeof(*nk));
+        nk->hdr.size = body;
+        nk->has_sig  = true;
 
-    tbft_principal_t *local = r->node.local_principal;
-    if (!local) return;
-    if (local->priv_ecdh_id == 0) return;
-
-    /* Derive new HMAC out-keys for each peer via ECDH */
-    for (int i = 0; i < n; i++) {
-        if (i == local_id) continue;
-        tbft_principal_t *p = r->node.principals[i];
-        if (!p) continue;
-
-        tbft_hmac_key_t new_key;
-        if (tbft_principal_ecdh_derive_key(local, p, nk->nonce, &new_key) != 0) {
-            ESP_LOGW(TAG, "send_new_key: ECDH derive for replica %d failed", i);
-            continue;
+        int32_t total = body + (int32_t)sizeof(tbft_sig_t);
+        if ((size_t)total > sizeof(r->out_buf)) {
+            ESP_LOGE(TAG, "new_key: out_buf too small");
+            r->new_key_peer_idx = -1;
+            return;
         }
-        tbft_principal_set_out_key(p, &new_key);
-        ESP_LOGI(TAG, "send_new_key: set out_key for replica %d", i);
+        tbft_sig_t *sig = (tbft_sig_t *)(r->out_buf + body);
+        if (tbft_node_gen_sig(&r->node, r->out_buf, (size_t)body, sig) != 0) {
+            ESP_LOGE(TAG, "new_key: failed to sign");
+            r->new_key_peer_idx = -1;
+            return;
+        }
+        r->new_key_msg_len = total;
+
+        /* Cache for unicast retransmission in handle_new_key */
+        if ((size_t)total <= sizeof(r->last_new_key_buf)) {
+            memcpy(r->last_new_key_buf, r->out_buf, (size_t)total);
+            r->last_new_key_len = total;
+        }
     }
 
-    int32_t body = tbft_msg_align((int32_t)sizeof(*nk));
-    nk->hdr.size = body;
-    nk->has_sig = true;
+    /* Phase 2: derive one peer's key */
+    tbft_principal_t *local = r->node.local_principal;
+    if (!local) { r->new_key_peer_idx = -1; return; }
 
-    int32_t total = body + (int32_t)sizeof(tbft_sig_t);
-    if ((size_t)total > sizeof(r->out_buf)) {
-        ESP_LOGE(TAG, "send_new_key: out_buf too small");
-        return;
+    int peer = r->new_key_peer_idx;
+    if (peer == local_id) {
+        /* Skip self; try next peer */
+        r->new_key_peer_idx++;
+    } else {
+        tbft_principal_t *p = r->node.principals[peer];
+        if (p && local->priv_ecdh_id != 0) {
+            tbft_hmac_key_t new_key;
+            if (tbft_principal_ecdh_derive_key(local, p, r->new_key_nonce,
+                                               &new_key) == 0) {
+                tbft_principal_set_out_key(p, &new_key);
+                ESP_LOGI(TAG, "send_new_key: set out_key for replica %d", peer);
+            } else {
+                ESP_LOGW(TAG, "send_new_key: ECDH derive for %d failed", peer);
+            }
+        }
+        r->new_key_peer_idx++;
     }
-    tbft_sig_t *sig = (tbft_sig_t *)(r->out_buf + body);
-    if (tbft_node_gen_sig(&r->node, r->out_buf, (size_t)body, sig) != 0) {
-        ESP_LOGE(TAG, "send_new_key: failed to sign");
-        return;
-    }
-    tbft_node_send(&r->node, r->out_buf, (size_t)total, TBFT_ALL_REPLICAS);
-    ESP_LOGI(TAG, "sent New_key nonce=%02x%02x... (signed)",
-             nk->nonce[0], nk->nonce[1]);
 
-    /* Cache message for reliable retransmission during handle_new_key */
-    if ((size_t)total <= sizeof(r->last_new_key_buf)) {
-        memcpy(r->last_new_key_buf, r->out_buf, (size_t)total);
-        r->last_new_key_len = total;
-    }
+    /* Phase 3: all peers done — broadcast */
+    if (r->new_key_peer_idx >= r->node.num_replicas) {
+        int n = r->node.num_replicas;
+        int32_t total = r->new_key_msg_len;
+        tbft_node_send(&r->node, r->out_buf, (size_t)total, TBFT_ALL_REPLICAS);
+        tbft_new_key_rep_t *nk = (tbft_new_key_rep_t *)r->out_buf;
+        ESP_LOGI(TAG, "sent New_key nonce=%02x%02x... (signed)",
+                 nk->nonce[0], nk->nonce[1]);
 
-    /* Unicast to peers whose in_keys aren't confirmed yet — a lost
-     * broadcast would leave them with stale in_keys permanently. */
-    for (int i = 0; i < n; i++) {
-        if (i == local_id) continue;
-        if (r->node.principals[i] && !r->node.principals[i]->keys_fresh)
-            tbft_node_send(&r->node, r->out_buf, (size_t)total, i);
+        /* Unicast to peers whose in_keys aren't confirmed */
+        for (int i = 0; i < n; i++) {
+            if (i == local_id) continue;
+            if (r->node.principals[i] && !r->node.principals[i]->keys_fresh)
+                tbft_node_send(&r->node, r->out_buf, (size_t)total, i);
+        }
+        r->new_key_peer_idx = -1;
     }
+}
+
+/* Start a key rotation cycle.  Sets new_key_peer_idx = 0 so the
+ * tick function derives one peer's key per main-loop iteration.
+ * Idempotent — if a rotation is already in progress, this is a no-op. */
+void tbft_replica_send_new_key(tbft_replica_t *r)
+{
+    if (r->new_key_peer_idx >= 0) return;  /* already rotating */
+    r->new_key_peer_idx = 0;
 }
 
 void tbft_replica_handle_new_key(tbft_replica_t *r, const void *msg, int len)
