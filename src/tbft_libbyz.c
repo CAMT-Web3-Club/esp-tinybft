@@ -957,6 +957,7 @@ int Byz_init_replica(const char *config_file, const char *priv_config,
     tbft_itimer_start(&s_replica->stimer, s_replica->stimer_period_us);
 
     s_replica->view_installed_us = esp_timer_get_time();
+    s_replica->view_start_executed = s_replica->last_executed;
 
     s_is_replica = true;
     ESP_LOGI(TAG, "replica %d initialised", local_id);

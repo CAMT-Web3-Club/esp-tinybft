@@ -139,6 +139,12 @@ typedef struct {
      * accelerated view-change instead of waiting for the full vtimer. */
     int64_t view_installed_us;
 
+    /* last_executed at the moment the current view was installed.
+     * Dead-primary detection only fires if no progress was made
+     * (last_executed hasn't advanced past this value).  Prevents
+     * false positives when the cluster IS committing seqnos. */
+    tbft_seqno_t view_start_executed;
+
     /* Event group for decoupling timer callbacks from heavy processing */
     EventGroupHandle_t evt_group;
 } tbft_replica_t;
