@@ -119,6 +119,12 @@ typedef struct {
     /* Outgoing message build buffer */
     uint8_t  out_buf[TBFT_MAX_MESSAGE_SIZE];
 
+    /* Cached last-sent New_key message for reliable retransmission.
+     * When a peer sends us its New_key, we re-send ours via unicast
+     * to ensure bidirectional key sync. */
+    uint8_t  last_new_key_buf[128 + (size_t)TBFT_SIG_SIZE];
+    int32_t  last_new_key_len;
+
     /* Running flag */
     volatile bool  running;
 

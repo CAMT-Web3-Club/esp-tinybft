@@ -52,6 +52,7 @@ static struct {
     bool             valid;
 } s_replies[TBFT_MAX_NUM_REPLICAS];
 static int s_reply_count = 0;
+static tbft_req_id_t s_last_accepted_rid = 0;
 
 /* --------------------------------------------------------------------------
  * Config file parser (section 12)
@@ -546,10 +547,11 @@ int Byz_send_request(Byz_req *req, bool read_only)
             if (drained <= 0) break;
             const tbft_msg_hdr_t *hdr = (const tbft_msg_hdr_t *)dummy;
             if (drained >= (int)sizeof(*hdr) && hdr->tag == TBFT_MSG_REPLY) {
-                Byz_rep rep;
-                if (Byz_recv_reply(&rep) == 0) {
-                    /* Reply consumed — caller can re-check later */
-                }
+                /* Stale reply for a previous rid — discard it.
+                 * The outer Byz_recv_reply will handle replies for the
+                 * new rid with the correctly-incremented expected_rid.
+                 * Calling Byz_recv_reply here would re-accept an
+                 * already-completed request ID, corrupt reply tracking. */
             }
             /* Non-reply messages are stale — discard */
         }
@@ -619,6 +621,16 @@ int Byz_recv_reply(Byz_rep *rep)
     int needed = f + 1; /* f+1 matching replies from DISTINCT replicas */
     int num_replicas = s_client->num_replicas;
     tbft_req_id_t expected_rid = ((tbft_req_id_t)(uint64_t)s_client->node_id << 48) | s_client->rid_counter;
+
+    if (s_last_accepted_rid != 0 && expected_rid <= s_last_accepted_rid) {
+        ESP_LOGW(TAG, "recv_reply: rid %llu already completed (last_accepted=%llu)",
+                 (unsigned long long)expected_rid,
+                 (unsigned long long)s_last_accepted_rid);
+        memset(s_replies, 0, sizeof(s_replies));
+        s_reply_count = 0;
+        return -1;
+    }
+
     int64_t deadline_us = esp_timer_get_time()
         + (int64_t)TBFT_CLIENT_REPLY_TIMEOUT_MS * 1000LL;
 
@@ -749,6 +761,8 @@ int Byz_recv_reply(Byz_rep *rep)
             ESP_LOGI(TAG, "reply accepted: %d matching replies (needed=%d)",
                      match, needed);
 
+            s_last_accepted_rid = expected_rid;
+
             /* Clear reply cache */
             memset(s_replies, 0, sizeof(s_replies));
             s_reply_count = 0;
@@ -830,6 +844,7 @@ void Byz_reset_client(void)
 {
     memset(s_replies, 0, sizeof(s_replies));
     s_reply_count = 0;
+    s_last_accepted_rid = 0;
 }
 
 /* --------------------------------------------------------------------------

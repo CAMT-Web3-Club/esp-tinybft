@@ -248,6 +248,10 @@ static void tbft_replica_start_fetch(tbft_replica_t *r, tbft_seqno_t seqno, int 
 
 static void tbft_replica_start_fetch(tbft_replica_t *r, tbft_seqno_t seqno, int replier)
 {
+    if (replier == r->node.node_id) {
+        replier = (replier + 1) % r->node.num_replicas;
+    }
+
     tbft_state_start_fetch(&r->state, seqno, replier);
 
     /* Send initial fetch request(s) */
@@ -645,20 +649,26 @@ void tbft_replica_run(tbft_replica_t *r)
             }
         }
 
+#define TBFT_BATCH_DRAIN_MAX  16
+
+        int first_msg = 1;
+        for (int batch = 0; batch < TBFT_BATCH_DRAIN_MAX; batch++) {
         tbft_node_id_t src_id = -1;
         int n = tbft_node_recv(&r->node, r->node.recv_buf, sizeof(r->node.recv_buf), &src_id);
         if (n < 0) {
-            /* Transport error — log and yield before retrying */
-            ESP_LOGW(TAG, "recv: transport error (id=%d)", r->node.node_id);
-            vTaskDelay(pdMS_TO_TICKS(10));
-            continue;
+            if (first_msg) {
+                ESP_LOGW(TAG, "recv: transport error (id=%d)", r->node.node_id);
+                vTaskDelay(pdMS_TO_TICKS(10));
+            }
+            break;
         }
         if (n < (int)sizeof(tbft_msg_hdr_t)) {
-            /* No message available — yield to let the WiFi task, lwIP,
-             * and the IDLE task get CPU time on single-core MCUs. */
-            vTaskDelay(pdMS_TO_TICKS(10));
-            continue;
+            if (first_msg) {
+                vTaskDelay(pdMS_TO_TICKS(10));
+            }
+            break;
         }
+        first_msg = 0;
 
         const tbft_msg_hdr_t *hdr = (const tbft_msg_hdr_t *)r->node.recv_buf;
         if (n < hdr->size) {
@@ -765,6 +775,7 @@ void tbft_replica_run(tbft_replica_t *r)
         default:
             ESP_LOGD(TAG, "unknown message tag %d", hdr->tag);
             break;
+        }
         }
     }
 
@@ -3110,6 +3121,20 @@ void tbft_replica_send_new_key(tbft_replica_t *r)
     tbft_node_send(&r->node, r->out_buf, (size_t)total, TBFT_ALL_REPLICAS);
     ESP_LOGI(TAG, "sent New_key nonce=%02x%02x... (signed)",
              nk->nonce[0], nk->nonce[1]);
+
+    /* Cache message for reliable retransmission during handle_new_key */
+    if ((size_t)total <= sizeof(r->last_new_key_buf)) {
+        memcpy(r->last_new_key_buf, r->out_buf, (size_t)total);
+        r->last_new_key_len = total;
+    }
+
+    /* Unicast to peers whose in_keys aren't confirmed yet — a lost
+     * broadcast would leave them with stale in_keys permanently. */
+    for (int i = 0; i < n; i++) {
+        if (i == local_id) continue;
+        if (r->node.principals[i] && !r->node.principals[i]->keys_fresh)
+            tbft_node_send(&r->node, r->out_buf, (size_t)total, i);
+    }
 }
 
 void tbft_replica_handle_new_key(tbft_replica_t *r, const void *msg, int len)
@@ -3148,6 +3173,13 @@ void tbft_replica_handle_new_key(tbft_replica_t *r, const void *msg, int len)
     tbft_principal_set_in_key(p, &new_key);
     ESP_LOGI(TAG, "handle_new_key: from replica %d", sender_id);
     memset(&new_key, 0, sizeof(new_key));
+
+    /* Reliable bidirectional handshake: whenever we receive a peer's
+     * New_key, re-send ours via unicast.  If the peer missed our
+     * broadcast, this guarantees they eventually receive it. */
+    if (r->last_new_key_len > 0)
+        tbft_node_send(&r->node, r->last_new_key_buf,
+                       (size_t)r->last_new_key_len, sender_id);
 }
 
 /* --------------------------------------------------------------------------

@@ -132,6 +132,18 @@ menu "TinyBFT Configuration"
                 MAC format: xx:xx:xx:xx:xx:xx
     endchoice
 
+    config TBFT_ESPNOW_MSG_QUEUE_DEPTH
+        int "ESP-NOW receive message queue depth"
+        default 32
+        range 8 128
+        depends on TBFT_TRANSPORT_ESPNOW
+        help
+            Number of reassembled messages the transport can buffer
+            before dropping. During checkpoint boundary storms, all
+            replicas broadcast simultaneously — increase this if you
+            see "msg_queue full" warnings. Each entry costs
+            TBFT_MAX_MESSAGE_SIZE + 10 bytes.
+
     config TBFT_ESPNOW_SEND_TASK_PRIORITY
         int "ESP-NOW send task priority"
         default 5
