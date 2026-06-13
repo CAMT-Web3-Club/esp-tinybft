@@ -134,7 +134,7 @@ menu "TinyBFT Configuration"
 
     config TBFT_ESPNOW_MSG_QUEUE_DEPTH
         int "ESP-NOW receive message queue depth"
-        default 32
+        default 16
         range 8 128
         depends on TBFT_TRANSPORT_ESPNOW
         help
