@@ -32,10 +32,17 @@ typedef struct {
     mbedtls_svc_key_id_t priv_sign_id;
     mbedtls_svc_key_id_t priv_ecdh_id;
 
-    /* HMAC session keys */
+    /* HMAC session keys — two-key window for rotation grace period */
     tbft_hmac_key_t hmac_in_key;
     tbft_hmac_key_t hmac_out_key;
     bool            keys_fresh;
+
+    /* Previous in_key — retained for one rotation cycle so that
+     * in-flight protocol messages signed with the old key before
+     * handle_new_key processed the new key don't fail MAC verification.
+     * Verified by verify_mac_in_with_replay_check as a fallback. */
+    tbft_hmac_key_t       hmac_in_key_prev;
+    mbedtls_svc_key_id_t  psa_hmac_in_id_prev;
 
     /* Persistent PSA key handles for HMAC */
     mbedtls_svc_key_id_t psa_hmac_in_id;

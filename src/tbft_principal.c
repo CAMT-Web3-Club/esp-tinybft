@@ -230,13 +230,35 @@ bool tbft_principal_verify_mac_in(const tbft_principal_t *p,
 bool tbft_principal_verify_mac_in_with_replay_check(tbft_principal_t *p,
     const void *msg, size_t msg_len, const tbft_mac_t *mac, int64_t msg_time_us)
 {
-    if (!tbft_principal_verify_mac_in(p, msg, msg_len, mac)) return false;
-    (void)msg_time_us;
-    return true;
+    /* Try current in_key first */
+    if (tbft_principal_verify_mac_in(p, msg, msg_len, mac)) {
+        (void)msg_time_us;
+        return true;
+    }
+
+    /* Key rotation grace period: the sender may have signed this
+     * message with the old key before processing our last New_key.
+     * Try the previous in_key as a fallback. */
+    if (p->psa_hmac_in_id_prev != 0) {
+        psa_status_t st = psa_mac_verify(p->psa_hmac_in_id_prev,
+            PSA_ALG_HMAC(PSA_ALG_SHA_256),
+            (const uint8_t *)msg, msg_len, mac->bytes, TBFT_HMAC_SIZE);
+        if (st == PSA_SUCCESS) {
+            (void)msg_time_us;
+            return true;
+        }
+    }
+
+    return false;
 }
 
 void tbft_principal_set_in_key(tbft_principal_t *p, const tbft_hmac_key_t *key)
 {
+    /* Retain previous key for rotation grace period */
+    if (p->psa_hmac_in_id_prev != 0) { psa_destroy_key(p->psa_hmac_in_id_prev); p->psa_hmac_in_id_prev = 0; }
+    p->hmac_in_key_prev = p->hmac_in_key;
+    p->psa_hmac_in_id_prev = p->psa_hmac_in_id;
+
     if (p->psa_hmac_in_id != 0) { psa_destroy_key(p->psa_hmac_in_id); p->psa_hmac_in_id = 0; }
     p->hmac_in_key = *key;
     p->psa_hmac_in_id = import_hmac_key(key, PSA_KEY_USAGE_VERIFY_MESSAGE);

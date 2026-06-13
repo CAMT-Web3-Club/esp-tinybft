@@ -331,6 +331,15 @@ void tbft_replica_run(tbft_replica_t *r)
         }
         ESP_LOGI(TAG, "key barrier complete: %d/%d keys ready",
                  keys_ok, r->node.num_replicas - 1);
+
+        /* Complete any in-progress key rotation before processing
+         * consensus messages.  Without this, the first PP may be
+         * sent with only partially-derived out_keys, causing MAC
+         * failures on peers whose key hasn't been generated yet. */
+        while (r->new_key_peer_idx >= 0) {
+            tbft_replica_rotate_key_tick(r);
+            taskYIELD();
+        }
     }
     /* Subscribe this task to the task watchdog so we can periodically feed it.
      * The default timeout is CONFIG_ESP_TASK_WDT_TIMEOUT_S (typically 5s). */
@@ -3159,12 +3168,15 @@ void tbft_replica_rotate_key_tick(tbft_replica_t *r)
         r->new_key_peer_idx++;
     }
 
-    /* Phase 3: all peers done — broadcast */
+    /* Phase 3: all peers done — broadcast.
+         * Use last_new_key_buf (cached in Phase 1) instead of out_buf
+         * because the batch drain between Phase 1 and Phase 3 may have
+         * overwritten out_buf with Prepare/Commit/Checkpoint data. */
     if (r->new_key_peer_idx >= r->node.num_replicas) {
         int n = r->node.num_replicas;
         int32_t total = r->new_key_msg_len;
-        tbft_node_send(&r->node, r->out_buf, (size_t)total, TBFT_ALL_REPLICAS);
-        tbft_new_key_rep_t *nk = (tbft_new_key_rep_t *)r->out_buf;
+        tbft_node_send(&r->node, r->last_new_key_buf, (size_t)total, TBFT_ALL_REPLICAS);
+        tbft_new_key_rep_t *nk = (tbft_new_key_rep_t *)r->last_new_key_buf;
         ESP_LOGI(TAG, "sent New_key nonce=%02x%02x... (signed)",
                  nk->nonce[0], nk->nonce[1]);
 
@@ -3172,7 +3184,7 @@ void tbft_replica_rotate_key_tick(tbft_replica_t *r)
         for (int i = 0; i < n; i++) {
             if (i == local_id) continue;
             if (r->node.principals[i] && !r->node.principals[i]->keys_fresh)
-                tbft_node_send(&r->node, r->out_buf, (size_t)total, i);
+                tbft_node_send(&r->node, r->last_new_key_buf, (size_t)total, i);
         }
         r->new_key_peer_idx = -1;
     }
