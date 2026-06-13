@@ -48,6 +48,7 @@ target_compile_options(${COMPONENT_LIB} PRIVATE
     -Wwrite-strings
     -Wstrict-prototypes
     -Wmissing-declarations
+    -Wformat-signedness
     -Wmissing-prototypes
     -Wnull-dereference
     -Wformat=2
