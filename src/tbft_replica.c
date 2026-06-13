@@ -3136,10 +3136,9 @@ void tbft_replica_rotate_key_tick(tbft_replica_t *r)
         }
         r->new_key_msg_len = total;
 
-        /* Cache for unicast retransmission in handle_new_key */
+        /* Cache for Phase 3 broadcast (avoids out_buf corruption) */
         if ((size_t)total <= sizeof(r->last_new_key_buf)) {
             memcpy(r->last_new_key_buf, r->out_buf, (size_t)total);
-            r->last_new_key_len = total;
         }
     }
 
@@ -3171,19 +3170,12 @@ void tbft_replica_rotate_key_tick(tbft_replica_t *r)
          * because the batch drain between Phase 1 and Phase 3 may have
          * overwritten out_buf with Prepare/Commit/Checkpoint data. */
     if (r->new_key_peer_idx >= r->node.num_replicas) {
-        int n = r->node.num_replicas;
         int32_t total = r->new_key_msg_len;
         tbft_node_send(&r->node, r->last_new_key_buf, (size_t)total, TBFT_ALL_REPLICAS);
         tbft_new_key_rep_t *nk = (tbft_new_key_rep_t *)r->last_new_key_buf;
         ESP_LOGI(TAG, "sent New_key nonce=%02x%02x... (signed)",
                  nk->nonce[0], nk->nonce[1]);
 
-        /* Unicast to peers whose in_keys aren't confirmed */
-        for (int i = 0; i < n; i++) {
-            if (i == local_id) continue;
-            if (r->node.principals[i] && !r->node.principals[i]->keys_fresh)
-                tbft_node_send(&r->node, r->last_new_key_buf, (size_t)total, i);
-        }
         r->new_key_peer_idx = -1;
     }
 }
@@ -3233,13 +3225,6 @@ void tbft_replica_handle_new_key(tbft_replica_t *r, const void *msg, int len)
     tbft_principal_set_in_key(p, &new_key);
     ESP_LOGI(TAG, "handle_new_key: from replica %d", sender_id);
     memset(&new_key, 0, sizeof(new_key));
-
-    /* Reliable bidirectional handshake: whenever we receive a peer's
-     * New_key, re-send ours via unicast.  If the peer missed our
-     * broadcast, this guarantees they eventually receive it. */
-    if (r->last_new_key_len > 0)
-        tbft_node_send(&r->node, r->last_new_key_buf,
-                       (size_t)r->last_new_key_len, sender_id);
 }
 
 /* --------------------------------------------------------------------------
