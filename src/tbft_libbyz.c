@@ -325,7 +325,8 @@ static int setup_principals(tbft_node_t *node, const tbft_config_t *cfg,
                              const char *priv_config_path,
                              tbft_node_id_t local_id)
 {
-    for (int i = 0; i < cfg->num_nodes; i++) {
+    int i;
+    for (i = 0; i < cfg->num_nodes; i++) {
         tbft_principal_t *p =
             (tbft_principal_t *)calloc(1, sizeof(tbft_principal_t));
         if (!p) {
@@ -436,26 +437,36 @@ static int setup_principals(tbft_node_t *node, const tbft_config_t *cfg,
             }
             node->local_principal = p;
 
-            /* Verify public/private key pair consistency */
-            if (p->has_priv_key) {
-                int rc = mbedtls_pk_check_pair(&p->pub_pk, &p->priv_pk);
-                if (rc != 0) {
+            /* Verify public/private key pair consistency — PSA sign+verify self-test */
+            if (p->priv_sign_id != 0) {
+                uint8_t test_msg[] = "keypair_self_test";
+                tbft_sig_t test_sig;
+                int sr = tbft_principal_sign(p, test_msg, sizeof(test_msg)-1, &test_sig);
+                if (sr != 0) {
+                    ESP_LOGE(TAG, "key pair self-test: sign failed for node %d (ret=%d)", i, sr);
+                    goto cleanup_keypair;
+                }
+                bool vok = tbft_principal_verify_sig(p, test_msg, sizeof(test_msg)-1, &test_sig);
+                if (!vok) {
                     ESP_LOGE(TAG, "key pair mismatch for node %d: "
-                             "public and private keys do not correspond "
-                             "(mbedtls err=%d)", i, rc);
-                    for (int j = 0; j <= i; j++) {
-                        if (node->principals[j]) {
-                            tbft_principal_free(node->principals[j]);
-                            free(node->principals[j]);
-                            node->principals[j] = NULL;
-                        }
-                    }
-                    return -1;
+                             "public and private keys do not correspond", i);
+                    goto cleanup_keypair;
                 }
             }
         }
     }
     return 0;
+
+cleanup_keypair:
+    for (int j = 0; j <= i; j++) {
+        if (node->principals[j]) {
+            tbft_principal_free(node->principals[j]);
+            free(node->principals[j]);
+            node->principals[j] = NULL;
+        }
+    }
+    return -1;
+
 }
 
 /* --------------------------------------------------------------------------
@@ -575,7 +586,7 @@ int Byz_send_request(Byz_req *req, bool read_only)
     /* Sign */
     tbft_sig_t *sig = (tbft_sig_t *)(cmd_ptr + req->size);
     memset(sig->bytes, 0, sizeof(sig->bytes));
-    if (s_client->local_principal && s_client->local_principal->has_priv_key) {
+    if (s_client->local_principal && s_client->local_principal->priv_sign_id != 0) {
         int64_t t0 = esp_timer_get_time();
         int sig_ret = tbft_node_gen_sig(s_client, out,
                                         sizeof(*rep) + (size_t)req->size,
