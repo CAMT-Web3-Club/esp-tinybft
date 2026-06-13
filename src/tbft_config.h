@@ -85,8 +85,7 @@
 #define TBFT_DIGEST_SIZE         32   /* SHA-256 output bytes */
 #define TBFT_HMAC_SIZE           32   /* HMAC-SHA256 output bytes */
 #define TBFT_HMAC_KEY_SIZE       32   /* Symmetric session key bytes */
-#define TBFT_RSA_KEY_BITS        2048
-#define TBFT_SIG_SIZE            (TBFT_RSA_KEY_BITS / 8)  /* 256 bytes */
+#define TBFT_SIG_SIZE            64  /* ECDSA P-256: r(32) + s(32) */
 
 /* Authenticator: one HMAC slot per remote replica */
 #define TBFT_AUTH_SIZE           (TBFT_HMAC_SIZE * (TBFT_MAX_NUM_REPLICAS - 1))

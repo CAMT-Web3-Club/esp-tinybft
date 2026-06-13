@@ -3,13 +3,14 @@ set -e
 
 mkdir -p spiffs_image
 
-echo "Generating RSA keys for 7 replicas and 1 client..."
+echo "Generating ECDSA P-256 keys for 7 replicas and 1 client..."
 for i in 0 1 2 3 4 5 6 7; do
-    openssl genrsa -out spiffs_image/priv$i.pem 2048 2>/dev/null
-    openssl rsa -in spiffs_image/priv$i.pem -pubout -out spiffs_image/pub$i.pem 2>/dev/null
-    openssl pkcs8 -topk8 -nocrypt -in spiffs_image/priv$i.pem -outform DER -out spiffs_image/priv$i.der 2>/dev/null
-    openssl rsa -in spiffs_image/priv$i.pem -pubout -outform DER -RSAPublicKey_out -out spiffs_image/pub$i.der 2>/dev/null
-    rm spiffs_image/priv$i.pem spiffs_image/pub$i.pem
+    openssl ecparam -name prime256v1 -genkey -noout -out spiffs_image/priv$i.pem 2>/dev/null
+    # Private: raw 32 bytes. ECPrivateKey DER is 30 77 02 01 01 04 20 [key] ...
+    openssl ec -in spiffs_image/priv$i.pem -outform DER 2>/dev/null | tail -c +8 | head -c 32 > spiffs_image/priv$i.der
+    # Public: raw 65 bytes uncompressed (0x04||X||Y). SPKI DER last 65 bytes.
+    openssl ec -in spiffs_image/priv$i.pem -pubout -outform DER 2>/dev/null | tail -c 65 > spiffs_image/pub$i.der
+    rm spiffs_image/priv$i.pem
 done
 
 echo "Generating UDP config..."

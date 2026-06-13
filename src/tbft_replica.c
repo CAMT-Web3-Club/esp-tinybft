@@ -3065,103 +3065,51 @@ void tbft_replica_send_new_key(tbft_replica_t *r)
     int n        = r->node.num_replicas;
     int local_id = r->node.node_id;
 
-    /* Max message size check: header + (n-1) slots */
-    size_t max_needed = sizeof(tbft_new_key_rep_t)
-                      + (size_t)(n - 1) * sizeof(tbft_new_key_slot_t);
-    if (max_needed > sizeof(r->out_buf)) {
-        ESP_LOGE(TAG, "send_new_key: out_buf too small (%zu needed, %zu available)",
-                 max_needed, sizeof(r->out_buf));
-        return;
-    }
-
     tbft_new_key_rep_t *nk = (tbft_new_key_rep_t *)r->out_buf;
     nk->hdr.tag   = TBFT_MSG_NEW_KEY;
     nk->hdr.extra        = 0;
     nk->hdr.timestamp_us = esp_timer_get_time();
     nk->id               = local_id;
-    nk->n_keys    = 0;
 
-    tbft_new_key_slot_t *slots =
-        (tbft_new_key_slot_t *)(r->out_buf + sizeof(*nk));
-    int slot_idx = 0;
+    /* Generate fresh random nonce (salt) for ECDH key derivation */
+    esp_fill_random(nk->nonce, sizeof(nk->nonce));
 
+    tbft_principal_t *local = r->node.local_principal;
+    if (!local) return;
+    if (local->priv_ecdh_id == 0) return;
+
+    /* Derive new HMAC out-keys for each peer via ECDH */
     for (int i = 0; i < n; i++) {
         if (i == local_id) continue;
-
         tbft_principal_t *p = r->node.principals[i];
         if (!p) continue;
 
-        /* Generate a cryptographically random session key.
-         * CRITICAL FIX: Only generate a new key if the out-key is not yet set.
-         * Re-broadcasts of New_key must use the SAME key — otherwise the
-         * primary's hmac_out_key changes every 2s while backups are still
-         * decrypting and installing keys from older broadcasts, causing
-         * a key mismatch and "pp: MAC verification failed". */
         tbft_hmac_key_t new_key;
-        bool need_new_key = true;
-        for (int b = 0; b < (int)sizeof(p->hmac_out_key.bytes); b++) {
-            if (p->hmac_out_key.bytes[b] != 0) {
-                need_new_key = false;
-                break;
-            }
+        if (tbft_principal_ecdh_derive_key(local, p, nk->nonce, &new_key) != 0) {
+            ESP_LOGW(TAG, "send_new_key: ECDH derive for replica %d failed", i);
+            continue;
         }
-        if (need_new_key) {
-            esp_fill_random(new_key.bytes, sizeof(new_key.bytes));
-            /* Encrypt the key under replica i's RSA public key */
-            size_t enc_len = 0;
-            int rc = tbft_principal_encrypt_new_key(p, &new_key,
-                                                     slots[slot_idx].ciphertext,
-                                                     sizeof(slots[slot_idx].ciphertext),
-                                                     &enc_len);
-            if (rc != 0 || enc_len != TBFT_SIG_SIZE) {
-                ESP_LOGW(TAG, "send_new_key: encrypt for replica %d failed", i);
-                /* M3 FIX: Skip this slot entirely — don't zero or include it.
-                 * The slot_idx is NOT incremented, so this slot is excluded
-                 * from the final message. Zeroing it would leave garbage
-                 * recipient_id=0 which could confuse the recipient. */
-                continue;
-            }
-            /* Cache the generated ciphertext so future re-broadcasts send the exact same bytes */
-            memcpy(p->last_sent_new_key_ciphertext, slots[slot_idx].ciphertext, TBFT_SIG_SIZE);
-        } else {
-            new_key = p->hmac_out_key;
-            /* Copy the previously generated ciphertext to keep it byte-for-byte identical */
-            memcpy(slots[slot_idx].ciphertext, p->last_sent_new_key_ciphertext, TBFT_SIG_SIZE);
-        }
-
-        /* Store locally as the out-key for messages we send TO replica i.
-         * Must happen AFTER successful encryption so peers that fail
-         * encryption don't get a stale out-key set locally. */
         tbft_principal_set_out_key(p, &new_key);
-        ESP_LOGI(TAG, "send_new_key: set out_key for replica %d (new=%d)", i, need_new_key);
-
-        slots[slot_idx].recipient_id = i;
-        slot_idx++;
+        ESP_LOGI(TAG, "send_new_key: set out_key for replica %d", i);
     }
 
-    if (slot_idx == 0) return;
+    int32_t body = tbft_msg_align((int32_t)sizeof(*nk));
+    nk->hdr.size = body;
+    nk->has_sig = true;
 
-    nk->n_keys = slot_idx;
-    int32_t body = (int32_t)(sizeof(*nk)
-                               + (size_t)slot_idx * sizeof(tbft_new_key_slot_t));
-    nk->hdr.size = tbft_msg_align(body);
-
-    /* CRITICAL FIX: RSA-sign New_key messages to prevent authentication bypass.
-     * Without this, any network participant can inject arbitrary HMAC keys. */
-    int32_t total = nk->hdr.size + (int32_t)sizeof(tbft_sig_t);
+    int32_t total = body + (int32_t)sizeof(tbft_sig_t);
     if ((size_t)total > sizeof(r->out_buf)) {
-        ESP_LOGE(TAG, "send_new_key: out_buf too small for signature");
+        ESP_LOGE(TAG, "send_new_key: out_buf too small");
         return;
     }
-    tbft_sig_t *sig = (tbft_sig_t *)(r->out_buf + nk->hdr.size);
-    if (tbft_node_gen_sig(&r->node, r->out_buf, (size_t)nk->hdr.size, sig) != 0) {
-        ESP_LOGE(TAG, "send_new_key: failed to sign; refusing to send");
+    tbft_sig_t *sig = (tbft_sig_t *)(r->out_buf + body);
+    if (tbft_node_gen_sig(&r->node, r->out_buf, (size_t)body, sig) != 0) {
+        ESP_LOGE(TAG, "send_new_key: failed to sign");
         return;
     }
-
-    tbft_node_send(&r->node, r->out_buf, (size_t)total,
-                   TBFT_ALL_REPLICAS);
-    ESP_LOGI(TAG, "sent New_key with %d slots (signed)", slot_idx);
+    tbft_node_send(&r->node, r->out_buf, (size_t)total, TBFT_ALL_REPLICAS);
+    ESP_LOGI(TAG, "sent New_key nonce=%02x%02x... (signed)",
+             nk->nonce[0], nk->nonce[1]);
 }
 
 void tbft_replica_handle_new_key(tbft_replica_t *r, const void *msg, int len)
@@ -3171,87 +3119,34 @@ void tbft_replica_handle_new_key(tbft_replica_t *r, const void *msg, int len)
 
     tbft_node_id_t sender_id = (tbft_node_id_t)nk->id;
     if (sender_id < 0 || sender_id >= r->node.num_replicas) return;
-    if (sender_id == r->node.node_id) return; /* ignore own broadcasts */
-
-    if (nk->n_keys <= 0 || nk->n_keys > r->node.num_replicas) return;
+    if (sender_id == r->node.node_id) return;
 
     tbft_principal_t *p = r->node.principals[sender_id];
     if (!p) return;
-
-    int expected_len = (int)(sizeof(*nk)
-                             + (size_t)nk->n_keys * sizeof(tbft_new_key_slot_t));
-    if (len < expected_len) {
-        ESP_LOGW(TAG, "new_key from %d: message too short", sender_id);
-        return;
-    }
-
-    const tbft_new_key_slot_t *slots =
-        (const tbft_new_key_slot_t *)((const uint8_t *)msg + sizeof(*nk));
-
-    /* Find the slot addressed to us */
-    int our_slot_idx = -1;
-    for (int i = 0; i < nk->n_keys; i++) {
-        if (slots[i].recipient_id == r->node.node_id) {
-            our_slot_idx = i;
-            break;
-        }
-    }
-
-    if (our_slot_idx == -1) {
-        return; /* not addressed to us — ignore */
-    }
-
-    /* Fast path: check if this is a duplicate of the last successfully processed New_key.
-     * Since RSA-OAEP uses random padding, different sessions produce completely different
-     * ciphertexts. If the ciphertext is exactly identical, and our key is already fresh,
-     * we are guaranteed that the key hasn't changed. We can safely skip the extremely
-     * slow RSA signature verification (~800ms) and RSA decryption (~800ms). */
-    if (p->keys_fresh && memcmp(p->last_new_key_ciphertext, slots[our_slot_idx].ciphertext, TBFT_SIG_SIZE) == 0) {
-        return;
-    }
-
-    /* Slow path: verify RSA signature first to prevent authentication bypass. */
-    int32_t body_size = nk->hdr.size;
-    if (body_size < (int32_t)sizeof(tbft_new_key_rep_t) || body_size > len) {
-        ESP_LOGW(TAG, "new_key from %d: invalid body_size %d", sender_id, (int)body_size);
-        return;
-    }
-    if (len < body_size + (int)sizeof(tbft_sig_t)) {
-        ESP_LOGW(TAG, "new_key from %d: missing RSA signature", sender_id);
-        return;
-    }
-    const tbft_sig_t *sig = (const tbft_sig_t *)((const uint8_t *)msg + body_size);
-    if (!tbft_node_verify_sig(&r->node, sender_id, msg, (size_t)body_size, sig)) {
-        ESP_LOGW(TAG, "new_key from %d: RSA signature verification failed", sender_id);
-        return;
-    }
-
-    /* Decrypt with our RSA private key */
     tbft_principal_t *local = r->node.local_principal;
     if (!local) return;
 
+    /* Verify ECDSA signature */
+    if (nk->has_sig) {
+        int32_t body_size = nk->hdr.size;
+        if (body_size < (int32_t)sizeof(tbft_new_key_rep_t) || body_size > len) return;
+        if (len < body_size + (int)sizeof(tbft_sig_t)) return;
+        const tbft_sig_t *sig = (const tbft_sig_t *)((const uint8_t *)msg + body_size);
+        if (!tbft_node_verify_sig(&r->node, sender_id, msg, (size_t)body_size, sig)) {
+            ESP_LOGW(TAG, "new_key from %d: signature verification failed", sender_id);
+            return;
+        }
+    }
+
+    /* Derive HMAC in-key via ECDH with sender's public key */
     tbft_hmac_key_t new_key;
-    int rc = tbft_principal_decrypt_new_key(local,
-                                             slots[our_slot_idx].ciphertext,
-                                             TBFT_SIG_SIZE,
-                                             &new_key);
-    if (rc != 0) {
-        ESP_LOGW(TAG, "new_key: decrypt from replica %d failed", sender_id);
+    if (tbft_principal_ecdh_derive_key(local, p, nk->nonce, &new_key) != 0) {
+        ESP_LOGW(TAG, "new_key from %d: ECDH derive failed", sender_id);
         return;
     }
 
-    /* Install as the in-key for verifying messages FROM sender_id */
-    ESP_LOGI(TAG, "handle_new_key: from replica %d, decrypted key[0..3]=%02x%02x%02x%02x",
-             sender_id, new_key.bytes[0], new_key.bytes[1],
-             new_key.bytes[2], new_key.bytes[3]);
     tbft_principal_set_in_key(p, &new_key);
-
-    /* Save the ciphertext to skip duplicate processing in the future */
-    memcpy(p->last_new_key_ciphertext, slots[our_slot_idx].ciphertext, TBFT_SIG_SIZE);
-
-    ESP_LOGI(TAG, "installed HMAC in-key from replica %d", sender_id);
-
-    /* Explicit wipe of plaintext key after installation */
+    ESP_LOGI(TAG, "handle_new_key: from replica %d", sender_id);
     memset(&new_key, 0, sizeof(new_key));
 }
 

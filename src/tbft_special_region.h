@@ -21,8 +21,7 @@
 /* Size bounds for variable-length messages */
 #define TBFT_VC_MSG_MAX_SIZE   TBFT_MAX_MESSAGE_SIZE
 #define TBFT_NV_MSG_MAX_SIZE   TBFT_MAX_MESSAGE_SIZE
-#define TBFT_NK_MSG_MAX_SIZE   (sizeof(tbft_new_key_rep_t) +                 \
-                                TBFT_MAX_NUM_REPLICAS * sizeof(tbft_new_key_slot_t))
+#define TBFT_NK_MSG_MAX_SIZE   (sizeof(tbft_new_key_rep_t) + TBFT_SIG_SIZE)
 #define TBFT_REQ_MSG_MAX_SIZE  TBFT_MAX_MESSAGE_SIZE
 #define TBFT_REP_MSG_MAX_SIZE  (sizeof(tbft_reply_rep_t) + TBFT_MAX_REPLY_SIZE \
                                 + TBFT_SIG_SIZE)

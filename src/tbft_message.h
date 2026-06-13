@@ -204,25 +204,22 @@ typedef struct __attribute__((packed)) {
 
 /* --------------------------------------------------------------------------
  * New_key  (tag = 11)  Replica → All
- * Wire: [hdr][New_key_rep][tbft_new_key_slot_t array, n_keys entries]
+ * Wire: [hdr][New_key_rep][optional ECDSA signature]
  *
- * Each slot carries one HMAC session key RSA-OAEP-encrypted for the named
- * recipient.  On receipt a node finds the slot with recipient_id == local_id,
- * decrypts it with its RSA private key, and stores the result as the HMAC
- * in-key for the sender.
+ * Session keys are derived via ECDH, not RSA encryption.  The sender
+ * includes a random 32-byte nonce (salt).  Each recipient computes:
+ *   shared = ECDH(my_priv, sender_pub)
+ *   key    = HMAC-SHA256(salt, shared)
+ * The result is the HMAC in-key for the sender.
  * -------------------------------------------------------------------------- */
 
 typedef struct __attribute__((packed)) {
     tbft_msg_hdr_t  hdr;
-    int32_t         id;       /* sender's replica id */
-    int32_t         n_keys;   /* number of tbft_new_key_slot_t entries */
+    int32_t         id;           /* sender's replica id */
+    uint8_t         nonce[32];    /* salt for ECDH key derivation */
+    bool            has_sig;      /* true if ECDSA signature follows this rep */
+    int8_t          _pad[3];      /* alignment */
 } tbft_new_key_rep_t;
-
-/** One encrypted-key slot inside a New_key message */
-typedef struct __attribute__((packed)) {
-    int32_t  recipient_id;
-    uint8_t  ciphertext[TBFT_SIG_SIZE]; /* RSA-OAEP encrypted tbft_hmac_key_t */
-} tbft_new_key_slot_t;
 
 /* --------------------------------------------------------------------------
  * Meta_data  (tag = 12)  Replica → Fetching
