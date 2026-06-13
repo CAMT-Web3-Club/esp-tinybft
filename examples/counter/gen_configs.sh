@@ -8,7 +8,7 @@ for i in 0 1 2 3 4 5 6 7; do
     openssl genrsa -out spiffs_image/priv$i.pem 2048 2>/dev/null
     openssl rsa -in spiffs_image/priv$i.pem -pubout -out spiffs_image/pub$i.pem 2>/dev/null
     openssl pkcs8 -topk8 -nocrypt -in spiffs_image/priv$i.pem -outform DER -out spiffs_image/priv$i.der 2>/dev/null
-    openssl pkey -in spiffs_image/priv$i.pem -pubout -outform DER -out spiffs_image/pub$i.der 2>/dev/null
+    openssl rsa -in spiffs_image/priv$i.pem -pubout -outform DER -RSAPublicKey_out -out spiffs_image/pub$i.der 2>/dev/null
     rm spiffs_image/priv$i.pem spiffs_image/pub$i.pem
 done
 
