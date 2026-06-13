@@ -72,13 +72,6 @@ static void rqueue_pop(tbft_rqueue_t *q) {
     q->count--;
 }
 
-static void rqueue_clear(tbft_rqueue_t *q) {
-    memset(q->entries, 0, sizeof(q->entries));
-    q->head  = 0;
-    q->tail  = 0;
-    q->count = 0;
-}
-
 /* --------------------------------------------------------------------------
  * Timer callbacks
  * -------------------------------------------------------------------------- */
@@ -809,14 +802,14 @@ void tbft_replica_handle_request(tbft_replica_t *r, const void *msg, int len)
     }
 
     /* Verify request signature */
-    int sig_offset = (int)(sizeof(*req) + req->command_size);
+    int sig_offset = (int)(sizeof(*req) + (size_t)req->command_size);
     if (len < sig_offset + (int)sizeof(tbft_sig_t)) {
         ESP_LOGW(TAG, "request: missing signature");
         return;
     }
     const tbft_sig_t *sig = (const tbft_sig_t *)((const uint8_t *)msg + sig_offset);
     if (!tbft_node_verify_sig(&r->node, (tbft_node_id_t)req->cid,
-                              req, sig_offset, sig)) {
+                               req, (size_t)sig_offset, sig)) {
         ESP_LOGW(TAG, "request: signature verification failed from client %d",
                  req->cid);
         return;
@@ -944,12 +937,12 @@ void tbft_replica_handle_pre_prepare(tbft_replica_t *r, const void *msg, int len
     if ((int64_t)sizeof(*pp) + pp->rset_size + pp->non_det_size +
         (int64_t)sizeof(tbft_auth_t) > len) {
         ESP_LOGW(TAG, "pp: embedded sizes exceed message length (need=%lld, have=%d)",
-                 (long long)(sizeof(*pp) + pp->rset_size + pp->non_det_size + sizeof(tbft_auth_t)), len);
+                 (long long)(sizeof(*pp) + (size_t)pp->rset_size + (size_t)pp->non_det_size + sizeof(tbft_auth_t)), len);
         return;
     }
 
     /* Verify authenticator from the primary */
-    int auth_offset = (int)(sizeof(*pp) + pp->rset_size + pp->non_det_size);
+    int auth_offset = (int)(sizeof(*pp) + (size_t)pp->rset_size + (size_t)pp->non_det_size);
     if (len < auth_offset + (int)sizeof(tbft_auth_t)) {
         ESP_LOGW(TAG, "pp: missing authenticator");
         return;
@@ -965,8 +958,10 @@ void tbft_replica_handle_pre_prepare(tbft_replica_t *r, const void *msg, int len
         ESP_LOGI(TAG, "pp: verifying MAC from primary %d, slot=%d, ts=%lld, auth_offset=%d, msg_len=%d, rset=%d, ndet=%d, hdr[0..7]=%02x%02x%02x%02x%02x%02x%02x%02x",
                  expected_primary, slot, (long long)pp->hdr.timestamp_us, auth_offset, len,
                  (int)pp->rset_size, (int)pp->non_det_size,
-                 ((uint8_t*)msg)[0], ((uint8_t*)msg)[1], ((uint8_t*)msg)[2], ((uint8_t*)msg)[3],
-                 ((uint8_t*)msg)[4], ((uint8_t*)msg)[5], ((uint8_t*)msg)[6], ((uint8_t*)msg)[7]);
+                  ((const uint8_t *)msg)[0], ((const uint8_t *)msg)[1],
+                  ((const uint8_t *)msg)[2], ((const uint8_t *)msg)[3],
+                  ((const uint8_t *)msg)[4], ((const uint8_t *)msg)[5],
+                  ((const uint8_t *)msg)[6], ((const uint8_t *)msg)[7]);
         if (!tbft_node_verify_auth(&r->node, expected_primary, msg,
                                     (size_t)auth_offset,
                                     &auth->slots[slot],
@@ -1608,20 +1603,20 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
         }
         nv->n_prep = n_proofs;
 
-        int32_t body_size = tbft_msg_align((int32_t)(body_ptr - r->out_buf));
-        nv->hdr.size = body_size;
+        int32_t nv_body_size = tbft_msg_align((int32_t)(body_ptr - r->out_buf));
+        nv->hdr.size = nv_body_size;
 
-        if ((size_t)body_size + sizeof(tbft_sig_t) > sizeof(r->out_buf)) {
+        if ((size_t)nv_body_size + sizeof(tbft_sig_t) > sizeof(r->out_buf)) {
             ESP_LOGE(TAG, "new-view: out_buf too small for signature");
             return;
         }
-        tbft_sig_t *sig = (tbft_sig_t *)(r->out_buf + body_size);
-        if (tbft_node_gen_sig(&r->node, r->out_buf, (size_t)body_size, sig) != 0) {
+        tbft_sig_t *nv_sig = (tbft_sig_t *)(r->out_buf + nv_body_size);
+        if (tbft_node_gen_sig(&r->node, r->out_buf, (size_t)nv_body_size, nv_sig) != 0) {
             ESP_LOGE(TAG, "new-view: failed to sign; refusing to send");
             return;
         }
 
-        int32_t total_size = body_size + (int32_t)sizeof(tbft_sig_t);
+        int32_t total_size = nv_body_size + (int32_t)sizeof(tbft_sig_t);
         tbft_node_send(&r->node, r->out_buf, (size_t)total_size,
                        TBFT_ALL_REPLICAS);
         ESP_LOGI(TAG, "sent new-view v=%lld min=%lld max=%lld n_prep=%d",
@@ -1647,7 +1642,7 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
                 const uint8_t *proofs_ptr = r->out_buf + sizeof(*nv);
                 for (int p = 0; p < nv->n_prep; p++) {
                     const tbft_vc_req_info_t *proof =
-                        (const tbft_vc_req_info_t *)(proofs_ptr + p * sizeof(tbft_vc_req_info_t));
+                        (const tbft_vc_req_info_t *)(proofs_ptr + (size_t)p * sizeof(tbft_vc_req_info_t));
                     if (proof->seqno > start_seq) start_seq = proof->seqno;
                 }
             }
@@ -1733,7 +1728,7 @@ void tbft_replica_handle_new_view(tbft_replica_t *r, const void *msg, int len)
      * proof-read loops at lines below would read past end-of-message.
      * int32_t overflow: n_prep <= TBFT_WINDOW_SIZE (≤ 256), so
      * n_prep * sizeof(tbft_vc_req_info_t) cannot overflow int32_t. */
-    int32_t proofs_size = (int32_t)(nv->n_prep * sizeof(tbft_vc_req_info_t));
+    int32_t proofs_size = (int32_t)((size_t)nv->n_prep * sizeof(tbft_vc_req_info_t));
     int32_t header_size = (int32_t)sizeof(tbft_new_view_rep_t);
     if (proofs_size > 0 && body_size < header_size + proofs_size) {
         ESP_LOGW(TAG, "new-view: body too short for n_prep=%d"
@@ -1770,7 +1765,7 @@ void tbft_replica_handle_new_view(tbft_replica_t *r, const void *msg, int len)
             const uint8_t *proofs_ptr = (const uint8_t *)msg + sizeof(*nv);
             for (int p = 0; p < nv->n_prep; p++) {
                 const tbft_vc_req_info_t *proof =
-                    (const tbft_vc_req_info_t *)(proofs_ptr + p * sizeof(tbft_vc_req_info_t));
+                    (const tbft_vc_req_info_t *)(proofs_ptr + (size_t)p * sizeof(tbft_vc_req_info_t));
                 if (proof->seqno > start_seq) start_seq = proof->seqno;
             }
         }
@@ -1811,11 +1806,11 @@ void tbft_replica_handle_new_view(tbft_replica_t *r, const void *msg, int len)
     if (nv->n_prep > 0) {
         const uint8_t *proofs = (const uint8_t *)msg + sizeof(*nv);
         int n_prep = nv->n_prep;
-        size_t proofs_size = (size_t)n_prep * sizeof(tbft_vc_req_info_t);
-        if ((size_t)len >= sizeof(*nv) + proofs_size) {
+        size_t nv_proofs_size = (size_t)n_prep * sizeof(tbft_vc_req_info_t);
+        if ((size_t)len >= sizeof(*nv) + nv_proofs_size) {
             for (int p = 0; p < n_prep; p++) {
                 const tbft_vc_req_info_t *proof =
-                    (const tbft_vc_req_info_t *)(proofs + p * sizeof(tbft_vc_req_info_t));
+                    (const tbft_vc_req_info_t *)(proofs + (size_t)p * sizeof(tbft_vc_req_info_t));
                 if (proof->seqno > r->last_executed && proof->seqno <= nv->max) {
                     ESP_LOGI(TAG, "new-view: prepared seqno=%lld digest=[...%02x] from view %lld"
                              " — will fill if needed",
@@ -2685,7 +2680,7 @@ void tbft_replica_execute_committed(tbft_replica_t *r)
 
             int rc = r->exec_cb(req_bytes, req_len,
                                 rep_payload, &rep_len,
-                                (void *)ndet, ndet_len,
+                                (void *)(uintptr_t)ndet, ndet_len,
                                 req_rep->cid, ro);
 
             if (rc != 0) {

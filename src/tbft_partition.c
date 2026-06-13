@@ -65,8 +65,8 @@ int tbft_ptree_init(tbft_ptree_t *tree, int num_blocks, int p_children)
     }
     tree->total_nodes = total;
 
-    tree->ptree_mem = (tbft_part_t *)calloc(total, sizeof(tbft_part_t));
-    tree->stree_mem = (tbft_dsum_t *)calloc(total, sizeof(tbft_dsum_t));
+    tree->ptree_mem = (tbft_part_t *)calloc((size_t)total, sizeof(tbft_part_t));
+    tree->stree_mem = (tbft_dsum_t *)calloc((size_t)total, sizeof(tbft_dsum_t));
     if (!tree->ptree_mem || !tree->stree_mem) {
         ESP_LOGE(TAG, "out of memory for partition tree (%d nodes)", total);
         free(tree->ptree_mem);

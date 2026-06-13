@@ -39,8 +39,7 @@ const uint8_t *tbft_ar_load_pp(const tbft_agreement_region_t *ar,
         return NULL;
     }
     const tbft_agreement_slice_t *sl =
-        (const tbft_agreement_slice_t *)tbft_ar_slice(
-            (tbft_agreement_region_t *)ar, seqno);
+        tbft_ar_slice_const(ar, seqno);
     if (len_out) *len_out = sl->prepared_cert.pp_len;
     return tbft_prepared_cert_pp(&sl->prepared_cert);
 }
@@ -74,8 +73,8 @@ bool tbft_ar_add_my_prepare(tbft_agreement_region_t *ar,
 bool tbft_ar_prepared(const tbft_agreement_region_t *ar, tbft_seqno_t seqno)
 {
     if (!tbft_ar_in_range(ar, seqno)) return false;
-    tbft_agreement_slice_t *sl =
-        tbft_ar_slice((tbft_agreement_region_t *)ar, seqno);
+    const tbft_agreement_slice_t *sl =
+        tbft_ar_slice_const(ar, seqno);
     return tbft_prepared_cert_is_complete(&sl->prepared_cert);
 }
 
@@ -106,8 +105,8 @@ bool tbft_ar_add_my_commit(tbft_agreement_region_t *ar,
 bool tbft_ar_committed(const tbft_agreement_region_t *ar, tbft_seqno_t seqno)
 {
     if (!tbft_ar_in_range(ar, seqno)) return false;
-    tbft_agreement_slice_t *sl =
-        tbft_ar_slice((tbft_agreement_region_t *)ar, seqno);
+    const tbft_agreement_slice_t *sl =
+        tbft_ar_slice_const(ar, seqno);
     return tbft_commit_cert_is_complete(&sl->commit_cert);
 }
 

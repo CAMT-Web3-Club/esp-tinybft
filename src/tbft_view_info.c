@@ -133,7 +133,7 @@ bool tbft_vi_verify_nv(const tbft_view_info_t *vi,
      * A Byzantine new primary can inject arbitrary proofs; each
      * (seqno, digest) must appear in at least f+1 collected VCs.
      * n_prep is untrusted — validate it fits the message body first. */
-    int32_t proofs_size = (int32_t)(nv->n_prep * sizeof(tbft_vc_req_info_t));
+    int32_t proofs_size = (int32_t)((size_t)nv->n_prep * sizeof(tbft_vc_req_info_t));
     int32_t header_size = (int32_t)sizeof(tbft_new_view_rep_t);
     if (proofs_size > 0) {
         if (nv_len < header_size + proofs_size) {
@@ -144,7 +144,7 @@ bool tbft_vi_verify_nv(const tbft_view_info_t *vi,
         const uint8_t *proofs = (const uint8_t *)nv + header_size;
         for (int p = 0; p < nv->n_prep; p++) {
             const tbft_vc_req_info_t *proof =
-                (const tbft_vc_req_info_t *)(proofs + p * sizeof(tbft_vc_req_info_t));
+                (const tbft_vc_req_info_t *)(proofs + (size_t)p * sizeof(tbft_vc_req_info_t));
 
             int attestations = 0;
             for (int r = 0; r < vi->num_replicas
@@ -160,8 +160,8 @@ bool tbft_vi_verify_nv(const tbft_view_info_t *vi,
                     (const tbft_view_change_rep_t *)vc_buf;
 
                 if (vc->n_ckpts < 0 || vc->n_reqs < 0) continue;
-                int32_t ckpt_bytes = (int32_t)(vc->n_ckpts * sizeof(tbft_vc_ckpt_t));
-                int32_t req_bytes  = (int32_t)(vc->n_reqs * sizeof(tbft_vc_req_info_t));
+                int32_t ckpt_bytes = (int32_t)((size_t)vc->n_ckpts * sizeof(tbft_vc_ckpt_t));
+                int32_t req_bytes  = (int32_t)((size_t)vc->n_reqs * sizeof(tbft_vc_req_info_t));
                 /* signature sits at vc_buf + vc_len - sizeof(tbft_sig_t) */
                 const uint8_t *body_end =
                     vc_buf + vc_len - (int32_t)sizeof(tbft_sig_t);
@@ -171,7 +171,7 @@ bool tbft_vi_verify_nv(const tbft_view_info_t *vi,
 
                 for (int q = 0; q < vc->n_reqs; q++) {
                     const tbft_vc_req_info_t *vc_req =
-                        (const tbft_vc_req_info_t *)(reqs + q * sizeof(tbft_vc_req_info_t));
+                        (const tbft_vc_req_info_t *)(reqs + (size_t)q * sizeof(tbft_vc_req_info_t));
                     if (vc_req->seqno == proof->seqno &&
                         tbft_digest_equal(&vc_req->digest, &proof->digest)) {
                         attestations++;

@@ -847,9 +847,9 @@ static int exec_adapter(const void *req, int req_len,
                         int cid, bool ro)
 {
     if (!s_exec_cb) return -1;
-    Byz_req in  = { .contents = (char *)req, .size = req_len };
-    Byz_rep out = { .contents = (char *)rep, .size = 0 };
-    Byz_buffer nd = { .contents = (char *)ndet, .size = ndet_len };
+    Byz_req in  = { .contents = (char *)(uintptr_t)req, .size = req_len };
+    Byz_rep out = { .contents = (char *)(uintptr_t)rep, .size = 0 };
+    Byz_buffer nd = { .contents = (char *)(uintptr_t)ndet, .size = ndet_len };
     int r = s_exec_cb(&in, &out, &nd, cid, ro);
     if (r == 0 && rep_len) *rep_len = out.size;
     return r;
@@ -867,7 +867,7 @@ static void comp_ndet_adapter(tbft_seqno_t seqno,
 static void recv_reply_adapter(const void *rep, int rep_len, int cid)
 {
     if (!s_recv_reply_cb) return;
-    Byz_rep r = { .contents = (char *)rep, .size = rep_len };
+    Byz_rep r = { .contents = (char *)(uintptr_t)rep, .size = rep_len };
     s_recv_reply_cb(&r, cid);
 }
 

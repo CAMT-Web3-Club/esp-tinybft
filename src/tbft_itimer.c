@@ -53,7 +53,7 @@ void tbft_itimer_start(tbft_itimer_t *t, int64_t timeout_us)
                                  * with callback running=t->false */
     t->period_us = timeout_us;
 
-    esp_err_t err = esp_timer_start_once(t->handle, timeout_us);
+    esp_err_t err = esp_timer_start_once(t->handle, (uint64_t)timeout_us);
     if (err != ESP_OK) {
         t->running = false;
         ESP_LOGE(TAG, "esp_timer_start_once failed: %s", esp_err_to_name(err));
