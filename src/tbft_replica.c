@@ -331,15 +331,6 @@ void tbft_replica_run(tbft_replica_t *r)
         }
         ESP_LOGI(TAG, "key barrier complete: %d/%d keys ready",
                  keys_ok, r->node.num_replicas - 1);
-
-        /* Complete any in-progress key rotation before processing
-         * consensus messages.  Without this, the first PP may be
-         * sent with only partially-derived out_keys, causing MAC
-         * failures on peers whose key hasn't been generated yet. */
-        while (r->new_key_peer_idx >= 0) {
-            tbft_replica_rotate_key_tick(r);
-            taskYIELD();
-        }
     }
     /* Subscribe this task to the task watchdog so we can periodically feed it.
      * The default timeout is CONFIG_ESP_TASK_WDT_TIMEOUT_S (typically 5s). */
@@ -2322,6 +2313,13 @@ void tbft_replica_send_pre_prepare(tbft_replica_t *r)
 {
     if (!tbft_replica_is_primary(r)) return;
     if (r->vi.in_progress) return; /* view-change in progress */
+
+    /* Defer PP while incremental key rotation is in progress.
+     * Without this, the first PP may be sent with partially-derived
+     * out_keys, causing MAC failures on peers whose key hasn't been
+     * generated yet.  The main-loop tick completes one peer per
+     * iteration; this guard ensures the PP waits. */
+    if (r->new_key_peer_idx >= 0) return;
 
     /* Only require that we have at least threshold-1 peers with fresh keys.
      * The self-test already verifies each key on import, so no additional
