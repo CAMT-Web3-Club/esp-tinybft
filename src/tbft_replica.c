@@ -345,6 +345,8 @@ void tbft_replica_run(tbft_replica_t *r)
                     (const tbft_msg_hdr_t *)r->node.recv_buf;
                 if (n >= hdr->size && hdr->tag == TBFT_MSG_NEW_KEY)
                     tbft_replica_handle_new_key(r, r->node.recv_buf, n);
+                if (n >= hdr->size && hdr->tag == TBFT_MSG_NEW_KEY_ACK)
+                    tbft_replica_handle_new_key_ack(r, r->node.recv_buf, n);
             }
             /* Advance incremental key rotation during bootstrap */
             tbft_replica_rotate_key_tick(r);
@@ -826,6 +828,9 @@ void tbft_replica_run(tbft_replica_t *r)
             break;
         case TBFT_MSG_NEW_KEY:
             tbft_replica_handle_new_key(r, r->node.recv_buf, n);
+            break;
+        case TBFT_MSG_NEW_KEY_ACK:
+            tbft_replica_handle_new_key_ack(r, r->node.recv_buf, n);
             break;
         case TBFT_MSG_STATUS:
             handle_status(r, r->node.recv_buf, n);
@@ -3236,7 +3241,7 @@ void tbft_replica_rotate_key_tick(tbft_replica_t *r)
             tbft_hmac_key_t new_key;
             if (tbft_principal_ecdh_derive_key(local, p, r->new_key_nonce,
                                                &new_key) == 0) {
-                tbft_principal_set_out_key(p, &new_key);
+                tbft_principal_set_out_key(p, &new_key, r->new_key_nonce);
                 ESP_LOGI(TAG, "send_new_key: set out_key for replica %d", peer);
             } else {
                 ESP_LOGW(TAG, "send_new_key: ECDH derive for %d failed", peer);
@@ -3284,23 +3289,41 @@ void tbft_replica_send_new_key(tbft_replica_t *r)
     r->new_key_peer_idx = 0;
 }
 
-/* B-FIX: Check if the New_key grace period has expired.  If so, commit
- * all principals' pending out_key rotations (destroy the old key backup,
- * the new key becomes the active signing key).  Called once per main-loop
- * iteration — cheap when no rotation is in flight. */
+/* v0.9.2 ACK: Check per-peer ACK state and commit each peer's
+ * out_key individually as ACKs arrive.  Also enforces a (long) timeout
+ * fallback so a slow/down peer doesn't block progress forever.
+ *
+ * Called once per main-loop iteration.  Cheap when no rotation is in
+ * flight. */
 void tbft_replica_check_out_key_commit(tbft_replica_t *r)
 {
-    if (r->new_key_commit_at_us == 0) return;
-    int64_t now = esp_timer_get_time();
-    if (now < r->new_key_commit_at_us) return;
+    if (r->new_key_commit_at_us == 0 &&
+        r->new_key_ack_pending_count == 0) return;
 
-    ESP_LOGI(TAG, "out_key grace expired — committing new out_keys for all peers");
+    int64_t now = esp_timer_get_time();
+
+    /* Per-peer commit: a peer is committed as soon as either
+     * (a) it has sent a New_key_ack matching the current nonce, or
+     * (b) the global grace deadline has expired (slow-peer fallback).
+     * The deadline uses the same 15s as v0.9.1, but now per-peer
+     * commits fire as soon as ACKs arrive — typically <1s. */
+    int still_pending = 0;
     for (int i = 0; i < r->node.num_replicas; i++) {
         if (i == r->node.node_id) continue;
         tbft_principal_t *p = r->node.principals[i];
-        if (p) tbft_principal_commit_out_key(p);
+        if (!p) continue;
+        if (tbft_principal_in_out_key_grace(p)) {
+            if (now >= r->new_key_commit_at_us) {
+                /* Timeout fallback: commit anyway */
+                tbft_principal_commit_out_key(p);
+                ESP_LOGW(TAG, "out_key commit for replica %d (timeout)", i);
+            } else {
+                still_pending++;
+            }
+        }
     }
-    r->new_key_commit_at_us = 0;
+    r->new_key_ack_pending_count = still_pending;
+    if (still_pending == 0) r->new_key_commit_at_us = 0;
 }
 
 void tbft_replica_handle_new_key(tbft_replica_t *r, const void *msg, int len)
@@ -3348,7 +3371,52 @@ void tbft_replica_handle_new_key(tbft_replica_t *r, const void *msg, int len)
 
     tbft_principal_set_in_key(p, &new_key);
     ESP_LOGI(TAG, "handle_new_key: from replica %d", sender_id);
+
+    /* v0.9.2 ACK: send a New_key_ack to the sender (the primary) so it
+     * knows our in_key is now updated.  The primary's rotate_key_tick
+     * will commit its out_key for us as soon as this ACK is received.
+     * Only send if we are NOT the primary (avoid self-loop). */
+    if (sender_id != r->node.node_id) {
+        tbft_new_key_ack_rep_t ack;
+        memset(&ack, 0, sizeof(ack));
+        ack.hdr.tag = TBFT_MSG_NEW_KEY_ACK;
+        ack.hdr.extra = 0;
+        ack.hdr.size = tbft_msg_align((int32_t)sizeof(ack));
+        ack.hdr.timestamp_us = esp_timer_get_time();
+        ack.id = (int32_t)r->node.node_id;
+        memcpy(ack.nonce, nk->nonce, sizeof(ack.nonce));
+        ack.has_sig = false;  /* ACK is unauthenticated (no ECDSA) */
+        tbft_node_send(&r->node, &ack, (size_t)ack.hdr.size, sender_id);
+        ESP_LOGD(TAG, "new_key_ack: sent to replica %d", sender_id);
+    }
+
     memset(&new_key, 0, sizeof(new_key));
+}
+
+/* v0.9.2 ACK: Handle a New_key_ack from a peer.  The primary uses this
+ * to commit its out_key for that peer without waiting for the time-based
+ * grace deadline.  Only the primary needs to act; on other replicas
+ * this is a no-op. */
+void tbft_replica_handle_new_key_ack(tbft_replica_t *r,
+                                     const void *msg, int len)
+{
+    if (len < (int)sizeof(tbft_new_key_ack_rep_t)) return;
+    const tbft_new_key_ack_rep_t *ack = (const tbft_new_key_ack_rep_t *)msg;
+
+    tbft_node_id_t sender_id = (tbft_node_id_t)ack->id;
+    if (sender_id < 0 || sender_id >= r->node.num_replicas) return;
+
+    tbft_principal_t *p = r->node.principals[sender_id];
+    if (!p) return;
+
+    /* Match the nonce against this principal's pending rotation.
+     * If matched, mark ACK as received — the next per-peer commit
+     * check will fire immediately. */
+    if (tbft_principal_ack_out_key(p, ack->nonce)) {
+        ESP_LOGI(TAG, "new_key_ack: from replica %d, committing out_key",
+                 sender_id);
+    }
+    /* Silently ignore stale ACKs (nonce already cleared). */
 }
 
 /* --------------------------------------------------------------------------

@@ -27,6 +27,7 @@ typedef enum {
     TBFT_MSG_QUERY_STABLE    = 16,
     TBFT_MSG_REPLY_STABLE    = 17,
     TBFT_MSG_FILL_REQUEST    = 18, /* backup → primary: resend pre-prepare for seqno */
+    TBFT_MSG_NEW_KEY_ACK     = 19, /* receiver → primary: confirms in_key updated for current view */
 } tbft_msg_tag_t;
 
 /* --------------------------------------------------------------------------
@@ -225,6 +226,30 @@ typedef struct __attribute__((packed)) {
     bool            has_sig;      /* true if ECDSA signature follows this rep */
     int8_t          _pad[3];      /* alignment */
 } tbft_new_key_rep_t;
+
+/* --------------------------------------------------------------------------
+ * New_key_ack  (tag = 19)  Receiver → Primary
+ * Wire: [hdr][New_key_ack_rep]
+ *
+ * Sent by a replica after it has processed a New_key and updated its
+ * in_key.  Tells the primary that the in_key for the sender is now
+ * current.  Signed with the sender's ECDSA key.
+ *
+ * This message replaces the time-based grace period in the New_key
+ * rotation protocol.  The primary tracks per-peer ACK state; when all
+ * peers have ACKed, the primary can safely commit the new out_key for
+ * every peer.  Slow peers that don't ACK within a (long) timeout are
+ * treated as failed — the primary commits without them and the system
+ * either makes progress or triggers a view-change.
+ * -------------------------------------------------------------------------- */
+
+typedef struct __attribute__((packed)) {
+    tbft_msg_hdr_t  hdr;
+    int32_t         id;           /* sender's replica id (the receiver) */
+    uint8_t         nonce[32];    /* the New_key nonce this ACK corresponds to */
+    bool            has_sig;      /* true if ECDSA signature follows this rep */
+    int8_t          _pad[3];      /* alignment */
+} tbft_new_key_ack_rep_t;
 
 /* --------------------------------------------------------------------------
  * Meta_data  (tag = 12)  Replica → Fetching

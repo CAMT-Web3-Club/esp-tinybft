@@ -60,6 +60,17 @@ typedef struct {
     mbedtls_svc_key_id_t  psa_hmac_out_id_old;
     int64_t               out_key_old_expires_us;  /* 0 = no grace active */
 
+    /* v0.9.2: per-peer ACK tracking for ack-based New_key commit.
+     * When the primary's rotate_key_tick calls tbft_principal_set_out_key
+     * for peer X, it sets pending_out_key_nonce = current_nonce and
+     * resets out_key_ack_received = false.  When the primary receives
+     * a New_key_ack from peer X for the matching nonce, it sets
+     * out_key_ack_received = true.  The per-peer commit fires when
+     * out_key_ack_received is true, OR after a long timeout (grace
+     * fallback for slow peers). */
+    uint8_t               pending_out_key_nonce[32];
+    bool                  out_key_ack_received;
+
     /* Persistent PSA key handles for HMAC */
     mbedtls_svc_key_id_t psa_hmac_in_id;
     mbedtls_svc_key_id_t psa_hmac_out_id;
@@ -111,7 +122,9 @@ static inline void tbft_principal_update_auth_time(tbft_principal_t *p, int64_t 
 }
 
 void tbft_principal_set_in_key(tbft_principal_t *p, const tbft_hmac_key_t *key);
-void tbft_principal_set_out_key(tbft_principal_t *p, const tbft_hmac_key_t *key);
+void tbft_principal_set_out_key(tbft_principal_t *p,
+                                const tbft_hmac_key_t *key,
+                                const uint8_t *nonce);
 
 /* B-FIX: Commit the pending old out_key (frees the backup PSA handle).
  * Called by the replica's rotate_key_tick after the grace period expires.
@@ -121,6 +134,19 @@ void tbft_principal_commit_out_key(tbft_principal_t *p);
 /* B-FIX: Returns true if this principal is currently in the out_key
  * grace period (signing with the old key while peers catch up). */
 bool tbft_principal_in_out_key_grace(const tbft_principal_t *p);
+
+/* v0.9.2 ACK: Mark this principal as having ACKed the current pending
+ * out_key rotation.  Called by the primary when it receives a
+ * New_key_ack from this peer with the matching nonce.  Returns true
+ * if the ACK matches the currently-pending nonce, false otherwise
+ * (stale ACK from a prior rotation). */
+bool tbft_principal_ack_out_key(tbft_principal_t *p,
+                                const uint8_t *nonce);
+
+/* v0.9.2 ACK: Get the nonce that this principal is currently waiting
+ * for ACK on.  Returns NULL if no rotation is pending. */
+const uint8_t *tbft_principal_pending_out_key_nonce(
+    const tbft_principal_t *p);
 
 /* --------------------------------------------------------------------------
  * ECDSA signature path

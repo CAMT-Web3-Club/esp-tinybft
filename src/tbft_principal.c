@@ -256,6 +256,30 @@ void tbft_principal_commit_out_key(tbft_principal_t *p)
     }
     p->out_key_old_expires_us = 0;
     memset(&p->hmac_out_key_old, 0, sizeof(p->hmac_out_key_old));
+    p->out_key_ack_received = false;
+    memset(p->pending_out_key_nonce, 0, sizeof(p->pending_out_key_nonce));
+}
+
+bool tbft_principal_ack_out_key(tbft_principal_t *p, const uint8_t *nonce)
+{
+    if (!p || !nonce) return false;
+    /* Match against the currently-pending nonce.  Stale ACKs from a
+     * prior rotation (nonce already cleared) are silently ignored. */
+    if (memcmp(p->pending_out_key_nonce, nonce, 32) != 0) return false;
+    p->out_key_ack_received = true;
+    return true;
+}
+
+const uint8_t *tbft_principal_pending_out_key_nonce(const tbft_principal_t *p)
+{
+    if (!p) return NULL;
+    if (!p->out_key_ack_received &&
+        p->pending_out_key_nonce[0] == 0 &&
+        p->pending_out_key_nonce[31] == 0) {
+        /* No rotation is pending */
+        return NULL;
+    }
+    return p->pending_out_key_nonce;
 }
 
 bool tbft_principal_verify_mac_in(const tbft_principal_t *p,
@@ -340,13 +364,15 @@ void tbft_principal_set_in_key(tbft_principal_t *p, const tbft_hmac_key_t *key)
     p->last_auth_time_us = 0;
 }
 
-void tbft_principal_set_out_key(tbft_principal_t *p, const tbft_hmac_key_t *key)
+void tbft_principal_set_out_key(tbft_principal_t *p,
+                                  const tbft_hmac_key_t *key,
+                                  const uint8_t *nonce)
 {
     /* B-FIX: Save the previous out_key as the "old" key for the rotation
      * grace period.  gen_mac_out will sign with the old key until
-     * commit_out_key is called (typically by the replica's rotate_key_tick
-     * after a 3s grace).  The receiver's in_key_prev fallback matches the
-     * old key, so verification succeeds during the grace window.
+     * commit_out_key is called.  The receiver's in_key_prev fallback
+     * matches the old key, so verification succeeds during the grace
+     * window.
      *
      * If we are already in a grace period (consecutive rotations without
      * commit), the previous "old" key is replaced with the current key.
@@ -356,20 +382,21 @@ void tbft_principal_set_out_key(tbft_principal_t *p, const tbft_hmac_key_t *key)
 
     p->hmac_out_key_old = p->hmac_out_key;
     p->psa_hmac_out_id_old = p->psa_hmac_out_id;  /* transfer ownership */
-    /* v0.9.1 FIX: Grace raised from 3s to 15s.  The incremental key rotation
-     * in tbft_replica_rotate_key_tick processes one peer at a time and
-     * then broadcasts the New_key.  Observed wall-clock: a single rotation
-     * takes ~6-15s end-to-end on this 7-replica cluster (per fresh log
-     * capture at 14:15), with the LAST handle_new_key arriving up to 6s
-     * after the broadcast.  3s was insufficient — the per-principal
-     * expiry fired before peers caught up, causing the B-FIX to use the
-     * new out_key while receivers still had the old in_key, producing
-     * `pp: MAC verification failed from primary N` and consensus stalls.
-     *
-     * TODO(proper-fix): replace the time-based grace with an explicit
-     * ack-based protocol.  Per-peer commit should fire when the replica
-     * has received the matching New_key from EVERY peer, not after a
-     * fixed delay.  This requires a small New_key_ack message type. */
+
+    /* v0.9.2 ACK: Record the nonce this rotation is using.  Peers will
+     * send New_key_ack with this nonce; we match ACKs against it and
+     * commit per-peer when matched.  This replaces the time-based
+     * grace deadline (15s in v0.9.1) with a real protocol. */
+    if (nonce) {
+        memcpy(p->pending_out_key_nonce, nonce, 32);
+    } else {
+        memset(p->pending_out_key_nonce, 0, sizeof(p->pending_out_key_nonce));
+    }
+    p->out_key_ack_received = false;
+
+    /* v0.9.1 fallback: 15s grace deadline in case ACKs never arrive
+     * (peer is down or slow).  The per-peer commit will still fire
+     * after this timeout even without an ACK. */
     p->out_key_old_expires_us = esp_timer_get_time() + 15 * 1000 * 1000;
 
     /* Install new key as the "active" out_key.  gen_mac_out will use the

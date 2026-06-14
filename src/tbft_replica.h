@@ -137,6 +137,12 @@ typedef struct {
      * destroyed and the new out_key becomes the active signing key. */
     int64_t  new_key_commit_at_us;
 
+    /* v0.9.2 ACK: number of peers still waiting for an ACK or
+     * grace-timeout to commit.  Decremented as peers ACK or expire.
+     * When this hits zero, the rotation is fully complete and the
+     * main loop can stop polling. */
+    int      new_key_ack_pending_count;
+
     /* Running flag */
     volatile bool  running;
 
@@ -256,8 +262,10 @@ void tbft_replica_handle_data(tbft_replica_t *r,
                               const void *msg, int len);
 void tbft_replica_handle_new_key(tbft_replica_t *r,
                                  const void *msg, int len);
+void tbft_replica_handle_new_key_ack(tbft_replica_t *r,
+                                     const void *msg, int len);
 void tbft_replica_handle_fill_request(tbft_replica_t *r,
-                                      const void *msg, int len);
+                                       const void *msg, int len);
 
 /* --------------------------------------------------------------------------
  * Protocol actions
