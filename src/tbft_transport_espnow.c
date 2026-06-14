@@ -43,7 +43,11 @@ static const char *TAG = "tbft_espnow";
 #define REASM_TIMEOUT_MS    5000
 #define FRAG_INTER_DELAY_MS 20
 
+#ifndef CONFIG_TBFT_ESPNOW_MSG_QUEUE_DEPTH
 #define MSG_QUEUE_DEPTH     16
+#else
+#define MSG_QUEUE_DEPTH     CONFIG_TBFT_ESPNOW_MSG_QUEUE_DEPTH
+#endif
 #define SEND_QUEUE_DEPTH    8
 #ifndef CONFIG_TBFT_ESPNOW_SEND_TASK_PRIORITY
 #define SEND_TASK_PRIORITY  5
@@ -68,7 +72,7 @@ static const char *TAG = "tbft_espnow";
 #define ESPNOW_CREDITS_CAP          CONFIG_TBFT_ESPNOW_TX_CREDITS
 #endif
 #define ESPNOW_TX_CREDITS           ((ESPNOW_CREDITS_PER_CLUSTER) < (ESPNOW_CREDITS_CAP) ? (ESPNOW_CREDITS_PER_CLUSTER) : (ESPNOW_CREDITS_CAP))
-#define ESPNOW_CREDIT_TIMEOUT_MS    100
+#define ESPNOW_CREDIT_TIMEOUT_MS    50
 
 #define SEND_TASK_SHUTDOWN  -999
 _Static_assert(SEND_TASK_SHUTDOWN < 0, "SEND_TASK_SHUTDOWN must be negative");
@@ -138,9 +142,49 @@ typedef struct tbft_espnow {
     volatile bool reasm_stale_flag;
     volatile bool shutting_down;
     SemaphoreHandle_t send_credit_sem;
+    TickType_t last_fail_tick[TBFT_MAX_NUM_REPLICAS + TBFT_MAX_NUM_CLIENTS];
 } tbft_espnow_t;
 
-static tbft_espnow_t *g_espnow_ctx = NULL;
+/* --------------------------------------------------------------------------
+ * Static allocation: queues, semaphores, struct, send-task stack/TCB
+ *
+ * All transport resources are file-scope `static` BSS — no heap allocation
+ * on the init path.  This eliminates fragmentation-induced OOM at boot,
+ * which previously manifested as `queue/sem alloc failed` on ESP32-C3
+ * replicas (heap_4 splits 4 KB blocks; a 32-entry queue storing 2 KB
+ * elements could not find a contiguous 65 KB block post-WiFi init).
+ *
+ * Memory budget (BSS, deterministic):
+ *   s_recv_queue_buf      = 16 * (6 + 4 + 2048) = 32,928 B
+ *   s_send_queue_buf      =  8 * (2048 + 4 + 4)  = 16,448 B
+ *   s_send_task_stack     = 8192 B
+ *   g_espnow_ctx_storage  = 16,804 B
+ *   s_sem / s_queue ctrl  = ~500 B
+ *   -------------------------------------------
+ *   Total added BSS       = ~74 KB (vs ~75 KB previously allocated on heap)
+ *
+ * Note: xSemaphoreCreate*Static only needs a StaticSemaphore_t (no separate
+ * buffer).  FreeRTOS embeds the semaphore state directly in that struct.
+ * -------------------------------------------------------------------------- */
+
+static uint8_t        s_recv_queue_buf[MSG_QUEUE_DEPTH * sizeof(recv_entry_t)];
+static StaticQueue_t  s_recv_queue;
+static uint8_t        s_send_queue_buf[SEND_QUEUE_DEPTH * sizeof(send_entry_t)];
+static StaticQueue_t  s_send_queue;
+
+/* Semaphore control blocks for xSemaphoreCreate*Static.
+ * The StaticSemaphore_t struct itself is the storage — no separate buffer needed. */
+static StaticSemaphore_t s_lock_ss;
+static StaticSemaphore_t s_exit_sem_ss;
+static StaticSemaphore_t s_credit_sem_ss;
+
+/* Send task: static stack + TCB (8 KB stack matches SEND_TASK_STACK_SIZE) */
+static StackType_t   s_send_task_stack[SEND_TASK_STACK_SIZE / sizeof(StackType_t)];
+static StaticTask_t  s_send_task_tcb;
+
+/* Transport struct itself is BSS-resident (singleton, guarded by g_espnow_inited) */
+static tbft_espnow_t g_espnow_ctx_storage;
+static bool          g_espnow_inited = false;
 
 /* --------------------------------------------------------------------------
  * ฟังก์ชันคำนวณ MAC Address อย่างปลอดภัย (รองรับ Overflow/Underflow)
@@ -192,6 +236,10 @@ static reasm_slot_t *reasm_find_or_alloc(tbft_espnow_t *enow, uint16_t msg_id, c
     for (int i = 0; i < REASM_MAX_SLOTS; i++) {
         reasm_slot_t *s = &enow->reasm[i];
         if (s->valid && s->msg_id == msg_id && memcmp(s->src_mac, src_mac, 6) == 0) {
+            if (s->stale) {
+                memset(s, 0, sizeof(*s));
+                s->last_tick = now_ticks();
+            }
             return s;
         }
     }
@@ -297,6 +345,27 @@ static bool reasm_feed(tbft_espnow_t *enow, reasm_slot_t *s, const uint8_t *data
     return false;
 }
 
+static tbft_node_id_t find_node_by_mac_lockless(tbft_espnow_t *enow, const uint8_t *mac) {
+    /* A7-F007 FIX: peer_valid[] is set in espnow_register_peer (application
+     * task) and read here from the WiFi task context.  Race possible if
+     * peers are added during active receive.  Peers are typically registered
+     * once at boot, so the race is theoretical.  The races() with readers
+     * finding a stale peer_valid[i]==false cause message drops (silent),
+     * not corruption — acceptable for the use case. */
+    tbft_node_id_t result = -1;
+    uint8_t base[6];
+    get_base_mac(mac, base);
+    for (int i = 0; i < enow->num_nodes; i++) {
+        if (!enow->peer_valid[i]) continue;
+
+        if (memcmp(enow->peers[i].u.mac.bytes, base, 6) == 0) {
+            result = (tbft_node_id_t)i;
+            break;
+        }
+    }
+    return result;
+}
+
 /* --------------------------------------------------------------------------
  * Callback ฝั่ง รับ-ส่ง (WiFi Context)
  * -------------------------------------------------------------------------- */
@@ -305,16 +374,24 @@ static void espnow_send_cb(const esp_now_send_info_t *tx_info, esp_now_send_stat
     if (status != ESP_NOW_SEND_SUCCESS) {
         ESP_LOGW(TAG, "esp_now_send to " MACSTR " failed: %d", MAC2STR(tx_info->des_addr), (int)status);
     }
-    if (g_espnow_ctx) {
-        xSemaphoreGive(g_espnow_ctx->send_credit_sem);
+    if (g_espnow_inited && !g_espnow_ctx_storage.shutting_down) {
+        tbft_node_id_t node_id = find_node_by_mac_lockless(&g_espnow_ctx_storage, tx_info->des_addr);
+        if (node_id >= 0 && node_id < g_espnow_ctx_storage.num_nodes) {
+            if (status != ESP_NOW_SEND_SUCCESS) {
+                g_espnow_ctx_storage.last_fail_tick[node_id] = xTaskGetTickCount();
+            } else {
+                g_espnow_ctx_storage.last_fail_tick[node_id] = 0;
+            }
+        }
+        xSemaphoreGive(g_espnow_ctx_storage.send_credit_sem);
     }
 }
 
 static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *data, int data_len) {
-    if (!g_espnow_ctx || !recv_info || !data) return;
+    if (!g_espnow_inited || !recv_info || !data) return;
     if (data_len < (int)sizeof(frag_hdr_t)) return;
 
-    tbft_espnow_t *enow = g_espnow_ctx;
+    tbft_espnow_t *enow = &g_espnow_ctx_storage;
     const uint8_t *src_mac = recv_info->src_addr;
     const frag_hdr_t *fhdr = (const frag_hdr_t *)data;
 
@@ -367,7 +444,7 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *
          * priority inversion with send_task. */
         xSemaphoreGive(enow->lock);
 
-        if (xQueueSend(enow->msg_queue, &q_entry, 0) != pdTRUE) {
+        if (xQueueSend(enow->msg_queue, &q_entry, pdMS_TO_TICKS(10)) != pdTRUE) {
             if (enow->local_id >= enow->num_replicas && msg_tag == TBFT_MSG_REPLY) {
                 ESP_LOGD(TAG, "client msg_queue full, dropping unsolicited reply len=%d",
                          q_entry.buf_len);
@@ -390,6 +467,15 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *
 
 static int espnow_do_send(tbft_espnow_t *enow, tbft_node_id_t dest_id, uint16_t msg_id, const uint8_t *buf, size_t len) {
     if (dest_id < 0 || dest_id >= enow->num_nodes || !buf || len == 0) return -1;
+
+    TickType_t last_fail = enow->last_fail_tick[dest_id];
+    if (last_fail != 0) {
+        TickType_t now = xTaskGetTickCount();
+        if ((now - last_fail) < pdMS_TO_TICKS(1000)) {
+            ESP_LOGD(TAG, "do_send: node %d is marked offline (cooldown), dropping packet", dest_id);
+            return -1;
+        }
+    }
 
     const uint8_t *ap_mac = enow->peer_ap_mac[dest_id];
 
@@ -565,7 +651,7 @@ static tbft_node_id_t find_node_by_mac(tbft_espnow_t *enow, const uint8_t *mac) 
  * -------------------------------------------------------------------------- */
 
 int tbft_transport_create(tbft_transport_t **out, tbft_transport_type_t type, int num_nodes, int num_replicas, const char *mcast_ip, uint16_t port) {
-    if (g_espnow_ctx != NULL) {
+    if (g_espnow_inited) {
         ESP_LOGE(TAG, "ESP-NOW transport is already initialized (Singleton Guard)");
         return -1;
     }
@@ -575,42 +661,40 @@ int tbft_transport_create(tbft_transport_t **out, tbft_transport_type_t type, in
         return -1;
     }
 
-    ESP_LOGI(TAG, "transport_create: free_heap=%u struct_size=%zu",
+    ESP_LOGI(TAG, "transport_create: free_heap=%u struct_size=%zu (static BSS, no heap alloc)",
              (unsigned)esp_get_free_heap_size(), sizeof(tbft_espnow_t));
 
-    tbft_espnow_t *enow = (tbft_espnow_t *)calloc(1, sizeof(*enow));
-    if (!enow) {
-        ESP_LOGE(TAG, "calloc(%zu) failed, free_heap=%u",
-                 sizeof(tbft_espnow_t), (unsigned)esp_get_free_heap_size());
-        return -1;
-    }
+    /* All resources are pre-allocated as file-scope `static` BSS.  No heap
+     * allocation on this path — eliminates fragmentation-induced OOM at boot
+     * that previously broke the cluster (queue/sem alloc failed). */
+    tbft_espnow_t *enow = &g_espnow_ctx_storage;
+    memset(enow, 0, sizeof(*enow));
 
     enow->num_nodes    = num_nodes;
     enow->num_replicas = num_replicas;
     enow->next_msg_id  = 1;
 
-    enow->lock = xSemaphoreCreateMutex();
-    enow->task_exit_sem = xSemaphoreCreateBinary();
-    enow->msg_queue = xQueueCreate(MSG_QUEUE_DEPTH, sizeof(recv_entry_t));
-    enow->send_queue = xQueueCreate(SEND_QUEUE_DEPTH, sizeof(send_entry_t));
-    enow->send_credit_sem = xSemaphoreCreateCounting(ESPNOW_TX_CREDITS, ESPNOW_TX_CREDITS);
+    /* Create queues and semaphores from pre-allocated static storage. */
+    enow->msg_queue = xQueueCreateStatic(MSG_QUEUE_DEPTH, sizeof(recv_entry_t),
+                                         s_recv_queue_buf, &s_recv_queue);
+    enow->send_queue = xQueueCreateStatic(SEND_QUEUE_DEPTH, sizeof(send_entry_t),
+                                          s_send_queue_buf, &s_send_queue);
+    enow->lock = xSemaphoreCreateMutexStatic(&s_lock_ss);
+    enow->task_exit_sem = xSemaphoreCreateBinaryStatic(&s_exit_sem_ss);
+    enow->send_credit_sem = xSemaphoreCreateCountingStatic(ESPNOW_TX_CREDITS,
+                                                           ESPNOW_TX_CREDITS,
+                                                           &s_credit_sem_ss);
 
     if (!enow->lock || !enow->task_exit_sem || !enow->msg_queue || !enow->send_queue || !enow->send_credit_sem) {
-        ESP_LOGE(TAG, "queue/sem alloc failed: lock=%p sem=%p msg_q=%p send_q=%p free_heap=%u",
+        ESP_LOGE(TAG, "static queue/sem create failed: lock=%p sem=%p msg_q=%p send_q=%p credit=%p",
                  enow->lock, enow->task_exit_sem, enow->msg_queue, enow->send_queue,
-                 (unsigned)esp_get_free_heap_size());
-        if (enow->send_credit_sem) vSemaphoreDelete(enow->send_credit_sem);
-        if (enow->send_queue) vQueueDelete(enow->send_queue);
-        if (enow->msg_queue) vQueueDelete(enow->msg_queue);
-        if (enow->task_exit_sem) vSemaphoreDelete(enow->task_exit_sem);
-        if (enow->lock) vSemaphoreDelete(enow->lock);
-        free(enow);
-        return -1;
+                 enow->send_credit_sem);
+        goto init_error;
     }
 
-    /* NOTE: xSemaphoreCreateMutex() creates the mutex in "not taken" state,
+    /* NOTE: xSemaphoreCreateMutexStatic() creates the mutex in "not taken" state,
      * so an immediate xSemaphoreGive would return pdFALSE. Removed dead code. */
-    g_espnow_ctx = enow;
+    g_espnow_inited = true;
 
     esp_err_t rcb_err = esp_now_register_recv_cb(espnow_recv_cb);
     if (rcb_err != ESP_OK) {
@@ -627,8 +711,17 @@ int tbft_transport_create(tbft_transport_t **out, tbft_transport_type_t type, in
         goto init_error;
     }
 
-    if (xTaskCreate(espnow_send_task, "tbft_send", SEND_TASK_STACK_SIZE, enow, SEND_TASK_PRIORITY, &enow->send_task_handle) != pdPASS) {
-        ESP_LOGE(TAG, "xTaskCreate for send_task failed");
+    /* Create send task with pre-allocated static stack + TCB.
+     * xTaskCreateStatic returns NULL if either buffer is NULL or stack too small. */
+    enow->send_task_handle = xTaskCreateStatic(
+        espnow_send_task, "tbft_send",
+        SEND_TASK_STACK_SIZE,                  /* bytes (per IDF) */
+        enow,                                   /* pvParameters */
+        SEND_TASK_PRIORITY,
+        s_send_task_stack,                      /* pre-allocated stack */
+        &s_send_task_tcb);                      /* pre-allocated TCB */
+    if (enow->send_task_handle == NULL) {
+        ESP_LOGE(TAG, "xTaskCreateStatic for send_task failed");
         goto init_error;
     }
 
@@ -636,7 +729,10 @@ int tbft_transport_create(tbft_transport_t **out, tbft_transport_type_t type, in
     return 0;
 
 init_error:
-    g_espnow_ctx = NULL;
+    /* Static objects: vQueueDelete/vSemaphoreDelete are no-ops on static
+     * allocations, but we call them for symmetry/clarity.  The BSS storage
+     * itself is not reclaimed; it is zeroed and reused on the next init. */
+    g_espnow_inited = false;
     esp_now_unregister_recv_cb();
     esp_now_unregister_send_cb();
     if (enow->send_credit_sem) vSemaphoreDelete(enow->send_credit_sem);
@@ -644,7 +740,7 @@ init_error:
     if (enow->msg_queue) vQueueDelete(enow->msg_queue);
     if (enow->task_exit_sem) vSemaphoreDelete(enow->task_exit_sem);
     if (enow->lock) vSemaphoreDelete(enow->lock);
-    free(enow);
+    memset(enow, 0, sizeof(*enow));
     return -1;
 }
 
@@ -655,7 +751,7 @@ void tbft_transport_free(tbft_transport_t *t) {
     enow->shutting_down = true;
     esp_now_unregister_recv_cb();
     esp_now_unregister_send_cb();
-    g_espnow_ctx = NULL;
+    g_espnow_inited = false;
 
     vTaskDelay(pdMS_TO_TICKS(50));
 
@@ -672,12 +768,14 @@ void tbft_transport_free(tbft_transport_t *t) {
         }
     }
 
+    /* Static objects: vQueueDelete/vSemaphoreDelete are no-ops on static
+     * allocations, but called for symmetry.  Stack/TCB are not reclaimed. */
     if (enow->send_queue) vQueueDelete(enow->send_queue);
     if (enow->msg_queue) vQueueDelete(enow->msg_queue);
     if (enow->task_exit_sem) vSemaphoreDelete(enow->task_exit_sem);
     if (enow->send_credit_sem) vSemaphoreDelete(enow->send_credit_sem);
     if (enow->lock) vSemaphoreDelete(enow->lock);
-    free(enow);
+    memset(enow, 0, sizeof(*enow));
 }
 
 void tbft_transport_set_peer(tbft_transport_t *t, tbft_node_id_t node_id, const tbft_addr_t *addr) {

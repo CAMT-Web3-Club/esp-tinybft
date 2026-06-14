@@ -35,7 +35,7 @@ void tbft_msg_digest(const void *data, size_t len, tbft_digest_t *out)
                                        &hash_len);
     if (st != PSA_SUCCESS) {
         ESP_LOGE(TAG, "psa_hash_compute failed: %d", (int)st);
-        memset(out->bytes, 0, TBFT_DIGEST_SIZE);
+        memset(out->bytes, 0xFF, TBFT_DIGEST_SIZE);
     }
 }
 

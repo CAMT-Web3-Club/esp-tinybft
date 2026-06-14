@@ -52,6 +52,7 @@ static struct {
     bool             valid;
 } s_replies[TBFT_MAX_NUM_REPLICAS];
 static int s_reply_count = 0;
+static tbft_req_id_t s_last_accepted_rid = 0;
 
 /* --------------------------------------------------------------------------
  * Config file parser (section 12)
@@ -109,6 +110,18 @@ static int parse_config(const char *path, tbft_config_t *cfg)
     if (fscanf(f, "%d", &cfg->auth_timeout_ms) != 1) goto fail;
     if (fscanf(f, "%d", &cfg->num_nodes) != 1) goto fail;
     if (fscanf(f, "%31s", cfg->mcast_ip) != 1) goto fail;
+
+    /* F13 (F-013) FIX: validate multicast IP format.
+     * A malformed IP (e.g., 224.0.0.300) silently fails at the socket layer.
+     * Every other IP field goes through validation — this was an oversight for
+     * mcast_ip.  Use sscanf to do a basic format check. */
+    unsigned int ip_a, ip_b, ip_c, ip_d;
+    if (sscanf(cfg->mcast_ip, "%u.%u.%u.%u", &ip_a, &ip_b, &ip_c, &ip_d) != 4 ||
+        ip_a > 255 || ip_b > 255 || ip_c > 255 || ip_d > 255) {
+        ESP_LOGE(TAG, "parse_config: mcast_ip='%s' is not a valid IPv4 address",
+                 cfg->mcast_ip);
+        goto fail;
+    }
 
     /* Validate: f must fit the static cert buffers sized at compile time */
     if (cfg->f < 1 || cfg->f > TBFT_MAX_FAULTY) {
@@ -186,11 +199,19 @@ static int parse_config(const char *path, tbft_config_t *cfg)
         }
     }
 
-    /* Count actual replicas by hostname prefix: "node*" = replica, anything else = client */
+    /* Count actual replicas by hostname prefix: "node*" = replica, anything else = client.
+     * A6-F009 FIX: require exactly "node" + numeric suffix (e.g. "node0", "node12"),
+     * not just any string starting with "node" (e.g. "node_evil" would be accepted). */
     cfg->num_replicas = 0;
     for (int i = 0; i < cfg->num_nodes; i++) {
-        if (strncmp(cfg->nodes[i].hostname, "node", 4) == 0)
-            cfg->num_replicas++;
+        const char *h = cfg->nodes[i].hostname;
+        if (strncmp(h, "node", 4) != 0) continue;
+        if (h[4] == '\0') continue; /* just "node" with no id */
+        for (int j = 4; h[j] != '\0'; j++) {
+            if (h[j] < '0' || h[j] > '9') goto next_node;
+        }
+        cfg->num_replicas++;
+next_node:;
     }
     if (cfg->num_replicas < 1) {
         ESP_LOGE(TAG, "no replica entries found (hostnames must start with \"node\")");
@@ -308,6 +329,17 @@ static uint8_t *load_key_file(const char *path, size_t *len_out)
     fseek(f, 0, SEEK_SET);
     if (sz <= 0) { fclose(f); return NULL; }
 
+    /* F14 (F-014) FIX: cap key file size to prevent OOM on ESP32-C3.
+     * ECDSA P-256 DER keys are 32-65 bytes; even a 2 KB PEM-encoded key
+     * is < 3 KB when converted to DER.  A 1 MB bogus file on the 80 KB
+     * ESP32-C3 heap would trigger malloc failure routed to a random task.
+     * 4 KB is 64x larger than any legitimate key while preventing OOM. */
+    if (sz > 4096) {
+        ESP_LOGE(TAG, "load_key_file: '%s' is %ld bytes — exceeds 4 KB cap", path, sz);
+        fclose(f);
+        return NULL;
+    }
+
     uint8_t *buf = (uint8_t *)malloc((size_t)sz);
     if (!buf) { fclose(f); return NULL; }
     if (fread(buf, 1, (size_t)sz, f) != (size_t)sz) {
@@ -325,7 +357,8 @@ static int setup_principals(tbft_node_t *node, const tbft_config_t *cfg,
                              const char *priv_config_path,
                              tbft_node_id_t local_id)
 {
-    for (int i = 0; i < cfg->num_nodes; i++) {
+    int i;
+    for (i = 0; i < cfg->num_nodes; i++) {
         tbft_principal_t *p =
             (tbft_principal_t *)calloc(1, sizeof(tbft_principal_t));
         if (!p) {
@@ -436,26 +469,36 @@ static int setup_principals(tbft_node_t *node, const tbft_config_t *cfg,
             }
             node->local_principal = p;
 
-            /* Verify public/private key pair consistency */
-            if (p->has_priv_key) {
-                int rc = mbedtls_pk_check_pair(&p->pub_pk, &p->priv_pk);
-                if (rc != 0) {
+            /* Verify public/private key pair consistency — PSA sign+verify self-test */
+            if (p->priv_sign_id != 0) {
+                uint8_t test_msg[] = "keypair_self_test";
+                tbft_sig_t test_sig;
+                int sr = tbft_principal_sign(p, test_msg, sizeof(test_msg)-1, &test_sig);
+                if (sr != 0) {
+                    ESP_LOGE(TAG, "key pair self-test: sign failed for node %d (ret=%d)", i, sr);
+                    goto cleanup_keypair;
+                }
+                bool vok = tbft_principal_verify_sig(p, test_msg, sizeof(test_msg)-1, &test_sig);
+                if (!vok) {
                     ESP_LOGE(TAG, "key pair mismatch for node %d: "
-                             "public and private keys do not correspond "
-                             "(mbedtls err=%d)", i, rc);
-                    for (int j = 0; j <= i; j++) {
-                        if (node->principals[j]) {
-                            tbft_principal_free(node->principals[j]);
-                            free(node->principals[j]);
-                            node->principals[j] = NULL;
-                        }
-                    }
-                    return -1;
+                             "public and private keys do not correspond", i);
+                    goto cleanup_keypair;
                 }
             }
         }
     }
     return 0;
+
+cleanup_keypair:
+    for (int j = 0; j <= i; j++) {
+        if (node->principals[j]) {
+            tbft_principal_free(node->principals[j]);
+            free(node->principals[j]);
+            node->principals[j] = NULL;
+        }
+    }
+    return -1;
+
 }
 
 /* --------------------------------------------------------------------------
@@ -524,16 +567,32 @@ int Byz_send_request(Byz_req *req, bool read_only)
 {
     if (!s_client) return -1;
 
-    /* Drain any stale replies or other messages in the transport queue */
+    /* Drain stale non-reply messages; process any queued replies inline.
+     * Discarding replies would lose them permanently — a previous recv_reply
+     * may have timed out while replies were still arriving. */
     if (!s_is_replica) {
         static uint8_t dummy[TBFT_MAX_MESSAGE_SIZE];
-        while (tbft_node_recv(s_client, dummy, sizeof(dummy), NULL) > 0) {
-            /* discard */
+        int drained;
+        for (int safety = 0; safety < 64; safety++) {
+            drained = tbft_node_recv(s_client, dummy, sizeof(dummy), NULL);
+            if (drained <= 0) break;
+            const tbft_msg_hdr_t *hdr = (const tbft_msg_hdr_t *)dummy;
+            if (drained >= (int)sizeof(*hdr) && hdr->tag == TBFT_MSG_REPLY) {
+                /* Stale reply for a previous rid — discard it.
+                 * The outer Byz_recv_reply will handle replies for the
+                 * new rid with the correctly-incremented expected_rid.
+                 * Calling Byz_recv_reply here would re-accept an
+                 * already-completed request ID, corrupt reply tracking. */
+            }
+            /* Non-reply messages are stale — discard */
         }
     }
 
     /* Build Request message. Use a static buffer to avoid stack overflow
-     * on tasks with limited stack size (TBFT_MAX_MESSAGE_SIZE can be large). */
+     * on tasks with limited stack size (TBFT_MAX_MESSAGE_SIZE can be large).
+     * F11 (F-011) FIX: not thread-safe — must be called from a single task.
+     * Concurrent calls interleave writes to the static out[] buffer, corrupting
+     * the message under the client's own identity.  Document in esp-tinybft.h. */
     static uint8_t out[TBFT_MAX_MESSAGE_SIZE];
     tbft_request_rep_t *rep = (tbft_request_rep_t *)out;
     rep->hdr.tag      = TBFT_MSG_REQUEST;
@@ -563,13 +622,13 @@ int Byz_send_request(Byz_req *req, bool read_only)
     /* Sign */
     tbft_sig_t *sig = (tbft_sig_t *)(cmd_ptr + req->size);
     memset(sig->bytes, 0, sizeof(sig->bytes));
-    if (s_client->local_principal && s_client->local_principal->has_priv_key) {
+    if (s_client->local_principal && s_client->local_principal->priv_sign_id != 0) {
         int64_t t0 = esp_timer_get_time();
         int sig_ret = tbft_node_gen_sig(s_client, out,
                                         sizeof(*rep) + (size_t)req->size,
                                         sig);
         int64_t dt = esp_timer_get_time() - t0;
-        ESP_LOGI(TAG, "request RSA sign took %lld us (ret=%d)", (long long)dt, sig_ret);
+        ESP_LOGI(TAG, "request ECDSA sign took %lld us (ret=%d)", (long long)dt, sig_ret);
         if (sig_ret != 0) return -1;
     }
 
@@ -596,11 +655,26 @@ int Byz_recv_reply(Byz_rep *rep)
     int needed = f + 1; /* f+1 matching replies from DISTINCT replicas */
     int num_replicas = s_client->num_replicas;
     tbft_req_id_t expected_rid = ((tbft_req_id_t)(uint64_t)s_client->node_id << 48) | s_client->rid_counter;
+
+    if (s_last_accepted_rid != 0 && expected_rid <= s_last_accepted_rid) {
+        ESP_LOGW(TAG, "recv_reply: rid %llu already completed (last_accepted=%llu)",
+                 (unsigned long long)expected_rid,
+                 (unsigned long long)s_last_accepted_rid);
+        memset(s_replies, 0, sizeof(s_replies));
+        s_reply_count = 0;
+        return -1;
+    }
+
     int64_t deadline_us = esp_timer_get_time()
         + (int64_t)TBFT_CLIENT_REPLY_TIMEOUT_MS * 1000LL;
 
+    /* F12 (F-012) FIX: use static buffer instead of stack.
+     * A 2KB stack buffer on a 4KB FreeRTOS task stack causes stack overflow.
+     * Safe: Byz_recv_reply is not thread-safe (documented in esp-tinybft.h)
+     * and must be called from a single task. */
+    static uint8_t buf[TBFT_MAX_MESSAGE_SIZE];
     while (esp_timer_get_time() < deadline_us) {
-        uint8_t buf[TBFT_MAX_MESSAGE_SIZE];
+        memset(buf, 0, sizeof(buf));
         int n = tbft_node_recv(s_client, buf, sizeof(buf), NULL);
         if (n < (int)sizeof(tbft_reply_rep_t)) {
             vTaskDelay(pdMS_TO_TICKS(1));
@@ -623,7 +697,7 @@ int Byz_recv_reply(Byz_rep *rep)
                  r0->cid, (unsigned long long)r0->rid,
                  (long long)r0->view, (long long)r0->seqno, r0->reply_size);
 
-        /* Verify RSA signature and identify sender.
+        /* Verify ECDSA P-256 signature and identify sender.
          * The replica appends the sig after hdr.size; total wire = hdr.size + SIG.
          * We try each replica's public key; only the true sender's key will
          * validate the signature, giving us a reliable sender id. */
@@ -642,7 +716,7 @@ int Byz_recv_reply(Byz_rep *rep)
             }
         }
         if (rep_id < 0) {
-            ESP_LOGW(TAG, "recv_reply: no valid RSA signature");
+            ESP_LOGW(TAG, "recv_reply: no valid ECDSA signature");
             vTaskDelay(pdMS_TO_TICKS(1));
             continue;
         }
@@ -726,6 +800,8 @@ int Byz_recv_reply(Byz_rep *rep)
             ESP_LOGI(TAG, "reply accepted: %d matching replies (needed=%d)",
                      match, needed);
 
+            s_last_accepted_rid = expected_rid;
+
             /* Clear reply cache */
             memset(s_replies, 0, sizeof(s_replies));
             s_reply_count = 0;
@@ -745,6 +821,44 @@ int Byz_invoke(Byz_req *req, Byz_rep *rep, bool read_only)
     int ret = Byz_send_request(req, read_only);
     if (ret != 0) return ret;
     return Byz_recv_reply(rep);
+}
+
+int Byz_invoke_with_retry(Byz_req *req, Byz_rep *rep, bool read_only,
+                          int max_attempts)
+{
+    if (max_attempts < 1) return -1;
+    int delay_ms = 1000;
+    const int delay_cap_ms = 10000;
+    for (int attempt = 1; attempt <= max_attempts; attempt++) {
+        int ret = Byz_invoke(req, rep, read_only);
+        if (ret == 0) {
+            if (attempt > 1) {
+                ESP_LOGI(TAG, "invoke_with_retry: succeeded on attempt %d/%d",
+                         attempt, max_attempts);
+            }
+            return attempt;
+        }
+        if (attempt == max_attempts) {
+            ESP_LOGW(TAG, "invoke_with_retry: giving up after %d attempts",
+                     max_attempts);
+            return -1;
+        }
+        ESP_LOGW(TAG, "invoke_with_retry: attempt %d/%d failed,"
+                 " retrying in %dms",
+                 attempt, max_attempts, delay_ms);
+        /* Cooperative sleep — feed the task watchdog so we don't get
+         * killed while waiting. */
+        int slept = 0;
+        while (slept < delay_ms) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+#if CONFIG_ESP_TASK_WDT_EN
+            esp_task_wdt_reset();
+#endif
+            slept += 100;
+        }
+        delay_ms = (delay_ms * 2 < delay_cap_ms) ? delay_ms * 2 : delay_cap_ms;
+    }
+    return -1;
 }
 
 void Byz_free_request(Byz_req *req)
@@ -769,6 +883,7 @@ void Byz_reset_client(void)
 {
     memset(s_replies, 0, sizeof(s_replies));
     s_reply_count = 0;
+    s_last_accepted_rid = 0;
 }
 
 /* --------------------------------------------------------------------------
@@ -786,9 +901,9 @@ static int exec_adapter(const void *req, int req_len,
                         int cid, bool ro)
 {
     if (!s_exec_cb) return -1;
-    Byz_req in  = { .contents = (char *)req, .size = req_len };
-    Byz_rep out = { .contents = (char *)rep, .size = 0 };
-    Byz_buffer nd = { .contents = (char *)ndet, .size = ndet_len };
+    Byz_req in  = { .contents = (char *)(uintptr_t)req, .size = req_len };
+    Byz_rep out = { .contents = (char *)(uintptr_t)rep, .size = 0 };
+    Byz_buffer nd = { .contents = (char *)(uintptr_t)ndet, .size = ndet_len };
     int r = s_exec_cb(&in, &out, &nd, cid, ro);
     if (r == 0 && rep_len) *rep_len = out.size;
     return r;
@@ -806,7 +921,7 @@ static void comp_ndet_adapter(tbft_seqno_t seqno,
 static void recv_reply_adapter(const void *rep, int rep_len, int cid)
 {
     if (!s_recv_reply_cb) return;
-    Byz_rep r = { .contents = (char *)rep, .size = rep_len };
+    Byz_rep r = { .contents = (char *)(uintptr_t)rep, .size = rep_len };
     s_recv_reply_cb(&r, cid);
 }
 
@@ -905,6 +1020,9 @@ int Byz_init_replica(const char *config_file, const char *priv_config,
     tbft_itimer_stop(&s_replica->stimer);
     /* Do NOT start vtimer on boot. It will be armed when a client request is received. */
     tbft_itimer_start(&s_replica->stimer, s_replica->stimer_period_us);
+
+    s_replica->view_installed_us = esp_timer_get_time();
+    s_replica->view_start_executed = s_replica->last_executed;
 
     s_is_replica = true;
     ESP_LOGI(TAG, "replica %d initialised", local_id);

@@ -34,9 +34,16 @@ bool tbft_cr_store(tbft_checkpoint_region_t *cr,
      * advanced past one full window.  If the slot's stored seqno does not
      * match, the old seqno's votes/digests/candidates are stale and must
      * be discarded before we record the new ones — otherwise stale-vote
-     * poisoning can spuriously complete a quorum. */
-    if (slot->seqno != seqno) {
+     * poisoning can spuriously complete a quorum.
+     *
+     * A4-F004 FIX: only wipe if the new seqno is FORWARD of the current
+     * slot's seqno (or the slot is uninitialised).  A backward seqno
+     * (retransmit of an old in-window checkpoint) must NOT wipe — the
+     * newer seqno's votes are still in flight and would be lost. */
+    if (slot->seqno != 0 && slot->seqno != seqno && seqno > slot->seqno) {
         memset(slot, 0, sizeof(*slot));
+        slot->seqno = seqno;
+    } else if (slot->seqno == 0) {
         slot->seqno = seqno;
     }
 

@@ -39,8 +39,7 @@ const uint8_t *tbft_ar_load_pp(const tbft_agreement_region_t *ar,
         return NULL;
     }
     const tbft_agreement_slice_t *sl =
-        (const tbft_agreement_slice_t *)tbft_ar_slice(
-            (tbft_agreement_region_t *)ar, seqno);
+        tbft_ar_slice_const(ar, seqno);
     if (len_out) *len_out = sl->prepared_cert.pp_len;
     return tbft_prepared_cert_pp(&sl->prepared_cert);
 }
@@ -74,8 +73,8 @@ bool tbft_ar_add_my_prepare(tbft_agreement_region_t *ar,
 bool tbft_ar_prepared(const tbft_agreement_region_t *ar, tbft_seqno_t seqno)
 {
     if (!tbft_ar_in_range(ar, seqno)) return false;
-    tbft_agreement_slice_t *sl =
-        tbft_ar_slice((tbft_agreement_region_t *)ar, seqno);
+    const tbft_agreement_slice_t *sl =
+        tbft_ar_slice_const(ar, seqno);
     return tbft_prepared_cert_is_complete(&sl->prepared_cert);
 }
 
@@ -106,8 +105,8 @@ bool tbft_ar_add_my_commit(tbft_agreement_region_t *ar,
 bool tbft_ar_committed(const tbft_agreement_region_t *ar, tbft_seqno_t seqno)
 {
     if (!tbft_ar_in_range(ar, seqno)) return false;
-    tbft_agreement_slice_t *sl =
-        tbft_ar_slice((tbft_agreement_region_t *)ar, seqno);
+    const tbft_agreement_slice_t *sl =
+        tbft_ar_slice_const(ar, seqno);
     return tbft_commit_cert_is_complete(&sl->commit_cert);
 }
 
@@ -133,6 +132,7 @@ void tbft_ar_truncate(tbft_agreement_region_t *ar, tbft_seqno_t new_head)
         tbft_prepared_cert_clear(&ar->slices[idx].prepared_cert);
         tbft_commit_cert_clear(&ar->slices[idx].commit_cert);
         ar->slices[idx].commit_sent_us = 0;
+        ar->slices[idx].fill_sent_us   = 0;
     }
 
     /* Advance the circular pointer by the FULL jump so the head lands
@@ -142,4 +142,15 @@ void tbft_ar_truncate(tbft_agreement_region_t *ar, tbft_seqno_t new_head)
      * consensus messages. */
     ar->head_idx = (int)((ar->head_idx + (int)full_delta) & ar->mask);
     ar->head     = new_head;
+
+    /* Clear the slot at the new head — it may contain stale certificates
+     * from a prior checkpoint window, which would cause incorrect Prepared
+     * certificates to persist across the truncation boundary (A4-F001 /
+     * CV_A4_by_A9 confirmed DoS chain: local node contributes to quorum
+     * with a stale bitmap entry, leaving at most 2f honest prepares). */
+    tbft_prepared_cert_clear(&ar->slices[ar->head_idx].prepared_cert);
+    tbft_commit_cert_clear(&ar->slices[ar->head_idx].commit_cert);
+    ar->slices[ar->head_idx].commit_sent_us = 0;
+    ar->slices[ar->head_idx].fill_sent_us   = 0;
 }
+

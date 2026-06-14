@@ -63,6 +63,7 @@ typedef struct {
     int           last_assigned_cid;      /* last cid assigned a seqno (dedup) */
     tbft_req_id_t last_assigned_rid;      /* last rid assigned a seqno (dedup) */
     tbft_seqno_t  last_stable;            /* last stable checkpoint seqno */
+    tbft_seqno_t  quorum_last_stable;     /* highest ckpt confirmed by 2f+1 (never set by fetch) */
     int64_t       last_ckpt_throttle_us;   /* last time we sent catch-up checkpoints */
     int64_t       last_fetch_throttle_us;   /* last time we initiated a state fetch */
     tbft_seqno_t  last_prepared;          /* highest prepared seqno */
@@ -73,6 +74,9 @@ typedef struct {
      * Fill_request to the primary for this seqno's pre-prepare. Cleared
      * when the seqno is committed/executed or leaves the window. */
     tbft_seqno_t  pending_fill_seqno;
+    /* Timestamp (us) when pending_fill_seqno was first set. Used to
+     * drive the v0.2.14 abandon timeout (10s). */
+    int64_t       fill_started_at_us;
 
     /* Client request tracking for idle timer suppression */
     tbft_req_id_t last_received_rid[TBFT_MAX_NUM_REPLICAS + TBFT_MAX_NUM_CLIENTS];
@@ -115,6 +119,30 @@ typedef struct {
     /* Outgoing message build buffer */
     uint8_t  out_buf[TBFT_MAX_MESSAGE_SIZE];
 
+    /* Cached New_key message for Phase 3 broadcast (avoids out_buf
+     * corruption between Phase 1 build and Phase 3 send). */
+    uint8_t  last_new_key_buf[sizeof(tbft_new_key_rep_t) + (size_t)TBFT_SIG_SIZE];
+
+    /* Incremental key rotation: derive one peer's key per main-loop
+     * iteration to avoid 1,000ms blind spots that overflow the
+     * ESP-NOW message queue.  new_key_peer_idx == -1 means idle. */
+    int      new_key_peer_idx;
+    uint8_t  new_key_nonce[32];
+    int32_t  new_key_msg_len;
+
+    /* B-FIX: Wall-clock timestamp (microseconds) at which to commit the
+     * pending out_key rotations across all peers.  Set when the New_key
+     * message is broadcast (Phase 3); checked in the main loop.  When
+     * now() >= new_key_commit_at_us, each principal's out_key_old is
+     * destroyed and the new out_key becomes the active signing key. */
+    int64_t  new_key_commit_at_us;
+
+    /* v0.9.2 ACK: number of peers still waiting for an ACK or
+     * grace-timeout to commit.  Decremented as peers ACK or expire.
+     * When this hits zero, the rotation is fully complete and the
+     * main loop can stop polling. */
+    int      new_key_ack_pending_count;
+
     /* Running flag */
     volatile bool  running;
 
@@ -123,6 +151,28 @@ typedef struct {
      * threshold the replica yields to let lower-priority tasks run.
      * Reset to 0 on replica restart to avoid stale values. */
     int yield_counter;
+
+    /* Consecutive MAC verification failures.  When a node boots and
+     * misses a session-key rotation, all incoming messages fail HMAC
+     * verification.  After THRESHOLD consecutive failures, request a
+     * key re-exchange instead of triggering a doomed view change. */
+    int consecutive_mac_failures;
+
+    /* When the current view was installed.  Used to detect dead primaries:
+     * if a backup receives no PP from the primary within 30 s, trigger
+     * accelerated view-change instead of waiting for the full vtimer. */
+    int64_t view_installed_us;
+
+    /* last_executed at the moment the current view was installed.
+     * Dead-primary detection only fires if no progress was made
+     * (last_executed hasn't advanced past this value).  Prevents
+     * false positives when the cluster IS committing seqnos. */
+    tbft_seqno_t view_start_executed;
+
+    /* Timestamp (us) of the last view-change trigger (any path).
+     * Used as a minimum-interval backoff so the dead-primary
+     * detector does not fire repeatedly while conditions remain true. */
+    int64_t last_vc_us;
 
     /* Event group for decoupling timer callbacks from heavy processing */
     EventGroupHandle_t evt_group;
@@ -165,6 +215,15 @@ int tbft_replica_init(tbft_replica_t *r,
 
 /**
  * Release all resources held by the replica.
+ *
+ * F-019 FIX: must only be called by the replica task itself (i.e., from
+ * within the loop that called tbft_replica_run).  Setting running=false
+ * and then freeing timers/event_group/node state while another pass of
+ * the loop is in flight (between the running check and xEventGroupWaitBits)
+ * is a use-after-free: the freed evt_group or timer state will be
+ * dereferenced on the next pass.  The safe pattern is to set running=false
+ * from inside the loop (e.g., on a 'should_stop' flag check) and let the
+ * loop itself call tbft_replica_free before exiting.
  */
 void tbft_replica_free(tbft_replica_t *r);
 
@@ -203,8 +262,10 @@ void tbft_replica_handle_data(tbft_replica_t *r,
                               const void *msg, int len);
 void tbft_replica_handle_new_key(tbft_replica_t *r,
                                  const void *msg, int len);
+void tbft_replica_handle_new_key_ack(tbft_replica_t *r,
+                                     const void *msg, int len);
 void tbft_replica_handle_fill_request(tbft_replica_t *r,
-                                      const void *msg, int len);
+                                       const void *msg, int len);
 
 /* --------------------------------------------------------------------------
  * Protocol actions
@@ -213,14 +274,18 @@ void tbft_replica_handle_fill_request(tbft_replica_t *r,
 /** Generate fresh HMAC session keys and broadcast a New_key message */
 void tbft_replica_send_new_key(tbft_replica_t *r);
 
+/** B-FIX: Commit any pending out_key rotations if the grace period has
+ * expired.  Cheap to call every loop iteration. */
+void tbft_replica_check_out_key_commit(tbft_replica_t *r);
+
 /** Primary: assign seqno and broadcast Pre_prepare for queued requests */
 void tbft_replica_send_pre_prepare(tbft_replica_t *r);
 
 /** Broadcast Prepare for sequence number @p n */
 void tbft_replica_send_prepare(tbft_replica_t *r, tbft_seqno_t n);
 
-/** Broadcast Commit for sequence number @p n */
-void tbft_replica_send_commit(tbft_replica_t *r, tbft_seqno_t n);
+/** Broadcast or unicast Commit for sequence number @p n */
+void tbft_replica_send_commit(tbft_replica_t *r, tbft_seqno_t n, int dest);
 
 /** Execute all committed-but-unexecuted requests in order */
 void tbft_replica_execute_committed(tbft_replica_t *r);

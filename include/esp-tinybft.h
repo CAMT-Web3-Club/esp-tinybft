@@ -36,7 +36,7 @@
  *
  * Switching transports requires **no code changes** — only the menuconfig
  * setting and the config file format differ. Both backends handle the same
- * message formats, HMAC authentication, and RSA signatures.
+ * message formats, HMAC authentication, and ECDSA P-256 signatures.
  *
  * Typical client usage:
  * @code
@@ -165,6 +165,8 @@ int Byz_alloc_request(Byz_req *req, int size);
  * @param req       Populated request buffer
  * @param read_only True if the request is read-only (no state modification)
  * @return 0 on success, -1 on error
+ * @note Thread safety: not thread-safe.  Must be called from a single task.
+ *       Uses an internal static buffer; concurrent calls corrupt the output.
  */
 int Byz_send_request(Byz_req *req, bool read_only);
 
@@ -173,6 +175,8 @@ int Byz_send_request(Byz_req *req, bool read_only);
  *
  * @param rep  Receives the agreed reply
  * @return 0 on success, -1 on timeout or mismatch
+ * @note Thread safety: not thread-safe.  Must be called from a single task.
+ *       Uses an internal static buffer; concurrent calls corrupt the output.
  */
 int Byz_recv_reply(Byz_rep *rep);
 
@@ -182,6 +186,32 @@ int Byz_recv_reply(Byz_rep *rep);
  * @return 0 on success, -1 on error
  */
 int Byz_invoke(Byz_req *req, Byz_rep *rep, bool read_only);
+
+/**
+ * Send a request and wait for a reply, with bounded retry and exponential
+ * backoff.  Used by clients that need to survive a request being abandoned
+ * by the cluster (e.g., a primary withholding a pre-prepare so the fill
+ * mechanism eventually times out).
+ *
+ * Each attempt calls `Byz_invoke()`, which has its own per-attempt timeout
+ * of `TBFT_CLIENT_REPLY_TIMEOUT_MS` (default 10s).  On timeout, the call
+ * sleeps for `delay_ms` (doubling each attempt, capped at 10s) and retries
+ * until `max_attempts` is reached.
+ *
+ * @param req         Populated request buffer (must remain valid for the
+ *                    duration of the call).  Each attempt resubmits the same
+ *                    request; the underlying transport increments rid, so
+ *                    retries are treated as fresh consensus operations.
+ * @param rep         Receives the agreed reply on success.
+ * @param read_only   True if the request is read-only.
+ * @param max_attempts Maximum number of attempts (must be >= 1).  Use a
+ *                    small value (e.g., 3) for non-idempotent requests and
+ *                    a larger value (e.g., 8) for idempotent ones.
+ * @return Number of attempts used on success (1..max_attempts), or -1 if
+ *         all attempts timed out / errored.
+ */
+int Byz_invoke_with_retry(Byz_req *req, Byz_rep *rep, bool read_only,
+                          int max_attempts);
 
 /** Free a request buffer allocated by Byz_alloc_request(). */
 void Byz_free_request(Byz_req *req);

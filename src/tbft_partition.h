@@ -9,7 +9,7 @@
  *
  * Layout:
  *   ptree[level][index] → Part (digest + version)
- *   stree[level][index] → DSum (sum of child digests for fast update)
+ *   (stree removed — was dead code, F016 fix)
  *
  * With DYNAMIC_PARTITION_TREE, PLevels and PChildren are computed at runtime.
  * Otherwise:
@@ -76,18 +76,13 @@ typedef struct {
     /* ptree[level] points to an array of (p_children^level) tbft_part_t */
     tbft_part_t  *ptree[TBFT_P_LEVELS];
 
-    /* stree[level] points to an array of (p_children^level) tbft_dsum_t */
-    tbft_dsum_t  *stree[TBFT_P_LEVELS];
-
     /* Backing storage (allocated once, sliced into levels) */
     tbft_part_t  *ptree_mem;
-    tbft_dsum_t  *stree_mem;
-    int           total_nodes; /* sum of nodes across all levels */
 } tbft_ptree_t;
 
 /**
  * Initialise the partition tree for @p num_blocks state blocks.
- * Allocates ptree and stree from the heap.
+ * Allocates ptree from the heap. F016 FIX: removed dead stree allocation.
  * @return 0 on success, -1 on allocation failure
  */
 int tbft_ptree_init(tbft_ptree_t *tree, int num_blocks, int p_children);
@@ -99,7 +94,7 @@ void tbft_ptree_free(tbft_ptree_t *tree);
 
 /**
  * Update the digest for leaf @p block_idx using the new block digest.
- * Propagates changes up the tree (stree then ptree).
+ * Propagates changes up the tree (ptree only; stree removed as dead code).
  * @return 0 on success, -1 on hash or validation failure
  */
 int tbft_ptree_update_leaf(tbft_ptree_t *tree, int block_idx,

@@ -27,6 +27,7 @@ typedef enum {
     TBFT_MSG_QUERY_STABLE    = 16,
     TBFT_MSG_REPLY_STABLE    = 17,
     TBFT_MSG_FILL_REQUEST    = 18, /* backup → primary: resend pre-prepare for seqno */
+    TBFT_MSG_NEW_KEY_ACK     = 19, /* receiver → primary: confirms in_key updated for current view */
 } tbft_msg_tag_t;
 
 /* --------------------------------------------------------------------------
@@ -43,7 +44,7 @@ typedef struct __attribute__((packed)) {
 
 /* --------------------------------------------------------------------------
  * Request  (tag = 1)  Client → Primary
- * Wire: [hdr][Request_rep][command bytes][RSA signature]
+ * Wire: [hdr][Request_rep][command bytes][ECDSA P-256 signature]
  * -------------------------------------------------------------------------- */
 
 typedef struct __attribute__((packed)) {
@@ -57,7 +58,7 @@ typedef struct __attribute__((packed)) {
 
 /* --------------------------------------------------------------------------
  * Reply  (tag = 2)  Replica → Client
- * Wire: [hdr][Reply_rep][reply payload][RSA signature]
+ * Wire: [hdr][Reply_rep][reply payload][ECDSA P-256 signature]
  * -------------------------------------------------------------------------- */
 
 typedef struct __attribute__((packed)) {
@@ -69,8 +70,8 @@ typedef struct __attribute__((packed)) {
     int32_t         reply_size;   /* bytes of reply payload that follow */
 } tbft_reply_rep_t;
 
-/* Compile-time assertion: a fully-sized reply (header + max payload + RSA
- * signature) must fit within TBFT_MAX_MESSAGE_SIZE.  If a project raises
+/* Compile-time assertion: a fully-sized reply (header + max payload + ECDSA
+ * P-256 signature) must fit within TBFT_MAX_MESSAGE_SIZE.  If a project raises
  * TBFT_MAX_REPLY_SIZE, this will fire at build time. */
 _Static_assert(sizeof(tbft_reply_rep_t) + TBFT_MAX_REPLY_SIZE + TBFT_SIG_SIZE
                    <= TBFT_MAX_MESSAGE_SIZE,
@@ -90,6 +91,11 @@ typedef struct __attribute__((packed)) {
     int16_t         non_det_size; /* bytes of non-deterministic choices */
     int16_t         _pad;
 } tbft_pre_prepare_rep_t;
+
+/* A2-F007 FIX: assert fixed-size struct is sensible (no padding surprises
+ * for packed structs that have odd-sized members). */
+_Static_assert(sizeof(tbft_pre_prepare_rep_t) > 0,
+    "Pre-prepare rep size must be positive");
 
 /* --------------------------------------------------------------------------
  * Prepare  (tag = 4)  Replica → All
@@ -150,7 +156,7 @@ typedef struct __attribute__((packed)) {
 /* --------------------------------------------------------------------------
  * View_change  (tag = 8)  Replica → All
  * Wire: [hdr][View_change_rep][ckpts array][prepared bitmap][req_info array]
- *       [RSA signature]
+ *       [ECDSA P-256 signature]
  * -------------------------------------------------------------------------- */
 
 /* One checkpoint entry embedded in a View_change */
@@ -179,7 +185,7 @@ typedef struct __attribute__((packed)) {
 /* --------------------------------------------------------------------------
  * New_view  (tag = 9)  New Primary → All
  * Wire: [hdr][New_view_rep][prepared array][Pre_prepare set][authenticator]
- *       [RSA signature of New_view_rep]
+ *       [ECDSA P-256 signature of New_view_rep]
  * -------------------------------------------------------------------------- */
 
 typedef struct __attribute__((packed)) {
@@ -204,25 +210,46 @@ typedef struct __attribute__((packed)) {
 
 /* --------------------------------------------------------------------------
  * New_key  (tag = 11)  Replica → All
- * Wire: [hdr][New_key_rep][tbft_new_key_slot_t array, n_keys entries]
+ * Wire: [hdr][New_key_rep][optional ECDSA signature]
  *
- * Each slot carries one HMAC session key RSA-OAEP-encrypted for the named
- * recipient.  On receipt a node finds the slot with recipient_id == local_id,
- * decrypts it with its RSA private key, and stores the result as the HMAC
- * in-key for the sender.
+ * Session keys are derived via ECDH, not RSA encryption.  The sender
+ * includes a random 32-byte nonce (salt).  Each recipient computes:
+ *   shared = ECDH(my_priv, sender_pub)
+ *   key    = HMAC-SHA256(salt, shared)
+ * The result is the HMAC in-key for the sender.
  * -------------------------------------------------------------------------- */
 
 typedef struct __attribute__((packed)) {
     tbft_msg_hdr_t  hdr;
-    int32_t         id;       /* sender's replica id */
-    int32_t         n_keys;   /* number of tbft_new_key_slot_t entries */
+    int32_t         id;           /* sender's replica id */
+    uint8_t         nonce[32];    /* salt for ECDH key derivation */
+    bool            has_sig;      /* true if ECDSA signature follows this rep */
+    int8_t          _pad[3];      /* alignment */
 } tbft_new_key_rep_t;
 
-/** One encrypted-key slot inside a New_key message */
+/* --------------------------------------------------------------------------
+ * New_key_ack  (tag = 19)  Receiver → Primary
+ * Wire: [hdr][New_key_ack_rep]
+ *
+ * Sent by a replica after it has processed a New_key and updated its
+ * in_key.  Tells the primary that the in_key for the sender is now
+ * current.  Signed with the sender's ECDSA key.
+ *
+ * This message replaces the time-based grace period in the New_key
+ * rotation protocol.  The primary tracks per-peer ACK state; when all
+ * peers have ACKed, the primary can safely commit the new out_key for
+ * every peer.  Slow peers that don't ACK within a (long) timeout are
+ * treated as failed — the primary commits without them and the system
+ * either makes progress or triggers a view-change.
+ * -------------------------------------------------------------------------- */
+
 typedef struct __attribute__((packed)) {
-    int32_t  recipient_id;
-    uint8_t  ciphertext[TBFT_SIG_SIZE]; /* RSA-OAEP encrypted tbft_hmac_key_t */
-} tbft_new_key_slot_t;
+    tbft_msg_hdr_t  hdr;
+    int32_t         id;           /* sender's replica id (the receiver) */
+    uint8_t         nonce[32];    /* the New_key nonce this ACK corresponds to */
+    bool            has_sig;      /* true if ECDSA signature follows this rep */
+    int8_t          _pad[3];      /* alignment */
+} tbft_new_key_ack_rep_t;
 
 /* --------------------------------------------------------------------------
  * Meta_data  (tag = 12)  Replica → Fetching

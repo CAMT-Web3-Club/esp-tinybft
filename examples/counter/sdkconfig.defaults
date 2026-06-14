@@ -19,7 +19,7 @@ CONFIG_TBFT_TRANSPORT_ESPNOW=y
 CONFIG_TBFT_MAX_NUM_REPLICAS=7
 
 # TinyBFT: aggressive RAM reduction for ESP32-C3 (~80KB app heap)
-# New_key needs 1840 bytes (1584 body + 256 RSA sig). Round to 2048.
+# New_key needs 496 bytes (24 hdr + 6*68 slot + 64 ECDSA sig). Round to 2048.
 CONFIG_TBFT_MAX_MESSAGE_SIZE=2048
 CONFIG_TBFT_MAX_REPLY_SIZE=900
 
@@ -39,7 +39,7 @@ CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
 
-# Relax timeouts to accommodate slow RSA operations on ESP32-C3
+# Relax timeouts to accommodate ECDSA P-256 sign/verify on ESP32-C3
 CONFIG_TBFT_CLIENT_REPLY_TIMEOUT_MS=20000
 CONFIG_TBFT_VIEW_CHANGE_TIMEOUT_US=15000000
 

@@ -7,7 +7,7 @@
  *   - Transport creation (type selected via Kconfig at compile time)
  *   - Message send/recv delegation to transport
  *   - Authenticator generation (HMAC) and verification (with replay check)
- *   - RSA signature generation and verification
+ *   - ECDSA P-256 signature generation and verification
  *   - Node ID to auth slot index mapping
  */
 
@@ -170,7 +170,7 @@ bool tbft_node_verify_auth(tbft_node_t *node, tbft_node_id_t sender_id,
 }
 
 /* --------------------------------------------------------------------------
- * RSA signature path
+ * ECDSA P-256 signature path
  * -------------------------------------------------------------------------- */
 
 int tbft_node_gen_sig(tbft_node_t *node, const void *msg, size_t msg_len,

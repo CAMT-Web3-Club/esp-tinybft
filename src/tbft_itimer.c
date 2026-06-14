@@ -49,12 +49,13 @@ void tbft_itimer_start(tbft_itimer_t *t, int64_t timeout_us)
      * stop and call esp_timer_start_once on an already-active timer, returning
      * ESP_ERR_INVALID_STATE and leaving t->running inconsistent. */
     esp_timer_stop(t->handle);
-    t->running = false;
+    t->running   = true;       /* set BEFORE start_once to prevent race
+                                 * with callback running=t->false */
+    t->period_us = timeout_us;
 
-    esp_err_t err = esp_timer_start_once(t->handle, timeout_us);
-    if (err == ESP_OK) {
-        t->running = true;
-    } else {
+    esp_err_t err = esp_timer_start_once(t->handle, (uint64_t)timeout_us);
+    if (err != ESP_OK) {
+        t->running = false;
         ESP_LOGE(TAG, "esp_timer_start_once failed: %s", esp_err_to_name(err));
     }
 }

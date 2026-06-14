@@ -10,12 +10,12 @@ Clients can submit `transfer` requests which subtract from one balance and add t
 ## Setup
 
 1. **Generate Configuration and Keys**
-   First, generate the RSA keys and configuration files that will be flashed onto the devices. Run the provided script on your host machine:
+   First, generate the ECDSA P-256 keys and configuration files that will be flashed onto the devices. Run the provided script on your host machine:
    ```bash
    ./gen_configs.sh
    ```
    This creates a `spiffs_image` directory containing:
-   - RSA private and public keys (`privX.der`, `pubX.der`)
+   - ECDSA P-256 private and public keys (`privX.der`, `pubX.der`)
    - `config_udp.txt` and `config_espnow.txt`
 
 2. **Configure the Transport**

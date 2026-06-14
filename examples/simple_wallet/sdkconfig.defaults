@@ -14,8 +14,8 @@ CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
 CONFIG_TBFT_TRANSPORT_ESPNOW=y
 
 # TinyBFT: aggressive RAM reduction for ESP32-C3 (~80KB app heap)
-# Reply = 48 (header) + 900 (payload) + 256 (RSA sig) = 1204 bytes
-# Message size must be >= 1204, round up to 1248 for 8-byte alignment.
+# Reply = 48 (header) + 900 (payload) + 64 (ECDSA P-256 sig) = 1012 bytes
+# Round up to 1248 for 8-byte alignment and headroom.
 CONFIG_TBFT_MAX_MESSAGE_SIZE=1248
 CONFIG_TBFT_MAX_REPLY_SIZE=900
 

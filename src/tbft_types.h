@@ -46,7 +46,7 @@ typedef struct {
     uint8_t bytes[TBFT_HMAC_KEY_SIZE];
 } tbft_hmac_key_t;
 
-/** RSA-2048 signature (256 bytes) */
+/** ECDSA P-256 signature (64 bytes: r(32) + s(32)) */
 typedef struct {
     uint8_t bytes[TBFT_SIG_SIZE];
 } tbft_sig_t;

@@ -132,6 +132,17 @@ menu "TinyBFT Configuration"
                 MAC format: xx:xx:xx:xx:xx:xx
     endchoice
 
+    config TBFT_ESPNOW_MSG_QUEUE_DEPTH
+        int "ESP-NOW receive message queue depth"
+        default 16
+        range 8 128
+        depends on TBFT_TRANSPORT_ESPNOW
+        help
+            Number of reassembled messages the transport can buffer
+            before dropping. Each entry costs TBFT_MAX_MESSAGE_SIZE + 10
+            bytes in BSS (static allocation). Larger values cost ~2 KB
+            per entry; reduce to save DRAM on ESP32-C3.
+
     config TBFT_ESPNOW_SEND_TASK_PRIORITY
         int "ESP-NOW send task priority"
         default 5
@@ -151,10 +162,10 @@ menu "TinyBFT Configuration"
             Maximum number of concurrent ESP-NOW sends (credits).
             Each fragment requires one credit. Multi-fragment sends
             acquire/release one credit per fragment (no pre-acquisition),
-            so 6 credits suffice for 2-fragment broadcasts to 6 peers
-            when combined with the 10ms inter-peer drain delay.
-            Values above 12 overload the ESP-NOW driver (fragment
-            send failures).
+            so 6 credits suffice for 2-fragment broadcasts to 6 peers.
+            The ESP-NOW driver has an undocumented internal TX queue
+            limit; values above 6 cause silent drops or esp_now_send
+            failures on fragment retries. Do not exceed 6.
 
     config TBFT_PRINT_STATS
         bool "Enable performance statistics"

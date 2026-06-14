@@ -35,3 +35,24 @@ idf_component_register(
         esp_wifi
         efuse
 )
+
+# === Strict compiler flags (Rust-like: warnings as errors, pedantic, all checks) ===
+# Applies to this component only — does not affect ESP-IDF libraries.
+# -Wundef and -Wpedantic omitted: ESP-IDF headers use #if UNDEFINED_MACRO patterns.
+target_compile_options(${COMPONENT_LIB} PRIVATE
+    -Wall
+    -Wextra
+    -Werror
+    -Wshadow
+    -Wconversion
+    -Wwrite-strings
+    -Wstrict-prototypes
+    -Wmissing-declarations
+    -Wformat-signedness
+    -Wmissing-prototypes
+    -Wnull-dereference
+    -Wformat=2
+    -Wswitch-default
+    -Wcast-qual
+    -Wfloat-equal
+)

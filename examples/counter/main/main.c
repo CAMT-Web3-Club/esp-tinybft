@@ -48,9 +48,14 @@ typedef struct {
     int8_t status;
 } __attribute__((packed)) counter_rep_t;
 
+/* A7-F016 FIX: use a named constant instead of hardcoded 68 (which was
+ * sizeof(tbft_request_rep_t)).  If the request header layout changes,
+ * this constant must be updated to match. */
+#define COUNTER_REQ_HEADER_SIZE  68
+
 int exec_cb(Byz_req *in, Byz_rep *out, Byz_buffer *ndet, int cid, bool ro) {
-    if (in->size < 68) return -1;
-    counter_req_t *req = (counter_req_t *)((const uint8_t *)in->contents + 68);
+    if (in->size < COUNTER_REQ_HEADER_SIZE) return -1;
+    counter_req_t *req = (counter_req_t *)((const uint8_t *)in->contents + COUNTER_REQ_HEADER_SIZE);
     counter_rep_t *rep = (counter_rep_t *)out->contents;
     out->size = sizeof(counter_rep_t);
 
@@ -220,13 +225,14 @@ static void client_task(void *arg) {
         req.size = sizeof(counter_req_t);
 
         ESP_LOGI(TAG, "Client sending increment...");
-        if (Byz_invoke(&req, &rep, false) == 0) {
+        int attempts = Byz_invoke_with_retry(&req, &rep, false, 3);
+        if (attempts > 0) {
             counter_rep_t *res = (counter_rep_t *)rep.contents;
-            ESP_LOGI(TAG, "Client reply: value=%ld, status=%d",
-                     res->value, res->status);
+            ESP_LOGI(TAG, "Client reply: value=%ld, status=%d (attempt %d)",
+                     res->value, res->status, attempts);
             Byz_free_reply(&rep);
         } else {
-            ESP_LOGW(TAG, "Request failed or timed out.");
+            ESP_LOGW(TAG, "Request failed or timed out after retries.");
         }
 
         Byz_free_request(&req);
