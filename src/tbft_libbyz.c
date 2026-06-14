@@ -111,6 +111,18 @@ static int parse_config(const char *path, tbft_config_t *cfg)
     if (fscanf(f, "%d", &cfg->num_nodes) != 1) goto fail;
     if (fscanf(f, "%31s", cfg->mcast_ip) != 1) goto fail;
 
+    /* F13 (F-013) FIX: validate multicast IP format.
+     * A malformed IP (e.g., 224.0.0.300) silently fails at the socket layer.
+     * Every other IP field goes through validation — this was an oversight for
+     * mcast_ip.  Use sscanf to do a basic format check. */
+    unsigned int ip_a, ip_b, ip_c, ip_d;
+    if (sscanf(cfg->mcast_ip, "%u.%u.%u.%u", &ip_a, &ip_b, &ip_c, &ip_d) != 4 ||
+        ip_a > 255 || ip_b > 255 || ip_c > 255 || ip_d > 255) {
+        ESP_LOGE(TAG, "parse_config: mcast_ip='%s' is not a valid IPv4 address",
+                 cfg->mcast_ip);
+        goto fail;
+    }
+
     /* Validate: f must fit the static cert buffers sized at compile time */
     if (cfg->f < 1 || cfg->f > TBFT_MAX_FAULTY) {
         ESP_LOGE(TAG, "f=%d out of range [1, %d] — increase TBFT_MAX_NUM_REPLICAS",
@@ -187,11 +199,19 @@ static int parse_config(const char *path, tbft_config_t *cfg)
         }
     }
 
-    /* Count actual replicas by hostname prefix: "node*" = replica, anything else = client */
+    /* Count actual replicas by hostname prefix: "node*" = replica, anything else = client.
+     * A6-F009 FIX: require exactly "node" + numeric suffix (e.g. "node0", "node12"),
+     * not just any string starting with "node" (e.g. "node_evil" would be accepted). */
     cfg->num_replicas = 0;
     for (int i = 0; i < cfg->num_nodes; i++) {
-        if (strncmp(cfg->nodes[i].hostname, "node", 4) == 0)
-            cfg->num_replicas++;
+        const char *h = cfg->nodes[i].hostname;
+        if (strncmp(h, "node", 4) != 0) continue;
+        if (h[4] == '\0') continue; /* just "node" with no id */
+        for (int j = 4; h[j] != '\0'; j++) {
+            if (h[j] < '0' || h[j] > '9') goto next_node;
+        }
+        cfg->num_replicas++;
+next_node:;
     }
     if (cfg->num_replicas < 1) {
         ESP_LOGE(TAG, "no replica entries found (hostnames must start with \"node\")");
@@ -308,6 +328,17 @@ static uint8_t *load_key_file(const char *path, size_t *len_out)
     long sz = ftell(f);
     fseek(f, 0, SEEK_SET);
     if (sz <= 0) { fclose(f); return NULL; }
+
+    /* F14 (F-014) FIX: cap key file size to prevent OOM on ESP32-C3.
+     * ECDSA P-256 DER keys are 32-65 bytes; even a 2 KB PEM-encoded key
+     * is < 3 KB when converted to DER.  A 1 MB bogus file on the 80 KB
+     * ESP32-C3 heap would trigger malloc failure routed to a random task.
+     * 4 KB is 64x larger than any legitimate key while preventing OOM. */
+    if (sz > 4096) {
+        ESP_LOGE(TAG, "load_key_file: '%s' is %ld bytes — exceeds 4 KB cap", path, sz);
+        fclose(f);
+        return NULL;
+    }
 
     uint8_t *buf = (uint8_t *)malloc((size_t)sz);
     if (!buf) { fclose(f); return NULL; }
@@ -558,7 +589,10 @@ int Byz_send_request(Byz_req *req, bool read_only)
     }
 
     /* Build Request message. Use a static buffer to avoid stack overflow
-     * on tasks with limited stack size (TBFT_MAX_MESSAGE_SIZE can be large). */
+     * on tasks with limited stack size (TBFT_MAX_MESSAGE_SIZE can be large).
+     * F11 (F-011) FIX: not thread-safe — must be called from a single task.
+     * Concurrent calls interleave writes to the static out[] buffer, corrupting
+     * the message under the client's own identity.  Document in esp-tinybft.h. */
     static uint8_t out[TBFT_MAX_MESSAGE_SIZE];
     tbft_request_rep_t *rep = (tbft_request_rep_t *)out;
     rep->hdr.tag      = TBFT_MSG_REQUEST;
@@ -594,7 +628,7 @@ int Byz_send_request(Byz_req *req, bool read_only)
                                         sizeof(*rep) + (size_t)req->size,
                                         sig);
         int64_t dt = esp_timer_get_time() - t0;
-        ESP_LOGI(TAG, "request RSA sign took %lld us (ret=%d)", (long long)dt, sig_ret);
+        ESP_LOGI(TAG, "request ECDSA sign took %lld us (ret=%d)", (long long)dt, sig_ret);
         if (sig_ret != 0) return -1;
     }
 
@@ -634,8 +668,13 @@ int Byz_recv_reply(Byz_rep *rep)
     int64_t deadline_us = esp_timer_get_time()
         + (int64_t)TBFT_CLIENT_REPLY_TIMEOUT_MS * 1000LL;
 
+    /* F12 (F-012) FIX: use static buffer instead of stack.
+     * A 2KB stack buffer on a 4KB FreeRTOS task stack causes stack overflow.
+     * Safe: Byz_recv_reply is not thread-safe (documented in esp-tinybft.h)
+     * and must be called from a single task. */
+    static uint8_t buf[TBFT_MAX_MESSAGE_SIZE];
     while (esp_timer_get_time() < deadline_us) {
-        uint8_t buf[TBFT_MAX_MESSAGE_SIZE];
+        memset(buf, 0, sizeof(buf));
         int n = tbft_node_recv(s_client, buf, sizeof(buf), NULL);
         if (n < (int)sizeof(tbft_reply_rep_t)) {
             vTaskDelay(pdMS_TO_TICKS(1));
@@ -658,7 +697,7 @@ int Byz_recv_reply(Byz_rep *rep)
                  r0->cid, (unsigned long long)r0->rid,
                  (long long)r0->view, (long long)r0->seqno, r0->reply_size);
 
-        /* Verify RSA signature and identify sender.
+        /* Verify ECDSA P-256 signature and identify sender.
          * The replica appends the sig after hdr.size; total wire = hdr.size + SIG.
          * We try each replica's public key; only the true sender's key will
          * validate the signature, giving us a reliable sender id. */
@@ -677,7 +716,7 @@ int Byz_recv_reply(Byz_rep *rep)
             }
         }
         if (rep_id < 0) {
-            ESP_LOGW(TAG, "recv_reply: no valid RSA signature");
+            ESP_LOGW(TAG, "recv_reply: no valid ECDSA signature");
             vTaskDelay(pdMS_TO_TICKS(1));
             continue;
         }

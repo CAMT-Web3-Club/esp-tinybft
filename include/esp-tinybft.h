@@ -36,7 +36,7 @@
  *
  * Switching transports requires **no code changes** — only the menuconfig
  * setting and the config file format differ. Both backends handle the same
- * message formats, HMAC authentication, and RSA signatures.
+ * message formats, HMAC authentication, and ECDSA P-256 signatures.
  *
  * Typical client usage:
  * @code
@@ -165,6 +165,8 @@ int Byz_alloc_request(Byz_req *req, int size);
  * @param req       Populated request buffer
  * @param read_only True if the request is read-only (no state modification)
  * @return 0 on success, -1 on error
+ * @note Thread safety: not thread-safe.  Must be called from a single task.
+ *       Uses an internal static buffer; concurrent calls corrupt the output.
  */
 int Byz_send_request(Byz_req *req, bool read_only);
 
@@ -173,6 +175,8 @@ int Byz_send_request(Byz_req *req, bool read_only);
  *
  * @param rep  Receives the agreed reply
  * @return 0 on success, -1 on timeout or mismatch
+ * @note Thread safety: not thread-safe.  Must be called from a single task.
+ *       Uses an internal static buffer; concurrent calls corrupt the output.
  */
 int Byz_recv_reply(Byz_rep *rep);
 

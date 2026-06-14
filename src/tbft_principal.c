@@ -166,11 +166,13 @@ int tbft_principal_load_priv_key(tbft_principal_t *p,
 void tbft_principal_free(tbft_principal_t *p)
 {
     if (!p) return;
-    if (p->psa_hmac_in_id  != 0) psa_destroy_key(p->psa_hmac_in_id);
-    if (p->psa_hmac_out_id != 0) psa_destroy_key(p->psa_hmac_out_id);
-    if (p->pub_verify_id   != 0) psa_destroy_key(p->pub_verify_id);
-    if (p->priv_sign_id    != 0) psa_destroy_key(p->priv_sign_id);
-    if (p->priv_ecdh_id    != 0) psa_destroy_key(p->priv_ecdh_id);
+    if (p->psa_hmac_in_id      != 0) psa_destroy_key(p->psa_hmac_in_id);
+    if (p->psa_hmac_in_id_prev != 0) psa_destroy_key(p->psa_hmac_in_id_prev);
+    if (p->psa_hmac_out_id     != 0) psa_destroy_key(p->psa_hmac_out_id);
+    if (p->psa_hmac_out_id_old != 0) psa_destroy_key(p->psa_hmac_out_id_old);  /* B-FIX */
+    if (p->pub_verify_id       != 0) psa_destroy_key(p->pub_verify_id);
+    if (p->priv_sign_id        != 0) psa_destroy_key(p->priv_sign_id);
+    if (p->priv_ecdh_id        != 0) psa_destroy_key(p->priv_ecdh_id);
     memset(p, 0, sizeof(*p));
 }
 
@@ -197,19 +199,50 @@ int tbft_principal_gen_mac_out(const tbft_principal_t *p,
                                tbft_mac_t *mac)
 {
     size_t mac_len = 0;
-    if (p->psa_hmac_out_id != 0) {
-        psa_status_t st = psa_mac_compute(p->psa_hmac_out_id, PSA_ALG_HMAC(PSA_ALG_SHA_256),
+    /* B-FIX: During the out_key grace window (set_out_key was just called
+     * for a rotation, but peers may not have processed New_key yet), sign
+     * with the OLD key.  The receiver's in_key_prev fallback matches this.
+     * Once the grace period expires, sign with the NEW key. */
+    int64_t now = esp_timer_get_time();
+    bool in_grace = (p->out_key_old_expires_us > 0) &&
+                    (now < p->out_key_old_expires_us) &&
+                    (p->psa_hmac_out_id_old != 0);
+    mbedtls_svc_key_id_t kid = in_grace ? p->psa_hmac_out_id_old : p->psa_hmac_out_id;
+    if (kid != 0) {
+        psa_status_t st = psa_mac_compute(kid, PSA_ALG_HMAC(PSA_ALG_SHA_256),
             (const uint8_t *)msg, msg_len, mac->bytes, TBFT_HMAC_SIZE, &mac_len);
         if (st != PSA_SUCCESS || mac_len != TBFT_HMAC_SIZE) return (st != PSA_SUCCESS) ? (int)st : -1;
         return 0;
     }
-    mbedtls_svc_key_id_t kid = import_hmac_key(&p->hmac_out_key, PSA_KEY_USAGE_SIGN_MESSAGE);
+    /* Cold path: import the active key on demand (grace aware). */
+    const tbft_hmac_key_t *src = in_grace ? &p->hmac_out_key_old : &p->hmac_out_key;
+    kid = import_hmac_key(src, PSA_KEY_USAGE_SIGN_MESSAGE);
     if (kid == 0) return -1;
     psa_status_t st = psa_mac_compute(kid, PSA_ALG_HMAC(PSA_ALG_SHA_256),
         (const uint8_t *)msg, msg_len, mac->bytes, TBFT_HMAC_SIZE, &mac_len);
     psa_destroy_key(kid);
     if (st != PSA_SUCCESS || mac_len != TBFT_HMAC_SIZE) return (st != PSA_SUCCESS) ? (int)st : -1;
     return 0;
+}
+
+bool tbft_principal_in_out_key_grace(const tbft_principal_t *p)
+{
+    if (!p) return false;
+    int64_t now = esp_timer_get_time();
+    return (p->out_key_old_expires_us > 0) &&
+           (now < p->out_key_old_expires_us) &&
+           (p->psa_hmac_out_id_old != 0);
+}
+
+void tbft_principal_commit_out_key(tbft_principal_t *p)
+{
+    if (!p) return;
+    if (p->psa_hmac_out_id_old != 0) {
+        psa_destroy_key(p->psa_hmac_out_id_old);
+        p->psa_hmac_out_id_old = 0;
+    }
+    p->out_key_old_expires_us = 0;
+    memset(&p->hmac_out_key_old, 0, sizeof(p->hmac_out_key_old));
 }
 
 bool tbft_principal_verify_mac_in(const tbft_principal_t *p,
@@ -238,14 +271,21 @@ bool tbft_principal_verify_mac_in_with_replay_check(tbft_principal_t *p,
 
     /* Key rotation grace period: the sender may have signed this
      * message with the old key before processing our last New_key.
-     * Try the previous in_key as a fallback. */
-    if (p->psa_hmac_in_id_prev != 0) {
-        psa_status_t st = psa_mac_verify(p->psa_hmac_in_id_prev,
-            PSA_ALG_HMAC(PSA_ALG_SHA_256),
-            (const uint8_t *)msg, msg_len, mac->bytes, TBFT_HMAC_SIZE);
-        if (st == PSA_SUCCESS) {
-            (void)msg_time_us;
-            return true;
+     * Try the previous in_key as a fallback.  Re-import from saved
+     * bytes to avoid storing a PSA key ID (which would dangle after
+     * psa_hmac_in_id is destroyed in the next set_in_key call). */
+    {
+        mbedtls_svc_key_id_t kid = import_hmac_key(&p->hmac_in_key_prev,
+            PSA_KEY_USAGE_VERIFY_MESSAGE);
+        if (kid != 0) {
+            psa_status_t st = psa_mac_verify(kid,
+                PSA_ALG_HMAC(PSA_ALG_SHA_256),
+                (const uint8_t *)msg, msg_len, mac->bytes, TBFT_HMAC_SIZE);
+            psa_destroy_key(kid);
+            if (st == PSA_SUCCESS) {
+                (void)msg_time_us;
+                return true;
+            }
         }
     }
 
@@ -254,10 +294,13 @@ bool tbft_principal_verify_mac_in_with_replay_check(tbft_principal_t *p,
 
 void tbft_principal_set_in_key(tbft_principal_t *p, const tbft_hmac_key_t *key)
 {
-    /* Retain previous key for rotation grace period */
-    if (p->psa_hmac_in_id_prev != 0) { psa_destroy_key(p->psa_hmac_in_id_prev); p->psa_hmac_in_id_prev = 0; }
+    /* Retain previous key bytes for rotation grace period fallback.
+     * Do NOT store psa_hmac_in_id_prev — it would dangle after the
+     * destroy below (the old psa_hmac_in_id and psa_hmac_in_id_prev
+     * would point to the same PSA key object).  The fallback path in
+     * verify_mac_in_with_replay_check re-imports from hmac_in_key_prev
+     * bytes instead. */
     p->hmac_in_key_prev = p->hmac_in_key;
-    p->psa_hmac_in_id_prev = p->psa_hmac_in_id;
 
     if (p->psa_hmac_in_id != 0) { psa_destroy_key(p->psa_hmac_in_id); p->psa_hmac_in_id = 0; }
     p->hmac_in_key = *key;
@@ -286,7 +329,27 @@ void tbft_principal_set_in_key(tbft_principal_t *p, const tbft_hmac_key_t *key)
 
 void tbft_principal_set_out_key(tbft_principal_t *p, const tbft_hmac_key_t *key)
 {
-    if (p->psa_hmac_out_id != 0) { psa_destroy_key(p->psa_hmac_out_id); p->psa_hmac_out_id = 0; }
+    /* B-FIX: Save the previous out_key as the "old" key for the rotation
+     * grace period.  gen_mac_out will sign with the old key until
+     * commit_out_key is called (typically by the replica's rotate_key_tick
+     * after a 3s grace).  The receiver's in_key_prev fallback matches the
+     * old key, so verification succeeds during the grace window.
+     *
+     * If we are already in a grace period (consecutive rotations without
+     * commit), the previous "old" key is replaced with the current key.
+     * The current key is the more recent of the two rotation sources and
+     * is more likely to be what peers have already processed. */
+    if (p->psa_hmac_out_id_old != 0) psa_destroy_key(p->psa_hmac_out_id_old);
+
+    p->hmac_out_key_old = p->hmac_out_key;
+    p->psa_hmac_out_id_old = p->psa_hmac_out_id;  /* transfer ownership */
+    /* Set grace to 3 seconds.  The replica's rotate_key_tick commits
+     * after this period.  Long enough for the New_key broadcast to reach
+     * all 6 peers via ESP-NOW (typical <100ms) plus processing time. */
+    p->out_key_old_expires_us = esp_timer_get_time() + 3 * 1000 * 1000;
+
+    /* Install new key as the "active" out_key.  gen_mac_out will use the
+     * old key during the grace period (see in_grace check above). */
     p->hmac_out_key = *key;
     p->psa_hmac_out_id = import_hmac_key(key, PSA_KEY_USAGE_SIGN_MESSAGE);
 }
@@ -360,24 +423,11 @@ int tbft_principal_ecdh_derive_key(const tbft_principal_t *p,
         return -1;
     }
 
-    /* HKDF: key = HMAC-SHA256(salt || shared, "TinyBFT session key") */
-    psa_key_attributes_t attr = PSA_KEY_ATTRIBUTES_INIT;
-    psa_set_key_type(&attr, PSA_KEY_TYPE_HMAC);
-    psa_set_key_algorithm(&attr, PSA_ALG_HMAC(PSA_ALG_SHA_256));
-    psa_set_key_usage_flags(&attr, PSA_KEY_USAGE_SIGN_MESSAGE);
-
-    mbedtls_svc_key_id_t hkid = MBEDTLS_SVC_KEY_ID_INIT;
-    st = psa_import_key(&attr, shared, shared_len, &hkid);
-    psa_reset_key_attributes(&attr);
-    if (st != PSA_SUCCESS) return -1;
-
     /* HKDF-Extract: PRK = HMAC(salt, shared) — salt is the key, shared is the msg */
-    /* First step: compute HKDF-like derivation manually:
-       session_key = HMAC-SHA256(key=salt, msg=shared) */
-    uint8_t hkdf_out[TBFT_HMAC_SIZE];
-    size_t hkdf_len = 0;
+    uint8_t prk[TBFT_HMAC_SIZE];
+    size_t prk_len = 0;
 
-    /* Use salt as the HMAC key */
+    /* Use salt as the HMAC key for the Extract step */
     psa_key_attributes_t salt_attr = PSA_KEY_ATTRIBUTES_INIT;
     psa_set_key_type(&salt_attr, PSA_KEY_TYPE_HMAC);
     psa_set_key_algorithm(&salt_attr, PSA_ALG_HMAC(PSA_ALG_SHA_256));
@@ -386,12 +436,41 @@ int tbft_principal_ecdh_derive_key(const tbft_principal_t *p,
     mbedtls_svc_key_id_t salt_id = MBEDTLS_SVC_KEY_ID_INIT;
     st = psa_import_key(&salt_attr, salt, 32, &salt_id);
     psa_reset_key_attributes(&salt_attr);
-    if (st != PSA_SUCCESS) { psa_destroy_key(hkid); return -1; }
+    if (st != PSA_SUCCESS) return -1;
 
     st = psa_mac_compute(salt_id, PSA_ALG_HMAC(PSA_ALG_SHA_256),
-        shared, shared_len, hkdf_out, sizeof(hkdf_out), &hkdf_len);
+        shared, shared_len, prk, sizeof(prk), &prk_len);
     psa_destroy_key(salt_id);
-    psa_destroy_key(hkid);
+    if (st != PSA_SUCCESS || prk_len != TBFT_HMAC_SIZE) {
+        ESP_LOGE(TAG, "ecdh_derive: HKDF-Extract failed: %d", (int)st);
+        return -1;
+    }
+
+    /* HKDF-Expand (RFC 5869): OKM = HMAC(PRK, info || 0x01)
+     * For 32 bytes (< SHA-256 block size), one Expand round is sufficient.
+     * The info string binds the key to its protocol role, preventing
+     * cross-protocol key reuse if ECDH is ever used elsewhere. */
+    static const uint8_t expand_info[] = "TinyBFT session key v1";
+    uint8_t expand_in[sizeof(expand_info) + 1];
+    memcpy(expand_in, expand_info, sizeof(expand_info) - 1);
+    expand_in[sizeof(expand_info) - 1] = 0x01;
+
+    psa_key_attributes_t prk_attr = PSA_KEY_ATTRIBUTES_INIT;
+    psa_set_key_type(&prk_attr, PSA_KEY_TYPE_HMAC);
+    psa_set_key_algorithm(&prk_attr, PSA_ALG_HMAC(PSA_ALG_SHA_256));
+    psa_set_key_usage_flags(&prk_attr, PSA_KEY_USAGE_SIGN_MESSAGE);
+
+    mbedtls_svc_key_id_t prk_id = MBEDTLS_SVC_KEY_ID_INIT;
+    st = psa_import_key(&prk_attr, prk, prk_len, &prk_id);
+    psa_reset_key_attributes(&prk_attr);
+    if (st != PSA_SUCCESS) { memset(prk, 0, sizeof(prk)); return -1; }
+
+    uint8_t hkdf_out[TBFT_HMAC_SIZE];
+    size_t hkdf_len = 0;
+    st = psa_mac_compute(prk_id, PSA_ALG_HMAC(PSA_ALG_SHA_256),
+        expand_in, sizeof(expand_in), hkdf_out, sizeof(hkdf_out), &hkdf_len);
+    psa_destroy_key(prk_id);
+    memset(prk, 0, sizeof(prk));
 
     if (st != PSA_SUCCESS || hkdf_len != TBFT_HMAC_SIZE) {
         ESP_LOGE(TAG, "ecdh_derive: HKDF failed: %d", (int)st);

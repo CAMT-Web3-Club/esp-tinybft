@@ -44,6 +44,22 @@ typedef struct {
     tbft_hmac_key_t       hmac_in_key_prev;
     mbedtls_svc_key_id_t  psa_hmac_in_id_prev;
 
+    /* B-FIX: Previous out_key — retained for one rotation cycle so that
+     * the SENDER (primary) keeps signing with the OLD key during the
+     * grace window between broadcast-New_key and replica-acknowledge.
+     * Without this, the primary's out_key switches immediately in
+     * tbft_principal_set_out_key, but replicas haven't received the
+     * New_key broadcast yet, so they verify with the OLD in_key and
+     * the MAC fails (no fallback available on the receiver side because
+     * hmac_in_key_prev is OLD-OLD, not OLD).
+     *
+     * Symmetric to hmac_in_key_prev on the receiver side: the receiver
+     * has a two-key window for OLD/NEW in_key; the sender has the same
+     * two-key window for OLD/NEW out_key. */
+    tbft_hmac_key_t       hmac_out_key_old;
+    mbedtls_svc_key_id_t  psa_hmac_out_id_old;
+    int64_t               out_key_old_expires_us;  /* 0 = no grace active */
+
     /* Persistent PSA key handles for HMAC */
     mbedtls_svc_key_id_t psa_hmac_in_id;
     mbedtls_svc_key_id_t psa_hmac_out_id;
@@ -96,6 +112,15 @@ static inline void tbft_principal_update_auth_time(tbft_principal_t *p, int64_t 
 
 void tbft_principal_set_in_key(tbft_principal_t *p, const tbft_hmac_key_t *key);
 void tbft_principal_set_out_key(tbft_principal_t *p, const tbft_hmac_key_t *key);
+
+/* B-FIX: Commit the pending old out_key (frees the backup PSA handle).
+ * Called by the replica's rotate_key_tick after the grace period expires.
+ * Safe to call when no grace is active (no-op). */
+void tbft_principal_commit_out_key(tbft_principal_t *p);
+
+/* B-FIX: Returns true if this principal is currently in the out_key
+ * grace period (signing with the old key while peers catch up). */
+bool tbft_principal_in_out_key_grace(const tbft_principal_t *p);
 
 /* --------------------------------------------------------------------------
  * ECDSA signature path

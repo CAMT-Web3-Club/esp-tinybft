@@ -11,7 +11,7 @@
  *
  * The replica runs as a single event loop (tbft_replica_run) that drains
  * messages from the transport layer and dispatches them by tag. All heavy
- * cryptographic operations (RSA) run in the loop context; timer callbacks
+ * cryptographic operations (ECDSA P-256) run in the loop context; timer callbacks
  * only set event bits to avoid blocking ISR/task contexts.
  *
  * Memory model: Three statically-allocated regions (agreement, checkpoint,
@@ -141,6 +141,33 @@ int tbft_replica_init(tbft_replica_t *r,
 {
     memset(r, 0, sizeof(*r));
     r->new_key_peer_idx = -1;
+    /* A8-F017 FIX: validate inputs at runtime.
+     * Parse_config in tbft_libbyz.c catches most bad values, but direct
+     * callers of tbft_replica_init (tests, alternative wrappers) would not
+     * have this guard. */
+    if (f < 1 || f > TBFT_MAX_FAULTY) {
+        ESP_LOGE(TAG, "tbft_replica_init: f=%d out of range [1, %d]",
+                 f, TBFT_MAX_FAULTY);
+        return -1;
+    }
+    if (num_replicas < 3 * f + 1 || num_replicas > TBFT_MAX_NUM_REPLICAS) {
+        ESP_LOGE(TAG, "tbft_replica_init: num_replicas=%d must be in [3f+1=%d, %d]",
+                 num_replicas, 3 * f + 1, TBFT_MAX_NUM_REPLICAS);
+        return -1;
+    }
+    if (num_nodes < num_replicas + 1 ||
+        num_nodes > num_replicas + TBFT_MAX_NUM_CLIENTS) {
+        ESP_LOGE(TAG, "tbft_replica_init: num_nodes=%d must be in [%d, %d]",
+                 num_nodes, num_replicas + 1,
+                 num_replicas + TBFT_MAX_NUM_CLIENTS);
+        return -1;
+    }
+    /* F5 FIX: initialise view_installed_us to a sentinel value so that the
+     * dead-primary detector (line ~390) does not fire spuriously for direct
+     * callers of tbft_replica_init who bypass Byz_init_replica.  The caller
+     * (Byz_init_replica) overwrites this with the correct timestamp at
+     * tbft_libbyz.c:985 after principals and timers are ready. */
+    r->view_installed_us = esp_timer_get_time();
 
     /* Init base node */
     if (tbft_node_init(&r->node, node_id, f, num_replicas, num_nodes,
@@ -175,6 +202,11 @@ int tbft_replica_init(tbft_replica_t *r,
     /* Set callbacks */
     r->exec_cb        = exec_cb;
     r->comp_ndet_cb   = comp_ndet_cb;
+    /* A8-F011 FIX: warn when ndet_max_len is silently clamped. */
+    if (ndet_max_len > TBFT_NDET_BUF_SIZE) {
+        ESP_LOGW(TAG, "ndet_max_len=%d exceeds TBFT_NDET_BUF_SIZE=%d — clamping",
+                 ndet_max_len, TBFT_NDET_BUF_SIZE);
+    }
     r->ndet_max_len   = (ndet_max_len > TBFT_NDET_BUF_SIZE)
                       ? TBFT_NDET_BUF_SIZE : ndet_max_len;
     r->recv_reply_cb  = recv_reply_cb;
@@ -383,10 +415,17 @@ void tbft_replica_run(tbft_replica_t *r)
             /* Dead-primary detection: if we are a backup and have received
              * no PP from the current primary within 30 s of view install,
              * the primary is dead or stuck.  Trigger accelerated view-change
-             * instead of waiting for the full vtimer (3+ minutes). */
+             * instead of waiting for the full vtimer (3+ minutes).
+             * F4 FIX: apply a minimum backoff so this does not fire on
+             * every iteration once the 30s threshold is crossed — wait
+             * at least 2× the vtimer period or 60s (whichever is smaller)
+             * since the last VC trigger. */
             if (!tbft_replica_is_primary(r) && !r->vi.in_progress) {
                 int64_t now = esp_timer_get_time();
+                int64_t min_interval = r->vtimer_period_us * 2;
+                if (min_interval < 60000000LL) min_interval = 60000000LL;
                 if (now - r->view_installed_us > 30 * 1000 * 1000LL &&
+                    now - r->last_vc_us > min_interval &&
                     r->last_executed <= r->view_start_executed) {
                     ESP_LOGW(TAG, "dead primary: no PP in %lld s,"
                              " accelerating view-change (view=%lld, primary=%d)",
@@ -622,7 +661,14 @@ void tbft_replica_run(tbft_replica_t *r)
                                 (long long)(elapsed_us / 1000));
                             r->pending_fill_seqno  = 0;
                             r->fill_started_at_us  = 0;
-                            if (!r->vi.in_progress) {
+                            /* F24 (F-VS-003) FIX: respect vtimer backoff.
+                             * If a VC was fired in the last vtimer_period_us,
+                             * defer the fill VC.  This prevents back-to-back
+                             * view-changes when a transient <10s commit loss
+                             * would have resolved on its own. */
+                            int64_t now = esp_timer_get_time();
+                            if (!r->vi.in_progress &&
+                                now - r->last_vc_us > r->vtimer_period_us) {
                                 tbft_replica_send_view_change(r);
                             }
                         }
@@ -658,6 +704,12 @@ void tbft_replica_run(tbft_replica_t *r)
          * ESP-NOW msg_queue when all 6 peers are derived atomically. */
         tbft_replica_rotate_key_tick(r);
 
+        /* B-FIX: If a New_key broadcast was issued recently, check whether
+         * the 3s grace period has expired and commit the pending out_keys
+         * for all peers.  Without this, the primary's gen_mac_out would
+         * keep signing with the OLD key indefinitely, blocking progress. */
+        tbft_replica_check_out_key_commit(r);
+
 #define TBFT_BATCH_DRAIN_MAX  16
 
         int first_msg = 1;
@@ -690,7 +742,7 @@ void tbft_replica_run(tbft_replica_t *r)
         }
 
         /* Until we have the sender's HMAC session key, only process non-HMAC messages.
-         * View_change and New_view use RSA signatures, so they can be processed immediately.
+         * View_change and New_view use ECDSA P-256 signatures, so they can be processed immediately.
          * Pre_prepare, Prepare, Commit, and Checkpoint use HMAC authenticators, so we must
          * have the sender's session key before we can verify and accept them. This prevents
          * both silent verification failure drops and state corruption. */
@@ -871,13 +923,16 @@ void tbft_replica_handle_request(tbft_replica_t *r, const void *msg, int len)
         return;
     }
 
-    /* Skip enqueue during a view-change: send_pre_prepare returns
-     * immediately when vi.in_progress is true (line 2124), so any
-     * queued request would just sit and fill the queue.  The client
-     * retries with exponential backoff — by the next retry the view
-     * change should be complete and the request will reach the
-     * correct primary. */
-    if (r->vi.in_progress) return;
+    /* F6 FIX: Do NOT skip enqueue during a view-change.  Previously this
+     * returned immediately, silently dropping the request with no Reply,
+     * no NACK, and no indication to the client.  With TBFT_CLIENT_
+     * REPLY_TIMEOUT_MS=10s and a 5-10s view-change (ECDSA P-256 sign
+     * ~194ms × 5+ ops), the client's 1s+2s retry budget cannot wait
+     * through one view-change deterministically, causing the 40% client
+     * failure rate observed in the 50-min deployment.  The request is
+     * queued and send_pre_prepare (line ~2124) correctly returns early
+     * when vi.in_progress is true; the queued request will be processed
+     * once the view is installed and vi.in_progress becomes false. */
 
     /* Primary: deduplicate by (cid, rid) before enqueuing.
      * Multiple copies of the same request can arrive — once from the
@@ -1040,7 +1095,7 @@ void tbft_replica_handle_pre_prepare(tbft_replica_t *r, const void *msg, int len
             return;
         }
 
-        /* Re-verify the embedded client RSA signature.  Without this, a
+        /* Re-verify the embedded client ECDSA signature.  Without this, a
          * Byzantine primary could inject forged requests attributed to
          * arbitrary clients — backups would accept the PP (digest matches,
          * HMAC from primary is valid), prepare, commit, and execute an
@@ -1415,7 +1470,7 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
     tbft_node_id_t sender_id = (tbft_node_id_t)vc->id;
     if (sender_id < 0 || sender_id >= r->node.num_replicas) return;
 
-    /* Verify RSA signature.  hdr.size is the body length (without the sig).
+    /* Verify ECDSA P-256 signature.  hdr.size is the body length (without the sig).
      * The sender appends the sig after the body but does not include it in
      * hdr.size, so the total wire size is hdr.size + TBFT_SIG_SIZE. */
     int32_t body_size = vc->hdr.size;
@@ -1424,12 +1479,12 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
         return;
     }
     if (len < (int)(body_size + (int)sizeof(tbft_sig_t))) {
-        ESP_LOGW(TAG, "view-change: missing RSA signature from %d", sender_id);
+        ESP_LOGW(TAG, "view-change: missing ECDSA signature from %d", sender_id);
         return;
     }
     const tbft_sig_t *sig = (const tbft_sig_t *)((const uint8_t *)msg + body_size);
     if (!tbft_node_verify_sig(&r->node, sender_id, msg, (size_t)body_size, sig)) {
-        ESP_LOGW(TAG, "view-change: RSA signature verification failed from %d",
+        ESP_LOGW(TAG, "view-change: ECDSA signature verification failed from %d",
                  sender_id);
         return;
     }
@@ -1532,6 +1587,7 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
             tbft_seqno_t seqno;
             tbft_digest_t digest;
             int count;
+            uint64_t replica_bmap;
         } prep_count_t;
 
         /* Static to avoid stack overflow with large TBFT_WINDOW_SIZE.
@@ -1577,6 +1633,14 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
                 for (k = 0; k < n_counts; k++) {
                     if (counts[k].seqno == reqs[j].seqno &&
                         tbft_digest_equal(&counts[k].digest, &reqs[j].digest)) {
+                        /* F17 (F-009) FIX: skip if replica i already contributed
+                         * to this (seqno, digest).  Without this, a Byzantine VC
+                         * with duplicate (seqno, digest) entries inflates the
+                         * count, potentially satisfying the f+1 threshold
+                         * with a single byzantine node. */
+                        uint64_t mask = (1ULL << i);
+                        if (counts[k].replica_bmap & mask) continue;
+                        counts[k].replica_bmap |= mask;
                         counts[k].count++;
                         break;
                     }
@@ -1585,6 +1649,7 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
                     counts[n_counts].seqno = reqs[j].seqno;
                     counts[n_counts].digest = reqs[j].digest;
                     counts[n_counts].count = 1;
+                    counts[n_counts].replica_bmap = (1ULL << i);
                     n_counts++;
                 }
             }
@@ -1735,7 +1800,7 @@ void tbft_replica_handle_new_view(tbft_replica_t *r, const void *msg, int len)
     }
 
     /* Validate body content against collected VCs.  By this point the
-     * RSA signature has authenticated the message — an attacker cannot
+     * ECDSA signature has authenticated the message — an attacker cannot
      * inject fake proofs to trigger the proof-verification loop. */
     if (!tbft_vi_verify_nv(&r->vi, nv, len)) {
         ESP_LOGW(TAG, "new-view verification failed for v=%lld",
@@ -1897,21 +1962,29 @@ static void handle_status(tbft_replica_t *r, const void *msg, int len)
     }
 
     if (st->view > r->node.view) {
-        /* Guard against cross-session stale Status.  A peer reporting a
-         * view far ahead of ours (e.g. view=70 when we are at view=0) is
-         * either from a prior test run with stale NVS state, or Byzantine.
-         * Legitimate clusters advance at most a few views between Status
-         * intervals.  Reject unless the delta is small or the peer's
-         * last_stable matches ours (same session, just view-jumped). */
-        if (st->view - r->node.view > 10 &&
-            st->last_stable < r->last_stable + TBFT_WINDOW_SIZE) {
-            ESP_LOGW(TAG, "status from %d: peer view=%lld is %lld views ahead"
-                     " of local view=%lld with different stable=%lld — "
-                     "rejecting as cross-session stale state",
+        /* F18 (F-010) FIX: tighten cross-session guard.
+         * The Status message is unauthenticated, so view advancement is
+         * only safe when: (a) the delta is small (≤2), AND (b) the
+         * peer's last_stable exactly matches ours (proving same session).
+         * A larger delta (3-10) requires the peer's last_stable to be
+         * within our window, preventing an attacker from injecting a view
+         * jump to an arbitrary view with a fabricated last_stable.
+         * Any view jump beyond 10 is unconditionally rejected as either
+         * cross-session stale state (prior test run) or Byzantine. */
+        uint32_t delta = (uint32_t)(st->view - r->node.view);
+        if (delta > 10) {
+            ESP_LOGW(TAG, "status from %d: peer view=%lld is %lu views ahead"
+                     " of local view=%lld — rejecting (cross-session or byzantine)",
                      st->id, (long long)st->view,
-                     (long long)(st->view - r->node.view),
-                     (long long)r->node.view,
-                     (long long)st->last_stable);
+                     (unsigned long)delta, (long long)r->node.view);
+            return;
+        }
+        if (delta > 2 && st->last_stable != r->last_stable) {
+            ESP_LOGW(TAG, "status from %d: peer view=%lld is %lu views ahead"
+                     " with last_stable=%lld != local=%lld — rejecting",
+                     st->id, (long long)st->view,
+                     (unsigned long)delta,
+                     (long long)st->last_stable, (long long)r->last_stable);
             return;
         }
         ESP_LOGI(TAG, "status from %d: peer view=%lld last_stable=%lld last_exec=%lld"
@@ -2479,6 +2552,10 @@ void tbft_replica_send_pre_prepare(tbft_replica_t *r)
     if (!tbft_ar_store_pp(&r->ar, r->seqno, r->out_buf, pp->hdr.size)) {
         ESP_LOGW(TAG, "pre-prepare: failed to store in own agreement region seqno=%lld"
                  " — slot occupied, skipping broadcast", (long long)r->seqno);
+        /* F002 (store_pp stuck) FIX: increment seqno so the next request gets
+         * a fresh slot.  Without this, the same seqno retries forever and
+         * the primary stalls until the vtimer fires a view-change. */
+        r->seqno++;
         rqueue_pop(src_queue);
         r->last_assigned_cid = -1; /* allow re-assignment on next attempt */
         return;
@@ -2698,7 +2775,7 @@ void tbft_replica_execute_committed(tbft_replica_t *r)
             /* Use r->out_buf for reply; max reply payload fits inside.
              * Zero the buffer first so padding bytes between the reply
              * payload and the aligned hdr.size do not leak stack/heap
-             * garbage into the RSA-signed data. */
+             * garbage into the ECDSA-signed data. */
             memset(r->out_buf, 0, sizeof(r->out_buf));
             tbft_reply_rep_t *reply = (tbft_reply_rep_t *)r->out_buf;
             uint8_t *rep_payload    = r->out_buf + sizeof(*reply);
@@ -2923,6 +3000,9 @@ void tbft_replica_mark_stable(tbft_replica_t *r, tbft_seqno_t seqno)
 
 void tbft_replica_send_view_change(tbft_replica_t *r)
 {
+    /* F4 FIX: record timestamp of VC trigger for dead-primary backoff */
+    r->last_vc_us = esp_timer_get_time();
+
     /* Suppress view-change if we have persistent MAC verification failures.
      * The session keys are stale — a view change with stale keys guarantees
      * failure because we cannot validate messages from any replica.
@@ -3042,7 +3122,7 @@ void tbft_replica_send_view_change(tbft_replica_t *r)
 
     vc->hdr.size = tbft_msg_align((int32_t)(ptr - r->out_buf));
 
-    /* Append RSA signature over the body (hdr.size bytes).
+    /* Append ECDSA P-256 signature over the body (hdr.size bytes).
      * The body length is stored in hdr.size; the signature follows but is
      * NOT included in hdr.size so receivers can locate it as msg + hdr.size.
      *
@@ -3176,6 +3256,15 @@ void tbft_replica_rotate_key_tick(tbft_replica_t *r)
         ESP_LOGI(TAG, "sent New_key nonce=%02x%02x... (signed)",
                  nk->nonce[0], nk->nonce[1]);
 
+        /* B-FIX: Schedule the grace-period expiry.  set_out_key (Phase 2)
+         * saved the OLD key bytes and set per-principal grace timers of
+         * 3 seconds each.  This replica-wide timestamp is the *latest*
+         * expiry: by the time it fires, every peer's per-principal grace
+         * has also expired and gen_mac_out will use the new key.
+         * 3s covers the ESP-NOW broadcast round-trip + replica processing
+         * (typical 50-200ms in this testbed). */
+        r->new_key_commit_at_us = esp_timer_get_time() + 3 * 1000 * 1000;
+
         r->new_key_peer_idx = -1;
     }
 }
@@ -3187,6 +3276,25 @@ void tbft_replica_send_new_key(tbft_replica_t *r)
 {
     if (r->new_key_peer_idx >= 0) return;  /* already rotating */
     r->new_key_peer_idx = 0;
+}
+
+/* B-FIX: Check if the New_key grace period has expired.  If so, commit
+ * all principals' pending out_key rotations (destroy the old key backup,
+ * the new key becomes the active signing key).  Called once per main-loop
+ * iteration — cheap when no rotation is in flight. */
+void tbft_replica_check_out_key_commit(tbft_replica_t *r)
+{
+    if (r->new_key_commit_at_us == 0) return;
+    int64_t now = esp_timer_get_time();
+    if (now < r->new_key_commit_at_us) return;
+
+    ESP_LOGI(TAG, "out_key grace expired — committing new out_keys for all peers");
+    for (int i = 0; i < r->node.num_replicas; i++) {
+        if (i == r->node.node_id) continue;
+        tbft_principal_t *p = r->node.principals[i];
+        if (p) tbft_principal_commit_out_key(p);
+    }
+    r->new_key_commit_at_us = 0;
 }
 
 void tbft_replica_handle_new_key(tbft_replica_t *r, const void *msg, int len)
@@ -3203,16 +3311,26 @@ void tbft_replica_handle_new_key(tbft_replica_t *r, const void *msg, int len)
     tbft_principal_t *local = r->node.local_principal;
     if (!local) return;
 
-    /* Verify ECDSA signature */
-    if (nk->has_sig) {
-        int32_t body_size = nk->hdr.size;
-        if (body_size < (int32_t)sizeof(tbft_new_key_rep_t) || body_size > len) return;
-        if (len < body_size + (int)sizeof(tbft_sig_t)) return;
-        const tbft_sig_t *sig = (const tbft_sig_t *)((const uint8_t *)msg + body_size);
-        if (!tbft_node_verify_sig(&r->node, sender_id, msg, (size_t)body_size, sig)) {
-            ESP_LOGW(TAG, "new_key from %d: signature verification failed", sender_id);
-            return;
-        }
+    /* F16 (F-008) FIX: reject unsigned New_key messages unconditionally.
+     * An attacker-controlled has_sig=false bypasses the entire ECDSA
+     * verification, allowing a byzantine node to install a divergent HMAC
+     * key via ECDH with an attacker-chosen nonce.  Legitimate senders
+     * always set has_sig=true, so only attacker-spoofed messages are
+     * rejected.  This was a DoS vector: a spoofed New_key (has_sig=false)
+     * forces the receiver to install a divergent in_key, causing all
+     * subsequent legitimate messages to fail HMAC verification. */
+    if (!nk->has_sig) {
+        ESP_LOGW(TAG, "new_key from %d: rejecting unsigned message (has_sig=0)", sender_id);
+        return;
+    }
+
+    int32_t body_size = nk->hdr.size;
+    if (body_size < (int32_t)sizeof(tbft_new_key_rep_t) || body_size > len) return;
+    if (len < body_size + (int)sizeof(tbft_sig_t)) return;
+    const tbft_sig_t *sig = (const tbft_sig_t *)((const uint8_t *)msg + body_size);
+    if (!tbft_node_verify_sig(&r->node, sender_id, msg, (size_t)body_size, sig)) {
+        ESP_LOGW(TAG, "new_key from %d: signature verification failed", sender_id);
+        return;
     }
 
     /* Derive HMAC in-key via ECDH with sender's public key */

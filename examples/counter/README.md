@@ -12,12 +12,12 @@ Requests are ordered and agreed upon by the BFT replicas before being executed.
 ## Setup
 
 1. **Generate Configuration and Keys**
-   First, generate the RSA keys and configuration files that will be flashed onto the devices:
+   First, generate the ECDSA P-256 keys and configuration files that will be flashed onto the devices:
    ```bash
    ./gen_configs.sh
    ```
    This creates a `spiffs_image` directory containing:
-   - RSA private and public keys (`privX.der`, `pubX.der`)
+   - ECDSA P-256 private and public keys (`privX.der`, `pubX.der`)
    - `config_udp.txt` and `config_espnow.txt`
 
 2. **Configure the Transport**

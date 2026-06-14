@@ -130,6 +130,13 @@ typedef struct {
     uint8_t  new_key_nonce[32];
     int32_t  new_key_msg_len;
 
+    /* B-FIX: Wall-clock timestamp (microseconds) at which to commit the
+     * pending out_key rotations across all peers.  Set when the New_key
+     * message is broadcast (Phase 3); checked in the main loop.  When
+     * now() >= new_key_commit_at_us, each principal's out_key_old is
+     * destroyed and the new out_key becomes the active signing key. */
+    int64_t  new_key_commit_at_us;
+
     /* Running flag */
     volatile bool  running;
 
@@ -155,6 +162,11 @@ typedef struct {
      * (last_executed hasn't advanced past this value).  Prevents
      * false positives when the cluster IS committing seqnos. */
     tbft_seqno_t view_start_executed;
+
+    /* Timestamp (us) of the last view-change trigger (any path).
+     * Used as a minimum-interval backoff so the dead-primary
+     * detector does not fire repeatedly while conditions remain true. */
+    int64_t last_vc_us;
 
     /* Event group for decoupling timer callbacks from heavy processing */
     EventGroupHandle_t evt_group;
@@ -197,6 +209,15 @@ int tbft_replica_init(tbft_replica_t *r,
 
 /**
  * Release all resources held by the replica.
+ *
+ * F-019 FIX: must only be called by the replica task itself (i.e., from
+ * within the loop that called tbft_replica_run).  Setting running=false
+ * and then freeing timers/event_group/node state while another pass of
+ * the loop is in flight (between the running check and xEventGroupWaitBits)
+ * is a use-after-free: the freed evt_group or timer state will be
+ * dereferenced on the next pass.  The safe pattern is to set running=false
+ * from inside the loop (e.g., on a 'should_stop' flag check) and let the
+ * loop itself call tbft_replica_free before exiting.
  */
 void tbft_replica_free(tbft_replica_t *r);
 
@@ -244,6 +265,10 @@ void tbft_replica_handle_fill_request(tbft_replica_t *r,
 
 /** Generate fresh HMAC session keys and broadcast a New_key message */
 void tbft_replica_send_new_key(tbft_replica_t *r);
+
+/** B-FIX: Commit any pending out_key rotations if the grace period has
+ * expired.  Cheap to call every loop iteration. */
+void tbft_replica_check_out_key_commit(tbft_replica_t *r);
 
 /** Primary: assign seqno and broadcast Pre_prepare for queued requests */
 void tbft_replica_send_pre_prepare(tbft_replica_t *r);

@@ -36,3 +36,5 @@ examples/**/spiffs_image/pub*.der
 .claude/
 .antigravitycli
 gha-creds-*.json
+.opencode/
+.swarm/

@@ -142,5 +142,15 @@ void tbft_ar_truncate(tbft_agreement_region_t *ar, tbft_seqno_t new_head)
      * consensus messages. */
     ar->head_idx = (int)((ar->head_idx + (int)full_delta) & ar->mask);
     ar->head     = new_head;
+
+    /* Clear the slot at the new head — it may contain stale certificates
+     * from a prior checkpoint window, which would cause incorrect Prepared
+     * certificates to persist across the truncation boundary (A4-F001 /
+     * CV_A4_by_A9 confirmed DoS chain: local node contributes to quorum
+     * with a stale bitmap entry, leaving at most 2f honest prepares). */
+    tbft_prepared_cert_clear(&ar->slices[ar->head_idx].prepared_cert);
+    tbft_commit_cert_clear(&ar->slices[ar->head_idx].commit_cert);
+    ar->slices[ar->head_idx].commit_sent_us = 0;
+    ar->slices[ar->head_idx].fill_sent_us   = 0;
 }
 

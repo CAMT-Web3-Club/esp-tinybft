@@ -138,7 +138,7 @@ void tbft_state_cow_single(tbft_state_t *state, int bindex)
     if (cow_test(state, bindex)) return; /* already snapshotted */
 
     /* Find the active (most recent) checkpoint record */
-    tbft_ckpt_record_t *rec = ckpt_slot_for(state, state->last_stable);
+    tbft_ckpt_record_t *rec = ckpt_slot_for(state, state->cow_target_seqno);
 
     if (!rec->old_blocks) {
         /* Should not happen: old_blocks is pre-allocated in tbft_state_init
@@ -198,6 +198,11 @@ void tbft_state_cow(tbft_state_t *state, void *mem, size_t size)
 
 void tbft_state_checkpoint(tbft_state_t *state, tbft_seqno_t seqno)
 {
+    /* F15 (F-015) FIX: advance cow_target_seqno so CoW and rollback
+     * use the correct checkpoint slot even if mark_stable advances
+     * mid-interval due to state fetch. */
+    state->cow_target_seqno = seqno;
+
     /* Recompute digests for all modified blocks */
     for (int i = 0; i < state->num_blocks; i++) {
         if (!cow_test(state, i)) continue;
@@ -236,7 +241,7 @@ const tbft_digest_t *tbft_state_root_digest(const tbft_state_t *state)
 
 tbft_seqno_t tbft_state_rollback(tbft_state_t *state)
 {
-    tbft_ckpt_record_t *rec = ckpt_slot_for(state, state->last_stable);
+    tbft_ckpt_record_t *rec = ckpt_slot_for(state, state->cow_target_seqno);
     if (!rec->valid) {
         ESP_LOGW(TAG, "rollback: no valid checkpoint record");
         return 0;
@@ -278,6 +283,25 @@ void tbft_state_mark_stable(tbft_state_t *state, tbft_seqno_t stable_seqno)
         new_rec->num_old_blocks = 0;
         memset(new_rec->old_blocks, 0,
                (size_t)state->num_blocks * sizeof(tbft_cow_entry_t));
+    }
+
+    /* F-018 FIX: reset num_old_blocks for older slots that share the same
+     * index via seqno % TBFT_NUM_CKPT_SLOTS collision.  Without this,
+     * num_old_blocks for older checkpoints grows indefinitely (memory
+     * bound at TBFT_NUM_CKPT_SLOTS still holds, but the desync between
+     * seqno and num_old_blocks is a real correctness issue). */
+    tbft_seqno_t obsolete_threshold = stable_seqno
+        - ((tbft_seqno_t)TBFT_NUM_CKPT_SLOTS - 1) * (tbft_seqno_t)TBFT_CHECKPOINT_INTERVAL;
+    for (int i = 0; i < TBFT_NUM_CKPT_SLOTS; i++) {
+        tbft_ckpt_record_t *rec = &state->ckpt_records[i];
+        if (rec->valid && rec->seqno < obsolete_threshold) {
+            rec->valid = false;
+            rec->num_old_blocks = 0;
+            if (rec->old_blocks) {
+                memset(rec->old_blocks, 0,
+                       (size_t)state->num_blocks * sizeof(tbft_cow_entry_t));
+            }
+        }
     }
 
     state->last_stable = stable_seqno;

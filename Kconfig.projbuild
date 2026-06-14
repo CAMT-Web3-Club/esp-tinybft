@@ -139,10 +139,9 @@ menu "TinyBFT Configuration"
         depends on TBFT_TRANSPORT_ESPNOW
         help
             Number of reassembled messages the transport can buffer
-            before dropping. During checkpoint boundary storms, all
-            replicas broadcast simultaneously — increase this if you
-            see "msg_queue full" warnings. Each entry costs
-            TBFT_MAX_MESSAGE_SIZE + 10 bytes.
+            before dropping. Each entry costs TBFT_MAX_MESSAGE_SIZE + 10
+            bytes in BSS (static allocation). Larger values cost ~2 KB
+            per entry; reduce to save DRAM on ESP32-C3.
 
     config TBFT_ESPNOW_SEND_TASK_PRIORITY
         int "ESP-NOW send task priority"
@@ -163,10 +162,10 @@ menu "TinyBFT Configuration"
             Maximum number of concurrent ESP-NOW sends (credits).
             Each fragment requires one credit. Multi-fragment sends
             acquire/release one credit per fragment (no pre-acquisition),
-            so 6 credits suffice for 2-fragment broadcasts to 6 peers
-            when combined with the 10ms inter-peer drain delay.
-            Values above 12 overload the ESP-NOW driver (fragment
-            send failures).
+            so 6 credits suffice for 2-fragment broadcasts to 6 peers.
+            The ESP-NOW driver has an undocumented internal TX queue
+            limit; values above 6 cause silent drops or esp_now_send
+            failures on fragment retries. Do not exceed 6.
 
     config TBFT_PRINT_STATS
         bool "Enable performance statistics"

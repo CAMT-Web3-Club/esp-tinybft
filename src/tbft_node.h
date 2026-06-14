@@ -138,7 +138,7 @@ bool tbft_node_verify_auth(tbft_node_t *node, tbft_node_id_t sender_id,
                            const tbft_mac_t *mac, int64_t timestamp_us);
 
 /* --------------------------------------------------------------------------
- * RSA signature path
+ * ECDSA P-256 signature path
  * -------------------------------------------------------------------------- */
 
 /**

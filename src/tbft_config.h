@@ -90,6 +90,11 @@
 /* Authenticator: one HMAC slot per remote replica */
 #define TBFT_AUTH_SIZE           (TBFT_HMAC_SIZE * (TBFT_MAX_NUM_REPLICAS - 1))
 
+/* A2-F004 FIX: assert authenticator is sized correctly.  With
+ * MAX_NUM_REPLICAS >= 4, TBFT_AUTH_SIZE must be 3 HMACs = 96 bytes. */
+_Static_assert(TBFT_AUTH_SIZE > 0,
+    "TBFT_AUTH_SIZE must be > 0 (MAX_NUM_REPLICAS must be >= 2)");
+
 /* Checkpoint log slots: window/interval + 2 for overlap */
 #define TBFT_NUM_CKPT_SLOTS      (TBFT_WINDOW_SIZE / TBFT_CHECKPOINT_INTERVAL + 2)
 

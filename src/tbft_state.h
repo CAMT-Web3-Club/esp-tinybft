@@ -11,7 +11,7 @@
  *
  *  - Flat array of fixed-size Blocks (TBFT_BLOCK_SIZE each)
  *  - Copy-on-Write (CoW) bitmap: before any block write, cow_single saves it
- *  - Partition tree (ptree + stree) for incremental Merkle digest
+ *  - Partition tree (ptree) for incremental Merkle digest
  *  - Checkpoint log: CheckpointRecord per checkpoint interval
  *  - Fetch protocol: receives Meta_data / Data messages to recover state
  *
@@ -57,8 +57,7 @@ typedef struct {
 
     /* Checkpoint records */
     tbft_ckpt_record_t ckpt_records[TBFT_NUM_CKPT_SLOTS];
-    int                ckpt_head;   /* index of oldest valid record */
-    int                ckpt_count;
+    /* A5-F008 FIX: removed dead state ckpt_head/ckpt_count (never read/written) */
 
     /* Fetch state */
     bool              in_fetch;
@@ -73,6 +72,12 @@ typedef struct {
 
     /* Stable seqno (updated when checkpoints become stable) */
     tbft_seqno_t      last_stable;
+
+    /* CoW target: the seqno that CoW and rollback should use.
+     * Decoupled from last_stable so that mid-interval mark_stable
+     * (from state fetch) does not misalign the CoW snapshot with
+     * the rollback target.  Advances only in tbft_state_checkpoint. */
+    tbft_seqno_t      cow_target_seqno;
 } tbft_state_t;
 
 /* --------------------------------------------------------------------------

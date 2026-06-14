@@ -43,7 +43,7 @@ typedef struct __attribute__((packed)) {
 
 /* --------------------------------------------------------------------------
  * Request  (tag = 1)  Client → Primary
- * Wire: [hdr][Request_rep][command bytes][RSA signature]
+ * Wire: [hdr][Request_rep][command bytes][ECDSA P-256 signature]
  * -------------------------------------------------------------------------- */
 
 typedef struct __attribute__((packed)) {
@@ -57,7 +57,7 @@ typedef struct __attribute__((packed)) {
 
 /* --------------------------------------------------------------------------
  * Reply  (tag = 2)  Replica → Client
- * Wire: [hdr][Reply_rep][reply payload][RSA signature]
+ * Wire: [hdr][Reply_rep][reply payload][ECDSA P-256 signature]
  * -------------------------------------------------------------------------- */
 
 typedef struct __attribute__((packed)) {
@@ -69,8 +69,8 @@ typedef struct __attribute__((packed)) {
     int32_t         reply_size;   /* bytes of reply payload that follow */
 } tbft_reply_rep_t;
 
-/* Compile-time assertion: a fully-sized reply (header + max payload + RSA
- * signature) must fit within TBFT_MAX_MESSAGE_SIZE.  If a project raises
+/* Compile-time assertion: a fully-sized reply (header + max payload + ECDSA
+ * P-256 signature) must fit within TBFT_MAX_MESSAGE_SIZE.  If a project raises
  * TBFT_MAX_REPLY_SIZE, this will fire at build time. */
 _Static_assert(sizeof(tbft_reply_rep_t) + TBFT_MAX_REPLY_SIZE + TBFT_SIG_SIZE
                    <= TBFT_MAX_MESSAGE_SIZE,
@@ -90,6 +90,11 @@ typedef struct __attribute__((packed)) {
     int16_t         non_det_size; /* bytes of non-deterministic choices */
     int16_t         _pad;
 } tbft_pre_prepare_rep_t;
+
+/* A2-F007 FIX: assert fixed-size struct is sensible (no padding surprises
+ * for packed structs that have odd-sized members). */
+_Static_assert(sizeof(tbft_pre_prepare_rep_t) > 0,
+    "Pre-prepare rep size must be positive");
 
 /* --------------------------------------------------------------------------
  * Prepare  (tag = 4)  Replica → All
@@ -150,7 +155,7 @@ typedef struct __attribute__((packed)) {
 /* --------------------------------------------------------------------------
  * View_change  (tag = 8)  Replica → All
  * Wire: [hdr][View_change_rep][ckpts array][prepared bitmap][req_info array]
- *       [RSA signature]
+ *       [ECDSA P-256 signature]
  * -------------------------------------------------------------------------- */
 
 /* One checkpoint entry embedded in a View_change */
@@ -179,7 +184,7 @@ typedef struct __attribute__((packed)) {
 /* --------------------------------------------------------------------------
  * New_view  (tag = 9)  New Primary → All
  * Wire: [hdr][New_view_rep][prepared array][Pre_prepare set][authenticator]
- *       [RSA signature of New_view_rep]
+ *       [ECDSA P-256 signature of New_view_rep]
  * -------------------------------------------------------------------------- */
 
 typedef struct __attribute__((packed)) {

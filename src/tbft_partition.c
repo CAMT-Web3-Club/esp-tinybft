@@ -63,22 +63,16 @@ int tbft_ptree_init(tbft_ptree_t *tree, int num_blocks, int p_children)
         }
         total += n_at_l;
     }
-    tree->total_nodes = total;
-
     tree->ptree_mem = (tbft_part_t *)calloc((size_t)total, sizeof(tbft_part_t));
-    tree->stree_mem = (tbft_dsum_t *)calloc((size_t)total, sizeof(tbft_dsum_t));
-    if (!tree->ptree_mem || !tree->stree_mem) {
+    if (!tree->ptree_mem) {
         ESP_LOGE(TAG, "out of memory for partition tree (%d nodes)", total);
-        free(tree->ptree_mem);
-        free(tree->stree_mem);
         return -1;
     }
 
-    /* Slice backing arrays into per-level pointers */
+    /* Slice backing array into per-level pointers */
     int offset = 0;
     for (int l = 0; l < levels; l++) {
         tree->ptree[l] = tree->ptree_mem + offset;
-        tree->stree[l] = tree->stree_mem + offset;
         offset += tbft_ptree_nodes_at_level(l, p_children);
     }
 
@@ -90,7 +84,6 @@ int tbft_ptree_init(tbft_ptree_t *tree, int num_blocks, int p_children)
 void tbft_ptree_free(tbft_ptree_t *tree)
 {
     free(tree->ptree_mem);
-    free(tree->stree_mem);
     memset(tree, 0, sizeof(*tree));
 }
 
