@@ -10,5 +10,3 @@ client3 1c:db:d4:c6:41:14 /spiffs/pub3.der
 60000
 5000
 10000
-
-
