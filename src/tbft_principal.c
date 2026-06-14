@@ -204,9 +204,19 @@ int tbft_principal_gen_mac_out(const tbft_principal_t *p,
      * with the OLD key.  The receiver's in_key_prev fallback matches this.
      * Once the grace period expires, sign with the NEW key. */
     int64_t now = esp_timer_get_time();
+    /* FB-FIX (v0.9.0 → v0.9.1): Drop the `psa_hmac_out_id_old != 0` clause.
+     * On the FIRST call to tbft_principal_set_out_key, psa_hmac_out_id_old
+     * is 0 (transferred from the never-imported psa_hmac_out_id), so the
+     * old check would yield in_grace=false on the initial rotation.  This
+     * caused the first PP to be signed with the NEW ECDH-derived out_key
+     * while every receiver's hmac_in_key was still all-zeros from
+     * tbft_principal_init — every PP failed MAC verification until the
+     * 3s grace expired, by which time the cluster had already entered a
+     * view-change storm.  The cold path (line 218) re-imports
+     * hmac_out_key_old from raw bytes and is safe to use for the all-
+     * zeros initial key, matching the receiver's all-zeros in_key. */
     bool in_grace = (p->out_key_old_expires_us > 0) &&
-                    (now < p->out_key_old_expires_us) &&
-                    (p->psa_hmac_out_id_old != 0);
+                    (now < p->out_key_old_expires_us);
     mbedtls_svc_key_id_t kid = in_grace ? p->psa_hmac_out_id_old : p->psa_hmac_out_id;
     if (kid != 0) {
         psa_status_t st = psa_mac_compute(kid, PSA_ALG_HMAC(PSA_ALG_SHA_256),
@@ -229,9 +239,12 @@ bool tbft_principal_in_out_key_grace(const tbft_principal_t *p)
 {
     if (!p) return false;
     int64_t now = esp_timer_get_time();
+    /* FB-FIX: mirror of gen_mac_out fix — drop the psa_hmac_out_id_old != 0
+     * clause.  On the first rotation, in_grace must be true so the cold
+     * path imports the all-zeros hmac_out_key_old to match the receiver's
+     * all-zeros hmac_in_key. */
     return (p->out_key_old_expires_us > 0) &&
-           (now < p->out_key_old_expires_us) &&
-           (p->psa_hmac_out_id_old != 0);
+           (now < p->out_key_old_expires_us);
 }
 
 void tbft_principal_commit_out_key(tbft_principal_t *p)
@@ -343,10 +356,21 @@ void tbft_principal_set_out_key(tbft_principal_t *p, const tbft_hmac_key_t *key)
 
     p->hmac_out_key_old = p->hmac_out_key;
     p->psa_hmac_out_id_old = p->psa_hmac_out_id;  /* transfer ownership */
-    /* Set grace to 3 seconds.  The replica's rotate_key_tick commits
-     * after this period.  Long enough for the New_key broadcast to reach
-     * all 6 peers via ESP-NOW (typical <100ms) plus processing time. */
-    p->out_key_old_expires_us = esp_timer_get_time() + 3 * 1000 * 1000;
+    /* v0.9.1 FIX: Grace raised from 3s to 15s.  The incremental key rotation
+     * in tbft_replica_rotate_key_tick processes one peer at a time and
+     * then broadcasts the New_key.  Observed wall-clock: a single rotation
+     * takes ~6-15s end-to-end on this 7-replica cluster (per fresh log
+     * capture at 14:15), with the LAST handle_new_key arriving up to 6s
+     * after the broadcast.  3s was insufficient — the per-principal
+     * expiry fired before peers caught up, causing the B-FIX to use the
+     * new out_key while receivers still had the old in_key, producing
+     * `pp: MAC verification failed from primary N` and consensus stalls.
+     *
+     * TODO(proper-fix): replace the time-based grace with an explicit
+     * ack-based protocol.  Per-peer commit should fire when the replica
+     * has received the matching New_key from EVERY peer, not after a
+     * fixed delay.  This requires a small New_key_ack message type. */
+    p->out_key_old_expires_us = esp_timer_get_time() + 15 * 1000 * 1000;
 
     /* Install new key as the "active" out_key.  gen_mac_out will use the
      * old key during the grace period (see in_grace check above). */

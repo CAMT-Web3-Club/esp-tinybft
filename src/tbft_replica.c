@@ -3258,12 +3258,18 @@ void tbft_replica_rotate_key_tick(tbft_replica_t *r)
 
         /* B-FIX: Schedule the grace-period expiry.  set_out_key (Phase 2)
          * saved the OLD key bytes and set per-principal grace timers of
-         * 3 seconds each.  This replica-wide timestamp is the *latest*
-         * expiry: by the time it fires, every peer's per-principal grace
-         * has also expired and gen_mac_out will use the new key.
-         * 3s covers the ESP-NOW broadcast round-trip + replica processing
-         * (typical 50-200ms in this testbed). */
-        r->new_key_commit_at_us = esp_timer_get_time() + 3 * 1000 * 1000;
+         * 15 seconds each (v0.9.1: was 3s, raised because the
+         * end-to-end rotation latency on this 7-replica cluster is ~6-15s).
+         * This replica-wide timestamp is the *latest* expiry: by the
+         * time it fires, every peer's per-principal grace has also
+         * expired and gen_mac_out will use the new key.
+         *
+         * TODO(proper-fix): replace the time-based grace with an
+         * ack-based protocol — per-peer commit should fire when the
+         * replica has received the matching New_key from EVERY peer,
+         * not after a fixed delay.  This requires a New_key_ack
+         * message type and a per-peer pending state machine. */
+        r->new_key_commit_at_us = esp_timer_get_time() + 15 * 1000 * 1000;
 
         r->new_key_peer_idx = -1;
     }
