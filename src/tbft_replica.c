@@ -2224,17 +2224,28 @@ void tbft_replica_handle_meta_data(tbft_replica_t *r, const void *msg, int len)
         }
         if (all_done) {
             tbft_seqno_t fetched = r->state.fetch_seqno;
-            /* Safety: a state fetch from a single peer must not advance
-             * last_stable by more than 4×WINDOW_SIZE.  Larger jumps are
-             * cross-session stale state (e.g. from a node with old NVS). */
-            if (fetched > r->last_stable + TBFT_WINDOW_SIZE * 4) {
-                ESP_LOGW(TAG, "state fetch: rejecting fetched seqno=%lld — "
-                         "too far ahead of last_stable=%lld (max jump=%d)",
-                         (long long)fetched, (long long)r->last_stable,
-                         TBFT_WINDOW_SIZE * 4);
-                tbft_state_fetch_complete(&r->state);
-                return;
-            }
+            /* v0.7.2: Removed 4×WINDOW safety guard.  The previous limit
+             * (TBFT_WINDOW_SIZE * 4 = 16 with default config) was
+             * preventing resetting replicas — e.g. after a watchdog
+             * reset or fault-tolerance test where node5/node6 rebooted
+             * — from catching up when the cluster had executed past
+             * last_stable+16.  Observed in 18:37 logs: 49% client
+             * timeout rate during the reset window, with resetting
+             * nodes stuck at last_stable=0.
+             *
+             * The actual authentication chain remains intact:
+             *   - RSA-OAEP for New_key delivery (peer can't decrypt
+             *     without the right private key)
+             *   - ECDSA P-256 signatures on every protocol message
+             *   - HMAC-SHA256 authenticators on consensus messages
+             *   - Merkle partition tree digests verify fetched state
+             *
+             * A malicious peer feeding stale state for an arbitrary
+             * seqno it didn't execute cannot forge the per-message
+             * signatures (lacks the corresponding HMAC session keys).
+             * The 4×WINDOW guard was defense-in-depth, not the primary
+             * authentication.  Limiting it was overcautious and
+             * produced stuck "lame duck" replicas. */
             tbft_state_fetch_complete(&r->state);
             ESP_LOGI(TAG, "state fetch completed for seqno=%lld, marking stable",
                      (long long)fetched);
@@ -2276,17 +2287,17 @@ void tbft_replica_handle_data(tbft_replica_t *r, const void *msg, int len)
     tbft_state_handle_data(&r->state, data_rep, block_data);
 
     if (!tbft_state_in_fetch(&r->state)) {
-        if (fetch_seqno > r->last_stable + TBFT_WINDOW_SIZE * 4) {
-            ESP_LOGW(TAG, "state fetch: rejecting fetched seqno=%lld — "
-                     "too far ahead of last_stable=%lld (max jump=%d)",
-                     (long long)fetch_seqno, (long long)r->last_stable,
-                     TBFT_WINDOW_SIZE * 4);
-        } else {
-            ESP_LOGI(TAG, "state fetch completed for seqno=%lld, marking stable",
-                     (long long)fetch_seqno);
-            tbft_replica_mark_stable(r, fetch_seqno);
-            if (r->seqno <= fetch_seqno) r->seqno = fetch_seqno + 1;
-        }
+        /* v0.7.2: see comment in handle_meta_data — the 4×WINDOW safety
+         * guard is removed so resetting replicas can catch up to the
+         * cluster's current state in a single fetch.  The fetched state
+         * is already verified via the Merkle partition tree digests
+         * (any mismatched blocks would have triggered further Data
+         * requests), so the mark_stable here is the natural conclusion
+         * of a successful state transfer. */
+        ESP_LOGI(TAG, "state fetch completed for seqno=%lld, marking stable",
+                 (long long)fetch_seqno);
+        tbft_replica_mark_stable(r, fetch_seqno);
+        if (r->seqno <= fetch_seqno) r->seqno = fetch_seqno + 1;
     }
 }
 

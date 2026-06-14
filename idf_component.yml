@@ -1,4 +1,4 @@
-version: "0.7.1-rsa-keyparse-fix"
+version: "0.7.2-state-transfer-fix"
 description: TinyBFT — memory-optimised PBFT consensus for ESP-IDF
 url: https://github.com/CAMT-Web3-Club/esp-tinybft
 license: "BSD-3-Clause AND MIT"
