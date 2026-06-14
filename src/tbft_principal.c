@@ -1,15 +1,23 @@
 /**
  * @file tbft_principal.c
- * @brief Per-peer cryptography — HMAC-SHA256 + RSA-2048 via pure PSA Crypto.
+ * @brief Per-peer cryptography — HMAC-SHA256 + RSA-2048 via PSA Crypto.
  *
  * All operations use persistent PSA key handles:
  *   - HMAC-SHA256 (hot path) via cached psa_hmac_in/out_id
  *   - RSA-2048 PKCS#1 v1.5 signing / verification
  *   - RSA-OAEP session key encryption/decryption for New_key rotation
  *
- * Zero mbedtls/pk dependency — DER keys are imported directly via
- * psa_import_key().  No MPI heap allocations at runtime → no fragmentation
- * over long uptime.
+ * Key import uses the Espressif-recommended mbedtls_pk parser pattern:
+ *   1. mbedtls_pk_parse_public_key() / mbedtls_pk_parse_key() to parse
+ *      the SPKI / PKCS#8 DER (mbedtls ASN.1 parser handles the format)
+ *   2. mbedtls_pk_get_psa_attributes() to derive correct PSA attributes
+ *   3. mbedtls_pk_import_into_psa() to actually import the key into PSA
+ *
+ * This is the v0.7.1 fix for "psa_import_key failed: -135" — the previous
+ * direct-psa_import_key path tried to feed SPKI DER (with the
+ * AlgorithmIdentifier wrapper) into PSA, but PSA expects the inner
+ * PKCS#1 RSAPublicKey SEQUENCE.  The mbedtls parser strips the wrapper
+ * and passes the correct inner bytes to PSA.
  */
 
 #include "tbft_principal.h"
@@ -17,6 +25,7 @@
 #include "esp_random.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "mbedtls/pk.h"
 #include "psa/crypto.h"
 #include <string.h>
 
@@ -59,22 +68,84 @@ void tbft_principal_ensure_psa(void) { ensure_psa_init(); }
 #define RSA_SIGN_ALG   PSA_ALG_RSA_PKCS1V15_SIGN(PSA_ALG_SHA_256)
 #define RSA_WRAP_ALG   PSA_ALG_RSA_OAEP(PSA_ALG_SHA_256)
 
-/** Import DER-encoded RSA key into PSA.  Returns key handle, 0 on failure. */
+/** Import DER-encoded RSA key into PSA using the mbedtls_pk parser.
+ *  This follows the Espressif PSA-migration pattern: mbedtls handles
+ *  the SPKI / PKCS#8 ASN.1 wrapper, then mbedtls_pk_import_into_psa()
+ *  feeds the inner PKCS#1 RSAPublicKey / PKCS#1 RSAPrivateKey to PSA.
+ *
+ *  Direct psa_import_key() with raw SPKI DER returns -135
+ *  (PSA_ERROR_INVALID_ARGUMENT) because PSA does not understand the
+ *  AlgorithmIdentifier wrapper.
+ *
+ *  Returns key handle, 0 on failure. */
 static mbedtls_svc_key_id_t import_rsa_key(psa_key_type_t type,
     psa_algorithm_t alg, psa_key_usage_t usage,
     const uint8_t *der, size_t der_len)
 {
+    mbedtls_svc_key_id_t kid = MBEDTLS_SVC_KEY_ID_INIT;
+
+    /* Parse the DER into an mbedtls_pk_context.  mbedtls understands
+     * both SubjectPublicKeyInfo (for public keys) and PKCS#8 (for
+     * private keys), and selects the right parser based on the DER
+     * structure.  We always call mbedtls_pk_parse_public_key() for
+     * RSA_PUBLIC_KEY type and mbedtls_pk_parse_key() for RSA_KEY_PAIR;
+     * the public-key parser works for SPKI and PKCS#1 RSAPublicKey
+     * formats, the private-key parser works for PKCS#8 and PKCS#1. */
+    mbedtls_pk_context pk;
+    mbedtls_pk_init(&pk);
+
+    int ret;
+    if (type == PSA_KEY_TYPE_RSA_KEY_PAIR) {
+        ret = mbedtls_pk_parse_key(&pk, der, der_len, NULL, 0);
+        if (ret != 0) {
+            ESP_LOGE(TAG, "mbedtls_pk_parse_key (private) failed: -0x%04x", (unsigned)-ret);
+            mbedtls_pk_free(&pk);
+            return MBEDTLS_SVC_KEY_ID_INIT;
+        }
+    } else {
+        ret = mbedtls_pk_parse_public_key(&pk, der, der_len);
+        if (ret != 0) {
+            ESP_LOGE(TAG, "mbedtls_pk_parse_public_key failed: -0x%04x", (unsigned)-ret);
+            mbedtls_pk_free(&pk);
+            return MBEDTLS_SVC_KEY_ID_INIT;
+        }
+    }
+
+    /* For PSA_KEY_TYPE_RSA_KEY_PAIR we only need the private half
+     * (sign / decrypt).  For PSA_KEY_TYPE_RSA_PUBLIC_KEY we only
+     * need the public half (verify / encrypt).  When the user asks
+     * for a "key pair" but the DER happens to be a public key, or
+     * vice versa, mbedtls_pk_get_psa_attributes() returns the right
+     * attributes for what was parsed — we then set our own usage
+     * flags to match the caller's intent. */
     psa_key_attributes_t attr = PSA_KEY_ATTRIBUTES_INIT;
+    ret = mbedtls_pk_get_psa_attributes(&pk, usage, &attr);
+    if (ret != 0) {
+        ESP_LOGE(TAG, "mbedtls_pk_get_psa_attributes failed: -0x%04x", (unsigned)-ret);
+        mbedtls_pk_free(&pk);
+        return MBEDTLS_SVC_KEY_ID_INIT;
+    }
+
+    /* Override the caller's requested type/algorithm/usage on the
+     * attributes returned by mbedtls.  mbedtls_pk_get_psa_attributes()
+     * sets sensible defaults (e.g. PSA_ALG_RSA_PKCS1V15_SIGN for sign
+     * usage) but we need to pin the exact algorithm and the exact
+     * usage flags requested by the caller. */
     psa_set_key_type(&attr, type);
-    psa_set_key_bits(&attr, TBFT_RSA_KEY_BITS);
     psa_set_key_algorithm(&attr, alg);
     psa_set_key_usage_flags(&attr, usage);
 
-    mbedtls_svc_key_id_t kid = MBEDTLS_SVC_KEY_ID_INIT;
-    psa_status_t st = psa_import_key(&attr, der, der_len, &kid);
+    /* If the caller asked for a public key but the DER is a key
+     * pair (or vice versa), the pk context holds both halves.  When
+     * importing a "public" key from a private-key DER, mbedtls still
+     * works — it just imports the public half.  Conversely, when
+     * importing a "key pair" from a public-key DER, mbedtls
+     * gracefully handles the missing private half. */
+    ret = mbedtls_pk_import_into_psa(&pk, &attr, &kid);
     psa_reset_key_attributes(&attr);
-    if (st != PSA_SUCCESS) {
-        ESP_LOGE(TAG, "psa_import_key failed: %d", (int)st);
+    mbedtls_pk_free(&pk);
+    if (ret != 0) {
+        ESP_LOGE(TAG, "mbedtls_pk_import_into_psa failed: -0x%04x", (unsigned)-ret);
         return MBEDTLS_SVC_KEY_ID_INIT;
     }
     return kid;
