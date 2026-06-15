@@ -68,7 +68,12 @@ static const char *TAG = "tbft_espnow";
 #define ESPNOW_CREDITS_CAP          CONFIG_TBFT_ESPNOW_TX_CREDITS
 #endif
 #define ESPNOW_TX_CREDITS           ((ESPNOW_CREDITS_PER_CLUSTER) < (ESPNOW_CREDITS_CAP) ? (ESPNOW_CREDITS_PER_CLUSTER) : (ESPNOW_CREDITS_CAP))
-#define ESPNOW_CREDIT_TIMEOUT_MS    100
+#define ESPNOW_CREDIT_TIMEOUT_MS    300  /* v0.7.7: was 100, raised because
+                                            * long-run tests showed 119 'no
+                                            * send credit' events on node0
+                                            * under sustained load.  The
+                                            * 100ms was too aggressive for
+                                            * radio-busy periods. */
 
 #define SEND_TASK_SHUTDOWN  -999
 _Static_assert(SEND_TASK_SHUTDOWN < 0, "SEND_TASK_SHUTDOWN must be negative");
@@ -446,8 +451,14 @@ static int espnow_do_send(tbft_espnow_t *enow, tbft_node_id_t dest_id, uint16_t 
         int retries = 0;
         while (retries < MAX_RETRIES) {
             if (xSemaphoreTake(enow->send_credit_sem, credit_timeout) != pdTRUE) {
-                ESP_LOGW(TAG, "espnow_do_send: no send credit after %dms, dropping",
-                         ESPNOW_CREDIT_TIMEOUT_MS);
+                /* v0.7.7: enhanced diagnostic.  Show current free heap
+                 * and in-flight count to help identify resource exhaustion
+                 * vs radio-busy as the root cause. */
+                ESP_LOGW(TAG, "espnow_do_send: no send credit after %dms"
+                         " (msg_id=%u in_flight=%u freeHeap=%u)",
+                         ESPNOW_CREDIT_TIMEOUT_MS, (unsigned)msg_id,
+                         (unsigned)uxQueueMessagesWaiting(enow->in_flight_sends_sem),
+                         (unsigned)esp_get_free_heap_size());
                 return -1;
             }
             if (esp_now_send(ap_mac, pkt, len + sizeof(fhdr)) == ESP_OK) {
@@ -486,11 +497,20 @@ static int espnow_do_send(tbft_espnow_t *enow, tbft_node_id_t dest_id, uint16_t 
         int retries = 0;
         while (retries < MAX_RETRIES) {
             if (xSemaphoreTake(enow->send_credit_sem, credit_timeout) != pdTRUE) {
-                ESP_LOGW(TAG, "espnow_do_send: no send credit after %dms for frag %d/%d",
-                         ESPNOW_CREDIT_TIMEOUT_MS, frag_idx + 1, frag_total);
+                /* v0.7.7: enhanced diagnostic (see single-frag path). */
+                ESP_LOGW(TAG, "espnow_do_send: no send credit after %dms"
+                         " for frag %d/%d (msg_id=%u in_flight=%u freeHeap=%u)",
+                         ESPNOW_CREDIT_TIMEOUT_MS, frag_idx + 1, frag_total,
+                         (unsigned)msg_id,
+                         (unsigned)uxQueueMessagesWaiting(enow->in_flight_sends_sem),
+                         (unsigned)esp_get_free_heap_size());
                 return -1;
             }
-            if (esp_now_send(ap_mac, pkt, chunk + sizeof(fhdr)) == ESP_OK) break;
+            if (esp_now_send(ap_mac, pkt, chunk + sizeof(fhdr)) == ESP_OK) {
+                /* v0.7.7: record in-flight send. */
+                xSemaphoreGive(enow->in_flight_sends_sem);
+                break;
+            }
             xSemaphoreGive(enow->send_credit_sem);
             retries++;
             if (retries < MAX_RETRIES) {
