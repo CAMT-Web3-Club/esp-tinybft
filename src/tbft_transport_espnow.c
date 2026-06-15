@@ -138,6 +138,7 @@ typedef struct tbft_espnow {
     volatile bool reasm_stale_flag;
     volatile bool shutting_down;
     SemaphoreHandle_t send_credit_sem;
+    SemaphoreHandle_t in_flight_sends_sem; /* v0.7.7: tracks in-flight esp_now_send for clean shutdown */
     TickType_t last_fail_tick[TBFT_MAX_NUM_REPLICAS + TBFT_MAX_NUM_CLIENTS];
 } tbft_espnow_t;
 
@@ -318,6 +319,12 @@ static tbft_node_id_t find_node_by_mac_lockless(tbft_espnow_t *enow, const uint8
  * -------------------------------------------------------------------------- */
 
 static void espnow_send_cb(const esp_now_send_info_t *tx_info, esp_now_send_status_t status) {
+    /* v0.7.7: signal the in-flight tracker that this send completed.
+     * Must be done unconditionally (even on error or during shutdown)
+     * so tbft_transport_free's drain loop can make progress. */
+    if (g_espnow_ctx) {
+        xSemaphoreGive(g_espnow_ctx->in_flight_sends_sem);
+    }
     if (status != ESP_NOW_SEND_SUCCESS) {
         ESP_LOGW(TAG, "esp_now_send to " MACSTR " failed: %d", MAC2STR(tx_info->des_addr), (int)status);
     }
@@ -443,7 +450,12 @@ static int espnow_do_send(tbft_espnow_t *enow, tbft_node_id_t dest_id, uint16_t 
                          ESPNOW_CREDIT_TIMEOUT_MS);
                 return -1;
             }
-            if (esp_now_send(ap_mac, pkt, len + sizeof(fhdr)) == ESP_OK) break;
+            if (esp_now_send(ap_mac, pkt, len + sizeof(fhdr)) == ESP_OK) {
+                /* v0.7.7: record in-flight send so tbft_transport_free can
+                 * wait for the matching send_cb before freeing state. */
+                xSemaphoreGive(enow->in_flight_sends_sem);
+                break;
+            }
             xSemaphoreGive(enow->send_credit_sem);
             retries++;
             if (retries < MAX_RETRIES) {
@@ -629,11 +641,16 @@ int tbft_transport_create(tbft_transport_t **out, tbft_transport_type_t type, in
     enow->lock = xSemaphoreCreateMutex();
     enow->task_exit_sem = xSemaphoreCreateBinary();
     enow->send_credit_sem = xSemaphoreCreateCounting(ESPNOW_TX_CREDITS, ESPNOW_TX_CREDITS);
+    /* v0.7.7: in_flight_sends_sem starts at 0; send_task gives before
+     * esp_now_send, send_cb takes when done.  Shutdown waits for this
+     * to drain to 0 (or timeout). */
+    enow->in_flight_sends_sem = xSemaphoreCreateCounting(0xFFFF, 0);
 
-    if (!enow->lock || !enow->task_exit_sem || !enow->msg_queue || !enow->send_queue || !enow->send_credit_sem) {
-        ESP_LOGE(TAG, "queue/sem alloc failed: lock=%p sem=%p msg_q=%p send_q=%p free_heap=%u",
+    if (!enow->lock || !enow->task_exit_sem || !enow->msg_queue || !enow->send_queue || !enow->send_credit_sem || !enow->in_flight_sends_sem) {
+        ESP_LOGE(TAG, "queue/sem alloc failed: lock=%p sem=%p msg_q=%p send_q=%p freeHeap=%u",
                  enow->lock, enow->task_exit_sem, enow->msg_queue, enow->send_queue,
                  (unsigned)esp_get_free_heap_size());
+        if (enow->in_flight_sends_sem) vSemaphoreDelete(enow->in_flight_sends_sem);
         if (enow->send_credit_sem) vSemaphoreDelete(enow->send_credit_sem);
         if (enow->send_queue) vQueueDelete(enow->send_queue);
         if (enow->msg_queue) vQueueDelete(enow->msg_queue);
@@ -692,7 +709,28 @@ void tbft_transport_free(tbft_transport_t *t) {
     esp_now_unregister_send_cb();
     g_espnow_ctx = NULL;
 
-    vTaskDelay(pdMS_TO_TICKS(50));
+    /* v0.7.7: drain in-flight sends before unregistering the cb is final.
+     * Previously a 50ms hope-delay was used, which could leak in-flight
+     * sends (UAF risk if send_cb fires after we've freed enow).  Now we
+     * poll the in_flight_sends_sem for up to 200ms waiting for all
+     * pending esp_now_send calls to complete. */
+    {
+        const int drain_timeout_ms = 200;
+        int waited_ms = 0;
+        UBaseType_t initial_count = uxQueueMessagesWaiting(enow->in_flight_sends_sem);
+        while (uxQueueMessagesWaiting(enow->in_flight_sends_sem) > 0 && waited_ms < drain_timeout_ms) {
+            vTaskDelay(pdMS_TO_TICKS(5));
+            waited_ms += 5;
+        }
+        UBaseType_t final_count = uxQueueMessagesWaiting(enow->in_flight_sends_sem);
+        if (final_count > 0) {
+            ESP_LOGW(TAG, "transport_free: %u in-flight sends did not complete in %d ms (had %u at shutdown)",
+                     (unsigned)final_count, drain_timeout_ms, (unsigned)initial_count);
+        } else {
+            ESP_LOGD(TAG, "transport_free: drained %u in-flight sends in %d ms",
+                     (unsigned)initial_count, waited_ms);
+        }
+    }
 
     if (enow->send_queue && enow->send_task_handle) {
         send_entry_t sentinel = { .dest = SEND_TASK_SHUTDOWN };
@@ -711,6 +749,7 @@ void tbft_transport_free(tbft_transport_t *t) {
     if (enow->msg_queue) vQueueDelete(enow->msg_queue);
     if (enow->task_exit_sem) vSemaphoreDelete(enow->task_exit_sem);
     if (enow->send_credit_sem) vSemaphoreDelete(enow->send_credit_sem);
+    if (enow->in_flight_sends_sem) vSemaphoreDelete(enow->in_flight_sends_sem);
     if (enow->lock) vSemaphoreDelete(enow->lock);
     free(enow);
 }
