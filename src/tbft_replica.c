@@ -1011,7 +1011,14 @@ void tbft_replica_handle_pre_prepare(tbft_replica_t *r, const void *msg, int len
             r->last_executed = r->last_stable;
         }
         tbft_cr_truncate(&r->cr, r->last_stable);
-        tbft_ar_init(&r->ar, r->ar.prepare_threshold, r->ar.commit_threshold);
+        /* v0.7.7 fix (A3v2-F003 / bug #19): use truncate instead of init.
+         * Soft view-advance is triggered by receiving a higher-view PP
+         * (without going through the full VC/New_view protocol).  The
+         * old code wiped all in-flight prepared certs.  Now we
+         * preserve them — if there's an in-flight prepare for a
+         * seqno in the new window, it'll be re-issued as a fresh PP
+         * by the new primary. */
+        tbft_ar_truncate(&r->ar, r->last_stable + 1);
         r->ar.head = r->last_stable + 1;
         r->last_prepared = r->last_executed;
         tbft_itimer_stop(&r->vtimer);
@@ -1465,7 +1472,9 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
                 r->last_executed = r->last_stable;
             }
         tbft_cr_truncate(&r->cr, r->last_stable);
-        tbft_ar_init(&r->ar, r->ar.prepare_threshold, r->ar.commit_threshold);
+        /* v0.7.7 fix (A5-F004 / bug #17): use truncate instead of init
+         * to preserve in-flight prepared certs across view-change sync. */
+        tbft_ar_truncate(&r->ar, r->last_stable + 1);
         r->ar.head = r->last_stable + 1;
         r->last_prepared = r->last_executed;
             ESP_LOGI(TAG, "sync view to %lld (from vc of %d), seqno reset to %lld",
@@ -1675,7 +1684,16 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
         if (nv->min > r->last_executed) r->last_executed = nv->min;
         if (nv->min > r->last_prepared) r->last_prepared = nv->min;
         tbft_cr_truncate(&r->cr, nv->min);
-        tbft_ar_init(&r->ar, r->ar.prepare_threshold, r->ar.commit_threshold);
+        /* v0.7.7 fix (A5-F004 / bug #17): use truncate instead of init.
+         * Previously tbft_ar_init() wiped all in-flight prepared certs
+         * in the agreement region.  ar_truncate() shifts the window
+         * but preserves any in-flight certs that fit in the new
+         * window.  After a new-view install, any O-set seqnos that
+         * have prepared certs are kept (they'll get re-issued as
+         * fresh PPs by the primary in the new view).  Seqnos that
+         * don't fit are dropped — same as before, just without
+         * the gratuitous clear of the whole window. */
+        tbft_ar_truncate(&r->ar, nv->min + 1);
         r->ar.head = nv->min + 1;
         if (r->seqno >= r->ar.head + TBFT_WINDOW_SIZE) {
             ESP_LOGI(TAG, "new-view: advancing window head from %lld to %lld",
@@ -1802,9 +1820,11 @@ void tbft_replica_handle_new_view(tbft_replica_t *r, const void *msg, int len)
     if (nv->min > r->last_executed) r->last_executed = nv->min;
     if (nv->min > r->last_prepared) r->last_prepared = nv->min;
     tbft_cr_truncate(&r->cr, nv->min);
-    /* Fresh init: clear all agreement region state for the new view.
-     * Prepared seqnos from prior views will be re-fetched via fill. */
-    tbft_ar_init(&r->ar, r->ar.prepare_threshold, r->ar.commit_threshold);
+    /* v0.7.7 fix (A5-F004 / bug #17): use truncate instead of init
+     * to preserve in-flight prepared certs in the new window.
+     * See the longer comment in the new-view install path above
+     * (handle_new_view) for the full rationale. */
+    tbft_ar_truncate(&r->ar, nv->min + 1);
     r->ar.head = nv->min + 1;
 
     /* When nv->min is 0 (no stable checkpoint) but nv->n_prep carries
@@ -1940,11 +1960,11 @@ static void handle_status(tbft_replica_t *r, const void *msg, int len)
             r->vi.in_progress = false;
         }
         /* Re-initialise agreement and checkpoint regions for the new view.
-         * This mirrors the cleanup in handle_pre_prepare (lines 660-662).
-         * Without it, stale slice data from the old view could pollute
-         * certificate tracking in the new view. */
+         * v0.7.7 fix (A5-F004 / bug #17): use truncate instead of init
+         * to preserve in-flight prepared certs.  See the longer
+         * comment in handle_new_view for the full rationale. */
         tbft_cr_truncate(&r->cr, r->last_stable);
-        tbft_ar_init(&r->ar, r->ar.prepare_threshold, r->ar.commit_threshold);
+        tbft_ar_truncate(&r->ar, r->last_stable + 1);
         r->ar.head = r->last_stable + 1;
         r->last_prepared = r->last_executed;
 
