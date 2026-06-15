@@ -388,7 +388,7 @@ void tbft_replica_run(tbft_replica_t *r)
 
         if (r->evt_group) {
             /* Dead-primary detection: if we are a backup and have received
-             * no PP from the current primary within 30 s of view install,
+             * no PP from the current primary within 90 s of view install,
              * the primary is dead or stuck.  Trigger accelerated view-change
              * instead of waiting for the full vtimer (3+ minutes). */
              if (!tbft_replica_is_primary(r) && !r->vi.in_progress) {

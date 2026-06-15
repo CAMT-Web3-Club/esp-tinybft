@@ -403,7 +403,7 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *
          * priority inversion with send_task. */
         xSemaphoreGive(enow->lock);
 
-        if (xQueueSend(enow->msg_queue, &q_entry, 0) != pdTRUE) {
+        if (xQueueSend(enow->msg_queue, &q_entry, pdMS_TO_TICKS(10)) != pdTRUE) {
             if (enow->local_id >= enow->num_replicas && msg_tag == TBFT_MSG_REPLY) {
                 ESP_LOGD(TAG, "client msg_queue full, dropping unsolicited reply len=%d",
                          q_entry.buf_len);
