@@ -323,24 +323,36 @@ bool tbft_principal_verify_mac_in_with_replay_check(tbft_principal_t *p,
 
 void tbft_principal_set_in_key(tbft_principal_t *p, const tbft_hmac_key_t *key)
 {
-    /* Destroy old PSA key before replacing */
+    /* v0.7.7 fix (A1-F001): use temp variable, assign only after successful
+     * PSA import.  Previously, on import failure, hmac_in_key was
+     * overwritten with NEW bytes but psa_hmac_in_id == 0 — slow-fallback
+     * would then verify with the new bytes, producing false MAC
+     * verification failures.  Test the import FIRST, commit only if OK. */
+    mbedtls_svc_key_id_t new_psa_id = import_hmac_key(key, PSA_KEY_USAGE_VERIFY_MESSAGE);
+    if (new_psa_id == 0) {
+        ESP_LOGE(TAG, "set_in_key: PSA import FAILED for id=%d (key bytes kept as old)", (int)p->id);
+        p->keys_fresh = false;
+        /* Do NOT touch p->hmac_in_key or p->psa_hmac_in_id — keep the
+         * old key so future slow-fallback verifications use a working key. */
+        return;
+    }
+
+    /* Import succeeded — now safe to destroy old and install new. */
     if (p->psa_hmac_in_id != 0) {
         psa_destroy_key(p->psa_hmac_in_id);
-        p->psa_hmac_in_id = 0;
     }
     p->hmac_in_key = *key;
-    p->psa_hmac_in_id = import_hmac_key(key, PSA_KEY_USAGE_VERIFY_MESSAGE);
-    if (p->psa_hmac_in_id == 0) {
-        ESP_LOGE(TAG, "set_in_key: PSA import FAILED for id=%d", (int)p->id);
-        p->keys_fresh = false;
-    } else {
-        ESP_LOGD(TAG, "set_in_key: id=%d key[0..3]=%02x%02x%02x%02x psa_id=%u",
-                 (int)p->id, key->bytes[0], key->bytes[1], key->bytes[2], key->bytes[3],
-                 (unsigned)p->psa_hmac_in_id);
-        /* Self-test: compute MAC with temp key, verify with in_key */
+    p->psa_hmac_in_id = new_psa_id;
+
+    ESP_LOGD(TAG, "set_in_key: id=%d key[0..3]=%02x%02x%02x%02x psa_id=%u",
+             (int)p->id, key->bytes[0], key->bytes[1], key->bytes[2], key->bytes[3],
+             (unsigned)p->psa_hmac_in_id);
+
+    /* Self-test: compute MAC with temp key, verify with in_key */
+    bool self_test_ok = false;
+    {
         uint8_t test_msg[] = "test123";
         tbft_mac_t test_mac;
-        bool self_test_ok = false;
         mbedtls_svc_key_id_t kid = import_hmac_key(key, PSA_KEY_USAGE_SIGN_MESSAGE);
         if (kid != 0) {
             size_t mac_len = 0;
@@ -364,9 +376,9 @@ void tbft_principal_set_in_key(tbft_principal_t *p, const tbft_hmac_key_t *key)
         } else {
             ESP_LOGE(TAG, "set_in_key: import_hmac_key sign FAILED for id=%d", (int)p->id);
         }
-        /* Only mark keys fresh if self-test passed */
-        p->keys_fresh = (p->psa_hmac_in_id != 0 && self_test_ok);
     }
+    /* Only mark keys fresh if self-test passed */
+    p->keys_fresh = self_test_ok;
 
     /* Reset the anti-replay watermark: old timestamps belong to the previous
      * key stream.  Capture-and-replay of pre-rotation messages is prevented

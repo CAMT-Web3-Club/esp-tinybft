@@ -147,6 +147,14 @@ int tbft_replica_init(tbft_replica_t *r,
                       tbft_recv_reply_cb_t recv_reply_cb)
 {
     memset(r, 0, sizeof(*r));
+    /* v0.7.7 fix (A3v2-F001): explicit -1 sentinels.  memset(0) was
+     * setting these to 0, but the dedup check at line 2367 compares
+     * against the LATEST_ASSIGNED cid/rid — and cid=0 is a valid
+     * client id.  The first request from client 0 with rid 0 (or any
+     * later request from cid=0 that happens to roll the same rid)
+     * would be silently deduped as a "duplicate". */
+    r->last_assigned_cid = -1;
+    r->last_assigned_rid = -1;
 
     /* Init base node */
     if (tbft_node_init(&r->node, node_id, f, num_replicas, num_nodes,
@@ -393,7 +401,8 @@ void tbft_replica_run(tbft_replica_t *r)
                  * storm on every view install.  90s gives 25s margin over
                  * the worst-case 65s primary ramp.  See REVIEW_REPORT.md
                  * A5-F001 / FB-DeadPrimary. */
-                if (now - r->view_installed_us > 90 * 1000 * 1000LL &&
+                 if (now - r->view_installed_us > 90 * 1000 * 1000LL &&
+                    !r->state.in_fetch &&                /* v0.7.7 (A5-F002) */
                     r->last_executed <= r->view_start_executed) {
                     ESP_LOGW(TAG, "dead primary: no PP in %lld s,"
                              " accelerating view-change (view=%lld, primary=%d)",
@@ -1965,12 +1974,24 @@ static void handle_status(tbft_replica_t *r, const void *msg, int len)
             if (fetch_target == 0) fetch_target = TBFT_CHECKPOINT_INTERVAL;
         }
         if (fetch_target > r->last_stable && !r->state.in_fetch) {
-            int replier = tbft_node_primary(&r->node, st->view);
-            ESP_LOGI(TAG, "view catch-up triggered state fetch to seqno=%lld"
-                     " from primary %d", (long long)fetch_target, replier);
-            /* Stagger fetch starts to avoid all replicas fetching at once. */
-            r->last_fetch_throttle_us = esp_timer_get_time();
-            tbft_replica_start_fetch(r, fetch_target, replier);
+            /* v0.7.7 fix (L2-F009): prevent re-triggering catch-up immediately
+             * after a successful fetch.  Without this, a second view-catchup
+             * fires after the first one completes, resetting seqno=1 and
+             * disrupting consensus.  Skip catch-up for 10s after a
+             * successful one. */
+            int64_t now_throttle = esp_timer_get_time();
+            if (r->last_catchup_completed_us == 0 ||
+                (now_throttle - r->last_catchup_completed_us) > 10 * 1000 * 1000LL) {
+                int replier = tbft_node_primary(&r->node, st->view);
+                ESP_LOGI(TAG, "view catch-up triggered state fetch to seqno=%lld"
+                         " from primary %d", (long long)fetch_target, replier);
+                /* Stagger fetch starts to avoid all replicas fetching at once. */
+                r->last_fetch_throttle_us = now_throttle;
+                tbft_replica_start_fetch(r, fetch_target, replier);
+            } else {
+                ESP_LOGD(TAG, "view catch-up skipped: last completed %lld ms ago",
+                         (long long)((now_throttle - r->last_catchup_completed_us) / 1000));
+            }
         }
 
         /* Use exponential backoff so the view-change timer grows with each
@@ -2260,6 +2281,8 @@ void tbft_replica_handle_meta_data(tbft_replica_t *r, const void *msg, int len)
             tbft_replica_mark_stable(r, fetched);
             /* Advance seqno past the newly-stable checkpoint */
             if (r->seqno <= fetched) r->seqno = fetched + 1;
+            /* v0.7.7 fix (L2-F009): record catch-up completion. */
+            r->last_catchup_completed_us = esp_timer_get_time();
             return;
         }
     }
@@ -2306,6 +2329,9 @@ void tbft_replica_handle_data(tbft_replica_t *r, const void *msg, int len)
                  (long long)fetch_seqno);
         tbft_replica_mark_stable(r, fetch_seqno);
         if (r->seqno <= fetch_seqno) r->seqno = fetch_seqno + 1;
+        /* v0.7.7 fix (L2-F009): record when catch-up completed so the
+         * view-catchup trigger can skip re-triggering for 10s. */
+        r->last_catchup_completed_us = esp_timer_get_time();
     }
 }
 

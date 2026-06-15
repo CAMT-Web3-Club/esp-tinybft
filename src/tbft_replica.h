@@ -66,6 +66,7 @@ typedef struct {
     tbft_seqno_t  quorum_last_stable;     /* highest ckpt confirmed by 2f+1 (never set by fetch) */
     int64_t       last_ckpt_throttle_us;   /* last time we sent catch-up checkpoints */
     int64_t       last_fetch_throttle_us;   /* last time we initiated a state fetch */
+    int64_t       last_catchup_completed_us; /* v0.7.7: last time a catch-up fetch completed successfully */
     tbft_seqno_t  last_prepared;          /* highest prepared seqno */
     tbft_seqno_t  last_executed;          /* highest committed + executed */
     tbft_seqno_t  last_tentative_execute; /* highest tentatively executed */
