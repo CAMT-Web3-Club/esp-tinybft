@@ -1,4 +1,4 @@
-version: "0.7.5-entropy-retry-fix"
+version: "0.7.6-deadprimary-fix"
 description: TinyBFT — memory-optimised PBFT consensus for ESP-IDF
 url: https://github.com/CAMT-Web3-Club/esp-tinybft
 license: "BSD-3-Clause AND MIT"

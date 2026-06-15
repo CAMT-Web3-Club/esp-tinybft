@@ -383,9 +383,17 @@ void tbft_replica_run(tbft_replica_t *r)
              * no PP from the current primary within 30 s of view install,
              * the primary is dead or stuck.  Trigger accelerated view-change
              * instead of waiting for the full vtimer (3+ minutes). */
-            if (!tbft_replica_is_primary(r) && !r->vi.in_progress) {
+             if (!tbft_replica_is_primary(r) && !r->vi.in_progress) {
                 int64_t now = esp_timer_get_time();
-                if (now - r->view_installed_us > 30 * 1000 * 1000LL &&
+                /* v0.7.6 fix: dead-primary timeout raised from 30s to 90s.
+                 * Rationale: New_key cadence is 60s; primary ramp takes
+                 * ~5s (RSA encrypt for 6 peers) + ~0.1s (PP build).  The
+                 * 30s threshold fired before the primary could finish its
+                 * first New_key + PP cycle, producing a 30s view-cycling
+                 * storm on every view install.  90s gives 25s margin over
+                 * the worst-case 65s primary ramp.  See REVIEW_REPORT.md
+                 * A5-F001 / FB-DeadPrimary. */
+                if (now - r->view_installed_us > 90 * 1000 * 1000LL &&
                     r->last_executed <= r->view_start_executed) {
                     ESP_LOGW(TAG, "dead primary: no PP in %lld s,"
                              " accelerating view-change (view=%lld, primary=%d)",
