@@ -418,11 +418,29 @@ int tbft_principal_sign(tbft_principal_t *p,
     }
 
     size_t sig_len = 0;
-    psa_status_t st = psa_sign_hash(p->priv_sign_id, RSA_SIGN_ALG,
-                                     hash, hash_len,
-                                     sig->bytes, TBFT_SIG_SIZE, &sig_len);
+    psa_status_t st = PSA_ERROR_INSUFFICIENT_ENTROPY;
+    int retry_us = 1000;  /* 1 ms initial backoff */
+    for (int attempt = 0; attempt < 5; attempt++) {
+        sig_len = 0;
+        st = psa_sign_hash(p->priv_sign_id, RSA_SIGN_ALG,
+                           hash, hash_len,
+                           sig->bytes, TBFT_SIG_SIZE, &sig_len);
+        if (st == PSA_SUCCESS) break;
+        if (st != PSA_ERROR_INSUFFICIENT_ENTROPY) {
+            ESP_LOGE(TAG, "psa_sign_hash failed: %d", (int)st);
+            return (int)st;
+        }
+        /* v0.7.5 fix: transient entropy pool depletion.  Observed in
+         * 2026-06-15 long-run logs: 2815 PSA sign failures in a 10s
+         * window from a single WiFi-busy event.  Wait + retry. */
+        ESP_LOGD(TAG, "psa_sign_hash: -141 (entropy low), retry %d/5 in %d us",
+                 attempt + 1, retry_us);
+        esp_rom_delay_us(retry_us);
+        retry_us *= 2;
+        if (retry_us > 16000) retry_us = 16000;
+    }
     if (st != PSA_SUCCESS) {
-        ESP_LOGE(TAG, "psa_sign_hash failed: %d", (int)st);
+        ESP_LOGE(TAG, "psa_sign_hash failed after retries: %d", (int)st);
         return (int)st;
     }
     if (sig_len != TBFT_SIG_SIZE) {
@@ -469,12 +487,30 @@ int tbft_principal_encrypt_new_key(tbft_principal_t *p,
         return -1;
     }
 
-    psa_status_t st = psa_asymmetric_encrypt(p->pub_encrypt_id, RSA_WRAP_ALG,
-                                              new_out_key->bytes, sizeof(new_out_key->bytes),
-                                              NULL, 0,
-                                              enc_buf, enc_buf_len, out_enc_len);
+    /* v0.7.5 fix: Retry on PSA_ERROR_INSUFFICIENT_ENTROPY (-141).
+     * Same rationale as in tbft_principal_sign: transient hardware
+     * RNG pool depletion under WiFi load. */
+    psa_status_t st = PSA_ERROR_INSUFFICIENT_ENTROPY;
+    int retry_us = 1000;
+    for (int attempt = 0; attempt < 5; attempt++) {
+        *out_enc_len = 0;
+        st = psa_asymmetric_encrypt(p->pub_encrypt_id, RSA_WRAP_ALG,
+                                    new_out_key->bytes, sizeof(new_out_key->bytes),
+                                    NULL, 0,
+                                    enc_buf, enc_buf_len, out_enc_len);
+        if (st == PSA_SUCCESS) break;
+        if (st != PSA_ERROR_INSUFFICIENT_ENTROPY) {
+            ESP_LOGE(TAG, "psa_asymmetric_encrypt failed: %d", (int)st);
+            return (int)st;
+        }
+        ESP_LOGD(TAG, "psa_asymmetric_encrypt: -141 (entropy low), retry %d/5 in %d us",
+                 attempt + 1, retry_us);
+        esp_rom_delay_us(retry_us);
+        retry_us *= 2;
+        if (retry_us > 16000) retry_us = 16000;
+    }
     if (st != PSA_SUCCESS) {
-        ESP_LOGE(TAG, "psa_asymmetric_encrypt failed: %d", (int)st);
+        ESP_LOGE(TAG, "psa_asymmetric_encrypt failed after retries: %d", (int)st);
         return (int)st;
     }
     return 0;
