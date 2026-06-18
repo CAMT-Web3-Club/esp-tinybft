@@ -147,8 +147,14 @@ bool tbft_vi_verify_nv(const tbft_view_info_t *vi,
                 (const tbft_vc_req_info_t *)(proofs + p * sizeof(tbft_vc_req_info_t));
 
             int attestations = 0;
+            /* v0.7.8 fix (C-1 verifier / A9-F002, L7-F007): PBFT §4.4
+             * requires 2f+1 matching digests to prove a prepared cert.
+             * The previous `(threshold / 2) + 1` (= f+1 under integer
+             * division) stopped counting early, so a proof with only
+             * f+1 attestations would pass — a Byzantine primary plus one
+             * colluding replica could install an inconsistent view. */
             for (int r = 0; r < vi->num_replicas
-                 && attestations < (vi->threshold / 2) + 1; r++) {
+                 && attestations < vi->threshold; r++) {
                 if (!vi->received[r]) continue;
                 int vc_len = 0;
                 const uint8_t *vc_buf = tbft_sr_load_vc(vi->sr, r, &vc_len);
@@ -179,10 +185,12 @@ bool tbft_vi_verify_nv(const tbft_view_info_t *vi,
                     }
                 }
             }
-            if (attestations < (vi->threshold / 2) + 1) {
+            /* v0.7.8 fix (C-1 verifier / A9-F002, L7-F007):
+             * require 2f+1 attestations, not (threshold/2)+1 = f+1. */
+            if (attestations < vi->threshold) {
                 ESP_LOGW(TAG, "verify_nv: proof seqno=%lld has %d attestations (need %d)",
                          (long long)proof->seqno,
-                         attestations, (vi->threshold / 2) + 1);
+                         attestations, vi->threshold);
                 return false;
             }
         }

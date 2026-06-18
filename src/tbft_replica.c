@@ -72,13 +72,6 @@ static void rqueue_pop(tbft_rqueue_t *q) {
     q->count--;
 }
 
-static void rqueue_clear(tbft_rqueue_t *q) {
-    memset(q->entries, 0, sizeof(q->entries));
-    q->head  = 0;
-    q->tail  = 0;
-    q->count = 0;
-}
-
 /* --------------------------------------------------------------------------
  * Timer callbacks
  * -------------------------------------------------------------------------- */
@@ -1017,10 +1010,16 @@ void tbft_replica_handle_pre_prepare(tbft_replica_t *r, const void *msg, int len
          * old code wiped all in-flight prepared certs.  Now we
          * preserve them — if there's an in-flight prepare for a
          * seqno in the new window, it'll be re-issued as a fresh PP
-         * by the new primary. */
+         * by the new primary.
+         *
+         * v0.7.8 fix (C-2 site 3 / A9-F008, A9-F012): do NOT clobber
+         * r->last_prepared here either. The truncate above preserved
+         * the prepared cert in the agreement region; resetting
+         * last_prepared to last_executed immediately makes it
+         * invisible to send_pre_prepare's window check, producing
+         * "pre-prepare: out of window" rejections. */
         tbft_ar_truncate(&r->ar, r->last_stable + 1);
         r->ar.head = r->last_stable + 1;
-        r->last_prepared = r->last_executed;
         tbft_itimer_stop(&r->vtimer);
         tbft_vi_reset(&r->vi, r->node.view + 1);
         r->vi.in_progress = false;
@@ -1476,7 +1475,11 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
          * to preserve in-flight prepared certs across view-change sync. */
         tbft_ar_truncate(&r->ar, r->last_stable + 1);
         r->ar.head = r->last_stable + 1;
-        r->last_prepared = r->last_executed;
+        /* v0.7.8 fix (C-2 / A9-F008, A9-F012): do NOT clobber
+         * r->last_prepared here. The v0.7.7-stability-protocol fix above
+         * preserved in-flight prepared certs; resetting last_prepared to
+         * last_executed immediately made them invisible to send_pre_prepare,
+         * producing "pre-prepare: out of window" rejections. */
             ESP_LOGI(TAG, "sync view to %lld (from vc of %d), seqno reset to %lld",
                      (long long)vc->v, sender_id, (long long)r->seqno);
             /* REMOVED: catch-up view-change cascade accelerator.
@@ -1616,10 +1619,16 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
         int n_proofs = 0;
 
         /* Append prepared proofs with quorum.
-         * Guard each iteration: writing past body_end would overflow out_buf. */
+         * Guard each iteration: writing past body_end would overflow out_buf.
+         *
+         * v0.7.8 fix (C-1 / A9-F002, L7-F007): PBFT §4.4 requires 2f+1
+         * matching digests to prove a prepared certificate in a New_view
+         * (one fault could be Byzantine). The previous `>= f + 1` accepted
+         * proofs with only 2 attestations under f=2, allowing a malicious
+         * primary + 1 colluding replica to install an inconsistent view. */
         for (int k = 0; k < n_counts; k++) {
             int f = (r->node.num_replicas - 1) / 3;
-            if (counts[k].count >= f + 1) {
+            if (counts[k].count >= 2 * f + 1) {
                 if (body_ptr + sizeof(tbft_vc_req_info_t) > body_end) {
                     ESP_LOGE(TAG, "new-view: out_buf full, truncating proofs at %d", n_proofs);
                     break;
@@ -1700,7 +1709,12 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
                      (long long)r->ar.head, (long long)r->seqno);
             tbft_ar_truncate(&r->ar, r->seqno);
         }
-        r->last_prepared = r->last_executed;
+        /* v0.7.8 fix (C-2 / A9-F008, A9-F012): do NOT clobber
+         * r->last_prepared after a new-view install. The v0.7.7
+         * stability-protocol fix above kept in-flight prepared certs in
+         * the window; resetting last_prepared to last_executed made them
+         * invisible to send_pre_prepare's window check, producing
+         * "pre-prepare: out of window" rejections on the next PP. */
         tbft_itimer_stop(&r->vtimer);
         tbft_vi_reset(&r->vi, r->node.view + 1);
         r->vi.in_progress = false;
@@ -1835,7 +1849,12 @@ void tbft_replica_handle_new_view(tbft_replica_t *r, const void *msg, int len)
                  (long long)r->ar.head, (long long)r->seqno);
         tbft_ar_truncate(&r->ar, r->seqno);
     }
-    r->last_prepared = r->last_executed;
+    /* v0.7.8 fix (C-2 site 4 / A9-F008, A9-F012): do NOT clobber
+     * r->last_prepared here. This is the no-min-stable branch of
+     * handle_new_view; the truncate above preserved in-flight
+     * prepared certs.  Resetting last_prepared to last_executed
+     * would re-introduce the "out of window" rejection that
+     * v0.7.7-stability-protocol fixed. */
     if (tbft_replica_is_primary(r)) {
         ESP_LOGI(TAG, "new primary: seqno reset to %lld", (long long)r->seqno);
     } else {
@@ -1962,11 +1981,16 @@ static void handle_status(tbft_replica_t *r, const void *msg, int len)
         /* Re-initialise agreement and checkpoint regions for the new view.
          * v0.7.7 fix (A5-F004 / bug #17): use truncate instead of init
          * to preserve in-flight prepared certs.  See the longer
-         * comment in handle_new_view for the full rationale. */
+         * comment in handle_new_view for the full rationale.
+         *
+         * v0.7.8 fix (C-2 site 5 / A9-F008, A9-F012): do NOT clobber
+         * r->last_prepared here. The truncate preserved the in-flight
+         * prepared cert; resetting last_prepared to last_executed
+         * would re-introduce the "out of window" rejection that
+         * v0.7.7-stability-protocol fixed. */
         tbft_cr_truncate(&r->cr, r->last_stable);
         tbft_ar_truncate(&r->ar, r->last_stable + 1);
         r->ar.head = r->last_stable + 1;
-        r->last_prepared = r->last_executed;
 
         /* Keep sequence numbers contiguous and preserve executed/prepared progress */
         tbft_seqno_t start_seq = r->last_stable;
