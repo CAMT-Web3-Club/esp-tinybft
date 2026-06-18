@@ -325,7 +325,8 @@ static int setup_principals(tbft_node_t *node, const tbft_config_t *cfg,
                              const char *priv_config_path,
                              tbft_node_id_t local_id)
 {
-    for (int i = 0; i < cfg->num_nodes; i++) {
+    int i;
+    for (i = 0; i < cfg->num_nodes; i++) {
         tbft_principal_t *p =
             (tbft_principal_t *)calloc(1, sizeof(tbft_principal_t));
         if (!p) {
@@ -436,26 +437,36 @@ static int setup_principals(tbft_node_t *node, const tbft_config_t *cfg,
             }
             node->local_principal = p;
 
-            /* Verify public/private key pair consistency */
-            if (p->has_priv_key) {
-                int rc = mbedtls_pk_check_pair(&p->pub_pk, &p->priv_pk);
-                if (rc != 0) {
+            /* Verify public/private key pair consistency — PSA sign+verify self-test */
+            if (p->priv_sign_id != 0) {
+                uint8_t test_msg[] = "keypair_self_test";
+                tbft_sig_t test_sig;
+                int sr = tbft_principal_sign(p, test_msg, sizeof(test_msg)-1, &test_sig);
+                if (sr != 0) {
+                    ESP_LOGE(TAG, "key pair self-test: sign failed for node %d (ret=%d)", i, sr);
+                    goto cleanup_keypair;
+                }
+                bool vok = tbft_principal_verify_sig(p, test_msg, sizeof(test_msg)-1, &test_sig);
+                if (!vok) {
                     ESP_LOGE(TAG, "key pair mismatch for node %d: "
-                             "public and private keys do not correspond "
-                             "(mbedtls err=%d)", i, rc);
-                    for (int j = 0; j <= i; j++) {
-                        if (node->principals[j]) {
-                            tbft_principal_free(node->principals[j]);
-                            free(node->principals[j]);
-                            node->principals[j] = NULL;
-                        }
-                    }
-                    return -1;
+                             "public and private keys do not correspond", i);
+                    goto cleanup_keypair;
                 }
             }
         }
     }
     return 0;
+
+cleanup_keypair:
+    for (int j = 0; j <= i; j++) {
+        if (node->principals[j]) {
+            tbft_principal_free(node->principals[j]);
+            free(node->principals[j]);
+            node->principals[j] = NULL;
+        }
+    }
+    return -1;
+
 }
 
 /* --------------------------------------------------------------------------
@@ -524,11 +535,23 @@ int Byz_send_request(Byz_req *req, bool read_only)
 {
     if (!s_client) return -1;
 
-    /* Drain any stale replies or other messages in the transport queue */
+    /* Drain stale non-reply messages; process any queued replies inline.
+     * Discarding replies would lose them permanently — a previous recv_reply
+     * may have timed out while replies were still arriving. */
     if (!s_is_replica) {
         static uint8_t dummy[TBFT_MAX_MESSAGE_SIZE];
-        while (tbft_node_recv(s_client, dummy, sizeof(dummy), NULL) > 0) {
-            /* discard */
+        int drained;
+        for (int safety = 0; safety < 64; safety++) {
+            drained = tbft_node_recv(s_client, dummy, sizeof(dummy), NULL);
+            if (drained <= 0) break;
+            const tbft_msg_hdr_t *hdr = (const tbft_msg_hdr_t *)dummy;
+            if (drained >= (int)sizeof(*hdr) && hdr->tag == TBFT_MSG_REPLY) {
+                Byz_rep rep;
+                if (Byz_recv_reply(&rep) == 0) {
+                    /* Reply consumed — caller can re-check later */
+                }
+            }
+            /* Non-reply messages are stale — discard */
         }
     }
 
@@ -563,7 +586,7 @@ int Byz_send_request(Byz_req *req, bool read_only)
     /* Sign */
     tbft_sig_t *sig = (tbft_sig_t *)(cmd_ptr + req->size);
     memset(sig->bytes, 0, sizeof(sig->bytes));
-    if (s_client->local_principal && s_client->local_principal->has_priv_key) {
+    if (s_client->local_principal && s_client->local_principal->priv_sign_id != 0) {
         int64_t t0 = esp_timer_get_time();
         int sig_ret = tbft_node_gen_sig(s_client, out,
                                         sizeof(*rep) + (size_t)req->size,
@@ -747,6 +770,44 @@ int Byz_invoke(Byz_req *req, Byz_rep *rep, bool read_only)
     return Byz_recv_reply(rep);
 }
 
+int Byz_invoke_with_retry(Byz_req *req, Byz_rep *rep, bool read_only,
+                          int max_attempts)
+{
+    if (max_attempts < 1) return -1;
+    int delay_ms = 1000;
+    const int delay_cap_ms = 10000;
+    for (int attempt = 1; attempt <= max_attempts; attempt++) {
+        int ret = Byz_invoke(req, rep, read_only);
+        if (ret == 0) {
+            if (attempt > 1) {
+                ESP_LOGI(TAG, "invoke_with_retry: succeeded on attempt %d/%d",
+                         attempt, max_attempts);
+            }
+            return attempt;
+        }
+        if (attempt == max_attempts) {
+            ESP_LOGW(TAG, "invoke_with_retry: giving up after %d attempts",
+                     max_attempts);
+            return -1;
+        }
+        ESP_LOGW(TAG, "invoke_with_retry: attempt %d/%d failed,"
+                 " retrying in %dms",
+                 attempt, max_attempts, delay_ms);
+        /* Cooperative sleep — feed the task watchdog so we don't get
+         * killed while waiting. */
+        int slept = 0;
+        while (slept < delay_ms) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+#if CONFIG_ESP_TASK_WDT_EN
+            esp_task_wdt_reset();
+#endif
+            slept += 100;
+        }
+        delay_ms = (delay_ms * 2 < delay_cap_ms) ? delay_ms * 2 : delay_cap_ms;
+    }
+    return -1;
+}
+
 void Byz_free_request(Byz_req *req)
 {
     if (req && req->contents) {
@@ -905,6 +966,9 @@ int Byz_init_replica(const char *config_file, const char *priv_config,
     tbft_itimer_stop(&s_replica->stimer);
     /* Do NOT start vtimer on boot. It will be armed when a client request is received. */
     tbft_itimer_start(&s_replica->stimer, s_replica->stimer_period_us);
+
+    s_replica->view_installed_us = esp_timer_get_time();
+    s_replica->view_start_executed = s_replica->last_executed;
 
     s_is_replica = true;
     ESP_LOGI(TAG, "replica %d initialised", local_id);

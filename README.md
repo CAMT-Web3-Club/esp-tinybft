@@ -195,6 +195,89 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for full documentation covering
 
 ## Changelog
 
+### v0.4.0 — Cross-audit fixes
+
+- **SSH-5 (Critical): Fetch queue overflow → silent block drop:** BFS state fetch needs 273 entries (1 root + 16 internal + 256 leaves) but queue was 256. 17 leaf blocks silently dropped → permanent ptree divergence. Doubled queue to `TBFT_MAX_STATE_BLOCKS * 2`.
+- **CH-3 (High): Client `Byz_send_request` drains own queued replies:** The drain loop discarded all messages including queued replies from a timed-out `Byz_recv_reply`. Now processes replies inline instead of discarding.
+- **SSH-1 (High): Commit digest mismatch permanently skips seqno:** Previously set `last_executed = n` and `continue` → seqno permanently lost. Now `break`s and requests fill → view-change resolves deterministically (v0.3.1).
+- **SSH-3 (Medium): New_key size macro underestimated:** Used `TBFT_SIG_SIZE` (256) instead of `sizeof(tbft_new_key_slot_t)` (260) → 48-byte underestimate. Fixed buffer allocation.
+- **SSH-6 (Medium): Data race on `t->running` in timer:** Set `t->running = true` before `esp_timer_start_once` to prevent callback race. Reset to false on start failure.
+- **SSH-4**: Already guarded by `len < sizeof(tbft_pre_prepare_rep_t)` check at line 877 — no fix needed.
+
+### v0.3.6 — Missing timestamp write in send_new_key
+
+- **Fix v0.3.5 regression:** The M1 New_key replay guard reads `hdr.timestamp_us` but `send_new_key` never wrote it — the field was always 0. `last_key_install_time` starts at 0, so `0 <= 0` rejected every New_key silently → no HMAC keys installed → universal MAC failure → cluster dead. Added `nk->hdr.timestamp_us = esp_timer_get_time()` in `send_new_key`.
+
+### v0.3.5 — Fix 7 audit findings
+
+- **H1**: Guard against negative `st->last_stable` in Status → checkpoint-send loop.
+- **M1**: New_key replay guard via `hdr.timestamp_us` stored in `tbft_principal_t.last_key_install_time`.
+- **M2**: Reorder New_view handler — RSA signature verification before body processing (`tbft_vi_verify_nv`).
+- **M3**: Fix proof attestation threshold from `threshold-1` (2f) to `threshold/2+1` (f+1) matching standard PBFT.
+- **L1**: SR_STORE macro: add `(mlen) < 0` guard before `memcpy`.
+- **L2**: Reply alignment: account for `tbft_msg_align` padding (up to 7 bytes) in `out_buf` check.
+- **L3**: Zero digest on hash failure: use `0xFF` instead of `0` to prevent false match.
+
+### v0.3.4 — Suppress fill re-detection during view-change
+
+- **Prevent `execute_committed` from re-starting fill while `vi.in_progress`:** When v0.3.1 triggers a view change for a prepared-but-uncommitted seqno, `execute_committed` runs on the next main-loop iteration and re-detects the same gap — setting `pending_fill_seqno` again and starting a competing 10-second fill timer. If the view change takes longer than 10 seconds (common with ESP-NOW congestion), the fill timer fires, finds the PP was disposed by the view change, and abandons the seqno anyway. Now `execute_committed` skips fill initiation while a view change is in progress — the VC is already handling the gap.
+
+### v0.3.3 — Fallback fetch target when cluster has no genuine checkpoints
+
+- **Fix catch-up deadlock with `quorum_last_stable`:** v0.3.2 introduced `quorum_last_stable` which correctly prevents fetch-derived state from blocking checkpoint quorum, but broke fresh-node catch-up when the entire cluster lacked genuine checkpoints (all nodes report `quorum_last_stable==0`). Path A and Path B both compared `st->last_stable` against `r->last_stable` — both zero → no fetch ever triggered. Now both paths compute a fallback fetch target from `st->last_executed` (nearest checkpoint boundary below the peer's execution point) when `st->last_stable==0`, ensuring newly booted nodes can always catch up.
+
+### v0.3.2 — Prevent fetch-derived state from blocking checkpoint quorum
+
+- **Separate `quorum_last_stable` from fetch-derived `last_stable`:** A node that boots late and fetches state marks its `last_stable` to the fetched seqno, causing Status messages to report "I'm stable at N". Peers stop sending their checkpoints for N — but the fetched node's ptree root digest may differ from the cluster consensus. When the cluster later tries to checkpoint at N+2, the digest mismatch prevents quorum from ever forming, deadlocking the window and triggering a view-change loop. The fix: `r->quorum_last_stable` (new field) is only advanced by genuine checkpoint quorums (winning digest matched). Status messages report `quorum_last_stable` instead of `last_stable` — a fetched node reports 0 until a genuine quorum forms, so peers keep sending checkpoints until consensus is reached.
+
+### v0.3.1 — Deterministic commit-gap recovery
+
+- **Replace abandon with view-change when prepare quorum exists:** Commit gaps where a prepare quorum (2f+1 matching Prepares) already formed can no longer be abandoned — the request IS certified, only commits are missing due to network drops. Abandoning would create permanent state divergence (some nodes committed, some abandoned) that blocks all future checkpoints. Now triggers a view change instead: the new primary collects prepared state from all replicas via VC messages, and every node reaches the same commit/execute decision deterministically. Trivial gaps (no PP, or PP stored but no prepare quorum) are still abandoned safely since nobody has certified state.
+
+### v0.3.0 — Security audit fixes
+
+- **Fix #1 (Critical) — OOB bounds check in `handle_new_view`:** Added proof-size validation before reading `n_prep` entries. A malicious primary with `hdr.size == sizeof(*nv)` but `n_prep == WINDOW_SIZE` would cause out-of-bounds reads in the proof loops. Now `body_size >= sizeof(*nv) + n_prep * sizeof(tbft_vc_req_info_t)` is enforced.
+- **Fix #2 (High) — Exponential backoff shift always computed as 0:** At three sites (`handle_view_change`, `handle_new_view`, `handle_status`), `r->node.view` was overwritten before computing the view-gap for the vtimer backoff period. The gap was always 0, clamping the shift to 1 and preventing exponential growth. Now captures `old_view` before the overwrite.
+- **Fix #3 (High) — Per-proof verification in `tbft_vi_verify_nv`:** The New_view message's `n_prep` proofs were accepted without verification against collected View_change messages. A Byzantine primary could inject arbitrary proofs to advance `last_executed`. Now each proof must be attested by at least `f+1` collected VCs.
+- **Fix #4 (High) — `last_stable` set without checkpoint quorum:** The window-head advance path in `handle_new_view` set `r->last_stable = r->seqno - 1` without any checkpoint quorum proof. Now only the window head advances; `last_stable` stays at the verified `nv->min`.
+- **Fix #5 (Medium) — ESP-NOW shutdown semaphore race:** The `espnow_send_cb` could attempt `xSemaphoreGive` on a deleted semaphore during shutdown. Added `shutting_down` flag check before the semaphore operation.
+- **Fix #6/#7 (Medium) — vtimer backoff wiped on progress:** Marking a stable checkpoint or sending a pre-prepare reset the vtimer to the base period, discarding any accumulated exponential backoff from prior view-change turbulence. Now uses half the current backoff period as the floor (`max(base, period/2)`).
+- **Fix #8 (Low) — `fill_sent_us` not cleared on truncate:** `tbft_ar_truncate` cleared `commit_sent_us` but not `fill_sent_us`. When a slice was reused after window wrap, a stale `fill_sent_us` could bypass the fill throttle. Now both fields are cleared.
+- **Fix #9 (Low) — Stale-view fill requests:** `handle_fill_request` now drops requests whose `fr->view != r->node.view`, avoiding wasted HMAC verification and PP re-transmission for old-view fills.
+- **Fix #11 (Low) — Misleading comment:** Corrected a comment claiming fill responses could come from "any replica" — the HMAC keys restrict it to the primary.
+
+### v0.2.19
+
+- **Revert v0.2.18 primary-vtimer-suppress:** Preventing the primary from calling `send_view_change` on its own vtimer (v0.2.18) proved to be a regression — the primary must participate in the view-change protocol to contribute its prepared certificates. Without the primary's view-change message the new primary may lack complete prepare state, causing cascading incomplete view changes.
+- **Skip enqueue during view-change instead:** The correct fix for the request-queue-full problem is to skip enqueuing client requests on the primary while `vi.in_progress` is true.  `send_pre_prepare` returns immediately in that state (line 2124), so any queued request would just sit, fill the queue, and get dropped with log spam.  Silently returning lets the client retry with exponential backoff; by the next attempt the view change will normally be complete and the correct primary handles the request.
+
+### v0.2.17
+
+- **Commit re-broadcast during fill gap:** When the fill mechanism detects a stuck seqno where the pre-prepare is stored and prepare quorum is reached but commit quorum is not, it now **actively re-broadcasts the local commit** every 500ms (Layer 1.5). Previously the replica waited passively for commits to arrive during the 10-second fill window; with exactly 2f+1 live replicas, a single commit packet dropped by an unreliable transport (ESP-NOW `no send credit`, UDP loss) could block consensus until the Layer-2 abandon fired. Each re-send may trigger `handle_commit` on other replicas, which re-send their own commits — closing the gap through a chain reaction. Rate-limited to 500ms and gated on `tbft_ar_prepared` + `!tbft_ar_committed` (same guards as the existing `handle_commit` re-send path).
+
+### v0.2.16
+
+- **Prevent infinite state-fetch loop after node reboot:** Added `st->last_stable > r->last_stable` guard to the `handle_status` Path B fetch trigger (which already checked `st->last_executed > r->last_executed` and execution gap > `CHECKPOINT_INTERVAL`). After a rebooted node marks a stable checkpoint, Path B would previously re-fetch the same `last_stable` seqno whenever a peer had higher `last_executed` — a no-op that never advances the node. The guard aligns Path B with Path A (view catch-up), which already had this check.
+- **Diagnostic logging for post-fetch digest mismatch:** Enhanced the `mark_stable` log message when a checkpoint digest mismatch is detected after a completed state fetch. The log now prints the first 8 bytes + last byte of both the winning checkpoint digest and the local ptree root digest, plus the `in_fetch` flag and `fetch_seqno`. This provides evidence to determine whether the mismatch is caused by stale checkpoint data in the CR (fixable by clearing CR) or a genuine state reconstruction bug in the ptree.
+
+### v0.2.15
+
+- **Fill short-circuit when PP is already stored:** When the fill mechanism's `pending_fill_seqno` slot already contains a pre-prepare, the Layer-1 fill request is now skipped — the gap is about missing commit certificates, not the PP itself. Previously the fill block re-requested the same PP every 500ms for 10 seconds, hitting `tbft_prepared_cert_add_pp`'s "slot occupied" check and wasting bandwidth, before the abandon log message misleadingly said "no replica had the PP" when the local replica had stored it on the first reception. The backup now waits passively for the missing commits; the 10-second abandon still fires as a last-resort fallback.
+- **More accurate abandon log message:** When the fill mechanism's 10s abandon fires, the log now distinguishes between "PP stored but commit quorum not reached" (the most common case in production, likely network drop or Byzantine withholding) and "no replica had the PP" (the original gap-stall case from v0.2.14). The text shown on the operator's serial console is now actionable.
+- **No protocol changes:** Wire format and message tags unchanged. This is a behaviour refinement to the v0.2.14 fill/abandon mechanism.
+
+### v0.2.14
+
+- **Fill timeout + abandon (recovery from PP loss after node failure):** When a stuck seqno cannot be filled by the current primary within 10 seconds (e.g., the original sender crashed before the broadcast reached any of the new primaries after view changes), the local replica now **abandons the seqno** — `last_executed` is force-advanced past it, unblocking the cluster. The client's request at that seqno is effectively a no-op on this replica; the client detects `TBFT_CLIENT_REPLY_TIMEOUT_MS` and must retransmit. Bounded state divergence (≤ `f+1` replicas) is recovered on the next checkpoint via the existing state-fetch protocol.
+
+  A cross-view broadcast-fill (sending fill requests to all replicas) was considered but does not help: the PP stored in any backup's ar slot is for the original view, and the requester (in a later view) rejects PPs from earlier views in `handle_pre_prepare`. Abandon is the correct recovery for the cross-view PP-loss case.
+
+  Fixes the "1 node down → no consensus" deadlock observed when a primary crashes mid-broadcast and no replica (including subsequent primaries) holds the pre-prepare.
+
+- **`Byz_invoke_with_retry()` client API:** New library-level retry helper. Bounded attempts with exponential backoff (1s, 2s, 4s, ..., capped at 10s). Returns the number of attempts used on success. Both example apps (`counter`, `simple_wallet`) updated to use it with 3-attempt retry. Survives requests that are abandoned by the cluster due to the fill mechanism timing out.
+
+- **No protocol changes:** Wire format and message tags unchanged. The escalation policy is purely a recovery-path improvement; consensus rules and message semantics are identical to v0.2.13.
+
 ### v0.2.13
 
 - **Gap-fill (`Fill_request`):** Replicas can request a re-sent pre-prepare from the primary when commits arrive out of order. Closes the gap-stall bug where `seqno N+1` would commit before `N`, causing the execution loop to freeze for minutes until a view-change. The new `TBFT_MSG_FILL_REQUEST` (tag 18) is a 72-byte HMAC-authenticated unicast; the primary re-sends the original stored pre-prepare bytes (still HMAC-valid), letting the backup run the normal prepare/commit flow and close the gap. No protocol correctness regression.

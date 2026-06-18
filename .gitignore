@@ -36,3 +36,14 @@ examples/**/spiffs_image/pub*.der
 .claude/
 .antigravitycli
 gha-creds-*.json
+
+# Clang-tidy cache
+.clang-tidy
+
+# Ultra-debug swarm artifacts (local-only, regenerated on demand)
+.swarm/
+
+# Review reports (local-only, regenerated on demand)
+REVIEW_REPORT.md
+RUNTIME_ANALYSIS.md
+FINDINGS_FEEDBACK.md

@@ -1,16 +1,23 @@
 /**
  * @file tbft_principal.c
- * @brief Per-peer cryptography — HMAC-SHA256 (hot path) + RSA-2048 (slow path).
+ * @brief Per-peer cryptography — HMAC-SHA256 + RSA-2048 via PSA Crypto.
  *
- * Handles all cryptographic operations for individual principals:
- *   - HMAC-SHA256 via PSA Crypto (persistent key handles for performance)
- *   - RSA-2048 signing and verification (MbedTLS pk layer)
- *   - RSA-OAEP session key encryption/decryption for key rotation
- *   - Anti-replay timestamp tracking
+ * All operations use persistent PSA key handles:
+ *   - HMAC-SHA256 (hot path) via cached psa_hmac_in/out_id
+ *   - RSA-2048 PKCS#1 v1.5 signing / verification
+ *   - RSA-OAEP session key encryption/decryption for New_key rotation
  *
- * Crypto migration note: Uses PSA Crypto API for symmetric primitives
- * (SHA-256, HMAC) because MbedTLS 4.x removed classic md/sha256 APIs.
- * Asymmetric operations still use mbedtls/pk.h for RSA.
+ * Key import uses the Espressif-recommended mbedtls_pk parser pattern:
+ *   1. mbedtls_pk_parse_public_key() / mbedtls_pk_parse_key() to parse
+ *      the SPKI / PKCS#8 DER (mbedtls ASN.1 parser handles the format)
+ *   2. mbedtls_pk_get_psa_attributes() to derive correct PSA attributes
+ *   3. mbedtls_pk_import_into_psa() to actually import the key into PSA
+ *
+ * This is the v0.7.1 fix for "psa_import_key failed: -135" — the previous
+ * direct-psa_import_key path tried to feed SPKI DER (with the
+ * AlgorithmIdentifier wrapper) into PSA, but PSA expects the inner
+ * PKCS#1 RSAPublicKey SEQUENCE.  The mbedtls parser strips the wrapper
+ * and passes the correct inner bytes to PSA.
  */
 
 #include "tbft_principal.h"
@@ -22,18 +29,14 @@
 #include "psa/crypto.h"
 #include <string.h>
 
-/* Upper-bound slack for future-dated timestamps.  A Byzantine peer holding
- * the in-key can otherwise send a single message with msg_time_us near
- * INT64_MAX, latching last_auth_time_us and silently rejecting every
- * subsequent legitimate message as "stale". */
 #ifndef TBFT_ANTI_REPLAY_FUTURE_SLACK_US
-#define TBFT_ANTI_REPLAY_FUTURE_SLACK_US  ((int64_t)300 * 1000 * 1000) /* 5 min: allow for staggered boot */
+#define TBFT_ANTI_REPLAY_FUTURE_SLACK_US  ((int64_t)300 * 1000 * 1000)
 #endif
 
 static const char *TAG = "tbft_principal";
 
 /* --------------------------------------------------------------------------
- * Module-level PSA init (idempotent; called once before first crypto op)
+ * Module-level PSA init (idempotent)
  * -------------------------------------------------------------------------- */
 
 static bool s_psa_init = false;
@@ -42,33 +45,110 @@ static portMUX_TYPE s_psa_spinlock = portMUX_INITIALIZER_UNLOCKED;
 static void ensure_psa_init(void)
 {
     if (s_psa_init) return;
-
-    /* Claim the init responsibility under spinlock so only one caller
-     * proceeds, but release before calling psa_crypto_init() — that
-     * routine may allocate heap or take OS objects and must NOT run
-     * inside a critical section (interrupts disabled). */
     bool do_init = false;
     portENTER_CRITICAL(&s_psa_spinlock);
-    if (!s_psa_init) {
-        do_init = true;
-    }
+    if (!s_psa_init) do_init = true;
     portEXIT_CRITICAL(&s_psa_spinlock);
-
     if (do_init) {
         psa_status_t st = psa_crypto_init();
         if (st == PSA_SUCCESS) {
             portENTER_CRITICAL(&s_psa_spinlock);
             s_psa_init = true;
             portEXIT_CRITICAL(&s_psa_spinlock);
-        } else {
-            abort();
-        }
+        } else { abort(); }
     }
 }
 
-void tbft_principal_ensure_psa(void)
+void tbft_principal_ensure_psa(void) { ensure_psa_init(); }
+
+/* --------------------------------------------------------------------------
+ * PSA key import helpers
+ * -------------------------------------------------------------------------- */
+
+#define RSA_SIGN_ALG   PSA_ALG_RSA_PKCS1V15_SIGN(PSA_ALG_SHA_256)
+#define RSA_WRAP_ALG   PSA_ALG_RSA_OAEP(PSA_ALG_SHA_256)
+
+/** Import DER-encoded RSA key into PSA using the mbedtls_pk parser.
+ *  This follows the Espressif PSA-migration pattern: mbedtls handles
+ *  the SPKI / PKCS#8 ASN.1 wrapper, then mbedtls_pk_import_into_psa()
+ *  feeds the inner PKCS#1 RSAPublicKey / PKCS#1 RSAPrivateKey to PSA.
+ *
+ *  Direct psa_import_key() with raw SPKI DER returns -135
+ *  (PSA_ERROR_INVALID_ARGUMENT) because PSA does not understand the
+ *  AlgorithmIdentifier wrapper.
+ *
+ *  Returns key handle, 0 on failure. */
+static mbedtls_svc_key_id_t import_rsa_key(psa_key_type_t type,
+    psa_algorithm_t alg, psa_key_usage_t usage,
+    const uint8_t *der, size_t der_len)
 {
-    ensure_psa_init();
+    mbedtls_svc_key_id_t kid = MBEDTLS_SVC_KEY_ID_INIT;
+
+    /* Parse the DER into an mbedtls_pk_context.  mbedtls understands
+     * both SubjectPublicKeyInfo (for public keys) and PKCS#8 (for
+     * private keys), and selects the right parser based on the DER
+     * structure.  We always call mbedtls_pk_parse_public_key() for
+     * RSA_PUBLIC_KEY type and mbedtls_pk_parse_key() for RSA_KEY_PAIR;
+     * the public-key parser works for SPKI and PKCS#1 RSAPublicKey
+     * formats, the private-key parser works for PKCS#8 and PKCS#1. */
+    mbedtls_pk_context pk;
+    mbedtls_pk_init(&pk);
+
+    int ret;
+    if (type == PSA_KEY_TYPE_RSA_KEY_PAIR) {
+        ret = mbedtls_pk_parse_key(&pk, der, der_len, NULL, 0);
+        if (ret != 0) {
+            ESP_LOGE(TAG, "mbedtls_pk_parse_key (private) failed: -0x%04x", (unsigned)-ret);
+            mbedtls_pk_free(&pk);
+            return MBEDTLS_SVC_KEY_ID_INIT;
+        }
+    } else {
+        ret = mbedtls_pk_parse_public_key(&pk, der, der_len);
+        if (ret != 0) {
+            ESP_LOGE(TAG, "mbedtls_pk_parse_public_key failed: -0x%04x", (unsigned)-ret);
+            mbedtls_pk_free(&pk);
+            return MBEDTLS_SVC_KEY_ID_INIT;
+        }
+    }
+
+    /* For PSA_KEY_TYPE_RSA_KEY_PAIR we only need the private half
+     * (sign / decrypt).  For PSA_KEY_TYPE_RSA_PUBLIC_KEY we only
+     * need the public half (verify / encrypt).  When the user asks
+     * for a "key pair" but the DER happens to be a public key, or
+     * vice versa, mbedtls_pk_get_psa_attributes() returns the right
+     * attributes for what was parsed — we then set our own usage
+     * flags to match the caller's intent. */
+    psa_key_attributes_t attr = PSA_KEY_ATTRIBUTES_INIT;
+    ret = mbedtls_pk_get_psa_attributes(&pk, usage, &attr);
+    if (ret != 0) {
+        ESP_LOGE(TAG, "mbedtls_pk_get_psa_attributes failed: -0x%04x", (unsigned)-ret);
+        mbedtls_pk_free(&pk);
+        return MBEDTLS_SVC_KEY_ID_INIT;
+    }
+
+    /* Override the caller's requested type/algorithm/usage on the
+     * attributes returned by mbedtls.  mbedtls_pk_get_psa_attributes()
+     * sets sensible defaults (e.g. PSA_ALG_RSA_PKCS1V15_SIGN for sign
+     * usage) but we need to pin the exact algorithm and the exact
+     * usage flags requested by the caller. */
+    psa_set_key_type(&attr, type);
+    psa_set_key_algorithm(&attr, alg);
+    psa_set_key_usage_flags(&attr, usage);
+
+    /* If the caller asked for a public key but the DER is a key
+     * pair (or vice versa), the pk context holds both halves.  When
+     * importing a "public" key from a private-key DER, mbedtls still
+     * works — it just imports the public half.  Conversely, when
+     * importing a "key pair" from a public-key DER, mbedtls
+     * gracefully handles the missing private half. */
+    ret = mbedtls_pk_import_into_psa(&pk, &attr, &kid);
+    psa_reset_key_attributes(&attr);
+    mbedtls_pk_free(&pk);
+    if (ret != 0) {
+        ESP_LOGE(TAG, "mbedtls_pk_import_into_psa failed: -0x%04x", (unsigned)-ret);
+        return MBEDTLS_SVC_KEY_ID_INIT;
+    }
+    return kid;
 }
 
 /* --------------------------------------------------------------------------
@@ -81,51 +161,59 @@ void tbft_principal_init(tbft_principal_t *p, tbft_node_id_t id,
     memset(p, 0, sizeof(*p));
     p->id   = id;
     p->addr = *addr;
-    mbedtls_pk_init(&p->pub_pk);
-    mbedtls_pk_init(&p->priv_pk);
     ensure_psa_init();
 }
 
 int tbft_principal_load_pub_key(tbft_principal_t *p,
                                 const uint8_t *der, size_t der_len)
 {
-    int ret = mbedtls_pk_parse_public_key(&p->pub_pk, der, der_len);
-    if (ret != 0) {
-        ESP_LOGE(TAG, "parse_public_key failed: -0x%04x", (unsigned)(-ret));
+    /* Destroy old handles if re-loading */
+    if (p->pub_verify_id  != 0) { psa_destroy_key(p->pub_verify_id);  p->pub_verify_id  = 0; }
+    if (p->pub_encrypt_id != 0) { psa_destroy_key(p->pub_encrypt_id); p->pub_encrypt_id = 0; }
+
+    p->pub_verify_id = import_rsa_key(PSA_KEY_TYPE_RSA_PUBLIC_KEY,
+        RSA_SIGN_ALG, PSA_KEY_USAGE_VERIFY_HASH, der, der_len);
+    if (p->pub_verify_id == 0) return -1;
+
+    p->pub_encrypt_id = import_rsa_key(PSA_KEY_TYPE_RSA_PUBLIC_KEY,
+        RSA_WRAP_ALG, PSA_KEY_USAGE_ENCRYPT, der, der_len);
+    if (p->pub_encrypt_id == 0) {
+        psa_destroy_key(p->pub_verify_id);
+        p->pub_verify_id = 0;
+        return -1;
     }
-    return ret;
+    return 0;
 }
 
 int tbft_principal_load_priv_key(tbft_principal_t *p,
                                  const uint8_t *der, size_t der_len)
 {
-    /* MbedTLS 4.x: no f_rng/p_rng in pk_parse_key */
-    int ret = mbedtls_pk_parse_key(&p->priv_pk, der, der_len, NULL, 0);
-    if (ret != 0) {
-        ESP_LOGE(TAG, "parse_key failed: -0x%04x", (unsigned)(-ret));
-        return ret;
+    if (p->priv_sign_id    != 0) { psa_destroy_key(p->priv_sign_id);    p->priv_sign_id    = 0; }
+    if (p->priv_decrypt_id != 0) { psa_destroy_key(p->priv_decrypt_id); p->priv_decrypt_id = 0; }
+
+    p->priv_sign_id = import_rsa_key(PSA_KEY_TYPE_RSA_KEY_PAIR,
+        RSA_SIGN_ALG, PSA_KEY_USAGE_SIGN_HASH, der, der_len);
+    if (p->priv_sign_id == 0) return -1;
+
+    p->priv_decrypt_id = import_rsa_key(PSA_KEY_TYPE_RSA_KEY_PAIR,
+        RSA_WRAP_ALG, PSA_KEY_USAGE_DECRYPT, der, der_len);
+    if (p->priv_decrypt_id == 0) {
+        psa_destroy_key(p->priv_sign_id);
+        p->priv_sign_id = 0;
+        return -1;
     }
-    p->has_priv_key = true;
     return 0;
 }
 
 void tbft_principal_free(tbft_principal_t *p)
 {
     if (!p) return;
-    if (p->psa_hmac_in_id  != 0) {
-        psa_status_t st = psa_destroy_key(p->psa_hmac_in_id);
-        if (st != PSA_SUCCESS) {
-            ESP_LOGW(TAG, "destroy in_key failed: %d", (int)st);
-        }
-    }
-    if (p->psa_hmac_out_id != 0) {
-        psa_status_t st = psa_destroy_key(p->psa_hmac_out_id);
-        if (st != PSA_SUCCESS) {
-            ESP_LOGW(TAG, "destroy out_key failed: %d", (int)st);
-        }
-    }
-    mbedtls_pk_free(&p->pub_pk);
-    mbedtls_pk_free(&p->priv_pk);
+    if (p->psa_hmac_in_id  != 0) psa_destroy_key(p->psa_hmac_in_id);
+    if (p->psa_hmac_out_id != 0) psa_destroy_key(p->psa_hmac_out_id);
+    if (p->pub_verify_id   != 0) psa_destroy_key(p->pub_verify_id);
+    if (p->pub_encrypt_id  != 0) psa_destroy_key(p->pub_encrypt_id);
+    if (p->priv_sign_id    != 0) psa_destroy_key(p->priv_sign_id);
+    if (p->priv_decrypt_id != 0) psa_destroy_key(p->priv_decrypt_id);
     memset(p, 0, sizeof(*p));
 }
 
@@ -235,24 +323,36 @@ bool tbft_principal_verify_mac_in_with_replay_check(tbft_principal_t *p,
 
 void tbft_principal_set_in_key(tbft_principal_t *p, const tbft_hmac_key_t *key)
 {
-    /* Destroy old PSA key before replacing */
+    /* v0.7.7 fix (A1-F001): use temp variable, assign only after successful
+     * PSA import.  Previously, on import failure, hmac_in_key was
+     * overwritten with NEW bytes but psa_hmac_in_id == 0 — slow-fallback
+     * would then verify with the new bytes, producing false MAC
+     * verification failures.  Test the import FIRST, commit only if OK. */
+    mbedtls_svc_key_id_t new_psa_id = import_hmac_key(key, PSA_KEY_USAGE_VERIFY_MESSAGE);
+    if (new_psa_id == 0) {
+        ESP_LOGE(TAG, "set_in_key: PSA import FAILED for id=%d (key bytes kept as old)", (int)p->id);
+        p->keys_fresh = false;
+        /* Do NOT touch p->hmac_in_key or p->psa_hmac_in_id — keep the
+         * old key so future slow-fallback verifications use a working key. */
+        return;
+    }
+
+    /* Import succeeded — now safe to destroy old and install new. */
     if (p->psa_hmac_in_id != 0) {
         psa_destroy_key(p->psa_hmac_in_id);
-        p->psa_hmac_in_id = 0;
     }
     p->hmac_in_key = *key;
-    p->psa_hmac_in_id = import_hmac_key(key, PSA_KEY_USAGE_VERIFY_MESSAGE);
-    if (p->psa_hmac_in_id == 0) {
-        ESP_LOGE(TAG, "set_in_key: PSA import FAILED for id=%d", (int)p->id);
-        p->keys_fresh = false;
-    } else {
-        ESP_LOGD(TAG, "set_in_key: id=%d key[0..3]=%02x%02x%02x%02x psa_id=%u",
-                 (int)p->id, key->bytes[0], key->bytes[1], key->bytes[2], key->bytes[3],
-                 (unsigned)p->psa_hmac_in_id);
-        /* Self-test: compute MAC with temp key, verify with in_key */
+    p->psa_hmac_in_id = new_psa_id;
+
+    ESP_LOGD(TAG, "set_in_key: id=%d key[0..3]=%02x%02x%02x%02x psa_id=%u",
+             (int)p->id, key->bytes[0], key->bytes[1], key->bytes[2], key->bytes[3],
+             (unsigned)p->psa_hmac_in_id);
+
+    /* Self-test: compute MAC with temp key, verify with in_key */
+    bool self_test_ok = false;
+    {
         uint8_t test_msg[] = "test123";
         tbft_mac_t test_mac;
-        bool self_test_ok = false;
         mbedtls_svc_key_id_t kid = import_hmac_key(key, PSA_KEY_USAGE_SIGN_MESSAGE);
         if (kid != 0) {
             size_t mac_len = 0;
@@ -276,9 +376,9 @@ void tbft_principal_set_in_key(tbft_principal_t *p, const tbft_hmac_key_t *key)
         } else {
             ESP_LOGE(TAG, "set_in_key: import_hmac_key sign FAILED for id=%d", (int)p->id);
         }
-        /* Only mark keys fresh if self-test passed */
-        p->keys_fresh = (p->psa_hmac_in_id != 0 && self_test_ok);
     }
+    /* Only mark keys fresh if self-test passed */
+    p->keys_fresh = self_test_ok;
 
     /* Reset the anti-replay watermark: old timestamps belong to the previous
      * key stream.  Capture-and-replay of pre-rotation messages is prevented
@@ -306,16 +406,14 @@ void tbft_principal_set_out_key(tbft_principal_t *p, const tbft_hmac_key_t *key)
 }
 
 /* --------------------------------------------------------------------------
- * RSA signature path
- * MbedTLS 4.x: pk_sign/pk_verify no longer take f_rng/p_rng parameters.
- * SHA-256 hashing uses PSA (mbedtls_sha256() was removed in 4.x).
+ * RSA signature path — pure PSA
  * -------------------------------------------------------------------------- */
 
 int tbft_principal_sign(tbft_principal_t *p,
                         const void *msg, size_t msg_len,
                         tbft_sig_t *sig)
 {
-    if (!p->has_priv_key) {
+    if (p->priv_sign_id == 0) {
         ESP_LOGE(TAG, "sign: no private key loaded for id=%d", p->id);
         return -1;
     }
@@ -332,27 +430,44 @@ int tbft_principal_sign(tbft_principal_t *p,
     }
 
     size_t sig_len = 0;
-    /* MbedTLS 4.x pk_sign: no rng callback */
-    int ret = mbedtls_pk_sign(&p->priv_pk, MBEDTLS_MD_SHA256,
-                              hash, hash_len,
-                              sig->bytes, TBFT_SIG_SIZE, &sig_len);
-    if (ret != 0) {
-        ESP_LOGE(TAG, "pk_sign failed: -0x%04x", (unsigned)(-ret));
-        return ret;
+    psa_status_t st = PSA_ERROR_INSUFFICIENT_ENTROPY;
+    int retry_us = 1000;  /* 1 ms initial backoff */
+    for (int attempt = 0; attempt < 5; attempt++) {
+        sig_len = 0;
+        st = psa_sign_hash(p->priv_sign_id, RSA_SIGN_ALG,
+                           hash, hash_len,
+                           sig->bytes, TBFT_SIG_SIZE, &sig_len);
+        if (st == PSA_SUCCESS) break;
+        if (st != PSA_ERROR_INSUFFICIENT_ENTROPY) {
+            ESP_LOGE(TAG, "psa_sign_hash failed: %d", (int)st);
+            return (int)st;
+        }
+        /* v0.7.5 fix: transient entropy pool depletion.  Observed in
+         * 2026-06-15 long-run logs: 2815 PSA sign failures in a 10s
+         * window from a single WiFi-busy event.  Wait + retry. */
+        ESP_LOGD(TAG, "psa_sign_hash: -141 (entropy low), retry %d/5 in %d us",
+                 attempt + 1, retry_us);
+        esp_rom_delay_us(retry_us);
+        retry_us *= 2;
+        if (retry_us > 16000) retry_us = 16000;
     }
-    /* Reject unexpected signature length — zero-padding would mask key
-     * misconfiguration (e.g. 1024-bit key loaded by mistake). */
+    if (st != PSA_SUCCESS) {
+        ESP_LOGE(TAG, "psa_sign_hash failed after retries: %d", (int)st);
+        return (int)st;
+    }
     if (sig_len != TBFT_SIG_SIZE) {
-        ESP_LOGE(TAG, "pk_sign: unexpected sig_len=%zu (expected %d)", sig_len, TBFT_SIG_SIZE);
+        ESP_LOGE(TAG, "sign: unexpected sig_len=%zu (expected %d)", sig_len, TBFT_SIG_SIZE);
         return -1;
     }
-    return ret;
+    return 0;
 }
 
 bool tbft_principal_verify_sig(const tbft_principal_t *p,
                                const void *msg, size_t msg_len,
                                const tbft_sig_t *sig)
 {
+    if (p->pub_verify_id == 0) return false;
+
     uint8_t hash[TBFT_DIGEST_SIZE];
     size_t  hash_len = 0;
     psa_status_t pst = psa_hash_compute(PSA_ALG_SHA_256,
@@ -360,24 +475,14 @@ bool tbft_principal_verify_sig(const tbft_principal_t *p,
                                         hash, sizeof(hash), &hash_len);
     if (pst != PSA_SUCCESS || hash_len != TBFT_DIGEST_SIZE) return false;
 
-    /* MbedTLS pk_verify takes a non-const pk_context but does not mutate it.
-     * Cast-away-const is required here; the const on `p` is a caller contract
-     * (verify is read-only from the caller's perspective). */
-    int ret = mbedtls_pk_verify((mbedtls_pk_context *)&p->pub_pk,
-                                MBEDTLS_MD_SHA256,
-                                hash, hash_len,
-                                sig->bytes, TBFT_SIG_SIZE);
-    return ret == 0;
+    return psa_verify_hash(p->pub_verify_id, RSA_SIGN_ALG,
+                           hash, hash_len,
+                           sig->bytes, TBFT_SIG_SIZE) == PSA_SUCCESS;
 }
 
 /* --------------------------------------------------------------------------
- * Session key rotation
- * mbedtls_pk_encrypt / mbedtls_pk_decrypt removed in MbedTLS 4.x.
- * We import the pk context into a transient PSA key.
- * OAEP with SHA-256 is used (PKCS#1 v1.5 encryption is not CCA-secure).
+ * Session key rotation — persistent PSA handles (no transient import)
  * -------------------------------------------------------------------------- */
-
-#define TBFT_KEY_WRAP_ALG  PSA_ALG_RSA_OAEP(PSA_ALG_SHA_256)
 
 int tbft_principal_encrypt_new_key(tbft_principal_t *p,
                                    const tbft_hmac_key_t *new_out_key,
@@ -385,34 +490,42 @@ int tbft_principal_encrypt_new_key(tbft_principal_t *p,
                                    size_t *out_enc_len)
 {
     if (!p || !new_out_key || !enc_buf || !out_enc_len) return -1;
-
+    if (p->pub_encrypt_id == 0) {
+        ESP_LOGE(TAG, "encrypt_new_key: no public key loaded");
+        return -1;
+    }
     if (enc_buf_len < TBFT_SIG_SIZE) {
         ESP_LOGE(TAG, "encrypt_new_key: buffer too small (%zu < %d)", enc_buf_len, TBFT_SIG_SIZE);
         return -1;
     }
 
-    psa_key_attributes_t attr = PSA_KEY_ATTRIBUTES_INIT;
-    psa_set_key_type(&attr, PSA_KEY_TYPE_RSA_PUBLIC_KEY);
-    psa_set_key_algorithm(&attr, TBFT_KEY_WRAP_ALG);
-    psa_set_key_usage_flags(&attr, PSA_KEY_USAGE_ENCRYPT);
-
-    mbedtls_svc_key_id_t key_id;
-    int rc = mbedtls_pk_import_into_psa(&p->pub_pk, &attr, &key_id);
-    psa_reset_key_attributes(&attr);
-    if (rc != 0) {
-        ESP_LOGE(TAG, "pk_import_into_psa (enc) failed: -0x%04x", (unsigned)(-rc));
-        return rc;
+    /* v0.7.5 fix: Retry on PSA_ERROR_INSUFFICIENT_ENTROPY (-141).
+     * Same rationale as in tbft_principal_sign: transient hardware
+     * RNG pool depletion under WiFi load. */
+    psa_status_t st = PSA_ERROR_INSUFFICIENT_ENTROPY;
+    int retry_us = 1000;
+    for (int attempt = 0; attempt < 5; attempt++) {
+        *out_enc_len = 0;
+        st = psa_asymmetric_encrypt(p->pub_encrypt_id, RSA_WRAP_ALG,
+                                    new_out_key->bytes, sizeof(new_out_key->bytes),
+                                    NULL, 0,
+                                    enc_buf, enc_buf_len, out_enc_len);
+        if (st == PSA_SUCCESS) break;
+        if (st != PSA_ERROR_INSUFFICIENT_ENTROPY) {
+            ESP_LOGE(TAG, "psa_asymmetric_encrypt failed: %d", (int)st);
+            return (int)st;
+        }
+        ESP_LOGD(TAG, "psa_asymmetric_encrypt: -141 (entropy low), retry %d/5 in %d us",
+                 attempt + 1, retry_us);
+        esp_rom_delay_us(retry_us);
+        retry_us *= 2;
+        if (retry_us > 16000) retry_us = 16000;
     }
-
-    psa_status_t st = psa_asymmetric_encrypt(key_id, TBFT_KEY_WRAP_ALG,
-                                             new_out_key->bytes, sizeof(new_out_key->bytes),
-                                             NULL, 0,
-                                             enc_buf, enc_buf_len, out_enc_len);
-    psa_destroy_key(key_id);
     if (st != PSA_SUCCESS) {
-        ESP_LOGE(TAG, "psa_asymmetric_encrypt failed: %d", (int)st);
+        ESP_LOGE(TAG, "psa_asymmetric_encrypt failed after retries: %d", (int)st);
+        return (int)st;
     }
-    return (st == PSA_SUCCESS) ? 0 : (int)st;
+    return 0;
 }
 
 int tbft_principal_decrypt_new_key(tbft_principal_t *p,
@@ -420,33 +533,17 @@ int tbft_principal_decrypt_new_key(tbft_principal_t *p,
                                    tbft_hmac_key_t *new_in_key)
 {
     if (!p || !enc_buf || !new_in_key) return -1;
-
-    /* Validate that the private key context is properly loaded. */
-    if (!p->has_priv_key) {
+    if (p->priv_decrypt_id == 0) {
         ESP_LOGE(TAG, "decrypt_new_key: no private key loaded for id=%d", p->id);
         return -1;
     }
 
-    psa_key_attributes_t attr = PSA_KEY_ATTRIBUTES_INIT;
-    psa_set_key_type(&attr, PSA_KEY_TYPE_RSA_KEY_PAIR);
-    psa_set_key_algorithm(&attr, TBFT_KEY_WRAP_ALG);
-    psa_set_key_usage_flags(&attr, PSA_KEY_USAGE_DECRYPT);
-
-    mbedtls_svc_key_id_t key_id;
-    int rc = mbedtls_pk_import_into_psa(&p->priv_pk, &attr, &key_id);
-    psa_reset_key_attributes(&attr);
-    if (rc != 0) {
-        ESP_LOGE(TAG, "pk_import_into_psa (dec) failed: -0x%04x", (unsigned)(-rc));
-        return rc;
-    }
-
     size_t out_len = 0;
-    psa_status_t st = psa_asymmetric_decrypt(key_id, TBFT_KEY_WRAP_ALG,
-                                             enc_buf, enc_len,
-                                             NULL, 0,
-                                             new_in_key->bytes, sizeof(new_in_key->bytes),
-                                             &out_len);
-    psa_destroy_key(key_id);
+    psa_status_t st = psa_asymmetric_decrypt(p->priv_decrypt_id, RSA_WRAP_ALG,
+                                              enc_buf, enc_len,
+                                              NULL, 0,
+                                              new_in_key->bytes, sizeof(new_in_key->bytes),
+                                              &out_len);
     if (st != PSA_SUCCESS) {
         ESP_LOGE(TAG, "psa_asymmetric_decrypt failed: %d", (int)st);
         return (int)st;

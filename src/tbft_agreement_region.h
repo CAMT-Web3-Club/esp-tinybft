@@ -151,3 +151,4 @@ bool tbft_ar_committed(const tbft_agreement_region_t *ar, tbft_seqno_t seqno);
  * Advance the window head to @p new_head, clearing freed slots.
  */
 void tbft_ar_truncate(tbft_agreement_region_t *ar, tbft_seqno_t new_head);
+

@@ -63,7 +63,7 @@ typedef struct {
     /* Fetch state */
     bool              in_fetch;
     tbft_seqno_t      fetch_seqno;
-    tbft_fetch_req_t  fetch_queue[TBFT_MAX_STATE_BLOCKS];
+    tbft_fetch_req_t  fetch_queue[TBFT_MAX_STATE_BLOCKS * 2];
     int               fetch_queue_len;
     int               n_data_pending; /* number of leaf requests dispatched but not fulfilled */
     int64_t           fetch_timeout_us;

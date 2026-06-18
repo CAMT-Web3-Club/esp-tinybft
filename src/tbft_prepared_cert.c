@@ -23,7 +23,29 @@ bool tbft_prepared_cert_add_pp(tbft_prepared_cert_t *cert,
                                const void *pp_buf, int pp_len)
 {
     if (cert->pp_len > 0) {
-        return false; /* already have a pre-prepare */
+        const tbft_pre_prepare_rep_t *old =
+            (const tbft_pre_prepare_rep_t *)cert->pp_buf;
+        const tbft_pre_prepare_rep_t *new_pp =
+            (const tbft_pre_prepare_rep_t *)pp_buf;
+        /* Different seqno means the circular buffer slot was recycled
+         * by window advancement.  The old PP is from a previous window
+         * cycle — unconditionally overwrite. */
+        if (old->seqno != new_pp->seqno) {
+            memcpy(cert->pp_buf, pp_buf, (size_t)pp_len);
+            cert->pp_len    = pp_len;
+            cert->t_sent_us = esp_timer_get_time();
+            return true;
+        }
+        /* Same seqno: accept re-proposal if same request, new view. */
+        if (pp_len >= (int)sizeof(tbft_pre_prepare_rep_t) &&
+            tbft_digest_equal(&old->digest, &new_pp->digest) &&
+            new_pp->view > old->view) {
+            memcpy(cert->pp_buf, pp_buf, (size_t)pp_len);
+            cert->pp_len    = pp_len;
+            cert->t_sent_us = esp_timer_get_time();
+            return true;
+        }
+        return false; /* different request or same view — reject */
     }
     if (pp_len < (int)sizeof(tbft_pre_prepare_rep_t)) {
         return false; /* shorter than the fixed header — and guards negatives */

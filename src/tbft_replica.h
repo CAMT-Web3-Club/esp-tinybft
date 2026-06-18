@@ -63,8 +63,10 @@ typedef struct {
     int           last_assigned_cid;      /* last cid assigned a seqno (dedup) */
     tbft_req_id_t last_assigned_rid;      /* last rid assigned a seqno (dedup) */
     tbft_seqno_t  last_stable;            /* last stable checkpoint seqno */
+    tbft_seqno_t  quorum_last_stable;     /* highest ckpt confirmed by 2f+1 (never set by fetch) */
     int64_t       last_ckpt_throttle_us;   /* last time we sent catch-up checkpoints */
     int64_t       last_fetch_throttle_us;   /* last time we initiated a state fetch */
+    int64_t       last_catchup_completed_us; /* v0.7.7: last time a catch-up fetch completed successfully */
     tbft_seqno_t  last_prepared;          /* highest prepared seqno */
     tbft_seqno_t  last_executed;          /* highest committed + executed */
     tbft_seqno_t  last_tentative_execute; /* highest tentatively executed */
@@ -73,6 +75,9 @@ typedef struct {
      * Fill_request to the primary for this seqno's pre-prepare. Cleared
      * when the seqno is committed/executed or leaves the window. */
     tbft_seqno_t  pending_fill_seqno;
+    /* Timestamp (us) when pending_fill_seqno was first set. Used to
+     * drive the v0.2.14 abandon timeout (10s). */
+    int64_t       fill_started_at_us;
 
     /* Client request tracking for idle timer suppression */
     tbft_req_id_t last_received_rid[TBFT_MAX_NUM_REPLICAS + TBFT_MAX_NUM_CLIENTS];
@@ -123,6 +128,23 @@ typedef struct {
      * threshold the replica yields to let lower-priority tasks run.
      * Reset to 0 on replica restart to avoid stale values. */
     int yield_counter;
+
+    /* Consecutive MAC verification failures.  When a node boots and
+     * misses a session-key rotation, all incoming messages fail HMAC
+     * verification.  After THRESHOLD consecutive failures, request a
+     * key re-exchange instead of triggering a doomed view change. */
+    int consecutive_mac_failures;
+
+    /* When the current view was installed.  Used to detect dead primaries:
+     * if a backup receives no PP from the primary within 30 s, trigger
+     * accelerated view-change instead of waiting for the full vtimer. */
+    int64_t view_installed_us;
+
+    /* last_executed at the moment the current view was installed.
+     * Dead-primary detection only fires if no progress was made
+     * (last_executed hasn't advanced past this value).  Prevents
+     * false positives when the cluster IS committing seqnos. */
+    tbft_seqno_t view_start_executed;
 
     /* Event group for decoupling timer callbacks from heavy processing */
     EventGroupHandle_t evt_group;
@@ -219,8 +241,8 @@ void tbft_replica_send_pre_prepare(tbft_replica_t *r);
 /** Broadcast Prepare for sequence number @p n */
 void tbft_replica_send_prepare(tbft_replica_t *r, tbft_seqno_t n);
 
-/** Broadcast Commit for sequence number @p n */
-void tbft_replica_send_commit(tbft_replica_t *r, tbft_seqno_t n);
+/** Broadcast or unicast Commit for sequence number @p n */
+void tbft_replica_send_commit(tbft_replica_t *r, tbft_seqno_t n, int dest);
 
 /** Execute all committed-but-unexecuted requests in order */
 void tbft_replica_execute_committed(tbft_replica_t *r);

@@ -238,13 +238,14 @@ static void client_task(void *arg) {
         req.size = sizeof(wallet_req_t);
 
         ESP_LOGI(TAG, "Client invoking transfer...");
-        if (Byz_invoke(&req, &rep, false) == 0) {
+        int attempts = Byz_invoke_with_retry(&req, &rep, false, 3);
+        if (attempts > 0) {
             wallet_rep_t *res = (wallet_rep_t *)rep.contents;
-            ESP_LOGI(TAG, "Client received reply: status=%d, balance0=%ld, balance1=%ld",
-                     res->status, res->balance_from, res->balance_to);
+            ESP_LOGI(TAG, "Client received reply: status=%d, balance0=%ld, balance1=%ld (attempt %d)",
+                     res->status, res->balance_from, res->balance_to, attempts);
             Byz_free_reply(&rep);
         } else {
-            ESP_LOGW(TAG, "Request failed or timed out.");
+            ESP_LOGW(TAG, "Request failed or timed out after retries.");
         }
 
         Byz_free_request(&req);

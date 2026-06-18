@@ -15,7 +15,7 @@ void tbft_sr_init(tbft_special_region_t *sr,
 
 #define SR_STORE(slot, m, mlen, maxlen)                      \
     do {                                                     \
-        if ((mlen) > (int)(maxlen)) return false;            \
+        if ((mlen) < 0 || (mlen) > (int)(maxlen)) return false;            \
         memcpy((slot).buf, (m), (size_t)(mlen));             \
         (slot).len   = (mlen);                               \
         (slot).valid = true;                                 \

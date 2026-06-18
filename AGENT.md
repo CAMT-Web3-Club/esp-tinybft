@@ -8,8 +8,15 @@ This is an **ESP-IDF component** (not a standalone app). It is built as part of 
 
 ### Local IDF build
 
+This project's verified local toolchain lives at `~/esp/esp-idf` (ESP-IDF v6.0.x).
+Source the env once per shell, then run `idf.py` from an example directory:
+
 ```bash
+# One-time per shell: activate the local toolchain
+. ~/esp/esp-idf/export.sh
+
 # From a host ESP-IDF project that uses this component:
+cd examples/counter          # or examples/simple_wallet
 idf.py build                   # full build
 idf.py build 2>&1 | head -50   # check for early errors
 idf.py menuconfig              # configure TBFT_* parameters (TinyBFT Configuration menu)
@@ -17,6 +24,7 @@ idf.py flash monitor           # flash and open serial console
 idf.py -p /dev/ttyUSB0 flash monitor  # with explicit port
 
 # Component-only sanity check (requires IDF env active):
+cd examples/counter
 idf.py set-target esp32c3
 idf.py build
 ```

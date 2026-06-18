@@ -19,34 +19,35 @@ set replica_ports /dev/ttyACM3 /dev/ttyACM1 /dev/ttyACM2 /dev/ttyACM7 /dev/ttyAC
 # Create log directory inside build
 mkdir -p build/flash_logs
 
-set active_jobs 0
+set pids
 
 for port in $replica_ports
     if test -e $port
         set -l port_name (basename $port)
         set -l log_file "build/flash_logs/$port_name.log"
 
-        # Run flashing in parallel
-        begin
-            echo "[$port] Flashing started..."
-            if idf.py -p $port flash > $log_file 2>&1
-                echo "[$port] SUCCESS: Flashed successfully."
-            else
-                echo "[$port] FAILED: Flashing failed. See $log_file for details."
-            end
-        end &
+        # Spawn a separate shell process for each device — no shared build system state
+        fish -c "idf.py -p $port flash" > $log_file 2>&1 &
+        set -a pids $last_pid
 
-        set active_jobs (math $active_jobs + 1)
+        echo "[$port] Flashing started (pid $last_pid)..."
     else
         echo "Skip: Port $port not found/connected."
     end
 end
 
-if test $active_jobs -gt 0
+if test (count $pids) -gt 0
     echo "------------------------------------------"
-    echo "Waiting for $active_jobs flashing jobs to complete..."
+    echo "Waiting for "(count $pids)" flashing jobs to complete..."
     echo "------------------------------------------"
-    wait
+    for pid in $pids
+        wait $pid
+        if test $status -eq 0
+            echo "[pid $pid] SUCCESS"
+        else
+            echo "[pid $pid] FAILED — see build/flash_logs/ for details"
+        end
+    end
     echo "=========================================="
     echo "Parallel flashing sequence finished."
     echo "=========================================="

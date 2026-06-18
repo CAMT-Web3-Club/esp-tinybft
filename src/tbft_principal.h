@@ -3,33 +3,38 @@
 #include "tbft_types.h"
 #include "tbft_config.h"
 #include "tbft_message.h"
-#include "mbedtls/pk.h"
 #include "psa/crypto.h"
 #include <stdbool.h>
 
 /* --------------------------------------------------------------------------
  * Principal — represents a remote (or local) participant.
  *
- * Stores the node's address, RSA public key, and the pair of symmetric
- * HMAC session keys used for fast authenticator-based message authentication:
+ * Stores the node's address, RSA public/private keys (PSA handles), and
+ * the pair of symmetric HMAC session keys:
  *
  *   hmac_in_key  — key to verify MACs on messages *received from* this node
  *   hmac_out_key — key to generate MACs on messages *sent to* this node
  *
- * For the local principal (id == local_node_id), priv_pk holds the RSA
- * private key used for signing.
+ * All RSA operations use PSA Crypto with persistent key handles.
+ * Zero mbedtls/pk dependency — no MPI heap fragmentation at runtime.
  * -------------------------------------------------------------------------- */
+
+#define TBFT_RSA_KEY_BITS  2048
 
 typedef struct {
     tbft_node_id_t  id;
     tbft_addr_t     addr;
 
-    /* RSA public key (always present for any known principal) */
-    mbedtls_pk_context  pub_pk;
+    /* RSA public key handles (PSA — always present for any known principal).
+     * Two handles because PSA requires one algorithm per key:
+     *   verify_id  — PKCS#1 v1.5 signature verification (SHA-256)
+     *   encrypt_id — OAEP encryption (SHA-256) for New_key exchange */
+    mbedtls_svc_key_id_t pub_verify_id;
+    mbedtls_svc_key_id_t pub_encrypt_id;
 
-    /* RSA private key (only populated for the local node) */
-    mbedtls_pk_context  priv_pk;
-    bool                has_priv_key;
+    /* RSA private key handles (PSA — only populated for the local node) */
+    mbedtls_svc_key_id_t priv_sign_id;
+    mbedtls_svc_key_id_t priv_decrypt_id;
 
     /* HMAC session keys (plaintext copy kept for re-import if needed) */
     tbft_hmac_key_t hmac_in_key;   /* verify MACs from this principal */

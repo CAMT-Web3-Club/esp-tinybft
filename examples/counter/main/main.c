@@ -220,13 +220,14 @@ static void client_task(void *arg) {
         req.size = sizeof(counter_req_t);
 
         ESP_LOGI(TAG, "Client sending increment...");
-        if (Byz_invoke(&req, &rep, false) == 0) {
+        int attempts = Byz_invoke_with_retry(&req, &rep, false, 3);
+        if (attempts > 0) {
             counter_rep_t *res = (counter_rep_t *)rep.contents;
-            ESP_LOGI(TAG, "Client reply: value=%ld, status=%d",
-                     res->value, res->status);
+            ESP_LOGI(TAG, "Client reply: value=%ld, status=%d (attempt %d)",
+                     res->value, res->status, attempts);
             Byz_free_reply(&rep);
         } else {
-            ESP_LOGW(TAG, "Request failed or timed out.");
+            ESP_LOGW(TAG, "Request failed or timed out after retries.");
         }
 
         Byz_free_request(&req);

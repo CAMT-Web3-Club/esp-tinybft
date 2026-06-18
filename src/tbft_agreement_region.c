@@ -133,6 +133,7 @@ void tbft_ar_truncate(tbft_agreement_region_t *ar, tbft_seqno_t new_head)
         tbft_prepared_cert_clear(&ar->slices[idx].prepared_cert);
         tbft_commit_cert_clear(&ar->slices[idx].commit_cert);
         ar->slices[idx].commit_sent_us = 0;
+        ar->slices[idx].fill_sent_us   = 0;
     }
 
     /* Advance the circular pointer by the FULL jump so the head lands
@@ -143,3 +144,4 @@ void tbft_ar_truncate(tbft_agreement_region_t *ar, tbft_seqno_t new_head)
     ar->head_idx = (int)((ar->head_idx + (int)full_delta) & ar->mask);
     ar->head     = new_head;
 }
+
