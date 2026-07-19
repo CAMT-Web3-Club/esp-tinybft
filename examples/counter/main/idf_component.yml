@@ -1,3 +1,6 @@
 dependencies:
+  phukrit7171/esp-tinybft:
+    version: "0.2.9"
+    override_path: "../../.."
   idf:
     version: ">=6.0"
