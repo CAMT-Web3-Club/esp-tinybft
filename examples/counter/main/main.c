@@ -230,11 +230,14 @@ static void client_task(void *arg) {
         }
 
         Byz_free_request(&req);
-        for (int i = 0; i < 30; i++) {
-            vTaskDelay(pdMS_TO_TICKS(1000));
+        int remaining_ms = CONFIG_EXAMPLE_CLIENT_REQUEST_INTERVAL_MS;
+        while (remaining_ms > 0) {
+            int chunk_ms = remaining_ms > 1000 ? 1000 : remaining_ms;
+            vTaskDelay(pdMS_TO_TICKS(chunk_ms));
 #if CONFIG_ESP_TASK_WDT_EN
             esp_task_wdt_reset();
 #endif
+            remaining_ms -= chunk_ms;
         }
     }
 }

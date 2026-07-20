@@ -12,6 +12,14 @@ menu "Counter Example Configuration"
             bool "Client"
     endchoice
 
+    config EXAMPLE_CLIENT_REQUEST_INTERVAL_MS
+        int "Client request interval (ms)"
+        default 30000
+        depends on EXAMPLE_ROLE_CLIENT
+        help
+            Delay between successive requests sent by the client to the
+            replica cluster.
+
     config EXAMPLE_WIFI_SSID
         string "WiFi SSID"
         default "myssid"
