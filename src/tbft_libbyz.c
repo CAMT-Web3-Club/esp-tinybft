@@ -319,6 +319,38 @@ static uint8_t *load_key_file(const char *path, size_t *len_out)
 }
 
 /**
+ * Verify that a public-key context and a private-key context belong to the
+ * same key pair by exporting both as SubjectPublicKeyInfo and comparing.
+ *
+ * This must not be replaced by mbedtls_pk_check_pair(): on ESP-IDF 6.x
+ * (MbedTLS 4.x PSA-backed pk layer) that call returns
+ * PSA_ERROR_INVALID_ARGUMENT (-135) for PKCS#8-parsed private keys because
+ * the PKCS#8 parse path never populates pub_raw, even though the key is
+ * perfectly usable.  mbedtls_pk_write_pubkey_der() falls back to
+ * psa_export_public_key() when pub_raw is empty, so this comparison works
+ * for PKCS#1- and PKCS#8-parsed keys alike.
+ *
+ * @return 0 if the keys match, -1 otherwise.
+ */
+static int check_key_pair_matches(const mbedtls_pk_context *pub,
+                                  const mbedtls_pk_context *prv)
+{
+    unsigned char pub_der[1024];
+    unsigned char prv_der[1024];
+    int pub_len = mbedtls_pk_write_pubkey_der(pub, pub_der, sizeof(pub_der));
+    int prv_len = mbedtls_pk_write_pubkey_der(prv, prv_der, sizeof(prv_der));
+
+    if (pub_len <= 0 || prv_len <= 0 || pub_len != prv_len) {
+        return -1;
+    }
+
+    /* mbedtls_pk_write_pubkey_der() writes the DER at the end of the buffer. */
+    return (memcmp(pub_der + sizeof(pub_der) - (size_t)pub_len,
+                   prv_der + sizeof(prv_der) - (size_t)prv_len,
+                   (size_t)pub_len) == 0) ? 0 : -1;
+}
+
+/**
  * Populate principal records in a node from parsed config.
  */
 static int setup_principals(tbft_node_t *node, const tbft_config_t *cfg,
@@ -436,13 +468,20 @@ static int setup_principals(tbft_node_t *node, const tbft_config_t *cfg,
             }
             node->local_principal = p;
 
-            /* Verify public/private key pair consistency */
+            /* Verify public/private key pair consistency.
+             * NB: do NOT use mbedtls_pk_check_pair() here - ESP-IDF 6.x
+             * (MbedTLS 4.x PSA-backed pk layer) returns
+             * PSA_ERROR_INVALID_ARGUMENT (-135) for PKCS#8-parsed private
+             * keys, because the PKCS#8 parse path never populates the
+             * context's pub_raw buffer.  Comparing the exported
+             * SubjectPublicKeyInfo works for both PKCS#1- and PKCS#8-parsed
+             * keys: mbedtls_pk_write_pubkey_der() falls back to
+             * psa_export_public_key() when pub_raw is empty. */
             if (p->has_priv_key) {
-                int rc = mbedtls_pk_check_pair(&p->pub_pk, &p->priv_pk);
+                int rc = check_key_pair_matches(&p->pub_pk, &p->priv_pk);
                 if (rc != 0) {
                     ESP_LOGE(TAG, "key pair mismatch for node %d: "
-                             "public and private keys do not correspond "
-                             "(mbedtls err=%d)", i, rc);
+                             "public and private keys do not correspond", i);
                     for (int j = 0; j <= i; j++) {
                         if (node->principals[j]) {
                             tbft_principal_free(node->principals[j]);
