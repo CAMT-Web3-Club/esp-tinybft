@@ -105,9 +105,14 @@ static void print_banner(void) {
              EXAMPLE_REQ_INTERVAL_MS, __DATE__ " " __TIME__,
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 #else
-    ESP_LOGW(TAG, "BANNER role=%s transport=espnow mode=ap ps=n/a "
+    ESP_LOGW(TAG, "BANNER role=%s transport=espnow if=%s ps=n/a "
              "req_interval_ms=%d ver=%s mac=%02x:%02x:%02x:%02x:%02x:%02x",
              EXAMPLE_ROLE_STR,
+#if CONFIG_TBFT_ESPNOW_IF_STA
+             "sta",
+#else
+             "ap",
+#endif
              EXAMPLE_REQ_INTERVAL_MS, __DATE__ " " __TIME__,
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 #endif
@@ -151,6 +156,17 @@ static void wifi_init(void) {
                         pdFALSE, pdFALSE, portMAX_DELAY);
     ESP_LOGI(TAG, "WiFi connected");
 #else
+#if CONFIG_TBFT_ESPNOW_IF_STA
+    /* Station interface, never connected: no beacons, no AP forcing RF on.
+     * Must match TBFT_ESPNOW_IF on every board. */
+    ESP_LOGI(TAG, "Starting WiFi STA for ESP-NOW (channel %d)...", CONFIG_EXAMPLE_ESPNOW_CHANNEL);
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_ERROR_CHECK(esp_wifi_set_channel(CONFIG_EXAMPLE_ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE));
+#else
     ESP_LOGI(TAG, "Starting WiFi AP for ESP-NOW...");
     esp_netif_create_default_wifi_ap();
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
@@ -160,13 +176,14 @@ static void wifi_init(void) {
         .ap = {
             .ssid = "tinybft",
             .ssid_len = 7,
-            .channel = 1,
+            .channel = CONFIG_EXAMPLE_ESPNOW_CHANNEL,
             .authmode = WIFI_AUTH_OPEN,
             .max_connection = 0,
         },
     };
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_cfg));
     ESP_ERROR_CHECK(esp_wifi_start());
+#endif
     ESP_ERROR_CHECK(esp_now_init());
 #endif
 }

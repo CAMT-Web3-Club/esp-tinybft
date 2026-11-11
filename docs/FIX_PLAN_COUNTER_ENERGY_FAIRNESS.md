@@ -26,6 +26,29 @@
 - ทุกจุดที่ทิ้งข้อความมีตัวนับ และ run ปกติ 30 นาทีต่อ variant ไม่มี request ล้มเหลว
 - มีคู่เทียบแบบเดียวกัน คือ ESP-NOW (RF เปิดตลอด) กับ UDP `PS_NONE`
 
+## 1.1 สถานะการทำงาน (อัปเดตหลังลงมือแก้บน `fix/develop/v0.2.9`)
+
+Build ผ่านแบบไม่มี warning สำหรับ `counter` ทั้ง 4 variant/role ที่ลอง (espnow replica+client, udp_psnone client, udp_psmin replica, udp_psmax client) และ `simple_wallet` (esp32c3) **ยังไม่ได้ทดสอบบนบอร์ดจริง** เกณฑ์ตรวจรับที่ต้องใช้บอร์ดยังเป็นของคนทดสอบ
+
+| งาน | สถานะ | หมายเหตุ |
+|---|---|---|
+| A1 | ทำแล้ว | Kconfig `TBFT_ESPNOW_IF_STA` (ค่าเริ่มต้น) / `_AP`; ต้อง flash ใหม่ทุกบอร์ด |
+| A2 | ทำแล้ว | `EXAMPLE_WIFI_LISTEN_INTERVAL`, variant `udp_psnone`, `BANNER` (ไม่มี version จริง ใช้เวลา build) |
+| A3 | ทำแล้ว | ใช้ค่ากลาง VC=30000 ms; **เจ้าของงานวิจัยยังต้องยืนยันค่านี้** |
+| A4 | ทำแล้ว | `LWIP_UDP_RECVMBOX_SIZE=16` |
+| A5 | ทำแล้ว | คาบสัมบูรณ์ + `CLIENT_STATS` |
+| A6 | ทำแล้ว | `sdkconfig.measure` ตั้ง log WARN; ลบการพิมพ์ key |
+| A7 | ทำแล้ว | overlay + `build_variant.sh` + README |
+| A8 | ทำแล้ว | `TBFT_STATS` ทุก 60 s (replica) / ต่อ request (client); UDP นับ drop ของ lwIP ไม่ได้ |
+| A9, A10, A11 | ยังไม่ทำ | ทางเลือก รอเจ้าของงานวิจัยตัดสินใจ |
+| B1 | ทำแล้ว | รอ send callback ต่อเฟรม, retry 3 ครั้ง, ลบ delay คงที่ |
+| B2 | ทำแล้ว | callback ไม่มี lock/log, fast path เฟรมเดียว |
+| B3 | ทำแล้ว | `TBFT_MS_TO_TICKS_MIN1` |
+| B4 | ทำแล้ว | retry เมื่อ `ENOMEM`/`ENOBUFS` |
+| B5 | ทำแบบขั้นต่ำ | retry 10 ครั้งแล้ว reboot, backoff ใน Wi-Fi handler; static IP จาก MAC (แบบแนะนำ) ยังไม่ทำ |
+| B6 | ทำแล้ว | ลอง key ของ `src_id` ก่อน แล้ววนตัวอื่น |
+| B7 | ทำบางส่วน | replica ไม่ค้างเมื่อ `exec_cb` คืน -1; ค่าคงที่ 68 และ reply status ใน example ยังไม่แก้ |
+
 ## 2. ข้อตกลงในการทำงาน
 
 - **Branch:** แตกจาก `devlope/v0.2.9` ใช้ชื่อรูปแบบ `fix/develop/<version>` เช่น `fix/develop/v0.2.9` (ยังไม่ได้สร้าง)

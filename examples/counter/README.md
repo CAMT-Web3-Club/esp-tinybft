@@ -40,3 +40,39 @@ Requests are ordered and agreed upon by the BFT replicas before being executed.
 The generated `config_espnow.txt` and `config_udp.txt` contain dummy MAC addresses and loopback IP addresses.
 **For a real test across multiple boards, you MUST edit `config_espnow.txt` in the `spiffs_image/` folder**
 to contain the real MAC addresses of your ESP32 boards before running `idf.py build`.
+
+## Experiment variants (energy comparison)
+
+Variants are built from overlay files, each into its own `build_<variant>_<role>/`
+directory with its own `sdkconfig` (no `menuconfig`, no hand-edited sdkconfig):
+
+| Variant | Transport | Radio |
+|---|---|---|
+| `espnow` | ESP-NOW (station interface) | always on |
+| `udp_psnone` | UDP | `WIFI_PS_NONE` (always on, direct counterpart of `espnow`) |
+| `udp_psmin` | UDP | `WIFI_PS_MIN_MODEM` |
+| `udp_psmax` | UDP | `WIFI_PS_MAX_MODEM`, listen interval 3 |
+
+```bash
+cp sdkconfig.wifi.local.example sdkconfig.wifi.local   # SSID/password, git-ignored
+./build_variant.sh udp_psmax replica build
+./build_variant.sh udp_psmax client build
+./build_variant.sh espnow replica -p /dev/ttyACM0 flash
+```
+
+All variants share `sdkconfig.defaults` (protocol sizes/timeouts, UDP receive
+mailbox = 16 to match the ESP-NOW queue) and `sdkconfig.measure` (log level WARN,
+`TBFT_STATS`). `gen_configs.sh` writes the same timeouts to both config files and
+keeps existing keys unless run with `--keys`.
+
+Every boot prints a `BANNER` line (role, transport, PS mode, listen interval,
+channel, request period) at WARN level - check it on every board before measuring.
+The client prints `CLIENT_STATS` after each request and `TBFT_STATS` counters
+(sent/received per message type, send failures, queue drops, view changes,
+re-sent commits). Report runs with `vc_sent`/`fetch` > 0 or failed requests
+separately.
+
+Measurement notes: use the same channel for ESP-NOW (`EXAMPLE_ESPNOW_CHANNEL`)
+and the router; UDP energy excludes the router; ESP-NOW and UDP `PS_NONE` are
+the like-for-like pair; `PS_MIN`/`PS_MAX` save RF power only because the CPU
+never sleeps (power management is not enabled).

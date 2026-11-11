@@ -124,6 +124,17 @@ static void wifi_init(void) {
         ESP_LOGI(TAG, "WiFi reconnected");
     }
 #else
+#if CONFIG_TBFT_ESPNOW_IF_STA
+    /* Station interface, never connected: no beacons, no AP forcing RF on.
+     * Must match TBFT_ESPNOW_IF on every board. */
+    ESP_LOGI(TAG, "Starting WiFi STA for ESP-NOW (channel %d)...", CONFIG_EXAMPLE_ESPNOW_CHANNEL);
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_ERROR_CHECK(esp_wifi_set_channel(CONFIG_EXAMPLE_ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE));
+#else
     ESP_LOGI(TAG, "Starting WiFi AP for ESP-NOW...");
     esp_netif_create_default_wifi_ap();
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
@@ -133,13 +144,14 @@ static void wifi_init(void) {
         .ap = {
             .ssid = "tinybft",
             .ssid_len = 7,
-            .channel = 1,
+            .channel = CONFIG_EXAMPLE_ESPNOW_CHANNEL,
             .authmode = WIFI_AUTH_OPEN,
             .max_connection = 0,
         },
     };
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_cfg));
     ESP_ERROR_CHECK(esp_wifi_start());
+#endif
     ESP_ERROR_CHECK(esp_now_init());
 #endif
 }

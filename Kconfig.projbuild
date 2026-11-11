@@ -132,6 +132,28 @@ menu "TinyBFT Configuration"
                 MAC format: xx:xx:xx:xx:xx:xx
     endchoice
 
+    choice TBFT_ESPNOW_IF
+        prompt "ESP-NOW Wi-Fi interface"
+        depends on TBFT_TRANSPORT_ESPNOW
+        default TBFT_ESPNOW_IF_STA
+        help
+            Interface ESP-NOW frames are sent from. ALL boards in a cluster
+            must use the same setting (the peer MAC differs: AP MAC is the
+            station MAC + 1).
+
+        config TBFT_ESPNOW_IF_STA
+            bool "Station (WIFI_MODE_STA)"
+            help
+                No beacons, RF not forced on by an AP; the only mode where
+                Wi-Fi power saving / ESP-NOW wake windows can apply.
+                Host app must start Wi-Fi in STA mode (no connect needed).
+        config TBFT_ESPNOW_IF_AP
+            bool "SoftAP (WIFI_MODE_AP)"
+            help
+                Legacy behaviour. The softAP beacons every ~100 ms and keeps
+                the radio on, which inflates energy measurements.
+    endchoice
+
     config TBFT_PRINT_STATS
         bool "Enable performance statistics"
         default n

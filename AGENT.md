@@ -173,6 +173,9 @@ MAC format: `xx:xx:xx:xx:xx:xx` (e.g. `aa:bb:cc:dd:ee:ff`). The parser auto-dete
 
 When using ESP-NOW, the host application must:
 1. Initialize WiFi (`esp_wifi_init`, `esp_wifi_set_mode`, `esp_wifi_start`)
+   - The interface is chosen by `CONFIG_TBFT_ESPNOW_IF_STA` (default) or `CONFIG_TBFT_ESPNOW_IF_AP`; **every board must use the same one**. STA: `esp_wifi_set_mode(WIFI_MODE_STA)`, never connect, set the channel after `esp_wifi_start()`. AP (legacy) uses the softAP MAC = base MAC + 1 and keeps the radio on with beacons.
+   - The interface is chosen by `CONFIG_TBFT_ESPNOW_IF_STA` (default) or `CONFIG_TBFT_ESPNOW_IF_AP`; **every board must use the same one**. STA: `esp_wifi_set_mode(WIFI_MODE_STA)`, never connect, set the channel after `esp_wifi_start()`. AP (legacy) uses the softAP MAC = base MAC + 1 and keeps the radio on with beacons.
+   - The interface is chosen by `CONFIG_TBFT_ESPNOW_IF_STA` (default) or `CONFIG_TBFT_ESPNOW_IF_AP`; **every board must use the same one**. STA: `esp_wifi_set_mode(WIFI_MODE_STA)`, never connect, set the channel after `esp_wifi_start()`. AP (legacy) uses the softAP MAC = base MAC + 1 and keeps the radio on with beacons.
 2. The ESP-NOW transport registers its own `esp_now_recv_cb` and `esp_now_send_cb`
 3. Peer MAC addresses are registered via `esp_now_add_peer` automatically
 

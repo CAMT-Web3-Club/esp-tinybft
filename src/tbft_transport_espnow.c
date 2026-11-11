@@ -58,6 +58,12 @@ _Static_assert(SEND_TASK_SHUTDOWN < 0, "SEND_TASK_SHUTDOWN must be negative");
 
 #define ESPNOW_MAC_LEN  6
 
+#if CONFIG_TBFT_ESPNOW_IF_AP
+#define CONFIG_TBFT_ESPNOW_IF_AP_FLAG 1
+#else
+#define CONFIG_TBFT_ESPNOW_IF_AP_FLAG 0
+#endif
+
 /* --------------------------------------------------------------------------
  * โครงสร้างข้อมูลคิวและการแบ่งส่วน (Structures)
  * -------------------------------------------------------------------------- */
@@ -135,8 +141,20 @@ static tbft_espnow_t *g_espnow_ctx = NULL;
  * ฟังก์ชันคำนวณ MAC Address อย่างปลอดภัย (รองรับ Overflow/Underflow)
  * -------------------------------------------------------------------------- */
 
+#if CONFIG_TBFT_ESPNOW_IF_AP
+#define TBFT_ESPNOW_IFIDX WIFI_IF_AP
+#else
+#define TBFT_ESPNOW_IFIDX WIFI_IF_STA
+#endif
+
+/* "AP MAC" = the on-air address of the interface ESP-NOW uses.  For the
+ * softAP interface it is the base (eFuse) MAC + 1; for the station
+ * interface it is the base MAC itself. */
 static void get_ap_mac(const uint8_t *base_mac, uint8_t *ap_mac) {
     memcpy(ap_mac, base_mac, 6);
+#if !CONFIG_TBFT_ESPNOW_IF_AP
+    return;
+#endif
     for (int i = 5; i >= 0; i--) {
         ap_mac[i]++;
         if (ap_mac[i] != 0) break; /* หากไม่เกิด Overflow (255 -> 0) ให้หยุดคำนวณทดบิต */
@@ -145,6 +163,9 @@ static void get_ap_mac(const uint8_t *base_mac, uint8_t *ap_mac) {
 
 static void get_base_mac(const uint8_t *ap_mac, uint8_t *base_mac) {
     memcpy(base_mac, ap_mac, 6);
+#if !CONFIG_TBFT_ESPNOW_IF_AP
+    return;
+#endif
     for (int i = 5; i >= 0; i--) {
         uint8_t val = base_mac[i];
         base_mac[i]--;
@@ -638,7 +659,7 @@ void tbft_transport_set_peer(tbft_transport_t *t, tbft_node_id_t node_id, const 
     uint8_t self_ap[6];
     if (esp_efuse_mac_get_default(self_base) == ESP_OK) {
         get_ap_mac(self_base, self_ap);
-        if (memcmp(ap_mac, self_ap, 6) == 0) {
+        if (CONFIG_TBFT_ESPNOW_IF_AP_FLAG && memcmp(ap_mac, self_ap, 6) == 0) {
             ESP_LOGW(TAG, "set_peer: node %d AP MAC matches local AP MAC — "
                      "config may contain AP MAC instead of base (eFuse) MAC",
                      node_id);
@@ -649,7 +670,7 @@ void tbft_transport_set_peer(tbft_transport_t *t, tbft_node_id_t node_id, const 
      * Hardcoded channel 1 caused silent failures when AP was on a different
      * channel.  WiFi must be started before this call for channel 0 to
      * resolve correctly. */
-    esp_now_peer_info_t peer = { .channel = 0, .ifidx = WIFI_IF_AP, .encrypt = false };
+    esp_now_peer_info_t peer = { .channel = 0, .ifidx = TBFT_ESPNOW_IFIDX, .encrypt = false };
     memcpy(peer.peer_addr, ap_mac, 6);
 
     esp_now_del_peer(ap_mac);

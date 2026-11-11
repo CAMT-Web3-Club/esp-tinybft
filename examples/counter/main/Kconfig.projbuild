@@ -62,4 +62,13 @@ menu "Counter Example Configuration"
             Only used with WIFI_PS_MAX_MODEM. Fixed explicitly so the
             experiment does not depend on the IDF default.
 
+    config EXAMPLE_ESPNOW_CHANNEL
+        int "ESP-NOW Wi-Fi channel"
+        default 1
+        range 1 13
+        depends on TBFT_TRANSPORT_ESPNOW
+        help
+            Channel all boards use for ESP-NOW. Use the same channel as the
+            router in the UDP runs so both transports share the RF environment.
+
 endmenu

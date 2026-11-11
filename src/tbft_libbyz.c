@@ -640,7 +640,8 @@ int Byz_recv_reply(Byz_rep *rep)
 
     while (esp_timer_get_time() < deadline_us) {
         uint8_t buf[TBFT_MAX_MESSAGE_SIZE];
-        int n = tbft_node_recv(s_client, buf, sizeof(buf), NULL);
+        tbft_node_id_t src_hint = -1;
+        int n = tbft_node_recv(s_client, buf, sizeof(buf), &src_hint);
         if (n < (int)sizeof(tbft_reply_rep_t)) {
             vTaskDelay(TBFT_MS_TO_TICKS_MIN1(1));
 #if CONFIG_ESP_TASK_WDT_EN
@@ -673,11 +674,17 @@ int Byz_recv_reply(Byz_rep *rep)
 
         const tbft_sig_t *sig =
             (const tbft_sig_t *)((const uint8_t *)buf + body_sz);
-        for (int ri = 0; ri < num_replicas; ri++) {
+        /* The transport's apparent sender is only a hint to save RSA work:
+         * try it first, and only trust the signature check for identity. */
+        if (src_hint >= 0 && src_hint < num_replicas &&
+            tbft_node_verify_sig(s_client, src_hint, buf, (size_t)body_sz, sig)) {
+            rep_id = src_hint;
+        }
+        for (int ri = 0; rep_id < 0 && ri < num_replicas; ri++) {
+            if (ri == src_hint) continue;   /* already tried */
             if (tbft_node_verify_sig(s_client, (tbft_node_id_t)ri,
                                      buf, (size_t)body_sz, sig)) {
                 rep_id = (tbft_node_id_t)ri;
-                break;
             }
         }
         if (rep_id < 0) {
