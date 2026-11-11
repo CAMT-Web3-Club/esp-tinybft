@@ -410,10 +410,8 @@ static bool espnow_tx_frame(tbft_espnow_t *enow, const uint8_t *mac,
     return false;
 }
 
-static int espnow_do_send(tbft_espnow_t *enow, tbft_node_id_t dest_id, uint16_t msg_id, const uint8_t *buf, size_t len) {
-    if (dest_id < 0 || dest_id >= enow->num_nodes || !buf || len == 0) return -1;
-
-    const uint8_t *ap_mac = enow->peer_ap_mac[dest_id];
+static int espnow_do_send_mac(tbft_espnow_t *enow, const uint8_t *ap_mac, uint16_t msg_id, const uint8_t *buf, size_t len) {
+    if (!buf || len == 0) return -1;
 
     /* Stack packet buffer; send_task is the sole caller. */
     uint8_t pkt[sizeof(frag_hdr_t) + FRAG_MAX_PAYLOAD] __attribute__((aligned(4)));
@@ -430,14 +428,21 @@ static int espnow_do_send(tbft_espnow_t *enow, tbft_node_id_t dest_id, uint16_t 
         memcpy(pkt + sizeof(fhdr), src, chunk);
 
         if (!espnow_tx_frame(enow, ap_mac, pkt, chunk + sizeof(fhdr))) {
-            ESP_LOGW(TAG, "tx to node %d failed: frame %d/%d after %d attempts",
-                     dest_id, frag_idx + 1, frag_total, ESPNOW_TX_MAX_ATTEMPTS);
+            ESP_LOGW(TAG, "tx to " MACSTR " failed: frame %d/%d after %d attempts",
+                     MAC2STR(ap_mac), frag_idx + 1, frag_total, ESPNOW_TX_MAX_ATTEMPTS);
             return -1;   /* remaining frames are useless without this one */
         }
         src += chunk;
         remaining -= chunk;
     }
     return (int)len;
+}
+
+static const uint8_t k_bcast_mac[6] = {0xff,0xff,0xff,0xff,0xff,0xff};
+
+static int espnow_do_send(tbft_espnow_t *enow, tbft_node_id_t dest_id, uint16_t msg_id, const uint8_t *buf, size_t len) {
+    if (dest_id < 0 || dest_id >= enow->num_nodes) return -1;
+    return espnow_do_send_mac(enow, enow->peer_ap_mac[dest_id], msg_id, buf, len);
 }
 
 static void espnow_send_task(void *pvParameters) {
@@ -468,6 +473,13 @@ static void espnow_send_task(void *pvParameters) {
             this_msg_id = enow->next_msg_id++;
             xSemaphoreGive(enow->lock);
 
+#if CONFIG_TBFT_ESPNOW_BROADCAST
+            (void)limit;
+            if (espnow_do_send_mac(enow, k_bcast_mac, this_msg_id, entry.buf, (size_t)entry.len) <= 0) {
+                enow->stats.tx_fail++;
+            }
+            continue;
+#endif
             for (int i = 0; i < limit; i++) {
                 if (i == enow->local_id) continue;
 
@@ -584,6 +596,18 @@ int tbft_transport_create(tbft_transport_t **out, tbft_transport_type_t type, in
         goto init_error;
     }
 
+#if CONFIG_TBFT_ESPNOW_BROADCAST
+    {
+        esp_now_peer_info_t bp = { .channel = 0, .ifidx = TBFT_ESPNOW_IFIDX, .encrypt = false };
+        memcpy(bp.peer_addr, k_bcast_mac, 6);
+        esp_err_t be = esp_now_add_peer(&bp);
+        if (be != ESP_OK && be != ESP_ERR_ESPNOW_EXIST) {
+            ESP_LOGE(TAG, "add broadcast peer failed: 0x%x", be);
+            esp_now_unregister_recv_cb();
+            goto init_error;
+        }
+    }
+#endif
     if (xTaskCreate(espnow_send_task, "tbft_send", SEND_TASK_STACK_SIZE, enow, SEND_TASK_PRIORITY, &enow->send_task_handle) != pdPASS) {
         ESP_LOGE(TAG, "xTaskCreate for send_task failed");
         goto init_error;

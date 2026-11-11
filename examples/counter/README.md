@@ -90,3 +90,19 @@ EXTRA="sdkconfig.pm;sdkconfig.static_ip" ./build_variant.sh udp_psmin client bui
   Apply it to every variant of a comparison or to none.
 - `sdkconfig.static_ip` derives the board IP from its MAC (no DHCP reservation).
 - `TBFT_ESPNOW_PHY_RATE` sets the ESP-NOW rate (0 = IDF default 1 Mbps); report it.
+
+## Optional "cheapest send" axis: multicast / broadcast
+
+Default runs are unicast (one frame per peer) on both transports. To compare the
+cheapest-send case instead, change BOTH transports together:
+
+```bash
+EXTRA="sdkconfig.mcast" ./build_variant.sh udp_psnone replica build   # UDP IP multicast
+./build_variant.sh espnow_bcast replica build                         # ESP-NOW broadcast
+```
+
+Neither has MAC-level ACK/retry, so expect more loss than unicast (check `rx_drop`,
+request success rate). With UDP multicast the AP relays frames after the DTIM
+beacon at a basic rate; `PS_MAX` stations may sleep through it, so `udp_psmax`
+is expected to fail and is best left out of this axis. Report these runs
+separately from the unicast results.

@@ -154,6 +154,16 @@ menu "TinyBFT Configuration"
                 the radio on, which inflates energy measurements.
     endchoice
 
+    config TBFT_ESPNOW_BROADCAST
+        bool "ESP-NOW: one broadcast frame instead of per-peer unicast"
+        default n
+        depends on TBFT_TRANSPORT_ESPNOW
+        help
+            TBFT_ALL_REPLICAS sends ONE frame to FF:FF:FF:FF:FF:FF instead of
+            one unicast per replica. Broadcast frames have no MAC ACK and no
+            hardware retry (counterpart of UDP multicast). All boards should
+            use the same setting. Direct sends (replies, fetch) stay unicast.
+
     config TBFT_ESPNOW_TX_RETRIES
         int "ESP-NOW attempts per frame"
         default 3
