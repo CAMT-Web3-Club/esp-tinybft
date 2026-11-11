@@ -1,3 +1,6 @@
 components/
 sdkconfig.wifi.local
 build_*/
+build_sweep/
+sweeps/
+runs/

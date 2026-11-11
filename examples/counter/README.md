@@ -106,3 +106,32 @@ request success rate). With UDP multicast the AP relays frames after the DTIM
 beacon at a basic rate; `PS_MAX` stations may sleep through it, so `udp_psmax`
 is expected to fail and is best left out of this axis. Report these runs
 separately from the unicast results.
+
+## Best-vs-best sweep (efficacy = successful requests per joule)
+
+Each transport is tuned over its own free parameters, then the best point of
+each is compared. Run in an activated IDF shell, inside `examples/counter/`:
+
+```bash
+python3 tools/sweep.py plan --stage 1        # ESP-NOW PHY rates + all UDP PS x PM points
+python3 tools/sweep.py build                 # replica+client images -> build_sweep/<point>_<role>/
+# flash 8 boards, run each point 3x (>=10 min), meter energy, save serial logs:
+#   runs/<point>-r1/{node0..node6,client7}.log + energy.csv
+#   runs/<point>-base/  (optional: same image, client off) for incremental energy
+python3 tools/analyze.py runs/               # table + best per transport
+python3 tools/sweep.py plan --stage 2 --rate <best wifi_phy_rate_t from stage 1>
+python3 tools/sweep.py plan --stage 3        # UDP PS_MAX listen interval 1/3/10
+```
+
+- Stage 1 rate values (`wifi_phy_rate_t`): 0 = IDF default 1M, 11 = 6M, 9 = 24M,
+  12 = 54M, 16 = MCS0, 23 = MCS7. Stage 2 then sweeps ESP-NOW retries,
+  PM on/off and duty-cycling (window/interval 50/100 and 20/100) at that rate.
+- `energy.csv`: `node,joules[,seconds]` or `node,avg_ma,volts,seconds`. The meter
+  window must start at the first successful request (that is how the analyzer
+  counts requests).
+- `analyze.py` drops runs with view-changes or state fetches (use
+  `--include-faulty` to keep them), requires `--min-success` (default 95%) to
+  qualify, and says when the best two transports are within one stdev.
+- The UDP side includes PS and listen interval; ESP-NOW includes rate, retries,
+  duty-cycling. Both include PM. Fix the channel, DTIM, request interval and run
+  duration for all points, and interleave points over time.

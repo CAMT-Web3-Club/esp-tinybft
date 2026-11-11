@@ -438,7 +438,9 @@ static int espnow_do_send_mac(tbft_espnow_t *enow, const uint8_t *ap_mac, uint16
     return (int)len;
 }
 
+#if CONFIG_TBFT_ESPNOW_BROADCAST
 static const uint8_t k_bcast_mac[6] = {0xff,0xff,0xff,0xff,0xff,0xff};
+#endif
 
 static int espnow_do_send(tbft_espnow_t *enow, tbft_node_id_t dest_id, uint16_t msg_id, const uint8_t *buf, size_t len) {
     if (dest_id < 0 || dest_id >= enow->num_nodes) return -1;
