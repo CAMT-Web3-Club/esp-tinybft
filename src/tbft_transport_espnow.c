@@ -41,7 +41,8 @@ static const char *TAG = "tbft_espnow";
 #define FRAG_MAX_PARTS      ((TBFT_MAX_MESSAGE_SIZE + FRAG_MAX_PAYLOAD - 1) / FRAG_MAX_PAYLOAD)
 #define REASM_MAX_SLOTS     8
 #define REASM_TIMEOUT_MS    5000
-#define FRAG_INTER_DELAY_MS 20
+#define ESPNOW_TX_MAX_ATTEMPTS   3     /* per frame */
+#define ESPNOW_TX_CB_TIMEOUT_MS  100   /* wait for the MAC-layer result */
 
 #define MSG_QUEUE_DEPTH     16
 #define SEND_QUEUE_DEPTH    8
@@ -117,8 +118,15 @@ typedef struct tbft_espnow {
     reasm_slot_t  reasm[REASM_MAX_SLOTS];
     uint16_t next_msg_id;
     SemaphoreHandle_t lock;
-    volatile bool reasm_stale_flag;
     volatile bool shutting_down;
+
+    /* TX completion: only send_task calls esp_now_send(), so at most one
+     * frame is in flight; the send callback reports its MAC-layer result. */
+    SemaphoreHandle_t tx_done;
+    volatile esp_now_send_status_t tx_status;
+    uint8_t tx_expect_mac[6];
+
+    tbft_transport_stats_t stats;
 } tbft_espnow_t;
 
 static tbft_espnow_t *g_espnow_ctx = NULL;
@@ -283,158 +291,128 @@ static bool reasm_feed(tbft_espnow_t *enow, reasm_slot_t *s, const uint8_t *data
  * -------------------------------------------------------------------------- */
 
 static void espnow_send_cb(const esp_now_send_info_t *tx_info, esp_now_send_status_t status) {
-    if (status != ESP_NOW_SEND_SUCCESS) {
-        ESP_LOGW(TAG, "esp_now_send to " MACSTR " failed: %d", MAC2STR(tx_info->des_addr), (int)status);
-    }
+    tbft_espnow_t *enow = g_espnow_ctx;
+    if (!enow || !tx_info) return;
+    /* Ignore a late result belonging to an earlier (timed-out) frame. */
+    if (memcmp(tx_info->des_addr, enow->tx_expect_mac, 6) != 0) return;
+    enow->tx_status = status;
+    xSemaphoreGive(enow->tx_done);   /* Wi-Fi task context, not an ISR */
 }
 
+static inline void stats_count_tag(uint32_t *arr, int tag) {
+    if (tag > 0 && tag < TBFT_STATS_NUM_TAGS) arr[tag]++;
+}
+
+/* Hand one complete message to the protocol task. Wi-Fi task context. */
+static void espnow_deliver(tbft_espnow_t *enow, recv_entry_t *q_entry) {
+    int msg_tag = q_entry->payload[0]; /* low byte of hdr.tag */
+    if (xQueueSend(enow->msg_queue, q_entry, 0) != pdTRUE) {
+        enow->stats.rx_drop++;
+        ESP_LOGD(TAG, "msg_queue full, dropping tag=%d len=%d", msg_tag, q_entry->buf_len);
+        return;
+    }
+    enow->stats.rx_msgs++;
+    stats_count_tag(enow->stats.rx_by_tag, msg_tag);
+}
+
+/* Runs in the Wi-Fi task.  Keep it short: no logging, no lock, no large
+ * stack objects.  The reassembly table is touched ONLY from here, so it
+ * needs no mutex (the Wi-Fi task is the sole caller). */
 static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *data, int data_len) {
     if (!g_espnow_ctx || !recv_info || !data) return;
-    if (data_len < (int)sizeof(frag_hdr_t)) return;
-
     tbft_espnow_t *enow = g_espnow_ctx;
+    if (data_len < (int)sizeof(frag_hdr_t)) { enow->stats.rx_frag_drop++; return; }
+
+    /* Static: single caller (Wi-Fi task) -> avoids ~2 KB on its stack. */
+    static recv_entry_t q_entry;
+
     const uint8_t *src_mac = recv_info->src_addr;
     const frag_hdr_t *fhdr = (const frag_hdr_t *)data;
-
-    /* M12 FIX: Log at DEBUG level to prevent massive log spam under load.
-     * Every fragment arriving at high rate would overwhelm UART and increase
-     * latency. Use DEBUG for per-fragment logging; completed messages
-     * already log at INFO level below. */
-    ESP_LOGD(TAG, "espnow_cb: frag %d/%d msg_id=%u len=%d from " MACSTR,
-             fhdr->frag_idx, fhdr->frag_total, fhdr->msg_id, data_len, MAC2STR(src_mac));
-
-    /* HIGH FIX H1: Keep lock timeout short (5ms) because recv_cb runs in
-     * the WiFi task context. Espressif docs warn against lengthy operations
-     * in WiFi callbacks. If the lock is held, drop the packet — BFT must
-     * tolerate message loss anyway. */
-    if (xSemaphoreTake(enow->lock, pdMS_TO_TICKS(5)) != pdTRUE) {
-        return;
-    }
-
-    /* Proactively clear any stale reassembly slots before processing
-     * a new fragment.  This prevents stale entries from consuming
-     * slots when the send_task hasn't had a chance to run (e.g. under
-     * heavy receive load where the queue never times out). */
-    reasm_clear_stale(enow);
-    enow->reasm_stale_flag = false;
-
-    reasm_slot_t *s = reasm_find_or_alloc(enow, fhdr->msg_id, src_mac);
-    if (!s) {
-        xSemaphoreGive(enow->lock);
-        return;
-    }
-
     const uint8_t *payload = data + sizeof(frag_hdr_t);
     int payload_len = data_len - (int)sizeof(frag_hdr_t);
 
-    bool complete = reasm_feed(enow, s, payload, payload_len, fhdr->msg_id, fhdr->frag_idx, fhdr->frag_total, src_mac);
-
-    if (complete) {
-        /* Copy completed message out of reassembly buffer BEFORE releasing lock,
-         * so the slot can be reused by the next fragment while we queue. */
-        recv_entry_t q_entry;
-        memcpy(q_entry.src_mac, src_mac, ESPNOW_MAC_LEN);
-        q_entry.buf_len = s->buf_len;
-        memcpy(q_entry.payload, s->buf, (size_t)s->buf_len);
-        int msg_tag = s->buf[0];
-
-        s->stale = true;
-        enow->reasm_stale_flag = true;
-
-        /* Release lock BEFORE potentially blocking queue send to avoid
-         * priority inversion with send_task. */
-        xSemaphoreGive(enow->lock);
-
-        if (xQueueSend(enow->msg_queue, &q_entry, 0) != pdTRUE) {
-            if (enow->local_id >= enow->num_replicas && msg_tag == TBFT_MSG_REPLY) {
-                ESP_LOGD(TAG, "client msg_queue full, dropping unsolicited reply len=%d",
-                         q_entry.buf_len);
-            } else {
-                ESP_LOGW(TAG, "msg_queue full, dropping reassembled msg tag=%d len=%d",
-                         msg_tag, q_entry.buf_len);
-            }
-        } else {
-            ESP_LOGI(TAG, "recv: tag=%d len=%d from " MACSTR,
-                     msg_tag, q_entry.buf_len, MAC2STR(src_mac));
+    /* Fast path: every message except New_key fits one frame. */
+    if (fhdr->frag_total == 1) {
+        if (fhdr->frag_idx != 0 || payload_len <= 0 || payload_len > TBFT_MAX_MESSAGE_SIZE) {
+            enow->stats.rx_frag_drop++;
+            return;
         }
-    } else {
-        xSemaphoreGive(enow->lock);
+        memcpy(q_entry.src_mac, src_mac, ESPNOW_MAC_LEN);
+        q_entry.buf_len = payload_len;
+        memcpy(q_entry.payload, payload, (size_t)payload_len);
+        espnow_deliver(enow, &q_entry);
+        return;
     }
+
+    reasm_clear_stale(enow);
+    reasm_slot_t *s = reasm_find_or_alloc(enow, fhdr->msg_id, src_mac);
+    if (!s) { enow->stats.rx_frag_drop++; return; }
+
+    if (!reasm_feed(enow, s, payload, payload_len, fhdr->msg_id,
+                    fhdr->frag_idx, fhdr->frag_total, src_mac)) {
+        return;   /* incomplete (or rejected fragment, logged at WARN inside) */
+    }
+
+    memcpy(q_entry.src_mac, src_mac, ESPNOW_MAC_LEN);
+    q_entry.buf_len = s->buf_len;
+    memcpy(q_entry.payload, s->buf, (size_t)s->buf_len);
+    s->stale = true;
+    espnow_deliver(enow, &q_entry);
 }
 
 /* --------------------------------------------------------------------------
  * ฟังก์ชันส่งข้อมูลและ Send Task
  * -------------------------------------------------------------------------- */
 
+/* Send one frame and wait for its MAC-layer result (send callback).
+ * esp_now_send() returning ESP_OK only means "queued"; the callback tells
+ * whether the peer ACKed.  Retries on either kind of failure. */
+static bool espnow_tx_frame(tbft_espnow_t *enow, const uint8_t *mac,
+                            const uint8_t *pkt, size_t len) {
+    for (int attempt = 0; attempt < ESPNOW_TX_MAX_ATTEMPTS; attempt++) {
+        memcpy(enow->tx_expect_mac, mac, 6);
+        xSemaphoreTake(enow->tx_done, 0);          /* clear any stale result */
+        esp_err_t err = esp_now_send(mac, pkt, len);
+        if (err == ESP_OK) {
+            if (xSemaphoreTake(enow->tx_done,
+                               pdMS_TO_TICKS(ESPNOW_TX_CB_TIMEOUT_MS)) == pdTRUE &&
+                enow->tx_status == ESP_NOW_SEND_SUCCESS) {
+                return true;
+            }
+        } else {
+            ESP_LOGD(TAG, "esp_now_send err=0x%x (attempt %d)", err, attempt + 1);
+        }
+        vTaskDelay(TBFT_MS_TO_TICKS_MIN1(1));       /* >= 1 tick backoff */
+    }
+    return false;
+}
+
 static int espnow_do_send(tbft_espnow_t *enow, tbft_node_id_t dest_id, uint16_t msg_id, const uint8_t *buf, size_t len) {
     if (dest_id < 0 || dest_id >= enow->num_nodes || !buf || len == 0) return -1;
 
     const uint8_t *ap_mac = enow->peer_ap_mac[dest_id];
 
-    /* CRITICAL FIX: Add per-fragment retry with exponential backoff.
-     * Without this, a single ESP-NOW send failure causes complete message
-     * loss, triggering unnecessary view-changes in the BFT protocol. */
-    const int MAX_RETRIES = 3;
-
-    /* Use stack buffer for packet assembly. Safe because send_task is
-     * the sole caller and this function does not yield. */
+    /* Stack packet buffer; send_task is the sole caller. */
     uint8_t pkt[sizeof(frag_hdr_t) + FRAG_MAX_PAYLOAD] __attribute__((aligned(4)));
-
-    if (len + sizeof(frag_hdr_t) <= ESPNOW_MAX_DATA_LEN) {
-        frag_hdr_t fhdr = { .msg_id = msg_id, .frag_total = 1, .frag_idx = 0 };
-        /* Reuse static pkt buffer (M5 FIX) — single-fragment path */
-        memcpy(pkt, &fhdr, sizeof(fhdr));
-        memcpy(pkt + sizeof(fhdr), buf, len);
-
-        int retries = 0;
-        while (retries < MAX_RETRIES) {
-            if (esp_now_send(ap_mac, pkt, len + sizeof(fhdr)) == ESP_OK) break;
-            retries++;
-            if (retries < MAX_RETRIES) {
-                vTaskDelay(pdMS_TO_TICKS(FRAG_INTER_DELAY_MS * retries));
-            }
-        }
-        if (retries == MAX_RETRIES) {
-            ESP_LOGW(TAG, "espnow_do_send: single-fragment failed after %d retries", MAX_RETRIES);
-            return -1;
-        }
-        vTaskDelay(pdMS_TO_TICKS(FRAG_INTER_DELAY_MS));
-        return (int)len;
-    }
 
     size_t remaining = len;
     const uint8_t *src = buf;
-    uint8_t frag_total = (uint8_t)((remaining + FRAG_MAX_PAYLOAD - 1) / FRAG_MAX_PAYLOAD);
-    uint8_t frag_idx = 0;
-
+    uint8_t frag_total = (uint8_t)((len + FRAG_MAX_PAYLOAD - 1) / FRAG_MAX_PAYLOAD);
     frag_hdr_t fhdr = { .msg_id = msg_id, .frag_total = frag_total };
-    /* Reuse static pkt buffer declared above (M5 FIX) */
 
-    while (remaining > 0) {
+    for (uint8_t frag_idx = 0; remaining > 0; frag_idx++) {
         fhdr.frag_idx = frag_idx;
         size_t chunk = remaining > FRAG_MAX_PAYLOAD ? FRAG_MAX_PAYLOAD : remaining;
-
         memcpy(pkt, &fhdr, sizeof(fhdr));
         memcpy(pkt + sizeof(fhdr), src, chunk);
 
-        int retries = 0;
-        while (retries < MAX_RETRIES) {
-            if (esp_now_send(ap_mac, pkt, chunk + sizeof(fhdr)) == ESP_OK) break;
-            retries++;
-            if (retries < MAX_RETRIES) {
-                vTaskDelay(pdMS_TO_TICKS(FRAG_INTER_DELAY_MS * retries));
-            }
+        if (!espnow_tx_frame(enow, ap_mac, pkt, chunk + sizeof(fhdr))) {
+            ESP_LOGW(TAG, "tx to node %d failed: frame %d/%d after %d attempts",
+                     dest_id, frag_idx + 1, frag_total, ESPNOW_TX_MAX_ATTEMPTS);
+            return -1;   /* remaining frames are useless without this one */
         }
-        if (retries == MAX_RETRIES) {
-            ESP_LOGW(TAG, "espnow_do_send: fragment %d/%d failed after %d retries",
-                     frag_idx + 1, frag_total, MAX_RETRIES);
-            return -1;
-        }
-        vTaskDelay(pdMS_TO_TICKS(FRAG_INTER_DELAY_MS));
-
         src += chunk;
         remaining -= chunk;
-        frag_idx++;
     }
     return (int)len;
 }
@@ -449,35 +427,19 @@ static void espnow_send_task(void *pvParameters) {
                 xSemaphoreGive(enow->task_exit_sem);
                 vTaskDelete(NULL);
             }
-            if (enow->reasm_stale_flag) {
-                xSemaphoreTake(enow->lock, portMAX_DELAY);
-                if (enow->reasm_stale_flag) {
-                    enow->reasm_stale_flag = false;
-                    reasm_clear_stale(enow);
-                }
-                xSemaphoreGive(enow->lock);
-            }
             continue;
         }
 
         if (entry.dest == SEND_TASK_SHUTDOWN) {
-            xSemaphoreTake(enow->lock, portMAX_DELAY);
-            reasm_clear_stale(enow);
-            xSemaphoreGive(enow->lock);
             ESP_LOGI(TAG, "send_task exiting cleanly");
-
-            /* ส่งสัญญาณให้กระบวนการ Free ถัดไปรับทราบว่า Task ปิดตัวเองเสร็จแล้ว */
             xSemaphoreGive(enow->task_exit_sem);
             vTaskDelete(NULL);
         }
 
         if (entry.dest == TBFT_ALL_REPLICAS) {
             int limit = enow->num_replicas > 0 ? enow->num_replicas : enow->num_nodes;
-            int msg_tag = (entry.len > 0) ? entry.buf[0] : -1; /* first byte is hdr.tag */
-            ESP_LOGI(TAG, "send_task: broadcast tag=%d size=%d to %d peers (limit=%d)",
-                     msg_tag, entry.len, limit - 1, limit);
 
-            /* Assign one msg_id per logical message, not per peer */
+            /* One msg_id per logical message, not per peer */
             uint16_t this_msg_id;
             xSemaphoreTake(enow->lock, portMAX_DELAY);
             this_msg_id = enow->next_msg_id++;
@@ -489,21 +451,12 @@ static void espnow_send_task(void *pvParameters) {
                 xSemaphoreTake(enow->lock, portMAX_DELAY);
                 bool valid = enow->peer_valid[i];
                 xSemaphoreGive(enow->lock);
+                if (!valid) continue;
 
-                if (valid) {
-                    int rc = espnow_do_send(enow, i, this_msg_id, entry.buf, (size_t)entry.len);
-                    ESP_LOGI(TAG, "send_task: broadcast to node %d → %s (rc=%d)", i, rc > 0 ? "OK" : "FAIL", rc);
-                    /* Delay between individual peer sends — ESP-NOW in softAP mode
-                     * needs time to complete each transmission before the next. */
-                    vTaskDelay(pdMS_TO_TICKS(20));
-                } else {
-                    ESP_LOGW(TAG, "send: skipping broadcast to node %d — peer not registered", i);
+                if (espnow_do_send(enow, i, this_msg_id, entry.buf, (size_t)entry.len) <= 0) {
+                    enow->stats.tx_fail++;
                 }
             }
-            /* Inter-message delay to prevent ESP-NOW transmit queue overflow.
-             * ESP-NOW has a small internal TX queue (~6 packets). Without this
-             * delay, rapid broadcasts silently drop packets. */
-            vTaskDelay(pdMS_TO_TICKS(50));
         } else if (entry.dest >= 0 && entry.dest < enow->num_nodes) {
             xSemaphoreTake(enow->lock, portMAX_DELAY);
             bool valid = enow->peer_valid[entry.dest];
@@ -511,15 +464,12 @@ static void espnow_send_task(void *pvParameters) {
             xSemaphoreGive(enow->lock);
 
             if (valid) {
-                int msg_tag = entry.buf[0];
-                int rc = espnow_do_send(enow, entry.dest, this_msg_id, entry.buf, (size_t)entry.len);
-                ESP_LOGI(TAG, "send_task: unicast to node %d tag=%d → %s (rc=%d)",
-                         entry.dest, msg_tag, rc > 0 ? "OK" : "FAIL", rc);
+                if (espnow_do_send(enow, entry.dest, this_msg_id, entry.buf, (size_t)entry.len) <= 0) {
+                    enow->stats.tx_fail++;
+                }
             } else {
-                ESP_LOGW(TAG, "send: skipping unicast to node %d — peer not registered", entry.dest);
+                ESP_LOGW(TAG, "send: skipping unicast to node %d - peer not registered", entry.dest);
             }
-            /* Inter-message delay to prevent ESP-NOW transmit queue overflow */
-            vTaskDelay(pdMS_TO_TICKS(10));
         }
     }
 }
@@ -572,16 +522,18 @@ int tbft_transport_create(tbft_transport_t **out, tbft_transport_type_t type, in
 
     enow->lock = xSemaphoreCreateMutex();
     enow->task_exit_sem = xSemaphoreCreateBinary();
+    enow->tx_done = xSemaphoreCreateBinary();
     enow->msg_queue = xQueueCreate(MSG_QUEUE_DEPTH, sizeof(recv_entry_t));
     enow->send_queue = xQueueCreate(SEND_QUEUE_DEPTH, sizeof(send_entry_t));
 
-    if (!enow->lock || !enow->task_exit_sem || !enow->msg_queue || !enow->send_queue) {
+    if (!enow->lock || !enow->task_exit_sem || !enow->tx_done || !enow->msg_queue || !enow->send_queue) {
         ESP_LOGE(TAG, "queue/sem alloc failed: lock=%p sem=%p msg_q=%p send_q=%p free_heap=%u",
                  enow->lock, enow->task_exit_sem, enow->msg_queue, enow->send_queue,
                  (unsigned)esp_get_free_heap_size());
         if (enow->send_queue) vQueueDelete(enow->send_queue);
         if (enow->msg_queue) vQueueDelete(enow->msg_queue);
         if (enow->task_exit_sem) vSemaphoreDelete(enow->task_exit_sem);
+        if (enow->tx_done) vSemaphoreDelete(enow->tx_done);
         if (enow->lock) vSemaphoreDelete(enow->lock);
         free(enow);
         return -1;
@@ -621,6 +573,7 @@ init_error:
     if (enow->send_queue) vQueueDelete(enow->send_queue);
     if (enow->msg_queue) vQueueDelete(enow->msg_queue);
     if (enow->task_exit_sem) vSemaphoreDelete(enow->task_exit_sem);
+    if (enow->tx_done) vSemaphoreDelete(enow->tx_done);
     if (enow->lock) vSemaphoreDelete(enow->lock);
     free(enow);
     return -1;
@@ -653,6 +606,7 @@ void tbft_transport_free(tbft_transport_t *t) {
     if (enow->send_queue) vQueueDelete(enow->send_queue);
     if (enow->msg_queue) vQueueDelete(enow->msg_queue);
     if (enow->task_exit_sem) vSemaphoreDelete(enow->task_exit_sem);
+    if (enow->tx_done) vSemaphoreDelete(enow->tx_done);
     if (enow->lock) vSemaphoreDelete(enow->lock);
     free(enow);
 }
@@ -725,24 +679,18 @@ int tbft_transport_send(tbft_transport_t *t, const void *buf, size_t len, tbft_n
     entry.dest = dest;
 
     if (xQueueSend(enow->send_queue, &entry, pdMS_TO_TICKS(SEND_QUEUE_TIMEOUT_MS)) != pdTRUE) {
+        enow->stats.tx_queue_full++;
         ESP_LOGW(TAG, "send_queue full, dropping msg to node %d (%d bytes)", dest, (int)len);
         return -1;
     }
+    enow->stats.tx_msgs++;
+    stats_count_tag(enow->stats.tx_by_tag, ((const uint8_t *)buf)[0]);
     return (int)len;
 }
 
 int tbft_transport_recv(tbft_transport_t *t, void *buf, size_t buf_len, tbft_node_id_t *src_id) {
     tbft_espnow_t *enow = (tbft_espnow_t *)t;
     if (!enow || enow->shutting_down) return -1;
-
-    if (enow->reasm_stale_flag) {
-        xSemaphoreTake(enow->lock, portMAX_DELAY);
-        if (enow->reasm_stale_flag) {
-            enow->reasm_stale_flag = false;
-            reasm_clear_stale(enow);
-        }
-        xSemaphoreGive(enow->lock);
-    }
 
     /* M10 FIX: Use non-blocking recv (timeout=0) to match UDP transport
      * API contract. The previous 50ms blocking call capped the replica
@@ -756,4 +704,9 @@ int tbft_transport_recv(tbft_transport_t *t, void *buf, size_t buf_len, tbft_nod
     if (src_id) *src_id = find_node_by_mac(enow, entry.src_mac);
 
     return entry.buf_len;
+}
+
+void tbft_transport_get_stats(tbft_transport_t *t, tbft_transport_stats_t *out) {
+    if (!t || !out) return;
+    *out = ((tbft_espnow_t *)t)->stats;
 }

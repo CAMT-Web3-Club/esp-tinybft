@@ -91,3 +91,22 @@ int tbft_transport_send(tbft_transport_t *t, const void *buf, size_t len,
  */
 int tbft_transport_recv(tbft_transport_t *t, void *buf, size_t buf_len,
                         tbft_node_id_t *src_id);
+
+/* --------------------------------------------------------------------------
+ * Statistics (A8) - plain counters, cheap enough to keep always on
+ * -------------------------------------------------------------------------- */
+#define TBFT_STATS_NUM_TAGS 18   /* tbft_msg_tag_t values are 1..17 */
+
+typedef struct {
+    uint32_t tx_msgs;        /* logical messages accepted for sending */
+    uint32_t tx_fail;        /* sends given up on (retries exhausted / hard error) */
+    uint32_t tx_queue_full;  /* ESP-NOW: send queue full, message dropped */
+    uint32_t rx_msgs;        /* complete messages handed to the protocol */
+    uint32_t rx_drop;        /* ESP-NOW: complete message dropped (rx queue full) */
+    uint32_t rx_frag_drop;   /* ESP-NOW: fragment dropped (bad header, reasm) */
+    uint32_t tx_by_tag[TBFT_STATS_NUM_TAGS];
+    uint32_t rx_by_tag[TBFT_STATS_NUM_TAGS];
+} tbft_transport_stats_t;
+
+/** Copy current counters (not atomic across fields; fine for reporting). */
+void tbft_transport_get_stats(tbft_transport_t *t, tbft_transport_stats_t *out);

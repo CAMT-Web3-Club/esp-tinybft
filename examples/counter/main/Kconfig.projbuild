@@ -39,10 +39,11 @@ menu "Counter Example Configuration"
         default EXAMPLE_WIFI_PS_NONE
         depends on TBFT_TRANSPORT_UDP
         help
-            Controls modem-sleep (power save) behaviour. The default
-            (WIFI_PS_MIN_MODEM) may add DTIM-period latency (~100 ms).
-            Select "Disabled" (WIFI_PS_NONE) for lowest latency at the
-            cost of higher power consumption.
+            Controls modem-sleep (power save) behaviour. The default here
+            is Disabled (WIFI_PS_NONE): radio always on, lowest latency,
+            highest power. MIN_MODEM wakes every DTIM; MAX_MODEM wakes every
+            listen interval (see EXAMPLE_WIFI_LISTEN_INTERVAL) and may miss
+            broadcast frames such as ARP requests.
 
         config EXAMPLE_WIFI_PS_NONE
             bool "Disabled (WIFI_PS_NONE)"
@@ -51,5 +52,14 @@ menu "Counter Example Configuration"
         config EXAMPLE_WIFI_PS_MAX_MODEM
             bool "Maximum (WIFI_PS_MAX_MODEM)"
     endchoice
+
+    config EXAMPLE_WIFI_LISTEN_INTERVAL
+        int "Station listen interval (beacon intervals)"
+        default 3
+        range 1 10
+        depends on TBFT_TRANSPORT_UDP
+        help
+            Only used with WIFI_PS_MAX_MODEM. Fixed explicitly so the
+            experiment does not depend on the IDF default.
 
 endmenu

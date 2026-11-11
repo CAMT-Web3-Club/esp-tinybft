@@ -33,13 +33,15 @@ typedef struct {
     int          num_nodes;
     int          num_replicas;
     int          local_id;       /* auto-detected via local netif IP; -1 if unknown */
+    tbft_transport_stats_t stats;
 } tbft_udp_t;
 
 /* sendto with bounded retry on transient TX-queue stalls.
  *
  * The socket is non-blocking (O_NONBLOCK set in socket_open), so a
  * momentarily-full WiFi MAC / lwIP TX queue causes sendto to return
- * EAGAIN/EWOULDBLOCK. Without retry, replies fired by 4 replicas at
+ * EAGAIN/EWOULDBLOCK, or ENOMEM/ENOBUFS when the Wi-Fi driver TX buffers
+ * are exhausted (lwIP maps ERR_MEM to ENOMEM). Without retry, replies fired by 4 replicas at
  * roughly the same instant race for the same queue and most fail
  * silently — observed as "only one replica's reply reaches the client".
  * Hard errors (e.g. ENETUNREACH) are returned immediately. */
@@ -53,9 +55,10 @@ static int udp_sendto_retry(int sock, const void *buf, size_t len,
                        (const struct sockaddr *)addr, sizeof(*addr));
         if (r >= 0) return r;
         last_errno = errno;
-        if (last_errno != EAGAIN && last_errno != EWOULDBLOCK) break;
+        if (last_errno != EAGAIN && last_errno != EWOULDBLOCK &&
+            last_errno != ENOMEM && last_errno != ENOBUFS) break;
         if (attempt + 1 < MAX_RETRIES) {
-            vTaskDelay(pdMS_TO_TICKS(5 * (attempt + 1)));
+            vTaskDelay(TBFT_MS_TO_TICKS_MIN1(5 * (attempt + 1)));
         }
     }
     errno = last_errno;
@@ -279,10 +282,9 @@ void tbft_transport_set_peer(tbft_transport_t *t,
     }
 }
 
-int tbft_transport_send(tbft_transport_t *t, const void *buf, size_t len,
-                        tbft_node_id_t dest)
+static int udp_send_inner(tbft_udp_t *udp, const void *buf, size_t len,
+                          tbft_node_id_t dest)
 {
-    tbft_udp_t *udp = (tbft_udp_t *)t;
     if (!udp) return -1;
 
     if (dest == TBFT_ALL_REPLICAS) {
@@ -328,6 +330,31 @@ int tbft_transport_send(tbft_transport_t *t, const void *buf, size_t len,
     return ret;
 }
 
+static inline void udp_count_tag(uint32_t *arr, int tag) {
+    if (tag > 0 && tag < TBFT_STATS_NUM_TAGS) arr[tag]++;
+}
+
+int tbft_transport_send(tbft_transport_t *t, const void *buf, size_t len,
+                        tbft_node_id_t dest)
+{
+    tbft_udp_t *udp = (tbft_udp_t *)t;
+    if (!udp || !buf || len == 0) return -1;
+    int r = udp_send_inner(udp, buf, len, dest);
+    if (r >= 0) {
+        udp->stats.tx_msgs++;
+        udp_count_tag(udp->stats.tx_by_tag, ((const uint8_t *)buf)[0]);
+    } else {
+        udp->stats.tx_fail++;
+    }
+    return r;
+}
+
+void tbft_transport_get_stats(tbft_transport_t *t, tbft_transport_stats_t *out)
+{
+    if (!t || !out) return;
+    *out = ((tbft_udp_t *)t)->stats;
+}
+
 int tbft_transport_recv(tbft_transport_t *t, void *buf, size_t buf_len,
                         tbft_node_id_t *src_id)
 {
@@ -364,5 +391,7 @@ int tbft_transport_recv(tbft_transport_t *t, void *buf, size_t buf_len,
         }
     }
 
+    udp->stats.rx_msgs++;
+    udp_count_tag(udp->stats.rx_by_tag, n > 0 ? ((const uint8_t *)buf)[0] : 0);
     return n;
 }

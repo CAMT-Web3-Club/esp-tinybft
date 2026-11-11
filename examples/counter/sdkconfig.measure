@@ -1,0 +1,4 @@
+# Equal, quiet logging for every variant while measuring
+CONFIG_LOG_DEFAULT_LEVEL_WARN=y
+# Periodic TBFT_STATS line (counters for loss/retry accounting)
+CONFIG_TBFT_PRINT_STATS=y

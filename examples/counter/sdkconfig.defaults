@@ -1,6 +1,3 @@
-CONFIG_EXAMPLE_ROLE_REPLICA=y
-CONFIG_EXAMPLE_WIFI_PS_NONE=y
-
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
 CONFIG_ESP_SYSTEM_EVENT_QUEUE_SIZE=32
@@ -10,9 +7,6 @@ CONFIG_COMPILER_OPTIMIZATION_PERF=y
 # Flash size must match the ESP32-C3 hardware (4MB, not default 2MB)
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
-
-# TinyBFT: use ESP-NOW transport
-CONFIG_TBFT_TRANSPORT_ESPNOW=y
 
 # TinyBFT: 7 replicas + 1 client (f=2)
 # MAX_NUM_REPLICAS=7 (1 less than total nodes; client is separate)
@@ -50,4 +44,9 @@ CONFIG_LWIP_IP4_REASSEMBLY=y
 # Enable unicast UDP mode by default to prevent Wi-Fi router multicast packet drops
 CONFIG_TBFT_DISABLE_MULTICAST=y
 
+# Equal receive buffering for both transports (ESP-NOW queue depth is 16).
+# lwIP drops UDP datagrams silently when this mailbox is full.
+CONFIG_LWIP_UDP_RECVMBOX_SIZE=16
 
+# NOTE: role, transport and Wi-Fi power-save are selected by the overlays
+# sdkconfig.role.* and sdkconfig.variant.* (see README), not here.

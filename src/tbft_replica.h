@@ -119,6 +119,13 @@ typedef struct {
      * Reset to 0 on replica restart to avoid stale values. */
     int yield_counter;
 
+    /* Protocol event counters (reported with transport stats) */
+    uint32_t stat_executed;
+    uint32_t stat_commit_resent;
+    uint32_t stat_view_change_sent;
+    uint32_t stat_new_view;
+    uint32_t stat_fetch_started;
+
     /* Event group for decoupling timer callbacks from heavy processing */
     EventGroupHandle_t evt_group;
 } tbft_replica_t;
@@ -171,6 +178,9 @@ void tbft_replica_free(tbft_replica_t *r);
  * Run the replica event loop (blocking — call from a dedicated FreeRTOS task).
  */
 void tbft_replica_run(tbft_replica_t *r);
+
+/** Print one "TBFT_STATS key=value ..." line (WARN level, parseable). */
+void tbft_replica_print_stats(const tbft_replica_t *r);
 
 /* --------------------------------------------------------------------------
  * Message handlers (called from tbft_replica_run dispatch)

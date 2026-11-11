@@ -3,6 +3,22 @@ set -e
 
 mkdir -p spiffs_image
 
+# Protocol timeouts shared by BOTH transports: the energy comparison is only
+# fair if UDP and ESP-NOW recover from loss on the same schedule.
+AUTH_TIMEOUT_MS=3000      # parsed but currently unused by the library
+VC_TIMEOUT_MS=30000       # view-change timeout
+STATUS_TIMEOUT_MS=5000
+RECOVERY_TIMEOUT_MS=10000
+
+# Keys are only generated when missing (or with --keys): regenerating them
+# invalidates every flashed board.  Config files are always rewritten.
+GEN_KEYS=0
+[ "$1" = "--keys" ] && GEN_KEYS=1
+for i in 0 1 2 3 4 5 6 7; do
+    [ -f spiffs_image/priv$i.der ] && [ -f spiffs_image/pub$i.der ] || GEN_KEYS=1
+done
+
+if [ "$GEN_KEYS" = 1 ]; then
 echo "Generating RSA keys for 7 replicas and 1 client..."
 for i in 0 1 2 3 4 5 6 7; do
     openssl genrsa -out spiffs_image/priv$i.pem 2048 2>/dev/null
@@ -36,12 +52,15 @@ for i in 0 1 2 3 4 5 6 7; do
     fi
 done
 echo "All keys verified: PKCS#1 private keys, matching pub/priv pairs."
+else
+    echo "Keys already present; keeping them (use --keys to regenerate)."
+fi
 
 echo "Generating UDP config..."
 cat <<EOF > spiffs_image/config_udp.txt
 counter
 2
-3000
+$AUTH_TIMEOUT_MS
 8
 239.0.0.1
 node0 192.168.100.150 5000 /spiffs/pub0.der
@@ -52,16 +71,16 @@ node4 192.168.100.154 5000 /spiffs/pub4.der
 node5 192.168.100.155 5000 /spiffs/pub5.der
 node6 192.168.100.156 5000 /spiffs/pub6.der
 client7 192.168.100.157 5000 /spiffs/pub7.der
-2000
-5000
-10000
+$VC_TIMEOUT_MS
+$STATUS_TIMEOUT_MS
+$RECOVERY_TIMEOUT_MS
 EOF
 
 echo "Generating ESP-NOW config (7 replicas + 1 client, f=2)..."
 cat <<EOF > spiffs_image/config_espnow.txt
 counter
 2
-60000
+$AUTH_TIMEOUT_MS
 8
 0.0.0.0
 node0 88:56:a6:5b:f2:f0 /spiffs/pub0.der
@@ -72,9 +91,9 @@ node4 1c:db:d4:c6:40:40 /spiffs/pub4.der
 node5 88:56:a6:5b:6b:2c /spiffs/pub5.der
 node6 88:56:a6:5b:78:dc /spiffs/pub6.der
 client7 e8:3d:c1:8c:18:58 /spiffs/pub7.der
-60000
-5000
-10000
+$VC_TIMEOUT_MS
+$STATUS_TIMEOUT_MS
+$RECOVERY_TIMEOUT_MS
 EOF
 
 

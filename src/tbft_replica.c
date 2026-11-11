@@ -253,6 +253,7 @@ static void tbft_replica_start_fetch(tbft_replica_t *r, tbft_seqno_t seqno, int 
 
 static void tbft_replica_start_fetch(tbft_replica_t *r, tbft_seqno_t seqno, int replier)
 {
+    r->stat_fetch_started++;
     tbft_state_start_fetch(&r->state, seqno, replier);
 
     /* Send initial fetch request(s) */
@@ -270,6 +271,30 @@ static void tbft_replica_start_fetch(tbft_replica_t *r, tbft_seqno_t seqno, int 
         tbft_node_send(&r->node, r->out_buf, (size_t)fr->hdr.size,
                        r->state.fetch_replier);
     }
+}
+
+void tbft_replica_print_stats(const tbft_replica_t *r)
+{
+    tbft_transport_stats_t t;
+    tbft_transport_get_stats(r->node.transport, &t);
+    ESP_LOGW(TAG, "TBFT_STATS id=%d view=%lld last_exec=%lld last_stable=%lld "
+             "executed=%lu commit_resent=%lu vc_sent=%lu new_view=%lu fetch=%lu "
+             "tx=%lu tx_fail=%lu tx_qfull=%lu rx=%lu rx_drop=%lu rx_frag_drop=%lu "
+             "tx_pp=%lu tx_prep=%lu tx_commit=%lu rx_pp=%lu rx_prep=%lu rx_commit=%lu",
+             r->node.node_id, (long long)r->node.view,
+             (long long)r->last_executed, (long long)r->last_stable,
+             (unsigned long)r->stat_executed, (unsigned long)r->stat_commit_resent,
+             (unsigned long)r->stat_view_change_sent, (unsigned long)r->stat_new_view,
+             (unsigned long)r->stat_fetch_started,
+             (unsigned long)t.tx_msgs, (unsigned long)t.tx_fail,
+             (unsigned long)t.tx_queue_full, (unsigned long)t.rx_msgs,
+             (unsigned long)t.rx_drop, (unsigned long)t.rx_frag_drop,
+             (unsigned long)t.tx_by_tag[TBFT_MSG_PRE_PREPARE],
+             (unsigned long)t.tx_by_tag[TBFT_MSG_PREPARE],
+             (unsigned long)t.tx_by_tag[TBFT_MSG_COMMIT],
+             (unsigned long)t.rx_by_tag[TBFT_MSG_PRE_PREPARE],
+             (unsigned long)t.rx_by_tag[TBFT_MSG_PREPARE],
+             (unsigned long)t.rx_by_tag[TBFT_MSG_COMMIT]);
 }
 
 void tbft_replica_run(tbft_replica_t *r)
@@ -339,6 +364,9 @@ void tbft_replica_run(tbft_replica_t *r)
 #endif
 
     TickType_t last_nk_send = xTaskGetTickCount();
+#if CONFIG_TBFT_PRINT_STATS
+    TickType_t last_stats = xTaskGetTickCount();
+#endif
 
     while (r->running) {
 #if CONFIG_ESP_TASK_WDT_EN
@@ -356,6 +384,13 @@ void tbft_replica_run(tbft_replica_t *r)
             r->yield_counter = 0;
             vTaskDelay(pdMS_TO_TICKS(1));
         }
+
+#if CONFIG_TBFT_PRINT_STATS
+        if (xTaskGetTickCount() - last_stats >= pdMS_TO_TICKS(60000)) {
+            last_stats = xTaskGetTickCount();
+            tbft_replica_print_stats(r);
+        }
+#endif
 
         /* Periodically re-broadcast New_key to help late-joining nodes.
          * Send every 2s if we're missing keys, every 10s once ready. */
@@ -736,7 +771,7 @@ void tbft_replica_handle_pre_prepare(tbft_replica_t *r, const void *msg, int len
         }
         const tbft_auth_t *auth =
             (const tbft_auth_t *)((const uint8_t *)msg + auth_offset);
-        ESP_LOGI(TAG, "pp: verifying MAC from primary %d, slot=%d, ts=%lld, auth_offset=%d, msg_len=%d, rset=%d, ndet=%d, hdr[0..7]=%02x%02x%02x%02x%02x%02x%02x%02x",
+        ESP_LOGD(TAG, "pp: verifying MAC from primary %d, slot=%d, ts=%lld, auth_offset=%d, msg_len=%d, rset=%d, ndet=%d, hdr[0..7]=%02x%02x%02x%02x%02x%02x%02x%02x",
                  expected_primary, slot, (long long)pp->hdr.timestamp_us, auth_offset, len,
                  (int)pp->rset_size, (int)pp->non_det_size,
                  ((uint8_t*)msg)[0], ((uint8_t*)msg)[1], ((uint8_t*)msg)[2], ((uint8_t*)msg)[3],
@@ -972,7 +1007,7 @@ void tbft_replica_handle_prepare(tbft_replica_t *r, const void *msg, int len)
     int pp_len2 = 0;
     const uint8_t *pp2 = tbft_ar_load_pp(&r->ar, prep->seqno, &pp_len2);
     bool is_prep = tbft_ar_prepared(&r->ar, prep->seqno);
-    ESP_LOGI(TAG, "prepare debug: seqno=%lld has_pp=%d prepared=%d",
+    ESP_LOGD(TAG, "prepare debug: seqno=%lld has_pp=%d prepared=%d",
              (long long)prep->seqno, pp2 ? 1 : 0, is_prep ? 1 : 0);
 
     /* Check if prepared — if so, update last_prepared, send commit and check for execution */
@@ -1590,6 +1625,7 @@ void tbft_replica_handle_new_view(tbft_replica_t *r, const void *msg, int len)
         tbft_itimer_stop(&r->vtimer);
     }
 
+    r->stat_new_view++;
     ESP_LOGI(TAG, "installed new view %lld, primary=%d",
              (long long)nv->v, r->node.cur_primary);
 }
@@ -2059,24 +2095,15 @@ void tbft_replica_send_pre_prepare(tbft_replica_t *r)
     memcpy(ptr, r->ndet_buf, (size_t)ndet_len);
     ptr += ndet_len;
 
-    /* Debug: log the key and auth offset used for each recipient */
+    /* Debug: auth offset (key material must never be logged) */
     {
         int auth_off = (int)(ptr - r->out_buf);
-        ESP_LOGI(TAG, "send_pp: tag=%d extra=%d size=%d ts=%lld, hdr[0..7]=%02x%02x%02x%02x%02x%02x%02x%02x, auth_offset=%d",
+        ESP_LOGD(TAG, "send_pp: tag=%d extra=%d size=%d ts=%lld, hdr[0..7]=%02x%02x%02x%02x%02x%02x%02x%02x, auth_offset=%d",
                  pp->hdr.tag, pp->hdr.extra, pp->hdr.size,
                  (long long)pp->hdr.timestamp_us,
                  r->out_buf[0], r->out_buf[1], r->out_buf[2], r->out_buf[3],
                  r->out_buf[4], r->out_buf[5], r->out_buf[6], r->out_buf[7],
                  auth_off);
-        for (int i = 0; i < r->node.num_replicas; i++) {
-            if (i == r->node.node_id) continue;
-            tbft_principal_t *p = r->node.principals[i];
-            if (p) {
-                ESP_LOGI(TAG, "send_pp: out_key for replica %d, key[0..3]=%02x%02x%02x%02x",
-                         i, p->hmac_out_key.bytes[0], p->hmac_out_key.bytes[1],
-                         p->hmac_out_key.bytes[2], p->hmac_out_key.bytes[3]);
-            }
-        }
     }
 
     /* Authenticator */
@@ -2222,6 +2249,7 @@ void tbft_replica_send_commit(tbft_replica_t *r, tbft_seqno_t n)
 
     tbft_node_send(&r->node, r->out_buf, (size_t)cm->hdr.size,
                    TBFT_ALL_REPLICAS);
+    if (!first_send) r->stat_commit_resent++;
     ESP_LOGI(TAG, "%s commit seqno=%lld",
              first_send ? "sent" : "re-sent", (long long)n);
 }
@@ -2319,8 +2347,13 @@ void tbft_replica_execute_committed(tbft_replica_t *r)
                                 req_rep->cid, ro);
 
             if (rc != 0) {
-                ESP_LOGW(TAG, "exec_cb rejected seqno=%lld", (long long)n);
-                break;
+                /* Rejected by the application (API: "-1 to reject, no reply
+                 * sent").  Every replica rejects the same request
+                 * deterministically, so treat the seqno as executed and move
+                 * on; breaking here would retry the same seqno forever. */
+                ESP_LOGW(TAG, "exec_cb rejected seqno=%lld - skipping reply",
+                         (long long)n);
+                goto exec_done;
             }
 
             /* Validate reply length AFTER exec_cb has set it */
@@ -2373,6 +2406,7 @@ void tbft_replica_execute_committed(tbft_replica_t *r)
                      r->exec_cb, req_len, (int)sizeof(tbft_request_rep_t), (long long)n);
         }
 
+exec_done:
         if (req_len >= (int)sizeof(tbft_request_rep_t)) {
             const tbft_request_rep_t *req_rep = (const tbft_request_rep_t *)req_bytes;
             if (req_rep->rid > r->last_executed_rid[req_rep->cid]) {
@@ -2381,6 +2415,7 @@ void tbft_replica_execute_committed(tbft_replica_t *r)
         }
 
         r->last_executed = n;
+        r->stat_executed++;
 
         /* Checkpoint at intervals */
         if ((n % TBFT_CHECKPOINT_INTERVAL) == 0) {
@@ -2577,6 +2612,7 @@ void tbft_replica_send_view_change(tbft_replica_t *r)
 
     tbft_node_send(&r->node, r->out_buf, (size_t)total_size, TBFT_ALL_REPLICAS);
 
+    r->stat_view_change_sent++;
     ESP_LOGI(TAG, "sent view-change to view %lld", (long long)target);
 
     if (!r->vi.received[r->node.node_id]) {
@@ -2781,9 +2817,6 @@ void tbft_replica_handle_new_key(tbft_replica_t *r, const void *msg, int len)
     }
 
     /* Install as the in-key for verifying messages FROM sender_id */
-    ESP_LOGI(TAG, "handle_new_key: from replica %d, decrypted key[0..3]=%02x%02x%02x%02x",
-             sender_id, new_key.bytes[0], new_key.bytes[1],
-             new_key.bytes[2], new_key.bytes[3]);
     tbft_principal_set_in_key(p, &new_key);
     
     /* Save the ciphertext to skip duplicate processing in the future */

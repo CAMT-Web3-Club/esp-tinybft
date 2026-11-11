@@ -642,7 +642,7 @@ int Byz_recv_reply(Byz_rep *rep)
         uint8_t buf[TBFT_MAX_MESSAGE_SIZE];
         int n = tbft_node_recv(s_client, buf, sizeof(buf), NULL);
         if (n < (int)sizeof(tbft_reply_rep_t)) {
-            vTaskDelay(pdMS_TO_TICKS(1));
+            vTaskDelay(TBFT_MS_TO_TICKS_MIN1(1));
 #if CONFIG_ESP_TASK_WDT_EN
             esp_task_wdt_reset();
 #endif
@@ -682,7 +682,7 @@ int Byz_recv_reply(Byz_rep *rep)
         }
         if (rep_id < 0) {
             ESP_LOGW(TAG, "recv_reply: no valid RSA signature");
-            vTaskDelay(pdMS_TO_TICKS(1));
+            vTaskDelay(TBFT_MS_TO_TICKS_MIN1(1));
             continue;
         }
 
@@ -1001,14 +1001,19 @@ void Byz_reset_stats(void)
 
 void Byz_print_stats(void)
 {
-    if (!s_replica) return;
-    ESP_LOGI(TAG,
-             "STATS: view=%lld last_stable=%lld last_executed=%lld "
-             "last_prepared=%lld",
-             (long long)s_replica->node.view,
-             (long long)s_replica->last_stable,
-             (long long)s_replica->last_executed,
-             (long long)s_replica->last_prepared);
+    if (s_replica) {
+        tbft_replica_print_stats(s_replica);
+    } else if (s_client && s_client->transport) {
+        tbft_transport_stats_t t;
+        tbft_transport_get_stats(s_client->transport, &t);
+        ESP_LOGW(TAG, "TBFT_STATS id=%d tx=%lu tx_fail=%lu tx_qfull=%lu rx=%lu "
+                 "rx_drop=%lu rx_frag_drop=%lu rx_reply=%lu",
+                 (int)s_client->node_id, (unsigned long)t.tx_msgs,
+                 (unsigned long)t.tx_fail, (unsigned long)t.tx_queue_full,
+                 (unsigned long)t.rx_msgs, (unsigned long)t.rx_drop,
+                 (unsigned long)t.rx_frag_drop,
+                 (unsigned long)t.rx_by_tag[TBFT_MSG_REPLY]);
+    }
 }
 
 int Byz_detect_local_id(const char *config_file)

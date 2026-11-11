@@ -1,1 +1,3 @@
 components/
+sdkconfig.wifi.local
+build_*/
