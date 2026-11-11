@@ -102,8 +102,17 @@ typedef struct {
  * Callback signatures (Replica API)
  * -------------------------------------------------------------------------- */
 
+/** Size of the request header that precedes the client command inside the
+ *  buffer passed to the exec callback ([header][command][signature]).
+ *  Checked against sizeof(tbft_request_rep_t) at build time. */
+#define BYZ_REQ_HEADER_SIZE 68
+
 /**
  * Execute callback: called by the library when a request is committed.
+ * `in->contents` starts with BYZ_REQ_HEADER_SIZE bytes of request header;
+ * the client command follows.  Prefer replying with an error status in the
+ * reply body: returning -1 means a deterministic rejection (every replica
+ * skips the request and the client gets no reply, so it times out).
  *
  * @param in       Committed request payload
  * @param insize   Length of @p in

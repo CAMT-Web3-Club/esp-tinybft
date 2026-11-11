@@ -57,19 +57,25 @@ typedef struct {
 int exec_cb(Byz_req *in, Byz_rep *out, Byz_buffer *ndet, int cid, bool ro) {
     /* The exec callback receives the full embedded request from the
      * pre-prepare's rset: [tbft_request_rep_t(68)][wallet command][sig].
-     * Skip the 68-byte header to reach the wallet_req_t command. */
-    if (in->size < 68) return -1;
-    wallet_req_t *req = (wallet_req_t *)((const uint8_t *)in->contents + 68);
+     * Skip BYZ_REQ_HEADER_SIZE bytes of header to reach the wallet_req_t command. */
+    if (in->size < BYZ_REQ_HEADER_SIZE) return -1;
+    wallet_req_t *req = (wallet_req_t *)((const uint8_t *)in->contents + BYZ_REQ_HEADER_SIZE);
     wallet_rep_t *rep = (wallet_rep_t *)out->contents;
     out->size = sizeof(wallet_rep_t);
 
     if (req->op == 0) {
-        if (req->from >= NUM_ACCOUNTS) return -1;
+        if (req->from >= NUM_ACCOUNTS) {
+            rep->balance_from = 0; rep->balance_to = 0; rep->status = -1;
+            return 0;
+        }
         rep->balance_from = app_state[req->from];
         rep->balance_to = 0;
         rep->status = 0;
     } else if (req->op == 1) {
-        if (req->from >= NUM_ACCOUNTS || req->to >= NUM_ACCOUNTS) return -1;
+        if (req->from >= NUM_ACCOUNTS || req->to >= NUM_ACCOUNTS) {
+            rep->balance_from = 0; rep->balance_to = 0; rep->status = -1;
+            return 0;
+        }
 
         Byz_modify(&app_state[req->from], sizeof(int32_t));
         Byz_modify(&app_state[req->to], sizeof(int32_t));
@@ -85,7 +91,7 @@ int exec_cb(Byz_req *in, Byz_rep *out, Byz_buffer *ndet, int cid, bool ro) {
         rep->balance_to = app_state[req->to];
         ESP_LOGI(TAG, "Transfer %ld from %d to %d (status %d)", req->amount, req->from, req->to, rep->status);
     } else {
-        return -1;
+        rep->balance_from = 0; rep->balance_to = 0; rep->status = -1;
     }
     return 0;
 }

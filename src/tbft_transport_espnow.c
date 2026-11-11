@@ -41,14 +41,14 @@ static const char *TAG = "tbft_espnow";
 #define FRAG_MAX_PARTS      ((TBFT_MAX_MESSAGE_SIZE + FRAG_MAX_PAYLOAD - 1) / FRAG_MAX_PAYLOAD)
 #define REASM_MAX_SLOTS     8
 #define REASM_TIMEOUT_MS    5000
-#define ESPNOW_TX_MAX_ATTEMPTS   3     /* per frame */
+#define ESPNOW_TX_MAX_ATTEMPTS   CONFIG_TBFT_ESPNOW_TX_RETRIES
 #define ESPNOW_TX_CB_TIMEOUT_MS  100   /* wait for the MAC-layer result */
 
 #define MSG_QUEUE_DEPTH     16
 #define SEND_QUEUE_DEPTH    8
 #define SEND_TASK_PRIORITY  7
 #define SEND_TASK_STACK_SIZE 8192
-#define SEND_TASK_RECV_TIMEOUT_MS  50
+#define SEND_TASK_RECV_TIMEOUT_MS  200
 #define RECV_TASK_TIMEOUT_MS  100
 #define SEND_QUEUE_TIMEOUT_MS 100
 #define SHUTDOWN_DRAIN_MS     200
@@ -129,6 +129,7 @@ typedef struct tbft_espnow {
     /* TX completion: only send_task calls esp_now_send(), so at most one
      * frame is in flight; the send callback reports its MAC-layer result. */
     SemaphoreHandle_t tx_done;
+    SemaphoreHandle_t rx_sem;   /* given on every delivered message (wait()) */
     volatile esp_now_send_status_t tx_status;
     uint8_t tx_expect_mac[6];
 
@@ -334,6 +335,7 @@ static void espnow_deliver(tbft_espnow_t *enow, recv_entry_t *q_entry) {
     }
     enow->stats.rx_msgs++;
     stats_count_tag(enow->stats.rx_by_tag, msg_tag);
+    xSemaphoreGive(enow->rx_sem);
 }
 
 /* Runs in the Wi-Fi task.  Keep it short: no logging, no lock, no large
@@ -403,7 +405,7 @@ static bool espnow_tx_frame(tbft_espnow_t *enow, const uint8_t *mac,
         } else {
             ESP_LOGD(TAG, "esp_now_send err=0x%x (attempt %d)", err, attempt + 1);
         }
-        vTaskDelay(TBFT_MS_TO_TICKS_MIN1(1));       /* >= 1 tick backoff */
+        vTaskDelay(TBFT_MS_TO_TICKS_MIN1(CONFIG_TBFT_ESPNOW_TX_RETRY_DELAY_MS));
     }
     return false;
 }
@@ -544,10 +546,11 @@ int tbft_transport_create(tbft_transport_t **out, tbft_transport_type_t type, in
     enow->lock = xSemaphoreCreateMutex();
     enow->task_exit_sem = xSemaphoreCreateBinary();
     enow->tx_done = xSemaphoreCreateBinary();
+    enow->rx_sem = xSemaphoreCreateBinary();
     enow->msg_queue = xQueueCreate(MSG_QUEUE_DEPTH, sizeof(recv_entry_t));
     enow->send_queue = xQueueCreate(SEND_QUEUE_DEPTH, sizeof(send_entry_t));
 
-    if (!enow->lock || !enow->task_exit_sem || !enow->tx_done || !enow->msg_queue || !enow->send_queue) {
+    if (!enow->lock || !enow->task_exit_sem || !enow->tx_done || !enow->rx_sem || !enow->msg_queue || !enow->send_queue) {
         ESP_LOGE(TAG, "queue/sem alloc failed: lock=%p sem=%p msg_q=%p send_q=%p free_heap=%u",
                  enow->lock, enow->task_exit_sem, enow->msg_queue, enow->send_queue,
                  (unsigned)esp_get_free_heap_size());
@@ -555,6 +558,8 @@ int tbft_transport_create(tbft_transport_t **out, tbft_transport_type_t type, in
         if (enow->msg_queue) vQueueDelete(enow->msg_queue);
         if (enow->task_exit_sem) vSemaphoreDelete(enow->task_exit_sem);
         if (enow->tx_done) vSemaphoreDelete(enow->tx_done);
+    if (enow->rx_sem) vSemaphoreDelete(enow->rx_sem);
+        if (enow->rx_sem) vSemaphoreDelete(enow->rx_sem);
         if (enow->lock) vSemaphoreDelete(enow->lock);
         free(enow);
         return -1;
@@ -595,6 +600,7 @@ init_error:
     if (enow->msg_queue) vQueueDelete(enow->msg_queue);
     if (enow->task_exit_sem) vSemaphoreDelete(enow->task_exit_sem);
     if (enow->tx_done) vSemaphoreDelete(enow->tx_done);
+    if (enow->rx_sem) vSemaphoreDelete(enow->rx_sem);
     if (enow->lock) vSemaphoreDelete(enow->lock);
     free(enow);
     return -1;
@@ -628,6 +634,7 @@ void tbft_transport_free(tbft_transport_t *t) {
     if (enow->msg_queue) vQueueDelete(enow->msg_queue);
     if (enow->task_exit_sem) vSemaphoreDelete(enow->task_exit_sem);
     if (enow->tx_done) vSemaphoreDelete(enow->tx_done);
+    if (enow->rx_sem) vSemaphoreDelete(enow->rx_sem);
     if (enow->lock) vSemaphoreDelete(enow->lock);
     free(enow);
 }
@@ -678,6 +685,22 @@ void tbft_transport_set_peer(tbft_transport_t *t, tbft_node_id_t node_id, const 
     if (add_ret != ESP_OK) {
         ESP_LOGW(TAG, "esp_now_add_peer for node %d failed: 0x%x", node_id, add_ret);
     }
+#if CONFIG_TBFT_ESPNOW_PHY_RATE != 0
+    else {
+        /* wifi_phy_rate_t value from Kconfig: 0x00-0x07 11b, 0x08-0x0F 11g,
+         * 0x10-0x17 HT20.  Applied after esp_now_add_peer() as required. */
+        esp_now_rate_config_t rc = {
+            .phymode = (CONFIG_TBFT_ESPNOW_PHY_RATE >= 0x10) ? WIFI_PHY_MODE_HT20
+                     : (CONFIG_TBFT_ESPNOW_PHY_RATE >= 0x08) ? WIFI_PHY_MODE_11G
+                     : WIFI_PHY_MODE_11B,
+            .rate = (wifi_phy_rate_t)CONFIG_TBFT_ESPNOW_PHY_RATE,
+        };
+        esp_err_t rr = esp_now_set_peer_rate_config(ap_mac, &rc);
+        if (rr != ESP_OK) {
+            ESP_LOGW(TAG, "esp_now_set_peer_rate_config node %d failed: 0x%x", node_id, rr);
+        }
+    }
+#endif
 }
 
 int tbft_transport_send(tbft_transport_t *t, const void *buf, size_t len, tbft_node_id_t dest) {
@@ -730,4 +753,11 @@ int tbft_transport_recv(tbft_transport_t *t, void *buf, size_t buf_len, tbft_nod
 void tbft_transport_get_stats(tbft_transport_t *t, tbft_transport_stats_t *out) {
     if (!t || !out) return;
     *out = ((tbft_espnow_t *)t)->stats;
+}
+
+void tbft_transport_wait(tbft_transport_t *t, int timeout_ms) {
+    tbft_espnow_t *enow = (tbft_espnow_t *)t;
+    if (!enow || enow->shutting_down) return;
+    if (uxQueueMessagesWaiting(enow->msg_queue) > 0) return;
+    xSemaphoreTake(enow->rx_sem, TBFT_MS_TO_TICKS_MIN1(timeout_ms));
 }

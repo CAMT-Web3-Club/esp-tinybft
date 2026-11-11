@@ -33,6 +33,7 @@ static const char *TAG = "tbft_replica";
 /* Low #8 FIX: Named constants for magic numbers */
 #define TBFT_INIT_DRAIN_LIMIT     64   /* max messages to drain after New_key broadcast */
 #define TBFT_KEY_DRAIN_LIMIT      32   /* max messages to drain during key confirmation */
+#define TBFT_IDLE_WAIT_MS         20   /* max sleep when idle; bounds timer-event latency */
 #define TBFT_YIELD_THRESHOLD      16   /* message loop iterations before cooperative yield */
 #define TBFT_VC_BACKOFF_MAX_MULT  60   /* max multiplier for view-change timeout backoff */
 
@@ -417,7 +418,7 @@ void tbft_replica_run(tbft_replica_t *r)
                 TBFT_EVT_VTIMER | TBFT_EVT_STIMER,
                 pdTRUE,   /* clear on exit */
                 pdFALSE,  /* wait for any bit */
-                pdMS_TO_TICKS(10));
+                0);   /* poll only: blocking happens in tbft_node_wait() below */
             /* Suppress view-change timeouts until we have enough HMAC keys.
              * Without keys, Prepare/Commit messages fail verification, so
              * view-changes would be triggered spuriously. */
@@ -488,7 +489,7 @@ void tbft_replica_run(tbft_replica_t *r)
         if (n < (int)sizeof(tbft_msg_hdr_t)) {
             /* No message available — yield to let the WiFi task, lwIP,
              * and the IDLE task get CPU time on single-core MCUs. */
-            vTaskDelay(pdMS_TO_TICKS(10));
+            tbft_node_wait(&r->node, TBFT_IDLE_WAIT_MS);
             continue;
         }
 

@@ -120,6 +120,11 @@ int tbft_node_recv(tbft_node_t *node, void *buf, size_t buf_len, tbft_node_id_t 
     return n;
 }
 
+void tbft_node_wait(tbft_node_t *node, int timeout_ms)
+{
+    if (node->transport) tbft_transport_wait(node->transport, timeout_ms);
+}
+
 /* --------------------------------------------------------------------------
  * Authenticator generation / verification
  * -------------------------------------------------------------------------- */

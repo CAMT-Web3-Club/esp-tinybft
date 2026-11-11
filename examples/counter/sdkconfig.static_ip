@@ -1,0 +1,2 @@
+# Optional: static IP from MAC (UDP variants only; no DHCP reservation needed)
+CONFIG_EXAMPLE_STATIC_IP=y

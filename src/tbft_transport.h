@@ -110,3 +110,11 @@ typedef struct {
 
 /** Copy current counters (not atomic across fields; fine for reporting). */
 void tbft_transport_get_stats(tbft_transport_t *t, tbft_transport_stats_t *out);
+
+/**
+ * Block until a message may be available or @p timeout_ms elapses.
+ * Lets the protocol task sleep instead of polling (needed for CPU power
+ * management).  May return early or spuriously; callers must re-check with
+ * tbft_transport_recv().
+ */
+void tbft_transport_wait(tbft_transport_t *t, int timeout_ms);

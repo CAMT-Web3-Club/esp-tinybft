@@ -49,6 +49,7 @@ directory with its own `sdkconfig` (no `menuconfig`, no hand-edited sdkconfig):
 | Variant | Transport | Radio |
 |---|---|---|
 | `espnow` | ESP-NOW (station interface) | always on |
+| `espnow_ps` | ESP-NOW (station) | duty-cycled RX: window/interval, retries raised to span one interval (optional, untested on hardware) |
 | `udp_psnone` | UDP | `WIFI_PS_NONE` (always on, direct counterpart of `espnow`) |
 | `udp_psmin` | UDP | `WIFI_PS_MIN_MODEM` |
 | `udp_psmax` | UDP | `WIFI_PS_MAX_MODEM`, listen interval 3 |
@@ -76,3 +77,16 @@ Measurement notes: use the same channel for ESP-NOW (`EXAMPLE_ESPNOW_CHANNEL`)
 and the router; UDP energy excludes the router; ESP-NOW and UDP `PS_NONE` are
 the like-for-like pair; `PS_MIN`/`PS_MAX` save RF power only because the CPU
 never sleeps (power management is not enabled).
+
+Optional overlays, passed with `EXTRA` (they get their own build dir):
+
+```bash
+EXTRA="sdkconfig.pm" ./build_variant.sh udp_psmax replica build            # CPU DFS + light-sleep
+EXTRA="sdkconfig.pm;sdkconfig.static_ip" ./build_variant.sh udp_psmin client build
+```
+
+- `sdkconfig.pm` works because the replica loop and the client now sleep in
+  `tbft_transport_wait()` (select/semaphore) instead of polling every tick.
+  Apply it to every variant of a comparison or to none.
+- `sdkconfig.static_ip` derives the board IP from its MAC (no DHCP reservation).
+- `TBFT_ESPNOW_PHY_RATE` sets the ESP-NOW rate (0 = IDF default 1 Mbps); report it.

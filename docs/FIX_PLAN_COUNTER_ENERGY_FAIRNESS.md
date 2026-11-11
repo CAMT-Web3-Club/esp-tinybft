@@ -40,14 +40,16 @@ Build ผ่านแบบไม่มี warning สำหรับ `counter` 
 | A6 | ทำแล้ว | `sdkconfig.measure` ตั้ง log WARN; ลบการพิมพ์ key |
 | A7 | ทำแล้ว | overlay + `build_variant.sh` + README |
 | A8 | ทำแล้ว | `TBFT_STATS` ทุก 60 s (replica) / ต่อ request (client); UDP นับ drop ของ lwIP ไม่ได้ |
-| A9, A10, A11 | ยังไม่ทำ | ทางเลือก รอเจ้าของงานวิจัยตัดสินใจ |
+| A9 | ทำแล้ว (ไม่ได้ทดสอบบนบอร์ด) | variant `espnow_ps`: `EXAMPLE_ESPNOW_POWER_SAVE` + wake window/interval; retry ปรับผ่าน `TBFT_ESPNOW_TX_RETRIES` / `_RETRY_DELAY_MS`; **ต้องตัดสินใจว่าจะรวมในชุดทดลอง** และตรวจอัตราส่งสำเร็จจริง |
+| A10 | ทำแล้ว | `TBFT_ESPNOW_PHY_RATE` (0 = ค่าเริ่มต้น IDF 1 Mbps) |
+| A11 | ทำแล้ว (ไม่ได้ทดสอบบนบอร์ด) | `tbft_transport_wait()` แทน polling ใน replica loop และ client; overlay `sdkconfig.pm` (DFS + light-sleep) ใช้ผ่าน `EXTRA="sdkconfig.pm"` |
 | B1 | ทำแล้ว | รอ send callback ต่อเฟรม, retry 3 ครั้ง, ลบ delay คงที่ |
 | B2 | ทำแล้ว | callback ไม่มี lock/log, fast path เฟรมเดียว |
 | B3 | ทำแล้ว | `TBFT_MS_TO_TICKS_MIN1` |
 | B4 | ทำแล้ว | retry เมื่อ `ENOMEM`/`ENOBUFS` |
-| B5 | ทำแบบขั้นต่ำ | retry 10 ครั้งแล้ว reboot, backoff ใน Wi-Fi handler; static IP จาก MAC (แบบแนะนำ) ยังไม่ทำ |
+| B5 | ทำแล้ว | retry+reboot, backoff, และ `EXAMPLE_STATIC_IP` (static IP จาก MAC โดยหา index ใน `config_espnow.txt` แล้วใช้ IP ที่ index เดียวกันใน `config_udp.txt`; ยังไม่ได้ทดสอบว่า event got-ip มาตามคาดบนบอร์ดจริง) |
 | B6 | ทำแล้ว | ลอง key ของ `src_id` ก่อน แล้ววนตัวอื่น |
-| B7 | ทำบางส่วน | replica ไม่ค้างเมื่อ `exec_cb` คืน -1; ค่าคงที่ 68 และ reply status ใน example ยังไม่แก้ |
+| B7 | ทำแล้ว | replica ไม่ค้างเมื่อ `exec_cb` คืน -1; `BYZ_REQ_HEADER_SIZE` ใน public header (มี static assert); example ตอบ `status=-1` แทนคืน -1 |
 
 ## 2. ข้อตกลงในการทำงาน
 

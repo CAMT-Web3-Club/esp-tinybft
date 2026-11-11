@@ -395,3 +395,15 @@ int tbft_transport_recv(tbft_transport_t *t, void *buf, size_t buf_len,
     udp_count_tag(udp->stats.rx_by_tag, n > 0 ? ((const uint8_t *)buf)[0] : 0);
     return n;
 }
+
+void tbft_transport_wait(tbft_transport_t *t, int timeout_ms)
+{
+    tbft_udp_t *udp = (tbft_udp_t *)t;
+    if (!udp || udp->sock < 0) return;
+    fd_set rfds;
+    FD_ZERO(&rfds);
+    FD_SET(udp->sock, &rfds);
+    struct timeval tv = { .tv_sec = timeout_ms / 1000,
+                          .tv_usec = (timeout_ms % 1000) * 1000 };
+    select(udp->sock + 1, &rfds, NULL, NULL, &tv);
+}

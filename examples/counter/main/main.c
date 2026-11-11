@@ -1,6 +1,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdlib.h>
+#include <strings.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_system.h"
@@ -14,6 +16,9 @@
 #include "esp_task_wdt.h"
 #include "esp_timer.h"
 #include "esp_mac.h"
+#if CONFIG_PM_ENABLE
+#include "esp_pm.h"
+#endif
 
 #define TAG "counter"
 
@@ -42,6 +47,12 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
 }
 #endif
 
+#if CONFIG_PM_ENABLE
+#define EXAMPLE_PM 1
+#else
+#define EXAMPLE_PM 0
+#endif
+
 #if CONFIG_EXAMPLE_ROLE_REPLICA
 #define EXAMPLE_ROLE_STR "replica"
 #else
@@ -66,8 +77,8 @@ typedef struct {
 } __attribute__((packed)) counter_rep_t;
 
 int exec_cb(Byz_req *in, Byz_rep *out, Byz_buffer *ndet, int cid, bool ro) {
-    if (in->size < 68) return -1;
-    counter_req_t *req = (counter_req_t *)((const uint8_t *)in->contents + 68);
+    if (in->size < BYZ_REQ_HEADER_SIZE) return -1;
+    counter_req_t *req = (counter_req_t *)((const uint8_t *)in->contents + BYZ_REQ_HEADER_SIZE);
     counter_rep_t *rep = (counter_rep_t *)out->contents;
     out->size = sizeof(counter_rep_t);
 
@@ -82,10 +93,86 @@ int exec_cb(Byz_req *in, Byz_rep *out, Byz_buffer *ndet, int cid, bool ro) {
         rep->status = 0;
         ESP_LOGI(TAG, "Read counter = %ld", counter_state[0]);
     } else {
-        return -1;
+        /* Unknown op: reply with an error status (deterministic on all
+         * replicas) instead of returning -1, so the client is not left
+         * waiting for a reply that will never come. */
+        rep->value = 0;
+        rep->status = -1;
     }
     return 0;
 }
+
+#if CONFIG_TBFT_TRANSPORT_UDP && CONFIG_EXAMPLE_STATIC_IP
+/* Return the 0-based node index whose MAC matches this board in
+ * config_espnow.txt (header: name, f, auth, num_nodes, mcast; then one
+ * "<host> <mac> <key>" line per node). -1 if not found. */
+static int node_index_by_mac(void) {
+    uint8_t mac[6];
+    if (esp_read_mac(mac, ESP_MAC_WIFI_STA) != ESP_OK) return -1;
+    char want[18];
+    snprintf(want, sizeof(want), "%02x:%02x:%02x:%02x:%02x:%02x",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    FILE *f = fopen("/spiffs/config_espnow.txt", "r");
+    if (!f) return -1;
+    char line[160];
+    int lineno = 0, nodes = 0, idx = -1;
+    while (fgets(line, sizeof(line), f)) {
+        lineno++;
+        if (lineno == 4) nodes = atoi(line);
+        if (lineno <= 5) continue;
+        if (lineno - 6 >= nodes) break;
+        char host[64], m[32];
+        if (sscanf(line, "%63s %31s", host, m) == 2 && strcasecmp(m, want) == 0) {
+            idx = lineno - 6;
+            break;
+        }
+    }
+    fclose(f);
+    return idx;
+}
+
+/* Return the IP string at node index idx in config_udp.txt (same layout). */
+static bool ip_for_index(int idx, char *out, size_t out_len) {
+    FILE *f = fopen("/spiffs/config_udp.txt", "r");
+    if (!f) return false;
+    char line[160];
+    int lineno = 0;
+    bool ok = false;
+    while (fgets(line, sizeof(line), f)) {
+        lineno++;
+        if (lineno - 6 == idx) {
+            char host[64], ip[32];
+            if (sscanf(line, "%63s %31s", host, ip) == 2) {
+                snprintf(out, out_len, "%s", ip);
+                ok = true;
+            }
+            break;
+        }
+    }
+    fclose(f);
+    return ok;
+}
+
+static void apply_static_ip(esp_netif_t *netif) {
+    int idx = node_index_by_mac();
+    char ip[32];
+    if (idx < 0 || !ip_for_index(idx, ip, sizeof(ip))) {
+        ESP_LOGE(TAG, "static IP: this board's MAC is not in config_espnow.txt - "
+                 "falling back to DHCP");
+        return;
+    }
+    esp_netif_ip_info_t info = {0};
+    if (esp_netif_str_to_ip4(ip, &info.ip) != ESP_OK ||
+        esp_netif_str_to_ip4(CONFIG_EXAMPLE_STATIC_IP_NETMASK, &info.netmask) != ESP_OK ||
+        esp_netif_str_to_ip4(CONFIG_EXAMPLE_STATIC_IP_GATEWAY, &info.gw) != ESP_OK) {
+        ESP_LOGE(TAG, "static IP: bad address in config/Kconfig - falling back to DHCP");
+        return;
+    }
+    ESP_ERROR_CHECK(esp_netif_dhcpc_stop(netif));
+    ESP_ERROR_CHECK(esp_netif_set_ip_info(netif, &info));
+    ESP_LOGW(TAG, "static IP %s (node index %d)", ip, idx);
+}
+#endif
 
 /* Printed at WARN so it survives CONFIG_LOG_DEFAULT_LEVEL_WARN: proves which
  * experiment variant each board runs. */
@@ -98,22 +185,22 @@ static void print_banner(void) {
     uint8_t ch = 0; wifi_second_chan_t sc;
     esp_wifi_get_channel(&ch, &sc);
     ESP_LOGW(TAG, "BANNER role=%s transport=udp ps=%s listen_interval=%d ch=%d "
-             "req_interval_ms=%d ver=%s mac=%02x:%02x:%02x:%02x:%02x:%02x",
+             "pm=%d req_interval_ms=%d ver=%s mac=%02x:%02x:%02x:%02x:%02x:%02x",
              EXAMPLE_ROLE_STR,
              ps == WIFI_PS_NONE ? "none" : ps == WIFI_PS_MIN_MODEM ? "min" : "max",
              CONFIG_EXAMPLE_WIFI_LISTEN_INTERVAL, ch,
-             EXAMPLE_REQ_INTERVAL_MS, __DATE__ " " __TIME__,
+             EXAMPLE_PM, EXAMPLE_REQ_INTERVAL_MS, __DATE__ " " __TIME__,
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 #else
     ESP_LOGW(TAG, "BANNER role=%s transport=espnow if=%s ps=n/a "
-             "req_interval_ms=%d ver=%s mac=%02x:%02x:%02x:%02x:%02x:%02x",
+             "pm=%d req_interval_ms=%d ver=%s mac=%02x:%02x:%02x:%02x:%02x:%02x",
              EXAMPLE_ROLE_STR,
 #if CONFIG_TBFT_ESPNOW_IF_STA
              "sta",
 #else
              "ap",
 #endif
-             EXAMPLE_REQ_INTERVAL_MS, __DATE__ " " __TIME__,
+             EXAMPLE_PM, EXAMPLE_REQ_INTERVAL_MS, __DATE__ " " __TIME__,
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 #endif
 }
@@ -125,7 +212,12 @@ static void wifi_init(void) {
 #if CONFIG_TBFT_TRANSPORT_UDP
     ESP_LOGI(TAG, "Connecting to WiFi (SSID: %s)...", CONFIG_EXAMPLE_WIFI_SSID);
     s_wifi_event_group = xEventGroupCreate();
-    esp_netif_create_default_wifi_sta();
+    esp_netif_t *sta_netif = esp_netif_create_default_wifi_sta();
+#if CONFIG_EXAMPLE_STATIC_IP
+    apply_static_ip(sta_netif);
+#else
+    (void)sta_netif;
+#endif
     wifi_init_config_t wcfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&wcfg));
     esp_event_handler_instance_t h1, h2;
@@ -185,6 +277,12 @@ static void wifi_init(void) {
     ESP_ERROR_CHECK(esp_wifi_start());
 #endif
     ESP_ERROR_CHECK(esp_now_init());
+#if CONFIG_EXAMPLE_ESPNOW_POWER_SAVE
+    /* Duty-cycled RX: only effective on the station interface. */
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_MIN_MODEM));
+    ESP_ERROR_CHECK(esp_now_set_wake_window(CONFIG_EXAMPLE_ESPNOW_WAKE_WINDOW_MS));
+    ESP_ERROR_CHECK(esp_wifi_connectionless_module_set_wake_interval(CONFIG_EXAMPLE_ESPNOW_WAKE_INTERVAL_MS));
+#endif
 #endif
 }
 
@@ -349,6 +447,16 @@ void app_main(void) {
     ESP_LOGI(TAG, "SPIFFS mounted at /spiffs");
 
     wifi_init();
+#if CONFIG_PM_ENABLE
+    /* CPU DFS + auto light-sleep. Effective because the protocol tasks now
+     * block in tbft_node_wait() instead of polling. */
+    esp_pm_config_t pm_cfg = {
+        .max_freq_mhz = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
+        .min_freq_mhz = 40,
+        .light_sleep_enable = CONFIG_FREERTOS_USE_TICKLESS_IDLE,
+    };
+    ESP_ERROR_CHECK(esp_pm_configure(&pm_cfg));
+#endif
     print_banner();
 
 #if CONFIG_EXAMPLE_ROLE_REPLICA

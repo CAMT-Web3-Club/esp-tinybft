@@ -154,6 +154,35 @@ menu "TinyBFT Configuration"
                 the radio on, which inflates energy measurements.
     endchoice
 
+    config TBFT_ESPNOW_TX_RETRIES
+        int "ESP-NOW attempts per frame"
+        default 3
+        range 1 50
+        depends on TBFT_TRANSPORT_ESPNOW
+        help
+            Attempts per frame (each waits for the MAC-layer send result).
+            With receivers duty-cycling (wake window < interval), use enough
+            attempts to span at least one wake interval.
+
+    config TBFT_ESPNOW_TX_RETRY_DELAY_MS
+        int "ESP-NOW delay between attempts (ms)"
+        default 10
+        range 1 1000
+        depends on TBFT_TRANSPORT_ESPNOW
+        help
+            Rounded up to one FreeRTOS tick (10 ms at 100 Hz).
+
+    config TBFT_ESPNOW_PHY_RATE
+        int "ESP-NOW PHY rate (wifi_phy_rate_t value, 0 = IDF default)"
+        default 0
+        range 0 23
+        depends on TBFT_TRANSPORT_ESPNOW
+        help
+            0 keeps the IDF default (1 Mbps). Examples: 11 = 6 Mbps (11g),
+            12 = 54 Mbps, 16 = MCS0 long GI (6.5 Mbps), 23 = MCS7.
+            Applied per peer with esp_now_set_peer_rate_config(). Always
+            report the value used.
+
     config TBFT_PRINT_STATS
         bool "Enable performance statistics"
         default n

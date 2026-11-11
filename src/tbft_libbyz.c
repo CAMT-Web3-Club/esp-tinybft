@@ -34,6 +34,9 @@
 
 static const char *TAG = "tbft_libbyz";
 
+_Static_assert(sizeof(tbft_request_rep_t) == BYZ_REQ_HEADER_SIZE,
+               "BYZ_REQ_HEADER_SIZE must match tbft_request_rep_t");
+
 /* --------------------------------------------------------------------------
  * Module-level singletons
  * -------------------------------------------------------------------------- */
@@ -643,7 +646,7 @@ int Byz_recv_reply(Byz_rep *rep)
         tbft_node_id_t src_hint = -1;
         int n = tbft_node_recv(s_client, buf, sizeof(buf), &src_hint);
         if (n < (int)sizeof(tbft_reply_rep_t)) {
-            vTaskDelay(TBFT_MS_TO_TICKS_MIN1(1));
+            tbft_node_wait(s_client, 20);
 #if CONFIG_ESP_TASK_WDT_EN
             esp_task_wdt_reset();
 #endif

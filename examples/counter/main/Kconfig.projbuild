@@ -71,4 +71,46 @@ menu "Counter Example Configuration"
             Channel all boards use for ESP-NOW. Use the same channel as the
             router in the UDP runs so both transports share the RF environment.
 
+    config EXAMPLE_STATIC_IP
+        bool "Derive a static IP from this board's MAC (no DHCP reservation)"
+        default n
+        depends on TBFT_TRANSPORT_UDP
+        help
+            Looks up this board's station MAC in spiffs config_espnow.txt and
+            uses the IP at the same index in config_udp.txt. One firmware
+            then works on every board without router reservations.
+
+    config EXAMPLE_STATIC_IP_NETMASK
+        string "Static IP netmask"
+        default "255.255.255.0"
+        depends on EXAMPLE_STATIC_IP
+
+    config EXAMPLE_STATIC_IP_GATEWAY
+        string "Static IP gateway (router)"
+        default "192.168.100.1"
+        depends on EXAMPLE_STATIC_IP
+
+    config EXAMPLE_ESPNOW_POWER_SAVE
+        bool "ESP-NOW: duty-cycled receive (wake window / interval)"
+        default n
+        depends on TBFT_TRANSPORT_ESPNOW && TBFT_ESPNOW_IF_STA
+        select ESP_WIFI_STA_DISCONNECTED_PM_ENABLE
+        help
+            Enables modem sleep for the (unconnected) station: the radio RX
+            is on only for WAKE_WINDOW ms out of every WAKE_INTERVAL ms.
+            Senders cannot know the receiver's window, so also raise
+            TBFT_ESPNOW_TX_RETRIES / RETRY_DELAY to span one interval.
+
+    config EXAMPLE_ESPNOW_WAKE_WINDOW_MS
+        int "ESP-NOW wake window (ms)"
+        default 50
+        range 0 65535
+        depends on EXAMPLE_ESPNOW_POWER_SAVE
+
+    config EXAMPLE_ESPNOW_WAKE_INTERVAL_MS
+        int "ESP-NOW wake interval (ms)"
+        default 100
+        range 1 65535
+        depends on EXAMPLE_ESPNOW_POWER_SAVE
+
 endmenu

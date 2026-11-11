@@ -101,6 +101,9 @@ int tbft_node_send(tbft_node_t *node, const void *buf, size_t len,
  */
 int tbft_node_recv(tbft_node_t *node, void *buf, size_t buf_len, tbft_node_id_t *src_id);
 
+/** Sleep until a message may be available (or timeout); see tbft_transport_wait. */
+void tbft_node_wait(tbft_node_t *node, int timeout_ms);
+
 /* --------------------------------------------------------------------------
  * Authenticator generation / verification
  * -------------------------------------------------------------------------- */
