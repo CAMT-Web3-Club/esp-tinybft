@@ -1,0 +1,6 @@
+# For ONE board that must keep logging over USB Serial/JTAG on a PM build
+# (typically the client, used as load generator and request counter).
+# The chip then refuses automatic light sleep while a USB host is connected
+# (ESP-IDF docs: api-guides/usb-serial-jtag-console, "Sleep Mode
+# Considerations"), so do NOT include this board's energy in the comparison.
+CONFIG_USJ_NO_AUTO_LS_ON_CONNECTION=y

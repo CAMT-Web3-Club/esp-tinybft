@@ -78,6 +78,10 @@
 #define TBFT_CLIENT_REPLY_TIMEOUT_MS  CONFIG_TBFT_CLIENT_REPLY_TIMEOUT_MS
 #endif
 
+#ifndef TBFT_IDLE_WAIT_MS
+#define TBFT_IDLE_WAIT_MS            CONFIG_TBFT_IDLE_WAIT_MS
+#endif
+
 /* ms -> ticks, never 0: at CONFIG_FREERTOS_HZ=100 pdMS_TO_TICKS(x<10) is 0,
  * which turns vTaskDelay() into a busy-wait. */
 #define TBFT_MS_TO_TICKS_MIN1(ms) \

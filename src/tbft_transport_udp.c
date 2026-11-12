@@ -291,6 +291,7 @@ static int udp_send_inner(tbft_udp_t *udp, const void *buf, size_t len,
         if (udp->use_multicast) {
             int ret = udp_sendto_retry(udp->sock, buf, len, &udp->mcast_addr);
             if (ret < 0) {
+                udp->stats.tx_fail++;
                 ESP_LOGE(TAG, "sendto(multicast) failed: %d", errno);
             }
             return ret;
@@ -308,6 +309,7 @@ static int udp_send_inner(tbft_udp_t *udp, const void *buf, size_t len,
                 };
                 int r = udp_sendto_retry(udp->sock, buf, len, &addr);
                 if (r >= 0) ok++;
+                else udp->stats.tx_fail++;      /* per destination */
             }
             return (ok > 0) ? (int)len : -1;
         }
@@ -325,6 +327,7 @@ static int udp_send_inner(tbft_udp_t *udp, const void *buf, size_t len,
     };
     int ret = udp_sendto_retry(udp->sock, buf, len, &addr);
     if (ret < 0) {
+        udp->stats.tx_fail++;
         ESP_LOGE(TAG, "sendto(%d) failed: %d", dest, errno);
     }
     return ret;
@@ -343,9 +346,7 @@ int tbft_transport_send(tbft_transport_t *t, const void *buf, size_t len,
     if (r >= 0) {
         udp->stats.tx_msgs++;
         udp_count_tag(udp->stats.tx_by_tag, ((const uint8_t *)buf)[0]);
-    } else {
-        udp->stats.tx_fail++;
-    }
+    }   /* failures are counted per destination in udp_send_inner() */
     return r;
 }
 
@@ -391,8 +392,10 @@ int tbft_transport_recv(tbft_transport_t *t, void *buf, size_t buf_len,
         }
     }
 
-    udp->stats.rx_msgs++;
-    udp_count_tag(udp->stats.rx_by_tag, n > 0 ? ((const uint8_t *)buf)[0] : 0);
+    if (n > 0) {
+        udp->stats.rx_msgs++;
+        udp_count_tag(udp->stats.rx_by_tag, ((const uint8_t *)buf)[0]);
+    }
     return n;
 }
 

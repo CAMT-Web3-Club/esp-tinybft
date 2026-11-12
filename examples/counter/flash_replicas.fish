@@ -1,57 +1,26 @@
 #!/usr/bin/env fish
+# Flash every connected board with the image that matches its role (replica
+# or client), decided from the board's MAC address.  Wrapper around
+# tools/flash.py, kept under the old name.
+#
+#   ./flash_replicas.fish <variant | sweep point id> [--dry-run] [--ports ...] [--client-port ...]
+#
+# Build first:  ./build_variant.sh <variant> replica; ./build_variant.sh <variant> client
+#
+# The old behaviour (idf.py build + flash of the default build directory) is
+# gone on purpose: the default sdkconfig no longer selects role or transport,
+# so it could flash the wrong image to the replicas.
 
-echo "=========================================="
-echo "TinyBFT Replica Parallel Flashing Script"
-echo "=========================================="
-
-# Build the replica firmware first to ensure it's up to date
-echo "Building replica firmware..."
-idf.py build
-if test $status -ne 0
-    echo "Error: Build failed. Aborting flash."
-    exit 1
+if test (count $argv) -lt 1
+    echo "usage: ./flash_replicas.fish <variant|sweep-point> [--dry-run] [--ports ...] [--client-port ...]"
+    echo "build first: ./build_variant.sh <variant> replica; ./build_variant.sh <variant> client"
+    exit 2
 end
 
-# List of replica ports (/dev/ttyACM0 to /dev/ttyACM6)
-# /dev/ttyACM7 is excluded as it is the client node
-set replica_ports /dev/ttyACM0 /dev/ttyACM1 /dev/ttyACM2 /dev/ttyACM3 /dev/ttyACM4 /dev/ttyACM5 /dev/ttyACM6
-
-# Create log directory inside build
-mkdir -p build/flash_logs
-
-set active_jobs 0
-
-for port in $replica_ports
-    if test -e $port
-        set -l port_name (basename $port)
-        set -l log_file "build/flash_logs/$port_name.log"
-
-        # Run flashing in parallel
-        begin
-            echo "[$port] Flashing started..."
-            if idf.py -p $port flash > $log_file 2>&1
-                echo "[$port] SUCCESS: Flashed successfully."
-            else
-                echo "[$port] FAILED: Flashing failed. See $log_file for details."
-            end
-        end &
-
-        set active_jobs (math $active_jobs + 1)
-    else
-        echo "Skip: Port $port not found/connected."
-    end
+set -l dir (dirname (status --current-filename))
+set -l py python3
+if set -q IDF_PYTHON_ENV_PATH; and test -x $IDF_PYTHON_ENV_PATH/bin/python
+    set py $IDF_PYTHON_ENV_PATH/bin/python
 end
 
-if test $active_jobs -gt 0
-    echo "------------------------------------------"
-    echo "Waiting for $active_jobs flashing jobs to complete..."
-    echo "------------------------------------------"
-    wait
-    echo "=========================================="
-    echo "Parallel flashing sequence finished."
-    echo "=========================================="
-else
-    echo "=========================================="
-    echo "No connected replica ports found to flash."
-    echo "=========================================="
-end
+exec $py $dir/tools/flash.py $argv

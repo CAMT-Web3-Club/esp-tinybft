@@ -1,19 +1,27 @@
 #!/usr/bin/env python3
 """Plan and build the parameter sweep for the best-vs-best comparison.
 
-  sweep.py plan  [--stage 1|2|3] [--rate N] [--listen N]   # write overlays + manifest
-  sweep.py list                                              # show planned points
-  sweep.py build [--stage ..] [--only ID ...] [--roles replica client]
+  sweep.py plan  --stage N [--rates R ...]      write overlays + manifest
+  sweep.py list                                  show planned points
+  sweep.py build [--only ID ...] [--roles replica client]
+                 [--client-overlay sdkconfig.usblog]
 
-Each point is a self-contained overlay (sweeps/<id>.overlay) on top of a base
-variant; images go to build_sweep/<id>_<role>/.  Run inside an activated IDF
-shell (idf.py on PATH).  Flashing and measuring stay manual: see README.
+Each point is a base variant plus an overlay (sweeps/<id>.overlay); power
+managed points also get sdkconfig.pm.  Images go to build_sweep/<id>_<role>/.
+Run inside an activated IDF shell (idf.py on PATH).  Flash with tools/flash.py
+<id>; measuring stays manual (see README).
 
-Stages
-  1  ESP-NOW PHY-rate sweep (retries 3, PM off) + every UDP PS mode x PM on/off
-  2  ESP-NOW with the chosen --rate: retries {3,8} x PM {off,on} x
-     {always-on, duty-cycled 50/100, 20/100}
-  3  UDP PS_MAX listen interval {1,3,10} with PM on
+Stages (plan them in order; each call adds to the manifest)
+  1  always-on screen: ESP-NOW at every PHY rate + UDP PS_NONE.
+     Energy is dominated by the idle radio here, so pick the ESP-NOW rate by
+     success rate and latency (analyze.py prints a suggestion), not by req/J.
+  2  ESP-NOW power saving at --rates (1-2 values from stage 1): duty-cycled
+     receive (window/interval 50/100, 25/100, 25/200 ms) with CPU sleep, one
+     reference without CPU sleep, and an always-on point with more retries.
+  3  UDP power saving: PS_MIN, PS_MAX (listen interval 3 and 10) with CPU
+     sleep, shorter Wi-Fi minimum-active time, and references without CPU sleep.
+  4  no-ACK sends: ESP-NOW broadcast (at --rates, default the IDF rate) and
+     UDP multicast.  Counted as candidates for each transport's best.
 """
 import argparse, json, os, subprocess, sys
 
@@ -22,63 +30,75 @@ ROOT = os.path.dirname(HERE)
 SWEEPS = os.path.join(ROOT, "sweeps")
 MANIFEST = os.path.join(SWEEPS, "manifest.json")
 
-PM = ["CONFIG_PM_ENABLE=y", "CONFIG_FREERTOS_USE_TICKLESS_IDLE=y"]
-# wifi_phy_rate_t values accepted by TBFT_ESPNOW_PHY_RATE
-RATES = {0: "idf-default(1M)", 11: "6M", 9: "24M", 12: "54M", 16: "MCS0", 23: "MCS7"}
+# wifi_phy_rate_t values accepted by TBFT_ESPNOW_PHY_RATE, slowest first
+RATES = {0: "1M (IDF default)", 11: "6M", 16: "MCS0 6.5M", 9: "24M", 12: "54M", 23: "MCS7 65M"}
 
 
-def point(pid, transport, base, **kw):
+def espnow(pid, base="espnow", rate=0, retries=3, pm=False, window=None, interval=None, bcast=False):
+    p = dict(id=pid, transport="espnow", base=base, pm=pm, rate=rate, retries=retries,
+             retry_delay=10, window=window, interval=interval, bcast=bcast)
+    cfg = {"CONFIG_TBFT_ESPNOW_PHY_RATE": rate}
+    if window:
+        # every attempt must be able to land inside a wake window, and the
+        # attempts together must span a whole interval (see espnow_ps overlay)
+        p["retry_delay"] = max(10, window * 2 // 5)
+        p["retries"] = -(-interval // p["retry_delay"]) + 2
+        cfg["CONFIG_EXAMPLE_ESPNOW_WAKE_WINDOW_MS"] = window
+        cfg["CONFIG_EXAMPLE_ESPNOW_WAKE_INTERVAL_MS"] = interval
+    cfg["CONFIG_TBFT_ESPNOW_TX_RETRY_DELAY_MS"] = p["retry_delay"]
+    cfg["CONFIG_TBFT_ESPNOW_TX_RETRIES"] = p["retries"]
+    return p, [f"{k}={v}" for k, v in cfg.items()]
+
+
+def udp(pid, ps, pm=False, listen=None, min_active=None, mcast=False):
+    p = dict(id=pid, transport="udp", base=f"udp_ps{ps}", pm=pm, ps=ps,
+             listen=listen, min_active=min_active, mcast=mcast)
     lines = []
-    p = dict(id=pid, transport=transport, base=base, pm=kw.get("pm", False),
-             rate=None, retries=None, window=None, interval=None, ps=None, listen=None)
-    if transport == "espnow":
-        p["rate"] = kw.get("rate", 0)
-        p["retries"] = kw.get("retries", 3)
-        cfg = {"CONFIG_TBFT_ESPNOW_PHY_RATE": p["rate"]}
-        if kw.get("window"):
-            p["window"], p["interval"] = kw["window"], kw["interval"]
-            # duty-cycled receivers: attempts (x 20 ms) must span one wake interval
-            p["retries"] = max(p["retries"], -(-p["interval"] // 20) + 2)
-            cfg["CONFIG_EXAMPLE_ESPNOW_WAKE_WINDOW_MS"] = p["window"]
-            cfg["CONFIG_EXAMPLE_ESPNOW_WAKE_INTERVAL_MS"] = p["interval"]
-            cfg["CONFIG_TBFT_ESPNOW_TX_RETRY_DELAY_MS"] = 20
-        cfg["CONFIG_TBFT_ESPNOW_TX_RETRIES"] = p["retries"]
-        lines += [f"{k}={v}" for k, v in cfg.items()]
-    else:
-        p["ps"] = base.replace("udp_ps", "")
-        if kw.get("listen"):
-            p["listen"] = kw["listen"]
-            lines.append(f"CONFIG_EXAMPLE_WIFI_LISTEN_INTERVAL={p['listen']}")
-    if p["pm"]:
-        lines += PM
+    if listen:
+        lines.append(f"CONFIG_EXAMPLE_WIFI_LISTEN_INTERVAL={listen}")
+    if min_active:
+        lines.append(f"CONFIG_ESP_WIFI_SLP_DEFAULT_MIN_ACTIVE_TIME={min_active}")
+    if mcast:
+        lines.append("CONFIG_TBFT_DISABLE_MULTICAST=n")
     return p, lines
 
 
-def plan(stage, rate, listen):
+def plan(stage, rates):
     pts = []
     if stage == 1:
         for r in RATES:
-            pts.append(point(f"en_r{r}_t3_pm0", "espnow", "espnow", rate=r))
-        for ps in ("none", "min", "max"):
-            for pm in (False, True):
-                pts.append(point(f"udp_{ps}_pm{int(pm)}", "udp", f"udp_ps{ps}", pm=pm))
+            pts.append(espnow(f"en_r{r}_pm0", rate=r))
+        pts.append(udp("udp_none_pm0", "none"))
     elif stage == 2:
-        if rate is None:
-            sys.exit("stage 2 needs --rate <best wifi_phy_rate_t value from stage 1>")
-        for pm in (False, True):
-            for t in (3, 8):
-                pts.append(point(f"en_r{rate}_t{t}_pm{int(pm)}", "espnow", "espnow",
-                                 rate=rate, retries=t, pm=pm))
-            for w, i in ((50, 100), (20, 100)):   # retries derived from the interval
-                pts.append(point(f"enps_r{rate}_w{w}i{i}_pm{int(pm)}", "espnow",
-                                 "espnow_ps", rate=rate, pm=pm, window=w, interval=i))
+        if not rates:
+            sys.exit("stage 2 needs --rates <1-2 wifi_phy_rate_t values chosen from stage 1>")
+        for r in rates:
+            pts.append(espnow(f"en_r{r}_t8_pm0", rate=r, retries=8))
+            for w, i in ((50, 100), (25, 100), (25, 200)):
+                pts.append(espnow(f"enps_r{r}_w{w}i{i}_pm1", "espnow_ps", rate=r, pm=True,
+                                  window=w, interval=i))
+            pts.append(espnow(f"enps_r{r}_w50i100_pm0", "espnow_ps", rate=r, window=50, interval=100))
     elif stage == 3:
-        for l in ([listen] if listen else (1, 3, 10)):
-            pts.append(point(f"udp_max_l{l}_pm1", "udp", "udp_psmax", pm=True, listen=l))
+        pts.append(udp("udp_min_pm1", "min", pm=True))
+        pts.append(udp("udp_max_l3_pm1", "max", pm=True, listen=3))
+        pts.append(udp("udp_max_l10_pm1", "max", pm=True, listen=10))
+        pts.append(udp("udp_min_a20_pm1", "min", pm=True, min_active=20))
+        pts.append(udp("udp_max_l3_a20_pm1", "max", pm=True, listen=3, min_active=20))
+        pts.append(udp("udp_min_pm0", "min"))
+        pts.append(udp("udp_max_l3_pm0", "max", listen=3))
+    elif stage == 4:
+        for r in (rates or [0]):
+            pts.append(espnow(f"enb_r{r}_pm0", "espnow_bcast", rate=r, bcast=True))
+        pts.append(udp("udp_none_mcast_pm0", "none", mcast=True))
+        pts.append(udp("udp_min_mcast_pm1", "min", pm=True, mcast=True))
+    else:
+        sys.exit("--stage must be 1, 2, 3 or 4")
     return pts
 
 
 def load():
+    if not os.path.exists(MANIFEST):
+        sys.exit("no sweeps/manifest.json - run 'sweep.py plan --stage 1' first")
     with open(MANIFEST) as f:
         return json.load(f)
 
@@ -86,45 +106,73 @@ def load():
 def cmd_plan(a):
     os.makedirs(SWEEPS, exist_ok=True)
     man = json.load(open(MANIFEST)) if os.path.exists(MANIFEST) else {}
-    for p, lines in plan(a.stage, a.rate, a.listen):
+    for r in a.rates or []:
+        if r not in RATES:
+            sys.exit(f"unknown rate {r}; choose from {sorted(RATES)}")
+    for p, lines in plan(a.stage, a.rates):
         with open(os.path.join(SWEEPS, p["id"] + ".overlay"), "w") as f:
-            f.write(f"# sweep point {p['id']}\n" + "\n".join(lines) + "\n")
+            f.write(f"# sweep point {p['id']}\n" + "".join(l + "\n" for l in lines))
         man[p["id"]] = p
     json.dump(man, open(MANIFEST, "w"), indent=1)
-    print(f"{len(man)} points in {MANIFEST}")
+    print(f"{len(man)} points in {os.path.relpath(MANIFEST, ROOT)}")
 
 
 def cmd_list(_):
     for p in load().values():
-        extra = {k: v for k, v in p.items() if k not in ("id", "transport", "base") and v not in (None, False)}
-        print(f"{p['id']:34} base={p['base']:11} {extra}")
+        extra = {k: v for k, v in p.items()
+                 if k not in ("id", "transport", "base") and v not in (None, False)}
+        print(f"{p['id']:26} base={p['base']:13} {extra}")
+
+
+def overlays(p, role, client_overlay):
+    ov = ["sdkconfig.pm"] if p["pm"] else []          # point overlay wins over pm
+    ov.append(os.path.join("sweeps", p["id"] + ".overlay"))
+    if role == "client" and client_overlay:
+        ov.append(client_overlay)
+    return ov
 
 
 def cmd_build(a):
     man = load()
     ids = a.only or list(man)
     for pid in ids:
+        if pid not in man:
+            sys.exit(f"unknown point {pid} (see 'sweep.py list')")
+    if a.client_overlay and not os.path.exists(os.path.join(ROOT, a.client_overlay)):
+        sys.exit(f"{a.client_overlay} not found in {ROOT}")
+    for pid in ids:
         p = man[pid]
         for role in a.roles:
             bd = os.path.join("build_sweep", f"{pid}_{role}")
-            env = dict(os.environ, EXTRA=os.path.join("sweeps", pid + ".overlay"), BUILD_DIR=bd)
-            print(f"== build {pid} {role} -> {bd}", flush=True)
+            extra = ";".join(overlays(p, role, a.client_overlay))
+            print(f"== build {pid} {role} -> {bd}  [{extra}]", flush=True)
+            if a.dry_run:
+                continue
+            env = dict(os.environ, EXTRA=extra, BUILD_DIR=bd)
             r = subprocess.run(["./build_variant.sh", p["base"], role, "build"],
                                cwd=ROOT, env=env, capture_output=True, text=True)
             if r.returncode != 0:
-                print(r.stdout[-1500:], r.stderr[-1500:])
+                print(r.stdout[-2000:], r.stderr[-2000:])
                 sys.exit(f"build failed: {pid} {role}")
 
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(required=True)
-    p = sub.add_parser("plan"); p.add_argument("--stage", type=int, default=1)
-    p.add_argument("--rate", type=int); p.add_argument("--listen", type=int); p.set_defaults(f=cmd_plan)
-    p = sub.add_parser("list"); p.set_defaults(f=cmd_list)
-    p = sub.add_parser("build"); p.add_argument("--only", nargs="*")
-    p.add_argument("--roles", nargs="*", default=["replica", "client"]); p.set_defaults(f=cmd_build)
-    a = ap.parse_args(); a.f(a)
+    p = sub.add_parser("plan")
+    p.add_argument("--stage", type=int, required=True)
+    p.add_argument("--rates", type=int, nargs="*")
+    p.set_defaults(f=cmd_plan)
+    p = sub.add_parser("list")
+    p.set_defaults(f=cmd_list)
+    p = sub.add_parser("build")
+    p.add_argument("--only", nargs="*")
+    p.add_argument("--roles", nargs="*", default=["replica", "client"], choices=["replica", "client"])
+    p.add_argument("--client-overlay", help="extra overlay for the client image only (e.g. sdkconfig.usblog)")
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(f=cmd_build)
+    a = ap.parse_args()
+    a.f(a)
 
 
 if __name__ == "__main__":

@@ -1,8 +1,11 @@
-# ESP-NOW with duty-cycled receive (window/interval from main Kconfig).
-# Senders must outlast a wake interval: 10 attempts x 20 ms (rounded to ticks).
+# ESP-NOW with duty-cycled receive: radio listens WINDOW ms of every INTERVAL ms
+# (ESP-IDF "connectionless module power save", station interface only).
+# A sender cannot know when the receiver listens, so each frame is retried
+# every RETRY_DELAY ms until one attempt lands in a window:
+#   RETRY_DELAY < WINDOW   and   RETRIES x RETRY_DELAY >= INTERVAL (+ margin)
 CONFIG_TBFT_TRANSPORT_ESPNOW=y
 CONFIG_EXAMPLE_ESPNOW_POWER_SAVE=y
 CONFIG_EXAMPLE_ESPNOW_WAKE_WINDOW_MS=50
 CONFIG_EXAMPLE_ESPNOW_WAKE_INTERVAL_MS=100
-CONFIG_TBFT_ESPNOW_TX_RETRIES=12
 CONFIG_TBFT_ESPNOW_TX_RETRY_DELAY_MS=20
+CONFIG_TBFT_ESPNOW_TX_RETRIES=7

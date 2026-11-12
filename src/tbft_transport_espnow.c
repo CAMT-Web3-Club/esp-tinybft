@@ -48,7 +48,7 @@ static const char *TAG = "tbft_espnow";
 #define SEND_QUEUE_DEPTH    8
 #define SEND_TASK_PRIORITY  7
 #define SEND_TASK_STACK_SIZE 8192
-#define SEND_TASK_RECV_TIMEOUT_MS  200
+#define SEND_TASK_RECV_TIMEOUT_MS  1000  /* only to notice shutdown; keeps the CPU asleep */
 #define RECV_TASK_TIMEOUT_MS  100
 #define SEND_QUEUE_TIMEOUT_MS 100
 #define SHUTDOWN_DRAIN_MS     200
@@ -442,6 +442,27 @@ static int espnow_do_send_mac(tbft_espnow_t *enow, const uint8_t *ap_mac, uint16
 static const uint8_t k_bcast_mac[6] = {0xff,0xff,0xff,0xff,0xff,0xff};
 #endif
 
+/* Apply TBFT_ESPNOW_PHY_RATE to a peer.  Must run after esp_wifi_start() and
+ * esp_now_add_peer() (ESP-NOW docs).  0 keeps the IDF default (1 Mbps). */
+static void espnow_apply_rate(const uint8_t *mac) {
+#if CONFIG_TBFT_ESPNOW_PHY_RATE != 0
+    /* wifi_phy_rate_t value: 0x00-0x07 11b, 0x08-0x0F 11g, 0x10-0x17 HT20 */
+    esp_now_rate_config_t rc = {
+        .phymode = (CONFIG_TBFT_ESPNOW_PHY_RATE >= 0x10) ? WIFI_PHY_MODE_HT20
+                 : (CONFIG_TBFT_ESPNOW_PHY_RATE >= 0x08) ? WIFI_PHY_MODE_11G
+                 : WIFI_PHY_MODE_11B,
+        .rate = (wifi_phy_rate_t)CONFIG_TBFT_ESPNOW_PHY_RATE,
+    };
+    esp_err_t rr = esp_now_set_peer_rate_config(mac, &rc);
+    if (rr != ESP_OK) {
+        ESP_LOGE(TAG, "esp_now_set_peer_rate_config " MACSTR " failed: 0x%x",
+                 MAC2STR(mac), rr);
+    }
+#else
+    (void)mac;
+#endif
+}
+
 static int espnow_do_send(tbft_espnow_t *enow, tbft_node_id_t dest_id, uint16_t msg_id, const uint8_t *buf, size_t len) {
     if (dest_id < 0 || dest_id >= enow->num_nodes) return -1;
     return espnow_do_send_mac(enow, enow->peer_ap_mac[dest_id], msg_id, buf, len);
@@ -572,7 +593,6 @@ int tbft_transport_create(tbft_transport_t **out, tbft_transport_type_t type, in
         if (enow->msg_queue) vQueueDelete(enow->msg_queue);
         if (enow->task_exit_sem) vSemaphoreDelete(enow->task_exit_sem);
         if (enow->tx_done) vSemaphoreDelete(enow->tx_done);
-    if (enow->rx_sem) vSemaphoreDelete(enow->rx_sem);
         if (enow->rx_sem) vSemaphoreDelete(enow->rx_sem);
         if (enow->lock) vSemaphoreDelete(enow->lock);
         free(enow);
@@ -608,6 +628,7 @@ int tbft_transport_create(tbft_transport_t **out, tbft_transport_type_t type, in
             esp_now_unregister_recv_cb();
             goto init_error;
         }
+        espnow_apply_rate(k_bcast_mac);
     }
 #endif
     if (xTaskCreate(espnow_send_task, "tbft_send", SEND_TASK_STACK_SIZE, enow, SEND_TASK_PRIORITY, &enow->send_task_handle) != pdPASS) {
@@ -711,22 +732,9 @@ void tbft_transport_set_peer(tbft_transport_t *t, tbft_node_id_t node_id, const 
     if (add_ret != ESP_OK) {
         ESP_LOGW(TAG, "esp_now_add_peer for node %d failed: 0x%x", node_id, add_ret);
     }
-#if CONFIG_TBFT_ESPNOW_PHY_RATE != 0
     else {
-        /* wifi_phy_rate_t value from Kconfig: 0x00-0x07 11b, 0x08-0x0F 11g,
-         * 0x10-0x17 HT20.  Applied after esp_now_add_peer() as required. */
-        esp_now_rate_config_t rc = {
-            .phymode = (CONFIG_TBFT_ESPNOW_PHY_RATE >= 0x10) ? WIFI_PHY_MODE_HT20
-                     : (CONFIG_TBFT_ESPNOW_PHY_RATE >= 0x08) ? WIFI_PHY_MODE_11G
-                     : WIFI_PHY_MODE_11B,
-            .rate = (wifi_phy_rate_t)CONFIG_TBFT_ESPNOW_PHY_RATE,
-        };
-        esp_err_t rr = esp_now_set_peer_rate_config(ap_mac, &rc);
-        if (rr != ESP_OK) {
-            ESP_LOGW(TAG, "esp_now_set_peer_rate_config node %d failed: 0x%x", node_id, rr);
-        }
+        espnow_apply_rate(ap_mac);
     }
-#endif
 }
 
 int tbft_transport_send(tbft_transport_t *t, const void *buf, size_t len, tbft_node_id_t dest) {

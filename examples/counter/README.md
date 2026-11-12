@@ -1,137 +1,181 @@
 # Counter Example (esp-tinybft)
 
-This example demonstrates how to use `esp-tinybft` to build a simple
-distributed counter application over ESP-NOW and UDP (Wi-Fi).
+A replicated counter over ESP-NOW or UDP (Wi-Fi): 7 replicas (f = 2) and 1
+client on ESP32-C3. The client sends `increment` requests; the replicas order
+and execute them and reply. This example is also the test bed for the
+ESP-NOW vs UDP energy comparison.
 
-## Architecture
+## Quick start
 
-The state of the application is a single integer counter starting at 0.
-Clients submit `increment` requests which increase the counter by 1.
-Requests are ordered and agreed upon by the BFT replicas before being executed.
+Run everything from `examples/counter/` in a shell where `idf.py` works.
 
-## Setup
+```bash
+./gen_configs.sh                                         # keys + config files
+cp sdkconfig.wifi.local.example sdkconfig.wifi.local     # UDP only: SSID/password (git-ignored)
+./build_variant.sh espnow replica                        # -> build_espnow_replica/
+./build_variant.sh espnow client                         # -> build_espnow_client/
+python3 tools/flash.py espnow                            # every connected board gets its image
+```
 
-1. **Generate Configuration and Keys**
-   First, generate the RSA keys and configuration files that will be flashed onto the devices:
-   ```bash
-   ./gen_configs.sh
-   ```
-   This creates a `spiffs_image` directory containing:
-   - RSA private and public keys (`privX.der`, `pubX.der`)
-   - `config_udp.txt` and `config_espnow.txt`
+- **Node list.** MAC addresses (ESP-NOW) and IP addresses (UDP) of the eight
+  boards live in the two here-documents inside `gen_configs.sh`; edit them
+  there and rerun the script. It rewrites `spiffs_image/config_*.txt` and
+  keeps the existing keys unless you pass `--keys`.
+- **Do not use a bare `idf.py build`.** Role, transport and power-save mode are
+  no longer in `sdkconfig.defaults`; they come from the overlays that
+  `build_variant.sh` selects. A bare build would use whatever an old local
+  `sdkconfig` says.
 
-2. **Configure the Transport**
-   Use `idf.py menuconfig` to configure the transport mechanism and network settings:
-   - Navigate to `Component config -> TinyBFT Configuration`
-   - Select either **ESP-NOW** or **UDP (lwIP sockets)** under `Transport backend`.
-   - If using UDP, navigate to `Counter Example Configuration` and set your Wi-Fi SSID and Password.
+## Variants
 
-3. **Build and Flash**
-   You need 8 ESP32 boards (7 replicas to tolerate 2 faults, and 1 client).
-
-   Build and flash:
-   ```bash
-   idf.py build
-   idf.py -p /dev/ttyUSB0 flash monitor
-   ```
-
-## Note on MACs and IP Addresses
-
-The generated `config_espnow.txt` and `config_udp.txt` contain dummy MAC addresses and loopback IP addresses.
-**For a real test across multiple boards, you MUST edit `config_espnow.txt` in the `spiffs_image/` folder**
-to contain the real MAC addresses of your ESP32 boards before running `idf.py build`.
-
-## Experiment variants (energy comparison)
-
-Variants are built from overlay files, each into its own `build_<variant>_<role>/`
-directory with its own `sdkconfig` (no `menuconfig`, no hand-edited sdkconfig):
+`./build_variant.sh <variant> <replica|client> [idf.py args]` builds into
+`build_<variant>_<role>/` with its own `sdkconfig`.
 
 | Variant | Transport | Radio |
 |---|---|---|
-| `espnow` | ESP-NOW (station interface) | always on |
-| `espnow_ps` | ESP-NOW (station) | duty-cycled RX: window/interval, retries raised to span one interval (optional, untested on hardware) |
-| `udp_psnone` | UDP | `WIFI_PS_NONE` (always on, direct counterpart of `espnow`) |
-| `udp_psmin` | UDP | `WIFI_PS_MIN_MODEM` |
-| `udp_psmax` | UDP | `WIFI_PS_MAX_MODEM`, listen interval 3 |
+| `espnow` | ESP-NOW, station interface | always on |
+| `espnow_ps` | ESP-NOW, station interface | receiver duty-cycled (wake window / interval) |
+| `espnow_bcast` | ESP-NOW, one broadcast frame per protocol broadcast | always on, no ACK |
+| `udp_psnone` | UDP | `WIFI_PS_NONE`: always on, the direct counterpart of `espnow` |
+| `udp_psmin` | UDP | `WIFI_PS_MIN_MODEM`: wakes every DTIM |
+| `udp_psmax` | UDP | `WIFI_PS_MAX_MODEM`: wakes every listen interval (3) |
+
+All variants share `sdkconfig.defaults` (protocol sizes, UDP receive mailbox
+16 = ESP-NOW queue depth) and `sdkconfig.measure` (log level WARN, statistics).
+Both config files carry the same protocol timeouts.
+
+Optional overlays are added with `EXTRA` and get their own build directory:
 
 ```bash
-cp sdkconfig.wifi.local.example sdkconfig.wifi.local   # SSID/password, git-ignored
-./build_variant.sh udp_psmax replica build
-./build_variant.sh udp_psmax client build
-./build_variant.sh espnow replica -p /dev/ttyACM0 flash
+EXTRA="sdkconfig.pm" ./build_variant.sh udp_psmax replica
+EXTRA="sdkconfig.pm;sdkconfig.static_ip" ./build_variant.sh udp_psmin replica
+EXTRA="sdkconfig.mcast" ./build_variant.sh udp_psnone replica
 ```
 
-All variants share `sdkconfig.defaults` (protocol sizes/timeouts, UDP receive
-mailbox = 16 to match the ESP-NOW queue) and `sdkconfig.measure` (log level WARN,
-`TBFT_STATS`). `gen_configs.sh` writes the same timeouts to both config files and
-keeps existing keys unless run with `--keys`.
+| Overlay | Effect |
+|---|---|
+| `sdkconfig.pm` | CPU frequency scaling + automatic light sleep (see below) |
+| `sdkconfig.usblog` | keep the USB console alive on a power-managed board (not for measured boards) |
+| `sdkconfig.static_ip` | UDP: take the board's IP from its MAC, no DHCP reservation needed |
+| `sdkconfig.mcast` | UDP: IP multicast instead of one datagram per peer |
 
-Every boot prints a `BANNER` line (role, transport, PS mode, listen interval,
-channel, request period) at WARN level - check it on every board before measuring.
-The client prints `CLIENT_STATS` after each request and `TBFT_STATS` counters
-(sent/received per message type, send failures, queue drops, view changes,
-re-sent commits). Report runs with `vc_sent`/`fetch` > 0 or failed requests
-separately.
+## Deploying replicas and the client
 
-Measurement notes: use the same channel for ESP-NOW (`EXAMPLE_ESPNOW_CHANNEL`)
-and the router; UDP energy excludes the router; ESP-NOW and UDP `PS_NONE` are
-the like-for-like pair; `PS_MIN`/`PS_MAX` save RF power only because the CPU
-never sleeps (power management is not enabled).
-
-Optional overlays, passed with `EXTRA` (they get their own build dir):
+The two roles are separate images. A board's role is fixed by the node list:
+entries named `node*` are replicas, any other entry (here `client7`) is a
+client. The board finds its own entry by MAC (ESP-NOW) or IP (UDP).
 
 ```bash
-EXTRA="sdkconfig.pm" ./build_variant.sh udp_psmax replica build            # CPU DFS + light-sleep
-EXTRA="sdkconfig.pm;sdkconfig.static_ip" ./build_variant.sh udp_psmin client build
+python3 tools/flash.py <variant>                 # read each board's MAC, pick the image
+python3 tools/flash.py <variant> --dry-run       # show the plan only
+python3 tools/flash.py <variant> --client-port /dev/ttyACM7   # no MAC read: that port = client
 ```
 
-- `sdkconfig.pm` works because the replica loop and the client now sleep in
-  `tbft_transport_wait()` (select/semaphore) instead of polling every tick.
-  Apply it to every variant of a comparison or to none.
-- `sdkconfig.static_ip` derives the board IP from its MAC (no DHCP reservation).
-- `TBFT_ESPNOW_PHY_RATE` sets the ESP-NOW rate (0 = IDF default 1 Mbps); report it.
+`flash.py` reads the MAC with esptool (this resets the board), looks it up in
+`spiffs_image/config_espnow.txt` and writes bootloader, partition table,
+application and the SPIFFS image. Boards whose MAC is not in the list are
+skipped and reported. The same tool takes a sweep point id instead of a
+variant name. `./flash_replicas.fish <variant>` is a wrapper around it.
 
-## Optional "cheapest send" axis: multicast / broadcast
-
-Default runs are unicast (one frame per peer) on both transports. To compare the
-cheapest-send case instead, change BOTH transports together:
+To flash one board by hand:
 
 ```bash
-EXTRA="sdkconfig.mcast" ./build_variant.sh udp_psnone replica build   # UDP IP multicast
-./build_variant.sh espnow_bcast replica build                         # ESP-NOW broadcast
+./build_variant.sh <variant> replica -p /dev/ttyACM0 flash
+./build_variant.sh <variant> client  -p /dev/ttyACM7 flash
 ```
 
-Neither has MAC-level ACK/retry, so expect more loss than unicast (check `rx_drop`,
-request success rate). With UDP multicast the AP relays frames after the DTIM
-beacon at a basic rate; `PS_MAX` stations may sleep through it, so `udp_psmax`
-is expected to fail and is best left out of this axis. Report these runs
-separately from the unicast results.
+After flashing, every board prints a `BANNER` line at boot. Check on each
+board that `role=` is what you expect and that all boards show the same
+transport, power-save and rate settings. A board with the wrong image logs
+`wrong firmware role for this board?` and restarts in a loop instead of
+sitting idle.
 
-## Best-vs-best sweep (efficacy = successful requests per joule)
+All eight boards must run the same variant. ESP-NOW station and softAP
+builds cannot talk to each other.
 
-Each transport is tuned over its own free parameters, then the best point of
-each is compared. Run in an activated IDF shell, inside `examples/counter/`:
+## What the firmware prints
+
+All three lines are at WARN level, so they survive the measurement overlay.
+
+- `BANNER role=… transport=… …` once at boot: every setting that defines the
+  experiment point (power save, listen interval, rate, retries, wake window
+  and interval, broadcast/multicast, channel, power management, tick rate).
+- `CLIENT_STATS ok=… fail=… missed=… last_ms=… min_ms=… avg_ms=… max_ms=…`
+  after every request. The client sends on a fixed period; `missed` counts
+  slots skipped because the previous request was still running.
+- `TBFT_STATS …` every 60 s on replicas and after each request on the client:
+  messages sent and received, send failures, queue drops, executed requests,
+  re-sent commits, view changes, state fetches, free heap and its minimum.
+
+## Power management (`sdkconfig.pm`)
+
+The overlay follows Espressif's recommended automatic light-sleep
+configuration for ESP32-C3 (ESP-IDF "Low Power Mode" guide): power
+management, tickless idle, 1000 Hz tick, GPIO disabled in sleep, MAC/baseband
+and CPU powered down in light sleep. `main.c` configures 160 MHz maximum,
+crystal frequency minimum, light sleep enabled. The build uses about 3 KB
+more static RAM than a build without it, plus roughly 4 KB of heap for the
+MAC/baseband backup (Kconfig help); watch `heap_min` in `TBFT_STATS`.
+
+- It only helps when the radio is allowed to sleep: `udp_psmin`, `udp_psmax`
+  or `espnow_ps`. With an always-on radio the Wi-Fi driver holds a power lock
+  and nothing changes.
+- The replica sleeps until a message arrives or `TBFT_IDLE_WAIT_MS` (500 ms)
+  elapses, so the CPU has long idle periods to sleep in.
+- **The USB Serial/JTAG port stops answering while the chip is in light
+  sleep.** Logs over USB are lost, and the board may need BOOT + RESET to be
+  flashed again. Take logs from the UART0 pins with a USB-UART adapter, or
+  build one logging board with `sdkconfig.usblog` and leave that board out
+  of the energy figures.
+
+## Best-vs-best sweep
+
+Goal: tune each transport over its own free parameters, then compare the best
+point of each by efficacy = successful requests per joule.
 
 ```bash
-python3 tools/sweep.py plan --stage 1        # ESP-NOW PHY rates + all UDP PS x PM points
-python3 tools/sweep.py build                 # replica+client images -> build_sweep/<point>_<role>/
-# flash 8 boards, run each point 3x (>=10 min), meter energy, save serial logs:
-#   runs/<point>-r1/{node0..node6,client7}.log + energy.csv
-#   runs/<point>-base/  (optional: same image, client off) for incremental energy
-python3 tools/analyze.py runs/               # table + best per transport
-python3 tools/sweep.py plan --stage 2 --rate <best wifi_phy_rate_t from stage 1>
-python3 tools/sweep.py plan --stage 3        # UDP PS_MAX listen interval 1/3/10
+python3 tools/sweep.py plan --stage 1          # then 2, 3, 4 (see below)
+python3 tools/sweep.py list
+python3 tools/sweep.py build --only <point> …  # images in build_sweep/<point>_<role>/
+python3 tools/flash.py <point>
+python3 tools/analyze.py runs/
 ```
 
-- Stage 1 rate values (`wifi_phy_rate_t`): 0 = IDF default 1M, 11 = 6M, 9 = 24M,
-  12 = 54M, 16 = MCS0, 23 = MCS7. Stage 2 then sweeps ESP-NOW retries,
-  PM on/off and duty-cycling (window/interval 50/100 and 20/100) at that rate.
-- `energy.csv`: `node,joules[,seconds]` or `node,avg_ma,volts,seconds`. The meter
-  window must start at the first successful request (that is how the analyzer
-  counts requests).
-- `analyze.py` drops runs with view-changes or state fetches (use
-  `--include-faulty` to keep them), requires `--min-success` (default 95%) to
-  qualify, and says when the best two transports are within one stdev.
-- The UDP side includes PS and listen interval; ESP-NOW includes rate, retries,
-  duty-cycling. Both include PM. Fix the channel, DTIM, request interval and run
-  duration for all points, and interleave points over time.
+| Stage | Points | Purpose |
+|---|---|---|
+| 1 | ESP-NOW at 1M, 6M, MCS0, 24M, 54M, MCS7; UDP `PS_NONE` | always-on screen; choose the ESP-NOW rate |
+| 2 | ESP-NOW at `--rates`: wake window/interval 50/100, 25/100, 25/200 ms with CPU sleep; 50/100 without; always-on with 8 retries | ESP-NOW power saving |
+| 3 | UDP `PS_MIN`, `PS_MAX` (listen 3 and 10) with CPU sleep; minimum active time 20 ms; `PS_MIN`/`PS_MAX` without CPU sleep | UDP power saving |
+| 4 | ESP-NOW broadcast at `--rates`; UDP multicast (`PS_NONE`, `PS_MIN` + CPU sleep) | sends without ACK |
+
+Procedure:
+
+1. Stage 1 needs no power meter. With an always-on radio the idle radio
+   dominates the energy, so the PHY rate barely changes requests per joule.
+   Choose the rate by success rate and latency; `analyze.py` prints the two
+   fastest rates that pass and the stage 2 command.
+2. Screen stages 2-4 with one short run per point, then repeat the two best
+   points of each transport at least three times. `analyze.py` marks a result
+   with fewer than three runs as a screen.
+3. Save each run as `runs/<point>-r1/` (`-r2`, …) with one serial log per
+   board (`node0.log` … `node6.log`, `client7.log`; only the client log is
+   required) and `energy.csv` (`node,joules[,seconds]` or
+   `node,avg_ma,volts,seconds`). Start the meter at the first successful
+   request. Measure the same boards in every run.
+4. Optional baseline: the same image with the client switched off, saved as
+   `runs/<point>-base/`, gives the energy added per request.
+
+`analyze.py` drops runs with view changes or state fetches (`--include-faulty`
+keeps them), requires `--min-success` (default 95%), and says when the two
+best points are within one standard deviation.
+
+Keep fixed for every point: channel (set `EXAMPLE_ESPNOW_CHANNEL` to the
+router's channel), router DTIM and beacon interval, request period, run
+length, board positions. Interleave the points over time. The router's energy
+is not counted on the UDP side.
+
+What "best" means here: the best point among those you ran. The search is
+staged, not exhaustive, and the request period is part of the result; repeat
+at a second period if the ranking matters at other loads. `espnow_ps`
+depends on retries landing inside the receiver's wake window and has not
+been run on hardware.

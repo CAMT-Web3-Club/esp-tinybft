@@ -21,6 +21,7 @@
 
 #include "tbft_replica.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "esp_random.h"
 #include "esp_timer.h"
 #include "esp_task_wdt.h"
@@ -33,7 +34,6 @@ static const char *TAG = "tbft_replica";
 /* Low #8 FIX: Named constants for magic numbers */
 #define TBFT_INIT_DRAIN_LIMIT     64   /* max messages to drain after New_key broadcast */
 #define TBFT_KEY_DRAIN_LIMIT      32   /* max messages to drain during key confirmation */
-#define TBFT_IDLE_WAIT_MS         20   /* max sleep when idle; bounds timer-event latency */
 #define TBFT_YIELD_THRESHOLD      16   /* message loop iterations before cooperative yield */
 #define TBFT_VC_BACKOFF_MAX_MULT  60   /* max multiplier for view-change timeout backoff */
 
@@ -281,7 +281,8 @@ void tbft_replica_print_stats(const tbft_replica_t *r)
     ESP_LOGW(TAG, "TBFT_STATS id=%d view=%lld last_exec=%lld last_stable=%lld "
              "executed=%lu commit_resent=%lu vc_sent=%lu new_view=%lu fetch=%lu "
              "tx=%lu tx_fail=%lu tx_qfull=%lu rx=%lu rx_drop=%lu rx_frag_drop=%lu "
-             "tx_pp=%lu tx_prep=%lu tx_commit=%lu rx_pp=%lu rx_prep=%lu rx_commit=%lu",
+             "tx_pp=%lu tx_prep=%lu tx_commit=%lu rx_pp=%lu rx_prep=%lu rx_commit=%lu "
+             "heap=%lu heap_min=%lu",
              r->node.node_id, (long long)r->node.view,
              (long long)r->last_executed, (long long)r->last_stable,
              (unsigned long)r->stat_executed, (unsigned long)r->stat_commit_resent,
@@ -295,7 +296,9 @@ void tbft_replica_print_stats(const tbft_replica_t *r)
              (unsigned long)t.tx_by_tag[TBFT_MSG_COMMIT],
              (unsigned long)t.rx_by_tag[TBFT_MSG_PRE_PREPARE],
              (unsigned long)t.rx_by_tag[TBFT_MSG_PREPARE],
-             (unsigned long)t.rx_by_tag[TBFT_MSG_COMMIT]);
+             (unsigned long)t.rx_by_tag[TBFT_MSG_COMMIT],
+             (unsigned long)esp_get_free_heap_size(),
+             (unsigned long)esp_get_minimum_free_heap_size());
 }
 
 void tbft_replica_run(tbft_replica_t *r)
@@ -487,8 +490,9 @@ void tbft_replica_run(tbft_replica_t *r)
             continue;
         }
         if (n < (int)sizeof(tbft_msg_hdr_t)) {
-            /* No message available — yield to let the WiFi task, lwIP,
-             * and the IDLE task get CPU time on single-core MCUs. */
+            /* No message available: sleep until one arrives or the idle
+             * wait elapses (timer event bits are polled at the top of the
+             * loop, so they are serviced within TBFT_IDLE_WAIT_MS). */
             tbft_node_wait(&r->node, TBFT_IDLE_WAIT_MS);
             continue;
         }

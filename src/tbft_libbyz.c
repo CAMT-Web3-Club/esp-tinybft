@@ -11,6 +11,7 @@
 #include "tbft_node.h"
 #include "tbft_principal.h"
 #include "esp_log.h"
+#include "esp_system.h"
 
 #include "esp_timer.h"
 #include "esp_task_wdt.h"
@@ -646,7 +647,7 @@ int Byz_recv_reply(Byz_rep *rep)
         tbft_node_id_t src_hint = -1;
         int n = tbft_node_recv(s_client, buf, sizeof(buf), &src_hint);
         if (n < (int)sizeof(tbft_reply_rep_t)) {
-            tbft_node_wait(s_client, 20);
+            tbft_node_wait(s_client, 100);   /* woken at once by an arriving reply */
 #if CONFIG_ESP_TASK_WDT_EN
             esp_task_wdt_reset();
 #endif
@@ -1017,12 +1018,14 @@ void Byz_print_stats(void)
         tbft_transport_stats_t t;
         tbft_transport_get_stats(s_client->transport, &t);
         ESP_LOGW(TAG, "TBFT_STATS id=%d tx=%lu tx_fail=%lu tx_qfull=%lu rx=%lu "
-                 "rx_drop=%lu rx_frag_drop=%lu rx_reply=%lu",
+                 "rx_drop=%lu rx_frag_drop=%lu rx_reply=%lu heap=%lu heap_min=%lu",
                  (int)s_client->node_id, (unsigned long)t.tx_msgs,
                  (unsigned long)t.tx_fail, (unsigned long)t.tx_queue_full,
                  (unsigned long)t.rx_msgs, (unsigned long)t.rx_drop,
                  (unsigned long)t.rx_frag_drop,
-                 (unsigned long)t.rx_by_tag[TBFT_MSG_REPLY]);
+                 (unsigned long)t.rx_by_tag[TBFT_MSG_REPLY],
+                 (unsigned long)esp_get_free_heap_size(),
+                 (unsigned long)esp_get_minimum_free_heap_size());
     }
 }
 

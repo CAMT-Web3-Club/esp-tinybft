@@ -193,6 +193,17 @@ menu "TinyBFT Configuration"
             Applied per peer with esp_now_set_peer_rate_config(). Always
             report the value used.
 
+    config TBFT_IDLE_WAIT_MS
+        int "Replica idle wait (ms)"
+        default 500
+        range 10 5000
+        help
+            How long the replica task sleeps when no message is pending.
+            An arriving message wakes it immediately; timer events (status,
+            view-change, fetch timeout) are serviced with at most this delay.
+            The wait must be longer than FREERTOS_IDLE_TIME_BEFORE_SLEEP ticks
+            for automatic light sleep to engage (20 ms at 100 Hz never did).
+
     config TBFT_PRINT_STATS
         bool "Enable performance statistics"
         default n

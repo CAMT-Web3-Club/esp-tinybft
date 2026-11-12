@@ -28,26 +28,26 @@
 
 ## 1.1 สถานะการทำงาน (อัปเดตหลังลงมือแก้บน `fix/develop/v0.2.9`)
 
-Build ผ่านแบบไม่มี warning สำหรับ `counter` ทั้ง 4 variant/role ที่ลอง (espnow replica+client, udp_psnone client, udp_psmin replica, udp_psmax client) และ `simple_wallet` (esp32c3) **ยังไม่ได้ทดสอบบนบอร์ดจริง** เกณฑ์ตรวจรับที่ต้องใช้บอร์ดยังเป็นของคนทดสอบ
+Build ผ่านแบบไม่มี warning ล่าสุด (2026-11-13) สำหรับ `counter`: espnow (replica, client), udp_psnone (replica), udp_psmin + `sdkconfig.pm` + `sdkconfig.static_ip` (replica), จุด sweep `enps_r12_w25i200_pm1`, `enb_r12_pm0`, `udp_none_mcast_pm0` (replica), `udp_max_l3_a20_pm1` + `sdkconfig.usblog` (client) และ `simple_wallet` (esp32c3) เครื่องมือ `tools/flash.py`, `tools/sweep.py`, `tools/analyze.py` ทดสอบด้วยข้อมูลจำลอง **ยังไม่ได้ทดสอบบนบอร์ดจริง** เกณฑ์ตรวจรับที่ต้องใช้บอร์ดยังเป็นของคนทดสอบ
 
 | งาน | สถานะ | หมายเหตุ |
 |---|---|---|
 | A1 | ทำแล้ว | Kconfig `TBFT_ESPNOW_IF_STA` (ค่าเริ่มต้น) / `_AP`; ต้อง flash ใหม่ทุกบอร์ด |
-| A2 | ทำแล้ว | `EXAMPLE_WIFI_LISTEN_INTERVAL`, variant `udp_psnone`, `BANNER` (ไม่มี version จริง ใช้เวลา build) |
+| A2 | ทำแล้ว | `EXAMPLE_WIFI_LISTEN_INTERVAL`, variant `udp_psnone`, `BANNER` พิมพ์ทุกค่าที่กำหนดจุดทดลอง (PS, listen interval, rate, retry, wake window/interval, broadcast/multicast, channel, PM, tick rate) |
 | A3 | ทำแล้ว | ใช้ค่ากลาง VC=30000 ms; **เจ้าของงานวิจัยยังต้องยืนยันค่านี้** |
 | A4 | ทำแล้ว | `LWIP_UDP_RECVMBOX_SIZE=16` |
 | A5 | ทำแล้ว | คาบสัมบูรณ์ + `CLIENT_STATS` |
 | A6 | ทำแล้ว | `sdkconfig.measure` ตั้ง log WARN; ลบการพิมพ์ key |
-| A7 | ทำแล้ว | overlay + `build_variant.sh` + README |
+| A7 | ทำแล้ว | overlay + `build_variant.sh` + README; `tools/flash.py` เลือก image ตาม role จาก MAC ของบอร์ด และ `flash_replicas.fish` เป็น wrapper ของมัน (ทดสอบด้วย esptool จำลอง ยังไม่ได้ flash บอร์ดจริง) |
 | A8 | ทำแล้ว | `TBFT_STATS` ทุก 60 s (replica) / ต่อ request (client); UDP นับ drop ของ lwIP ไม่ได้ |
-| A9 | ทำแล้ว (ไม่ได้ทดสอบบนบอร์ด) | variant `espnow_ps`: `EXAMPLE_ESPNOW_POWER_SAVE` + wake window/interval; retry ปรับผ่าน `TBFT_ESPNOW_TX_RETRIES` / `_RETRY_DELAY_MS`; **ต้องตัดสินใจว่าจะรวมในชุดทดลอง** และตรวจอัตราส่งสำเร็จจริง |
+| A9 | ทำแล้ว (ไม่ได้ทดสอบบนบอร์ด) | variant `espnow_ps`: wake window/interval; retry ต้องถี่กว่า window และรวมกันยาวกว่า interval (`tools/sweep.py` คำนวณให้) อัตราส่งสำเร็จจริงต้องวัดบนบอร์ด |
 | A10 | ทำแล้ว | `TBFT_ESPNOW_PHY_RATE` (0 = ค่าเริ่มต้น IDF 1 Mbps) |
-| A11 | ทำแล้ว (ไม่ได้ทดสอบบนบอร์ด) | `tbft_transport_wait()` แทน polling ใน replica loop และ client; overlay `sdkconfig.pm` (DFS + light-sleep) ใช้ผ่าน `EXTRA="sdkconfig.pm"` |
+| A11 | แก้ซ้ำแล้ว (ไม่ได้ทดสอบบนบอร์ด) | รอบแรกใช้ไม่ได้จริง: replica ตื่นทุก 20 ms จึงไม่ถึงเกณฑ์เข้า light-sleep ที่ tick 100 Hz ตอนนี้รอได้ถึง `TBFT_IDLE_WAIT_MS` (500 ms) และ `sdkconfig.pm` ใช้ชุดค่าที่ Espressif แนะนำสำหรับ ESP32-C3 (tick 1000 Hz, ปิด GPIO/MAC-BB/CPU ตอนหลับ) ข้อควรระวัง: พอร์ต USB Serial/JTAG ใช้ไม่ได้ระหว่าง light-sleep |
 | B1 | ทำแล้ว | รอ send callback ต่อเฟรม, retry 3 ครั้ง, ลบ delay คงที่ |
 | B2 | ทำแล้ว | callback ไม่มี lock/log, fast path เฟรมเดียว |
 | B3 | ทำแล้ว | `TBFT_MS_TO_TICKS_MIN1` |
 | B4 | ทำแล้ว | retry เมื่อ `ENOMEM`/`ENOBUFS` |
-| B5 | ทำแล้ว | retry+reboot, backoff, และ `EXAMPLE_STATIC_IP` (static IP จาก MAC โดยหา index ใน `config_espnow.txt` แล้วใช้ IP ที่ index เดียวกันใน `config_udp.txt`; ยังไม่ได้ทดสอบว่า event got-ip มาตามคาดบนบอร์ดจริง) |
+| B5 | ทำแล้ว (ไม่ได้ทดสอบบนบอร์ด) | retry แล้ว reboot เมื่อหา id ไม่ได้หรือ init ล้มเหลว (เช่น flash ผิด role), backoff ใน Wi-Fi handler, และ `EXAMPLE_STATIC_IP` ที่ตั้ง IP ตอน `WIFI_EVENT_STA_CONNECTED` ตามลำดับของ `examples/protocols/static_ip` ใน ESP-IDF |
 | B6 | ทำแล้ว | ลอง key ของ `src_id` ก่อน แล้ววนตัวอื่น |
 | B7 | ทำแล้ว | replica ไม่ค้างเมื่อ `exec_cb` คืน -1; `BYZ_REQ_HEADER_SIZE` ใน public header (มี static assert); example ตอบ `status=-1` แทนคืน -1 |
 

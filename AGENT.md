@@ -72,13 +72,14 @@ docker run --rm -it --device /dev/ttyACM0 \
   -u $(id -u) -e HOME=/tmp espressif/idf:v6.0.1 \
   idf.py -p /dev/ttyACM0 monitor
 
-# Change role from replica to client (edit sdkconfig before build):
-sed -i "s/CONFIG_EXAMPLE_ROLE_REPLICA=y/CONFIG_EXAMPLE_ROLE_REPLICA=n/" /path/to/sdkconfig
-echo "CONFIG_EXAMPLE_ROLE_CLIENT=y" >> /path/to/sdkconfig
-# Then fullclean + set-target + build
+# Counter example: role, transport and power-save mode come from overlays,
+# not from sdkconfig.defaults.  Build one image per role into its own dir:
+#   ./build_variant.sh <espnow|espnow_ps|espnow_bcast|udp_psnone|udp_psmin|udp_psmax> <replica|client>
+# and flash every board with the image for its role (chosen by MAC):
+#   python3 tools/flash.py <variant>
 ```
 
-**Role switching:** The counter example supports replica and client roles via `CONFIG_EXAMPLE_ROLE`. The default (`sdkconfig.defaults`) is replica. To build the client, change `CONFIG_EXAMPLE_ROLE_REPLICA` to `n` and add `CONFIG_EXAMPLE_ROLE_CLIENT=y` in `sdkconfig`, then rebuild. `espflash` alone does NOT flash the SPIFFS image — use `idf.py flash` via Docker.
+**Role switching (counter):** replica and client are separate images built by `examples/counter/build_variant.sh <variant> <role>` into `build_<variant>_<role>/`; a bare `idf.py build` there no longer selects a role or transport. `tools/flash.py <variant>` flashes each board with the image for its role (app, bootloader, partition table and SPIFFS). See `examples/counter/README.md`. `espflash` alone does NOT flash the SPIFFS image.
 
 ### After making changes
 
@@ -173,8 +174,6 @@ MAC format: `xx:xx:xx:xx:xx:xx` (e.g. `aa:bb:cc:dd:ee:ff`). The parser auto-dete
 
 When using ESP-NOW, the host application must:
 1. Initialize WiFi (`esp_wifi_init`, `esp_wifi_set_mode`, `esp_wifi_start`)
-   - The interface is chosen by `CONFIG_TBFT_ESPNOW_IF_STA` (default) or `CONFIG_TBFT_ESPNOW_IF_AP`; **every board must use the same one**. STA: `esp_wifi_set_mode(WIFI_MODE_STA)`, never connect, set the channel after `esp_wifi_start()`. AP (legacy) uses the softAP MAC = base MAC + 1 and keeps the radio on with beacons.
-   - The interface is chosen by `CONFIG_TBFT_ESPNOW_IF_STA` (default) or `CONFIG_TBFT_ESPNOW_IF_AP`; **every board must use the same one**. STA: `esp_wifi_set_mode(WIFI_MODE_STA)`, never connect, set the channel after `esp_wifi_start()`. AP (legacy) uses the softAP MAC = base MAC + 1 and keeps the radio on with beacons.
    - The interface is chosen by `CONFIG_TBFT_ESPNOW_IF_STA` (default) or `CONFIG_TBFT_ESPNOW_IF_AP`; **every board must use the same one**. STA: `esp_wifi_set_mode(WIFI_MODE_STA)`, never connect, set the channel after `esp_wifi_start()`. AP (legacy) uses the softAP MAC = base MAC + 1 and keeps the radio on with beacons.
 2. The ESP-NOW transport registers its own `esp_now_recv_cb` and `esp_now_send_cb`
 3. Peer MAC addresses are registered via `esp_now_add_peer` automatically
