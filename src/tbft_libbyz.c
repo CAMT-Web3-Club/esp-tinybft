@@ -1017,9 +1017,10 @@ void Byz_print_stats(void)
     } else if (s_client && s_client->transport) {
         tbft_transport_stats_t t;
         tbft_transport_get_stats(s_client->transport, &t);
-        ESP_LOGW(TAG, "TBFT_STATS id=%d tx=%lu tx_fail=%lu tx_qfull=%lu rx=%lu "
+        ESP_LOGW(TAG, "TBFT_STATS id=%d tx=%lu tx_frames=%lu tx_fail=%lu tx_qfull=%lu rx=%lu "
                  "rx_drop=%lu rx_frag_drop=%lu rx_reply=%lu heap=%lu heap_min=%lu",
                  (int)s_client->node_id, (unsigned long)t.tx_msgs,
+                 (unsigned long)t.tx_frames,
                  (unsigned long)t.tx_fail, (unsigned long)t.tx_queue_full,
                  (unsigned long)t.rx_msgs, (unsigned long)t.rx_drop,
                  (unsigned long)t.rx_frag_drop,

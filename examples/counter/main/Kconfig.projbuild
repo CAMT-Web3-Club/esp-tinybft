@@ -96,10 +96,13 @@ menu "Counter Example Configuration"
         depends on TBFT_TRANSPORT_ESPNOW && TBFT_ESPNOW_IF_STA
         select ESP_WIFI_STA_DISCONNECTED_PM_ENABLE
         help
-            Enables modem sleep for the (unconnected) station: the radio RX
-            is on only for WAKE_WINDOW ms out of every WAKE_INTERVAL ms.
-            Senders cannot know the receiver's window, so also raise
-            TBFT_ESPNOW_TX_RETRIES / RETRY_DELAY to span one interval.
+            ESP-NOW's own power saving ("connectionless module power save"
+            in ESP-IDF): the radio receives only for WAKE_WINDOW ms out of
+            every WAKE_INTERVAL ms; in between the RF is off while the CPU
+            keeps running (modem sleep, no light sleep needed).
+            Senders cannot know when a receiver listens, so set
+            TBFT_ESPNOW_TX_RETRY_SPAN_MS >= WAKE_INTERVAL and
+            TBFT_ESPNOW_TX_RETRY_DELAY_MS well below WAKE_WINDOW.
 
     config EXAMPLE_ESPNOW_WAKE_WINDOW_MS
         int "ESP-NOW wake window (ms)"

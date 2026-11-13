@@ -153,7 +153,7 @@ def main():
     # so choose by success rate, then by speed (shorter airtime).
     screen = [(pid, m) for pid, m in rows.items()
               if pid in man and man[pid]["transport"] == "espnow" and not man[pid].get("window")
-              and not man[pid].get("bcast") and not man[pid]["pm"] and man[pid]["retries"] == 3
+              and not man[pid].get("bcast") and man[pid].get("retries") == 3
               and m["succ"] is not None]
     if screen:
         ok = [(pid, m) for pid, m in screen if m["succ"] >= a.min_success]

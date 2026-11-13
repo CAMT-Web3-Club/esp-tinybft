@@ -99,6 +99,7 @@ int tbft_transport_recv(tbft_transport_t *t, void *buf, size_t buf_len,
 
 typedef struct {
     uint32_t tx_msgs;        /* logical messages accepted for sending */
+    uint32_t tx_frames;      /* radio transmissions requested, retries included */
     uint32_t tx_fail;        /* sends given up on (retries exhausted / hard error) */
     uint32_t tx_queue_full;  /* ESP-NOW: send queue full, message dropped */
     uint32_t rx_msgs;        /* complete messages handed to the protocol */

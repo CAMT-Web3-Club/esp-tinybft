@@ -1,11 +1,19 @@
-# ESP-NOW with duty-cycled receive: radio listens WINDOW ms of every INTERVAL ms
-# (ESP-IDF "connectionless module power save", station interface only).
-# A sender cannot know when the receiver listens, so each frame is retried
-# every RETRY_DELAY ms until one attempt lands in a window:
-#   RETRY_DELAY < WINDOW   and   RETRIES x RETRY_DELAY >= INTERVAL (+ margin)
+# ESP-NOW power saving: the radio listens WINDOW ms of every INTERVAL ms
+# (ESP-IDF "connectionless module power save": esp_now_set_wake_window +
+# esp_wifi_connectionless_module_set_wake_interval, station interface only,
+# needs CONFIG_ESP_WIFI_STA_DISCONNECTED_PM_ENABLE).  Between windows the RF is
+# off and the CPU keeps running: this is modem sleep, not light sleep.
+#
+# ESP-IDF leaves window synchronisation to the application.  Here a sender
+# retries every RETRY_DELAY ms (well below WINDOW) until the frame is
+# acknowledged or RETRY_SPAN ms (>= INTERVAL) have passed, so one attempt is
+# certain to fall inside the receiver's window.
+#
+# 50/100 ms are the defaults of ESP-IDF's examples/wifi/espnow.
 CONFIG_TBFT_TRANSPORT_ESPNOW=y
 CONFIG_EXAMPLE_ESPNOW_POWER_SAVE=y
 CONFIG_EXAMPLE_ESPNOW_WAKE_WINDOW_MS=50
 CONFIG_EXAMPLE_ESPNOW_WAKE_INTERVAL_MS=100
 CONFIG_TBFT_ESPNOW_TX_RETRY_DELAY_MS=20
-CONFIG_TBFT_ESPNOW_TX_RETRIES=7
+CONFIG_TBFT_ESPNOW_TX_RETRY_SPAN_MS=120
+CONFIG_TBFT_ESPNOW_TX_RETRIES=3

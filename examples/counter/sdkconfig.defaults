@@ -1,3 +1,8 @@
+# Default target for every build directory (ESP-IDF idf-py guide: "add the
+# CONFIG_IDF_TARGET option to the project's sdkconfig.defaults file").
+# Without it a fresh build directory falls back to esp32.
+CONFIG_IDF_TARGET="esp32c3"
+
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
 CONFIG_ESP_SYSTEM_EVENT_QUEUE_SIZE=32

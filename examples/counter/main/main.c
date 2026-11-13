@@ -245,7 +245,7 @@ static void print_banner(void) {
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 #else
     ESP_LOGW(TAG, "BANNER role=%s transport=espnow if=%s rate=%d retries=%d "
-             "retry_delay_ms=%d window_ms=%d interval_ms=%d bcast=%d ch=%d "
+             "retry_delay_ms=%d retry_span_ms=%d window_ms=%d interval_ms=%d bcast=%d ch=%d "
              "pm=%d hz=%d idle_wait_ms=%d req_interval_ms=%d build=%s "
              "mac=%02x:%02x:%02x:%02x:%02x:%02x",
              EXAMPLE_ROLE_STR,
@@ -255,7 +255,7 @@ static void print_banner(void) {
              "ap",
 #endif
              CONFIG_TBFT_ESPNOW_PHY_RATE, CONFIG_TBFT_ESPNOW_TX_RETRIES,
-             CONFIG_TBFT_ESPNOW_TX_RETRY_DELAY_MS,
+             CONFIG_TBFT_ESPNOW_TX_RETRY_DELAY_MS, CONFIG_TBFT_ESPNOW_TX_RETRY_SPAN_MS,
              EXAMPLE_EN_WINDOW, EXAMPLE_EN_INTERVAL, EXAMPLE_BCAST, ch,
              EXAMPLE_PM, CONFIG_FREERTOS_HZ, CONFIG_TBFT_IDLE_WAIT_MS,
              EXAMPLE_REQ_INTERVAL_MS, __DATE__ " " __TIME__,
@@ -335,13 +335,16 @@ static void wifi_init(void) {
     ESP_ERROR_CHECK(esp_now_init());
 #if CONFIG_EXAMPLE_ESPNOW_POWER_SAVE
     /* Duty-cycled RX (ESP-IDF "connectionless module power save"): the radio
-     * listens WINDOW ms out of every INTERVAL ms.  Station interface only. */
+     * listens WINDOW ms out of every INTERVAL ms.  Station interface only.
+     * Same calls and order as ESP-IDF examples/wifi/espnow; MIN_MODEM is the
+     * driver default (esp_wifi.h), set here only to make it visible. */
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_MIN_MODEM));
     ESP_ERROR_CHECK(esp_now_set_wake_window(CONFIG_EXAMPLE_ESPNOW_WAKE_WINDOW_MS));
     ESP_ERROR_CHECK(esp_wifi_connectionless_module_set_wake_interval(CONFIG_EXAMPLE_ESPNOW_WAKE_INTERVAL_MS));
 #else
-    /* Receiver always on: say so explicitly instead of relying on the
-     * default wake window. */
+    /* Receiver always on.  The default wake window (maximum) already keeps
+     * the RF on; WIFI_PS_NONE says so explicitly, as the always-on bulb of
+     * Espressif's esp-now coin_cell_demo does. */
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
 #endif
 #endif

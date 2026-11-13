@@ -171,8 +171,8 @@ menu "TinyBFT Configuration"
         depends on TBFT_TRANSPORT_ESPNOW
         help
             Attempts per frame (each waits for the MAC-layer send result).
-            With receivers duty-cycling (wake window < interval), use enough
-            attempts to span at least one wake interval.
+            With receivers duty-cycling (wake window < interval), set
+            TBFT_ESPNOW_TX_RETRY_SPAN_MS as well.
 
     config TBFT_ESPNOW_TX_RETRY_DELAY_MS
         int "ESP-NOW delay between attempts (ms)"
@@ -181,6 +181,25 @@ menu "TinyBFT Configuration"
         depends on TBFT_TRANSPORT_ESPNOW
         help
             Rounded up to one FreeRTOS tick (10 ms at 100 Hz).
+
+    config TBFT_ESPNOW_TX_RETRY_SPAN_MS
+        int "ESP-NOW: keep retrying a frame for at least this long (ms, 0 = off)"
+        default 0
+        range 0 5000
+        depends on TBFT_TRANSPORT_ESPNOW
+        help
+            For receivers that duty-cycle their radio with the ESP-NOW wake
+            window / wake interval.  A frame is retried every
+            TBFT_ESPNOW_TX_RETRY_DELAY_MS until it is acknowledged or this
+            time has passed, even after TBFT_ESPNOW_TX_RETRIES attempts.
+            Set it to the receivers' wake interval plus a margin and keep the
+            retry delay well below their wake window, so one attempt is
+            certain to fall inside a window.  ESP-IDF leaves window
+            synchronisation to the application.  Espressif's coin-cell button
+            application note (esp-now, coin_cell_demo/switch/docs) uses the
+            same rule against an ESP-NOW bridge with a 200 ms interval and a
+            110 ms window: attempts 50 ms apart, enough of them to cover the
+            90 ms the bridge sleeps.  0: stop after TBFT_ESPNOW_TX_RETRIES.
 
     config TBFT_ESPNOW_PHY_RATE
         int "ESP-NOW PHY rate (wifi_phy_rate_t value, 0 = IDF default)"

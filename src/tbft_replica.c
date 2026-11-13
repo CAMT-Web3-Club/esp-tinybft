@@ -280,7 +280,7 @@ void tbft_replica_print_stats(const tbft_replica_t *r)
     tbft_transport_get_stats(r->node.transport, &t);
     ESP_LOGW(TAG, "TBFT_STATS id=%d view=%lld last_exec=%lld last_stable=%lld "
              "executed=%lu commit_resent=%lu vc_sent=%lu new_view=%lu fetch=%lu "
-             "tx=%lu tx_fail=%lu tx_qfull=%lu rx=%lu rx_drop=%lu rx_frag_drop=%lu "
+             "tx=%lu tx_frames=%lu tx_fail=%lu tx_qfull=%lu rx=%lu rx_drop=%lu rx_frag_drop=%lu "
              "tx_pp=%lu tx_prep=%lu tx_commit=%lu rx_pp=%lu rx_prep=%lu rx_commit=%lu "
              "heap=%lu heap_min=%lu",
              r->node.node_id, (long long)r->node.view,
@@ -288,7 +288,8 @@ void tbft_replica_print_stats(const tbft_replica_t *r)
              (unsigned long)r->stat_executed, (unsigned long)r->stat_commit_resent,
              (unsigned long)r->stat_view_change_sent, (unsigned long)r->stat_new_view,
              (unsigned long)r->stat_fetch_started,
-             (unsigned long)t.tx_msgs, (unsigned long)t.tx_fail,
+             (unsigned long)t.tx_msgs, (unsigned long)t.tx_frames,
+             (unsigned long)t.tx_fail,
              (unsigned long)t.tx_queue_full, (unsigned long)t.rx_msgs,
              (unsigned long)t.rx_drop, (unsigned long)t.rx_frag_drop,
              (unsigned long)t.tx_by_tag[TBFT_MSG_PRE_PREPARE],

@@ -289,6 +289,7 @@ static int udp_send_inner(tbft_udp_t *udp, const void *buf, size_t len,
 
     if (dest == TBFT_ALL_REPLICAS) {
         if (udp->use_multicast) {
+            udp->stats.tx_frames++;
             int ret = udp_sendto_retry(udp->sock, buf, len, &udp->mcast_addr);
             if (ret < 0) {
                 udp->stats.tx_fail++;
@@ -307,6 +308,7 @@ static int udp_send_inner(tbft_udp_t *udp, const void *buf, size_t len,
                     .sin_addr.s_addr = tbft_addr_udp_ip(udp->peers[i]),
                     .sin_port        = tbft_addr_udp_port(udp->peers[i]),
                 };
+                udp->stats.tx_frames++;
                 int r = udp_sendto_retry(udp->sock, buf, len, &addr);
                 if (r >= 0) ok++;
                 else udp->stats.tx_fail++;      /* per destination */
@@ -325,6 +327,7 @@ static int udp_send_inner(tbft_udp_t *udp, const void *buf, size_t len,
         .sin_addr.s_addr = tbft_addr_udp_ip(udp->peers[dest]),
         .sin_port        = tbft_addr_udp_port(udp->peers[dest]),
     };
+    udp->stats.tx_frames++;
     int ret = udp_sendto_retry(udp->sock, buf, len, &addr);
     if (ret < 0) {
         udp->stats.tx_fail++;

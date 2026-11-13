@@ -12,6 +12,7 @@
 #include "esp_heap_caps.h"
 #include "esp_system.h"
 #include "esp_err.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -389,14 +390,26 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *
 
 /* Send one frame and wait for its MAC-layer result (send callback).
  * esp_now_send() returning ESP_OK only means "queued"; the callback tells
- * whether the peer ACKed.  Retries on either kind of failure. */
+ * whether the peer ACKed (ESP-NOW docs, "Send ESP-NOW Data").
+ *
+ * Retries on either kind of failure: at least ESPNOW_TX_MAX_ATTEMPTS times
+ * and, when TBFT_ESPNOW_TX_RETRY_SPAN_MS is set, until that much time has
+ * passed.  The time bound is for receivers that duty-cycle their radio: as
+ * long as the gap between attempts is shorter than their wake window, an
+ * attempt lands in a window before the span (>= their wake interval) ends,
+ * however quickly the driver reports each failure. */
 static bool espnow_tx_frame(tbft_espnow_t *enow, const uint8_t *mac,
                             const uint8_t *pkt, size_t len) {
-    for (int attempt = 0; attempt < ESPNOW_TX_MAX_ATTEMPTS; attempt++) {
+#if CONFIG_TBFT_ESPNOW_TX_RETRY_SPAN_MS > 0
+    const int64_t give_up_us = esp_timer_get_time()
+        + (int64_t)CONFIG_TBFT_ESPNOW_TX_RETRY_SPAN_MS * 1000;
+#endif
+    for (int attempt = 0; ; attempt++) {
         memcpy(enow->tx_expect_mac, mac, 6);
         xSemaphoreTake(enow->tx_done, 0);          /* clear any stale result */
         esp_err_t err = esp_now_send(mac, pkt, len);
         if (err == ESP_OK) {
+            enow->stats.tx_frames++;
             if (xSemaphoreTake(enow->tx_done,
                                pdMS_TO_TICKS(ESPNOW_TX_CB_TIMEOUT_MS)) == pdTRUE &&
                 enow->tx_status == ESP_NOW_SEND_SUCCESS) {
@@ -405,9 +418,13 @@ static bool espnow_tx_frame(tbft_espnow_t *enow, const uint8_t *mac,
         } else {
             ESP_LOGD(TAG, "esp_now_send err=0x%x (attempt %d)", err, attempt + 1);
         }
+        bool again = (attempt + 1 < ESPNOW_TX_MAX_ATTEMPTS);
+#if CONFIG_TBFT_ESPNOW_TX_RETRY_SPAN_MS > 0
+        again = again || (esp_timer_get_time() < give_up_us);
+#endif
+        if (!again) return false;
         vTaskDelay(TBFT_MS_TO_TICKS_MIN1(CONFIG_TBFT_ESPNOW_TX_RETRY_DELAY_MS));
     }
-    return false;
 }
 
 static int espnow_do_send_mac(tbft_espnow_t *enow, const uint8_t *ap_mac, uint16_t msg_id, const uint8_t *buf, size_t len) {
@@ -428,8 +445,8 @@ static int espnow_do_send_mac(tbft_espnow_t *enow, const uint8_t *ap_mac, uint16
         memcpy(pkt + sizeof(fhdr), src, chunk);
 
         if (!espnow_tx_frame(enow, ap_mac, pkt, chunk + sizeof(fhdr))) {
-            ESP_LOGW(TAG, "tx to " MACSTR " failed: frame %d/%d after %d attempts",
-                     MAC2STR(ap_mac), frag_idx + 1, frag_total, ESPNOW_TX_MAX_ATTEMPTS);
+            ESP_LOGW(TAG, "tx to " MACSTR " failed: frame %d/%d not acknowledged",
+                     MAC2STR(ap_mac), frag_idx + 1, frag_total);
             return -1;   /* remaining frames are useless without this one */
         }
         src += chunk;

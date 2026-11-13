@@ -25,6 +25,9 @@ python3 tools/flash.py espnow                            # every connected board
   no longer in `sdkconfig.defaults`; they come from the overlays that
   `build_variant.sh` selects. A bare build would use whatever an old local
   `sdkconfig` says.
+- **Target.** `sdkconfig.defaults` sets `CONFIG_IDF_TARGET="esp32c3"` (the way
+  the ESP-IDF `idf.py` guide gives a project a default target), so every new
+  build directory is configured for ESP32-C3 without `set-target`.
 
 ## Variants
 
@@ -34,30 +37,30 @@ python3 tools/flash.py espnow                            # every connected board
 | Variant | Transport | Radio |
 |---|---|---|
 | `espnow` | ESP-NOW, station interface | always on |
-| `espnow_ps` | ESP-NOW, station interface | receiver duty-cycled (wake window / interval) |
+| `espnow_ps` | ESP-NOW, station interface | receive window every wake interval, RF off in between ([below](#esp-now-power-saving-espnow_ps)) |
 | `espnow_bcast` | ESP-NOW, one broadcast frame per protocol broadcast | always on, no ACK |
 | `udp_psnone` | UDP | `WIFI_PS_NONE`: always on, the direct counterpart of `espnow` |
 | `udp_psmin` | UDP | `WIFI_PS_MIN_MODEM`: wakes every DTIM |
 | `udp_psmax` | UDP | `WIFI_PS_MAX_MODEM`: wakes every listen interval (3) |
 
-All variants share `sdkconfig.defaults` (protocol sizes, UDP receive mailbox
-16 = ESP-NOW queue depth) and `sdkconfig.measure` (log level WARN, statistics).
-Both config files carry the same protocol timeouts.
+All variants share `sdkconfig.defaults` (target, protocol sizes, UDP receive
+mailbox 16 = ESP-NOW queue depth) and `sdkconfig.measure` (log level WARN,
+statistics). Both config files carry the same protocol timeouts. The CPU runs
+at a fixed 160 MHz in every variant.
 
 Optional overlays are added with `EXTRA` and get their own build directory:
 
 ```bash
-EXTRA="sdkconfig.pm" ./build_variant.sh udp_psmax replica
-EXTRA="sdkconfig.pm;sdkconfig.static_ip" ./build_variant.sh udp_psmin replica
+EXTRA="sdkconfig.static_ip" ./build_variant.sh udp_psmin replica
 EXTRA="sdkconfig.mcast" ./build_variant.sh udp_psnone replica
 ```
 
 | Overlay | Effect |
 |---|---|
-| `sdkconfig.pm` | CPU frequency scaling + automatic light sleep (see below) |
-| `sdkconfig.usblog` | keep the USB console alive on a power-managed board (not for measured boards) |
 | `sdkconfig.static_ip` | UDP: take the board's IP from its MAC, no DHCP reservation needed |
 | `sdkconfig.mcast` | UDP: IP multicast instead of one datagram per peer |
+| `sdkconfig.pm` | CPU frequency scaling + automatic light sleep. **Not part of the best-vs-best comparison** ([below](#cpu-power-management-sdkconfigpm-outside-the-comparison)) |
+| `sdkconfig.usblog` | with `sdkconfig.pm` only: keep the USB console alive (not for measured boards) |
 
 ## Deploying replicas and the client
 
@@ -98,40 +101,88 @@ builds cannot talk to each other.
 All three lines are at WARN level, so they survive the measurement overlay.
 
 - `BANNER role=… transport=… …` once at boot: every setting that defines the
-  experiment point (power save, listen interval, rate, retries, wake window
-  and interval, broadcast/multicast, channel, power management, tick rate).
+  experiment point (power save, listen interval, minimum active time, rate,
+  retries, retry delay and span, wake window and interval,
+  broadcast/multicast, channel, power management, tick rate).
 - `CLIENT_STATS ok=… fail=… missed=… last_ms=… min_ms=… avg_ms=… max_ms=…`
   after every request. The client sends on a fixed period; `missed` counts
   slots skipped because the previous request was still running.
 - `TBFT_STATS …` every 60 s on replicas and after each request on the client:
-  messages sent and received, send failures, queue drops, executed requests,
-  re-sent commits, view changes, state fetches, free heap and its minimum.
+  messages sent (`tx`) and frames handed to the radio (`tx_frames`: every
+  ESP-NOW attempt, fragments and retries included; one per UDP datagram),
+  messages received, send failures, queue drops, executed requests, re-sent
+  commits, view changes, state fetches, free heap and its minimum.
 
-## Power management (`sdkconfig.pm`)
+## ESP-NOW power saving (`espnow_ps`)
 
-The overlay follows Espressif's recommended automatic light-sleep
-configuration for ESP32-C3 (ESP-IDF "Low Power Mode" guide): power
-management, tickless idle, 1000 Hz tick, GPIO disabled in sleep, MAC/baseband
-and CPU powered down in light sleep. `main.c` configures 160 MHz maximum,
-crystal frequency minimum, light sleep enabled. The build uses about 3 KB
-more static RAM than a build without it, plus roughly 4 KB of heap for the
-MAC/baseband backup (Kconfig help); watch `heap_min` in `TBFT_STATS`.
+`espnow_ps` uses ESP-NOW's own power saving, which ESP-IDF calls
+"connectionless module power save". Everything below is taken from ESP-IDF
+v6.1: `esp_now.h`, `esp_wifi.h`, the Wi-Fi guide section "Connectionless
+Modules Power-saving" and `examples/wifi/espnow`.
 
-- It only helps when the radio is allowed to sleep: `udp_psmin`, `udp_psmax`
-  or `espnow_ps`. With an always-on radio the Wi-Fi driver holds a power lock
-  and nothing changes.
-- The replica sleeps until a message arrives or `TBFT_IDLE_WAIT_MS` (500 ms)
-  elapses, so the CPU has long idle periods to sleep in.
-- **The USB Serial/JTAG port stops answering while the chip is in light
-  sleep.** Logs over USB are lost, and the board may need BOOT + RESET to be
-  flashed again. Take logs from the UART0 pins with a USB-UART adapter, or
-  build one logging board with `sdkconfig.usblog` and leave that board out
-  of the energy figures.
+- After `esp_now_init()`, `main.c` calls `esp_now_set_wake_window(WINDOW)` and
+  `esp_wifi_connectionless_module_set_wake_interval(INTERVAL)`, the same calls
+  in the same order as `examples/wifi/espnow`. Station interface only;
+  `CONFIG_ESP_WIFI_STA_DISCONNECTED_PM_ENABLE` is selected automatically, as
+  the boards are never connected to an AP.
+- At the start of every interval the RF, PHY and baseband turn on for
+  `WINDOW` ms and are off for the rest of it. The CPU keeps running: this is
+  modem sleep, not light sleep.
+- Sending works at any time; only receiving waits for the window.
+- Without the two calls the window stays at its maximum and the RF is always
+  on. The `espnow` variant relies on that and also sets `WIFI_PS_NONE`, as
+  the always-on receiver in Espressif's esp-now `coin_cell_demo` does.
+
+ESP-IDF leaves window synchronisation between boards to the application. A
+sender therefore retries a frame every `TBFT_ESPNOW_TX_RETRY_DELAY_MS`
+(shorter than the window, so an attempt cannot skip over it) until the
+receiver acknowledges it or `TBFT_ESPNOW_TX_RETRY_SPAN_MS` has passed (one
+interval plus 20 ms in the sweep). Espressif's coin-cell button application
+note (esp-now repository,
+`examples/coin_cell_demo/switch/docs/button_in_matter_bridging.md`) uses the
+same rule against an ESP-NOW bridge that listens 110 ms of every 200 ms:
+attempts 50 ms apart, three of them, to cover the 90 ms the bridge sleeps.
+Two things differ here: the button light-sleeps between attempts and the
+bridge is connected to an AP, whereas these boards wait with the CPU running
+and no AP is involved.
+
+ESP-IDF documents one way to line windows up: connect sender and receiver to
+the same AP and send on `WIFI_EVENT_CONNECTIONLESS_MODULE_WAKE_INTERVAL_START`.
+It needs an AP, so it is not used.
+
+Cost: every protocol step may wait up to (interval - window) for its receiver
+to wake, so latency grows, and a missed window costs another attempt.
+`espnow_ps` has not been run on hardware yet.
+
+For scale, the ESP32-C3 datasheet (section 5.6, peak values at 3.3 V) gives
+84 mA for receiving, 335 mA for sending at 1 Mbps, 285 mA at 54 Mbps and, in
+modem sleep at 160 MHz, 16 mA with the CPU idle and 23 mA with it running
+(all peripheral clocks off). Board-level figures are higher.
+
+## CPU power management (`sdkconfig.pm`, outside the comparison)
+
+The best-vs-best comparison uses radio modes only. No sweep point applies
+`sdkconfig.pm`; every board runs its CPU at a fixed 160 MHz without light
+sleep. The overlay stays for separate experiments.
+
+It follows Espressif's automatic light-sleep configuration for ESP32-C3
+(ESP-IDF "Low Power Mode" guide): power management, tickless idle, 1000 Hz
+tick, GPIO disabled in sleep, MAC/baseband and CPU powered down in light
+sleep. `main.c` then configures 160 MHz maximum, crystal frequency minimum,
+light sleep enabled.
+
+- It only helps when the radio may sleep (`udp_psmin`, `udp_psmax`,
+  `espnow_ps`). With an always-on radio the Wi-Fi driver holds a power lock.
+- **The USB Serial/JTAG port stops answering in light sleep.** Logs over USB
+  are lost, and the board may need BOOT + RESET to be flashed again. Take logs
+  from the UART0 pins, or build one logging board with `sdkconfig.usblog` and
+  leave it out of the energy figures.
 
 ## Best-vs-best sweep
 
-Goal: tune each transport over its own free parameters, then compare the best
-point of each by efficacy = successful requests per joule.
+Goal: tune each transport over its own radio parameters, then compare the
+best point of each by efficacy = successful requests per joule. Only radio
+modes are swept: no point uses CPU light sleep or frequency scaling.
 
 ```bash
 python3 tools/sweep.py plan --stage 1          # then 2, 3, 4 (see below)
@@ -144,9 +195,9 @@ python3 tools/analyze.py runs/
 | Stage | Points | Purpose |
 |---|---|---|
 | 1 | ESP-NOW at 1M, 6M, MCS0, 24M, 54M, MCS7; UDP `PS_NONE` | always-on screen; choose the ESP-NOW rate |
-| 2 | ESP-NOW at `--rates`: wake window/interval 50/100, 25/100, 25/200 ms with CPU sleep; 50/100 without; always-on with 8 retries | ESP-NOW power saving |
-| 3 | UDP `PS_MIN`, `PS_MAX` (listen 3 and 10) with CPU sleep; minimum active time 20 ms; `PS_MIN`/`PS_MAX` without CPU sleep | UDP power saving |
-| 4 | ESP-NOW broadcast at `--rates`; UDP multicast (`PS_NONE`, `PS_MIN` + CPU sleep) | sends without ACK |
+| 2 | ESP-NOW at `--rates`: wake window/interval 50/100 ms (ESP-IDF example), 110/200 ms (Espressif's ESP-NOW bridge), 50/200 ms, each with retry span = interval + 20 ms; always on with 8 attempts | ESP-NOW power saving |
+| 3 | UDP `PS_MIN`; `PS_MAX` with listen interval 3 and 10; Wi-Fi minimum active time 20 ms (default 50) for `PS_MIN` and `PS_MAX` listen 3 | UDP power saving |
+| 4 | ESP-NOW broadcast at `--rates` (default: IDF rate); UDP multicast with `PS_NONE` and `PS_MIN` | sends without ACK |
 
 Procedure:
 
