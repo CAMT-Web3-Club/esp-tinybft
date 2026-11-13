@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
-"""Summarise sweep runs and pick the best configuration per transport.
+"""Summarise measured runs and pick the best configuration per transport.
 
-Layout (one directory per run, repeats named <point-id>-r1, -r2, ...):
-  runs/<point-id>-r1/client7.log      serial logs, one file per board; the file
-  runs/<point-id>-r1/node0.log ...    stem must match the node label in energy.csv
-  runs/<point-id>-r1/energy.csv       node,joules[,seconds]  OR  node,avg_ma,volts,seconds
-                                      (seconds is needed for the incremental column)
-  runs/<point-id>-base/               optional baseline: same image, client OFF
-                                      (energy.csv only; replica logs optional)
+Optional helper: the firmware and menuconfig do not need it.
+
+Layout (one directory per run; you choose the configuration name, repeats are
+named <name>-r1, -r2, ...):
+  runs/<name>-r1/client7.log      serial logs, one file per board; the file
+  runs/<name>-r1/node0.log ...    stem must match the node label in energy.csv
+  runs/<name>-r1/energy.csv       node,joules[,seconds]  OR  node,avg_ma,volts,seconds
+                                  (seconds is needed for the incremental column)
+  runs/<name>-base/               optional baseline: same image, client OFF
+                                  (energy.csv only; replica logs optional)
+
+The settings of each configuration (transport, rate, power saving, ...) are
+read from the BANNER line the boards print at boot, so keep the boot output
+in the client log.
 
 Only the client log is required.  Without energy.csv a run still contributes
 success rate and latency (enough for the stage-1 ESP-NOW rate screen).
@@ -21,18 +28,18 @@ A configuration qualifies only if its mean success rate >= --min-success.
 Runs with view-changes or state fetches are excluded unless --include-faulty.
 "Best" means best among the points you ran, not a proven optimum.
 
-  analyze.py runs/ [--manifest sweeps/manifest.json] [--min-success 0.95]
+  analyze.py runs/ [--min-success 0.95]
 """
 import argparse
 import csv
 import glob
-import json
 import os
 import re
 import statistics as st
 
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 KV = re.compile(r"(\w+)=(-?\d+)")
+BANNER_KV = re.compile(r"(\w+)=(\S+)")
 RATE_MBPS = {0: 1, 11: 6, 16: 6.5, 9: 24, 12: 54, 23: 65}
 
 
@@ -47,7 +54,7 @@ def parse_log(path):
         elif "TBFT_STATS" in line:
             out["stats"] = dict((k, int(v)) for k, v in KV.findall(line))
         elif "BANNER" in line:
-            out["banner"] = line.strip()
+            out["banner"] = dict(BANNER_KV.findall(line.split("BANNER", 1)[1]))
     return out
 
 
@@ -67,7 +74,8 @@ def energy(path):
 def load_run(d):
     logs = {os.path.splitext(os.path.basename(p))[0]: parse_log(p)
             for p in glob.glob(os.path.join(d, "*.log"))}
-    r = {"dir": d, "ok": 0, "total": 0, "faulty": False, "avg_ms": None}
+    r = {"dir": d, "ok": 0, "total": 0, "faulty": False, "avg_ms": None,
+         "banner": next((v["banner"] for v in logs.values() if v["banner"]), None)}
     rows = next((v["client"] for v in logs.values() if v["client"]), [])
     first = next((i for i, x in enumerate(rows) if x["ok"] > 0), None)
     if first is not None:
@@ -91,8 +99,11 @@ def point_of(name):
     return re.sub(r"-(r\d+|base)$", "", name)
 
 
-def transport_of(pid, man):
-    return (man.get(pid) or {}).get("transport") or ("espnow" if pid.startswith("en") else "udp")
+def banner_int(b, key):
+    try:
+        return int(b.get(key))
+    except (TypeError, ValueError):
+        return None
 
 
 def mean_sd(v):
@@ -102,11 +113,9 @@ def mean_sd(v):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("runs")
-    ap.add_argument("--manifest", default="sweeps/manifest.json")
     ap.add_argument("--min-success", type=float, default=0.95)
     ap.add_argument("--include-faulty", action="store_true")
     a = ap.parse_args()
-    man = json.load(open(a.manifest)) if os.path.exists(a.manifest) else {}
 
     runs, base = {}, {}
     for d in sorted(glob.glob(os.path.join(a.runs, "*"))):
@@ -118,6 +127,12 @@ def main():
     if len(node_sets) > 1:
         print("WARNING: energy.csv lists different boards in different runs "
               f"({sorted(sorted(s) for s in node_sets)}); req/J is not comparable across them.\n")
+
+    # settings of each configuration, from the boot BANNER of its runs
+    meta = {pid: next((r["banner"] for r in rs if r["banner"]), {}) for pid, rs in runs.items()}
+    for pid, b in meta.items():
+        if not b:
+            print(f"WARNING: no BANNER line in the logs of {pid}: transport unknown.")
 
     rows = {}
     for pid, rs in runs.items():
@@ -152,17 +167,18 @@ def main():
     # ESP-NOW rate screen: with an always-on radio the rate barely moves req/J,
     # so choose by success rate, then by speed (shorter airtime).
     screen = [(pid, m) for pid, m in rows.items()
-              if pid in man and man[pid]["transport"] == "espnow" and not man[pid].get("window")
-              and not man[pid].get("bcast") and man[pid].get("retries") == 3
+              if meta[pid].get("transport") == "espnow" and banner_int(meta[pid], "window_ms") == 0
+              and banner_int(meta[pid], "bcast") == 0 and banner_int(meta[pid], "retries") == 3
               and m["succ"] is not None]
     if screen:
         ok = [(pid, m) for pid, m in screen if m["succ"] >= a.min_success]
-        ok.sort(key=lambda kv: -RATE_MBPS.get(man[kv[0]]["rate"], 0))
+        ok.sort(key=lambda kv: -RATE_MBPS.get(banner_int(meta[kv[0]], "rate"), 0))
         if ok:
-            picks = " ".join(str(man[pid]["rate"]) for pid, _ in ok[:2])
+            picks = ", ".join(f"{RATE_MBPS.get(banner_int(meta[pid], 'rate'), '?')} Mbps"
+                              for pid, _ in ok[:2])
             print(f"\nESP-NOW rate screen: fastest rates with success >= {a.min_success:.0%}: "
                   + ", ".join(f"{pid} ({m['succ']:.1%})" for pid, m in ok[:2])
-                  + f"\n  -> sweep.py plan --stage 2 --rates {picks}")
+                  + f"\n  -> next: ESP-NOW receive power saving at PHY rate {picks}")
         else:
             print(f"\nESP-NOW rate screen: no rate reached {a.min_success:.0%} success")
 
@@ -171,7 +187,7 @@ def main():
     for pid, m in rows.items():
         if m["eff"] is None or m["succ"] < a.min_success:
             continue
-        t = transport_of(pid, man)
+        t = meta[pid].get("transport", "unknown")
         if t not in best or m["eff"] > best[t][1]["eff"]:
             best[t] = (pid, m)
     for t, (pid, m) in best.items():

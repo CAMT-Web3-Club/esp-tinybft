@@ -1036,3 +1036,12 @@ int Byz_detect_local_id(const char *config_file)
     if (parse_config(config_file, &cfg) != 0) return -1;
     return cfg.local_node_id;
 }
+
+int Byz_node_is_replica(const char *config_file, int node_id)
+{
+    tbft_config_t cfg;
+    if (parse_config(config_file, &cfg) != 0) return -1;
+    if (node_id < 0 || node_id >= cfg.num_nodes) return -1;
+    /* The same test Byz_init_replica() and Byz_init_client() apply. */
+    return node_id < cfg.num_replicas ? 1 : 0;
+}

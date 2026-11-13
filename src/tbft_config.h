@@ -87,6 +87,32 @@
 #define TBFT_MS_TO_TICKS_MIN1(ms) \
     ((pdMS_TO_TICKS(ms) > 0) ? pdMS_TO_TICKS(ms) : (TickType_t)1)
 
+/* ESP-NOW retry timing (Kconfig "ESP-NOW radio").  Also printed in the
+ * counter example's BANNER, so it is defined once, here.
+ *
+ * Radio always on: TBFT_ESPNOW_TX_RETRY_DELAY_MS between attempts and no time
+ * floor.  Receive power saving: peers listen WINDOW ms at the start of every
+ * INTERVAL ms, so a frame is repeated every half window until it is
+ * acknowledged or INTERVAL + 20 ms have passed; with attempts closer than the
+ * window, one of them falls inside a window.  Delays are whole ticks (at
+ * least one), the unit vTaskDelay() works in. */
+#if CONFIG_TBFT_TRANSPORT_ESPNOW
+#define TBFT_TICK_MS  (1000 / CONFIG_FREERTOS_HZ)
+#define TBFT_WHOLE_TICKS_MS(ms) \
+    ((ms) >= TBFT_TICK_MS ? (ms) / TBFT_TICK_MS * TBFT_TICK_MS : TBFT_TICK_MS)
+#if CONFIG_TBFT_ESPNOW_POWER_SAVE
+#define TBFT_ESPNOW_RETRY_DELAY_MS  TBFT_WHOLE_TICKS_MS(CONFIG_TBFT_ESPNOW_WAKE_WINDOW_MS / 2)
+#define TBFT_ESPNOW_RETRY_SPAN_MS   (CONFIG_TBFT_ESPNOW_WAKE_INTERVAL_MS + 20)
+_Static_assert(CONFIG_TBFT_ESPNOW_WAKE_WINDOW_MS < CONFIG_TBFT_ESPNOW_WAKE_INTERVAL_MS,
+               "ESP-NOW wake window must be shorter than the wake interval");
+_Static_assert(TBFT_ESPNOW_RETRY_DELAY_MS < CONFIG_TBFT_ESPNOW_WAKE_WINDOW_MS,
+               "ESP-NOW wake window too short for the FreeRTOS tick: a retry could skip it");
+#else
+#define TBFT_ESPNOW_RETRY_DELAY_MS  TBFT_WHOLE_TICKS_MS(CONFIG_TBFT_ESPNOW_TX_RETRY_DELAY_MS)
+#define TBFT_ESPNOW_RETRY_SPAN_MS   0
+#endif
+#endif
+
 /* --------------------------------------------------------------------------
  * Derived protocol constants
  * -------------------------------------------------------------------------- */

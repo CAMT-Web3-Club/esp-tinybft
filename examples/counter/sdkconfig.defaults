@@ -53,5 +53,12 @@ CONFIG_TBFT_DISABLE_MULTICAST=y
 # lwIP drops UDP datagrams silently when this mailbox is full.
 CONFIG_LWIP_UDP_RECVMBOX_SIZE=16
 
-# NOTE: role, transport and Wi-Fi power-save are selected by the overlays
-# sdkconfig.role.* and sdkconfig.variant.* (see README), not here.
+# Starting point of the experiment; change it in idf.py menuconfig
+# (TinyBFT Configuration, Counter Example Configuration).
+CONFIG_TBFT_TRANSPORT_ESPNOW=y
+
+# Measurement: the same quiet logging for every configuration, plus the
+# TBFT_STATS line (counters for loss/retry accounting).  For debugging, raise
+# Component config > Log > Log Level > Default log verbosity to Info.
+CONFIG_LOG_DEFAULT_LEVEL_WARN=y
+CONFIG_TBFT_PRINT_STATS=y

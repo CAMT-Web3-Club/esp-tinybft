@@ -1,3 +1,0 @@
-# copy to sdkconfig.wifi.local (git-ignored) and fill in
-CONFIG_EXAMPLE_WIFI_SSID="your-ssid"
-CONFIG_EXAMPLE_WIFI_PASSWORD="your-password"

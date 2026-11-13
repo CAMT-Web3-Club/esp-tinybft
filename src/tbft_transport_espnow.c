@@ -393,16 +393,16 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *
  * whether the peer ACKed (ESP-NOW docs, "Send ESP-NOW Data").
  *
  * Retries on either kind of failure: at least ESPNOW_TX_MAX_ATTEMPTS times
- * and, when TBFT_ESPNOW_TX_RETRY_SPAN_MS is set, until that much time has
- * passed.  The time bound is for receivers that duty-cycle their radio: as
- * long as the gap between attempts is shorter than their wake window, an
- * attempt lands in a window before the span (>= their wake interval) ends,
- * however quickly the driver reports each failure. */
+ * and, with receive power saving, until TBFT_ESPNOW_RETRY_SPAN_MS has passed
+ * (tbft_config.h).  The time bound is for receivers that duty-cycle their
+ * radio: as long as the gap between attempts is shorter than their wake
+ * window, an attempt lands in a window before the span (> their wake
+ * interval) ends, however quickly the driver reports each failure. */
 static bool espnow_tx_frame(tbft_espnow_t *enow, const uint8_t *mac,
                             const uint8_t *pkt, size_t len) {
-#if CONFIG_TBFT_ESPNOW_TX_RETRY_SPAN_MS > 0
+#if TBFT_ESPNOW_RETRY_SPAN_MS > 0
     const int64_t give_up_us = esp_timer_get_time()
-        + (int64_t)CONFIG_TBFT_ESPNOW_TX_RETRY_SPAN_MS * 1000;
+        + (int64_t)TBFT_ESPNOW_RETRY_SPAN_MS * 1000;
 #endif
     for (int attempt = 0; ; attempt++) {
         memcpy(enow->tx_expect_mac, mac, 6);
@@ -419,11 +419,11 @@ static bool espnow_tx_frame(tbft_espnow_t *enow, const uint8_t *mac,
             ESP_LOGD(TAG, "esp_now_send err=0x%x (attempt %d)", err, attempt + 1);
         }
         bool again = (attempt + 1 < ESPNOW_TX_MAX_ATTEMPTS);
-#if CONFIG_TBFT_ESPNOW_TX_RETRY_SPAN_MS > 0
+#if TBFT_ESPNOW_RETRY_SPAN_MS > 0
         again = again || (esp_timer_get_time() < give_up_us);
 #endif
         if (!again) return false;
-        vTaskDelay(TBFT_MS_TO_TICKS_MIN1(CONFIG_TBFT_ESPNOW_TX_RETRY_DELAY_MS));
+        vTaskDelay(TBFT_MS_TO_TICKS_MIN1(TBFT_ESPNOW_RETRY_DELAY_MS));
     }
 }
 
@@ -634,6 +634,26 @@ int tbft_transport_create(tbft_transport_t **out, tbft_transport_type_t type, in
         esp_now_unregister_recv_cb();
         goto init_error;
     }
+
+#if CONFIG_TBFT_ESPNOW_POWER_SAVE
+    /* Receive power saving (Kconfig "Receive power saving"; ESP-IDF Wi-Fi
+     * guide, "Connectionless Modules Power-saving"): RF on for WINDOW ms at
+     * the start of every INTERVAL ms.  Same calls, in the same place (after
+     * esp_now_init() and the callbacks), as ESP-IDF's examples/wifi/espnow.
+     * WIFI_PS_MIN_MODEM is the driver default (esp_wifi.h); it is set again
+     * in case the application chose WIFI_PS_NONE. */
+    {
+        esp_err_t pe = esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+        if (pe == ESP_OK) pe = esp_now_set_wake_window(CONFIG_TBFT_ESPNOW_WAKE_WINDOW_MS);
+        if (pe == ESP_OK) pe = esp_wifi_connectionless_module_set_wake_interval(
+                                   CONFIG_TBFT_ESPNOW_WAKE_INTERVAL_MS);
+        if (pe != ESP_OK) {
+            ESP_LOGE(TAG, "ESP-NOW receive power saving failed: 0x%x (%s)",
+                     pe, esp_err_to_name(pe));
+            goto init_error;
+        }
+    }
+#endif
 
 #if CONFIG_TBFT_ESPNOW_BROADCAST
     {

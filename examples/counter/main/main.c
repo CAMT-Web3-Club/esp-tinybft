@@ -13,6 +13,7 @@
 #include "esp_wifi.h"
 #include "esp_now.h"
 #include "esp-tinybft.h"
+#include "tbft_config.h"   /* TBFT_ESPNOW_RETRY_* printed in the banner */
 #include "esp_task_wdt.h"
 #include "esp_timer.h"
 #include "esp_mac.h"
@@ -149,16 +150,23 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
 #define EXAMPLE_PM 0
 #endif
 
-#if CONFIG_EXAMPLE_ROLE_REPLICA
-#define EXAMPLE_ROLE_STR "replica"
+/* Role (menuconfig "Role of this board"): read from the node list at boot,
+ * or forced.  A forced image only contains the code of its role. */
+#if CONFIG_EXAMPLE_ROLE_AUTO
+#define EXAMPLE_ROLE_FROM "list"
 #else
-#define EXAMPLE_ROLE_STR "client"
+#define EXAMPLE_ROLE_FROM "forced"
 #endif
-
-#if CONFIG_EXAMPLE_ROLE_CLIENT
+#ifdef CONFIG_EXAMPLE_CLIENT_REQUEST_INTERVAL_MS
 #define EXAMPLE_REQ_INTERVAL_MS CONFIG_EXAMPLE_CLIENT_REQUEST_INTERVAL_MS
 #else
 #define EXAMPLE_REQ_INTERVAL_MS 0
+#endif
+
+#if CONFIG_TBFT_TRANSPORT_ESPNOW
+#define EXAMPLE_CONFIG_FILE "/spiffs/config_espnow.txt"
+#else
+#define EXAMPLE_CONFIG_FILE "/spiffs/config_udp.txt"
 #endif
 
 static int32_t counter_state[4096 / sizeof(int32_t)];
@@ -213,17 +221,23 @@ int exec_cb(Byz_req *in, Byz_rep *out, Byz_buffer *ndet, int cid, bool ro) {
 #else
 #define EXAMPLE_BCAST 0
 #endif
-#if CONFIG_EXAMPLE_ESPNOW_POWER_SAVE
-#define EXAMPLE_EN_WINDOW   CONFIG_EXAMPLE_ESPNOW_WAKE_WINDOW_MS
-#define EXAMPLE_EN_INTERVAL CONFIG_EXAMPLE_ESPNOW_WAKE_INTERVAL_MS
+#if CONFIG_TBFT_ESPNOW_POWER_SAVE
+#define EXAMPLE_EN_WINDOW   CONFIG_TBFT_ESPNOW_WAKE_WINDOW_MS
+#define EXAMPLE_EN_INTERVAL CONFIG_TBFT_ESPNOW_WAKE_INTERVAL_MS
 #else
 #define EXAMPLE_EN_WINDOW   0      /* 0/0 = receiver always on */
 #define EXAMPLE_EN_INTERVAL 0
 #endif
+#if CONFIG_EXAMPLE_WIFI_PS_MAX_MODEM
+#define EXAMPLE_LISTEN_INTERVAL CONFIG_EXAMPLE_WIFI_LISTEN_INTERVAL
+#else
+#define EXAMPLE_LISTEN_INTERVAL 0  /* only used with WIFI_PS_MAX_MODEM */
+#endif
 
 /* Printed at WARN so it survives CONFIG_LOG_DEFAULT_LEVEL_WARN: proves which
- * experiment point each board runs (every knob the sweep changes is here). */
-static void print_banner(void) {
+ * configuration each board runs (every menuconfig setting of the experiment,
+ * plus the role found in the node list and the node id). */
+static void print_banner(bool replica, int local_id) {
     uint8_t mac[6] = {0};
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
     uint8_t ch = 0; wifi_second_chan_t sc;
@@ -231,34 +245,34 @@ static void print_banner(void) {
 #if CONFIG_TBFT_TRANSPORT_UDP
     wifi_ps_type_t ps = WIFI_PS_NONE;
     esp_wifi_get_ps(&ps);
-    ESP_LOGW(TAG, "BANNER role=%s transport=udp ps=%s listen_interval=%d "
+    ESP_LOGW(TAG, "BANNER role=%s role_from=%s id=%d transport=udp ps=%s listen_interval=%d "
              "min_active_ms=%d mcast=%d static_ip=%d ch=%d pm=%d hz=%d "
              "idle_wait_ms=%d req_interval_ms=%d build=%s "
              "mac=%02x:%02x:%02x:%02x:%02x:%02x",
-             EXAMPLE_ROLE_STR,
+             replica ? "replica" : "client", EXAMPLE_ROLE_FROM, local_id,
              ps == WIFI_PS_NONE ? "none" : ps == WIFI_PS_MIN_MODEM ? "min" : "max",
-             CONFIG_EXAMPLE_WIFI_LISTEN_INTERVAL,
+             EXAMPLE_LISTEN_INTERVAL,
              CONFIG_ESP_WIFI_SLP_DEFAULT_MIN_ACTIVE_TIME,
              EXAMPLE_MCAST, EXAMPLE_STATIC_IP_ON, ch,
              EXAMPLE_PM, CONFIG_FREERTOS_HZ, CONFIG_TBFT_IDLE_WAIT_MS,
-             EXAMPLE_REQ_INTERVAL_MS, __DATE__ " " __TIME__,
+             replica ? 0 : EXAMPLE_REQ_INTERVAL_MS, __DATE__ " " __TIME__,
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 #else
-    ESP_LOGW(TAG, "BANNER role=%s transport=espnow if=%s rate=%d retries=%d "
+    ESP_LOGW(TAG, "BANNER role=%s role_from=%s id=%d transport=espnow if=%s rate=%d retries=%d "
              "retry_delay_ms=%d retry_span_ms=%d window_ms=%d interval_ms=%d bcast=%d ch=%d "
              "pm=%d hz=%d idle_wait_ms=%d req_interval_ms=%d build=%s "
              "mac=%02x:%02x:%02x:%02x:%02x:%02x",
-             EXAMPLE_ROLE_STR,
+             replica ? "replica" : "client", EXAMPLE_ROLE_FROM, local_id,
 #if CONFIG_TBFT_ESPNOW_IF_STA
              "sta",
 #else
              "ap",
 #endif
              CONFIG_TBFT_ESPNOW_PHY_RATE, CONFIG_TBFT_ESPNOW_TX_RETRIES,
-             CONFIG_TBFT_ESPNOW_TX_RETRY_DELAY_MS, CONFIG_TBFT_ESPNOW_TX_RETRY_SPAN_MS,
+             TBFT_ESPNOW_RETRY_DELAY_MS, TBFT_ESPNOW_RETRY_SPAN_MS,
              EXAMPLE_EN_WINDOW, EXAMPLE_EN_INTERVAL, EXAMPLE_BCAST, ch,
              EXAMPLE_PM, CONFIG_FREERTOS_HZ, CONFIG_TBFT_IDLE_WAIT_MS,
-             EXAMPLE_REQ_INTERVAL_MS, __DATE__ " " __TIME__,
+             replica ? 0 : EXAMPLE_REQ_INTERVAL_MS, __DATE__ " " __TIME__,
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 #endif
 }
@@ -284,7 +298,7 @@ static void wifi_init(void) {
     wifi_config_t wifi_cfg = {
         .sta = { .ssid = CONFIG_EXAMPLE_WIFI_SSID,
                  .password = CONFIG_EXAMPLE_WIFI_PASSWORD,
-                 .listen_interval = CONFIG_EXAMPLE_WIFI_LISTEN_INTERVAL },
+                 .listen_interval = EXAMPLE_LISTEN_INTERVAL },
     };
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
@@ -333,14 +347,10 @@ static void wifi_init(void) {
     ESP_ERROR_CHECK(esp_wifi_start());
 #endif
     ESP_ERROR_CHECK(esp_now_init());
-#if CONFIG_EXAMPLE_ESPNOW_POWER_SAVE
-    /* Duty-cycled RX (ESP-IDF "connectionless module power save"): the radio
-     * listens WINDOW ms out of every INTERVAL ms.  Station interface only.
-     * Same calls and order as ESP-IDF examples/wifi/espnow; MIN_MODEM is the
-     * driver default (esp_wifi.h), set here only to make it visible. */
-    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_MIN_MODEM));
-    ESP_ERROR_CHECK(esp_now_set_wake_window(CONFIG_EXAMPLE_ESPNOW_WAKE_WINDOW_MS));
-    ESP_ERROR_CHECK(esp_wifi_connectionless_module_set_wake_interval(CONFIG_EXAMPLE_ESPNOW_WAKE_INTERVAL_MS));
+#if CONFIG_TBFT_ESPNOW_POWER_SAVE
+    /* Receive power saving (TinyBFT Configuration > ESP-NOW radio): the
+     * transport sets the wake window and interval when it starts, right
+     * after esp_now_init() as in ESP-IDF's examples/wifi/espnow. */
 #else
     /* Receiver always on.  The default wake window (maximum) already keeps
      * the RF on; WIFI_PS_NONE says so explicitly, as the always-on bulb of
@@ -355,9 +365,9 @@ static void wifi_init(void) {
  * times (DHCP/IP may lag), then reboot loudly. */
 static void fatal_reboot(const char *what) {
     for (int i = 0; i < 3; i++) {
-        ESP_LOGE(TAG, "%s - wrong firmware role for this board? (role=%s; "
-                 "boards listed as node* need the replica image, others the "
-                 "client image)", what, EXAMPLE_ROLE_STR);
+        ESP_LOGE(TAG, "%s - check this board's entry in %s and the role "
+                 "(menuconfig: Counter Example Configuration > Role of this "
+                 "board)", what, EXAMPLE_CONFIG_FILE);
         vTaskDelay(pdMS_TO_TICKS(3000));
     }
     esp_restart();
@@ -377,15 +387,11 @@ static int detect_local_id_or_reboot(const char *config_file) {
     return -1;
 }
 
-#if CONFIG_EXAMPLE_ROLE_REPLICA
+#if !CONFIG_EXAMPLE_ROLE_CLIENT
 static void replica_task(void *arg) {
-    const char *config_file = "/spiffs/config_udp.txt";
-#if CONFIG_TBFT_TRANSPORT_ESPNOW
-    config_file = "/spiffs/config_espnow.txt";
-#endif
-
-    int local_id = detect_local_id_or_reboot(config_file);
-    ESP_LOGI(TAG, "Using local_id=%d", local_id);
+    const char *config_file = EXAMPLE_CONFIG_FILE;
+    int local_id = (int)(intptr_t)arg;
+    ESP_LOGI(TAG, "Replica, local_id=%d", local_id);
 
     char priv_config[32];
     snprintf(priv_config, sizeof(priv_config), "/spiffs/priv%d.der", local_id);
@@ -403,17 +409,15 @@ static void replica_task(void *arg) {
     ESP_LOGI(TAG, "Replica running...");
     Byz_replica_run();
 }
-#else
-static void client_task(void *arg) {
-    const char *config_file = "/spiffs/config_udp.txt";
-#if CONFIG_TBFT_TRANSPORT_ESPNOW
-    config_file = "/spiffs/config_espnow.txt";
 #endif
 
-    vTaskDelay(pdMS_TO_TICKS(5000));
+#if !CONFIG_EXAMPLE_ROLE_REPLICA
+static void client_task(void *arg) {
+    const char *config_file = EXAMPLE_CONFIG_FILE;
+    int local_id = (int)(intptr_t)arg;
+    ESP_LOGI(TAG, "Client, local_id=%d", local_id);
 
-    int local_id = detect_local_id_or_reboot(config_file);
-    ESP_LOGI(TAG, "Client detected local_id=%d", local_id);
+    vTaskDelay(pdMS_TO_TICKS(5000));   /* let the replicas finish booting */
 
     char priv_config[32];
     snprintf(priv_config, sizeof(priv_config), "/spiffs/priv%d.der", local_id);
@@ -531,11 +535,32 @@ void app_main(void) {
     };
     ESP_ERROR_CHECK(esp_pm_configure(&pm_cfg));
 #endif
-    print_banner();
 
+    /* Who am I?  The node list on SPIFFS says: entries named node* are
+     * replicas, any other entry is a client (Byz_node_is_replica). */
+    int local_id = detect_local_id_or_reboot(EXAMPLE_CONFIG_FILE);
+    int listed_replica = Byz_node_is_replica(EXAMPLE_CONFIG_FILE, local_id);
+    if (listed_replica < 0) {
+        fatal_reboot("cannot read the node list");
+    }
 #if CONFIG_EXAMPLE_ROLE_REPLICA
-    xTaskCreate(replica_task, "replica_task", 8192, NULL, 5, NULL);
-#else
-    xTaskCreate(client_task, "client_task", 8192, NULL, 5, NULL);
+    if (!listed_replica) {
+        fatal_reboot("this board is listed as a client, but the image is forced to Replica");
+    }
+#elif CONFIG_EXAMPLE_ROLE_CLIENT
+    if (listed_replica) {
+        fatal_reboot("this board is listed as a replica, but the image is forced to Client");
+    }
+#endif
+    print_banner(listed_replica == 1, local_id);
+
+#if !CONFIG_EXAMPLE_ROLE_CLIENT
+    if (listed_replica == 1) {
+        xTaskCreate(replica_task, "replica_task", 8192, (void *)(intptr_t)local_id, 5, NULL);
+        return;
+    }
+#endif
+#if !CONFIG_EXAMPLE_ROLE_REPLICA
+    xTaskCreate(client_task, "client_task", 8192, (void *)(intptr_t)local_id, 5, NULL);
 #endif
 }

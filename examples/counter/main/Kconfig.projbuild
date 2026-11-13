@@ -1,11 +1,20 @@
 menu "Counter Example Configuration"
 
-    choice EXAMPLE_NODE_ROLE
-        prompt "Node role"
-        default EXAMPLE_ROLE_REPLICA
-        help
-            Select whether this node runs as a BFT replica or a client.
+    comment "Transport, ESP-NOW rate and power saving: TinyBFT Configuration menu"
 
+    choice EXAMPLE_NODE_ROLE
+        prompt "Role of this board"
+        default EXAMPLE_ROLE_AUTO
+        help
+            Automatic: at boot the board looks itself up in the node list
+            (spiffs_image/config_espnow.txt by MAC, config_udp.txt by IP).
+            Entries named node* are replicas, any other entry is a client.
+            One image then works on every board.
+            Replica / Client: force the role. A board whose entry says
+            otherwise reports it and restarts.
+
+        config EXAMPLE_ROLE_AUTO
+            bool "Automatic, from the node list (same image on every board)"
         config EXAMPLE_ROLE_REPLICA
             bool "Replica"
         config EXAMPLE_ROLE_CLIENT
@@ -13,54 +22,15 @@ menu "Counter Example Configuration"
     endchoice
 
     config EXAMPLE_CLIENT_REQUEST_INTERVAL_MS
-        int "Client request interval (ms)"
-        default 30000
-        depends on EXAMPLE_ROLE_CLIENT
+        int "Client: request period (ms)"
+        default 10000
+        range 100 3600000
+        depends on !EXAMPLE_ROLE_REPLICA
         help
-            Delay between successive requests sent by the client to the
-            replica cluster.
-
-    config EXAMPLE_WIFI_SSID
-        string "WiFi SSID"
-        default "myssid"
-        depends on TBFT_TRANSPORT_UDP
-        help
-            SSID of the AP to connect to when using UDP transport.
-
-    config EXAMPLE_WIFI_PASSWORD
-        string "WiFi Password"
-        default "mypassword"
-        depends on TBFT_TRANSPORT_UDP
-        help
-            Password of the AP. Leave empty for open networks.
-
-    choice EXAMPLE_WIFI_MODEM_PS
-        prompt "WiFi Modem Power Save (STA mode)"
-        default EXAMPLE_WIFI_PS_NONE
-        depends on TBFT_TRANSPORT_UDP
-        help
-            Controls modem-sleep (power save) behaviour. The default here
-            is Disabled (WIFI_PS_NONE): radio always on, lowest latency,
-            highest power. MIN_MODEM wakes every DTIM; MAX_MODEM wakes every
-            listen interval (see EXAMPLE_WIFI_LISTEN_INTERVAL) and may miss
-            broadcast frames such as ARP requests.
-
-        config EXAMPLE_WIFI_PS_NONE
-            bool "Disabled (WIFI_PS_NONE)"
-        config EXAMPLE_WIFI_PS_MIN_MODEM
-            bool "Minimum (WIFI_PS_MIN_MODEM)"
-        config EXAMPLE_WIFI_PS_MAX_MODEM
-            bool "Maximum (WIFI_PS_MAX_MODEM)"
-    endchoice
-
-    config EXAMPLE_WIFI_LISTEN_INTERVAL
-        int "Station listen interval (beacon intervals)"
-        default 3
-        range 1 10
-        depends on TBFT_TRANSPORT_UDP
-        help
-            Only used with WIFI_PS_MAX_MODEM. Fixed explicitly so the
-            experiment does not depend on the IDF default.
+            The client starts one request every this many ms on a fixed
+            schedule: a slow request does not shift the schedule, and slots
+            it overruns are counted as "missed". Keep it the same for every
+            configuration you compare.
 
     config EXAMPLE_ESPNOW_CHANNEL
         int "ESP-NOW Wi-Fi channel"
@@ -71,49 +41,72 @@ menu "Counter Example Configuration"
             Channel all boards use for ESP-NOW. Use the same channel as the
             router in the UDP runs so both transports share the RF environment.
 
-    config EXAMPLE_STATIC_IP
-        bool "Derive a static IP from this board's MAC (no DHCP reservation)"
-        default n
+    menu "Wi-Fi station (UDP)"
         depends on TBFT_TRANSPORT_UDP
-        help
-            Looks up this board's station MAC in spiffs config_espnow.txt and
-            uses the IP at the same index in config_udp.txt. One firmware
-            then works on every board without router reservations.
 
-    config EXAMPLE_STATIC_IP_NETMASK
-        string "Static IP netmask"
-        default "255.255.255.0"
-        depends on EXAMPLE_STATIC_IP
+        config EXAMPLE_WIFI_SSID
+            string "Wi-Fi SSID"
+            default "myssid"
+            help
+                SSID of the access point. Stored in sdkconfig, which git
+                ignores.
 
-    config EXAMPLE_STATIC_IP_GATEWAY
-        string "Static IP gateway (router)"
-        default "192.168.100.1"
-        depends on EXAMPLE_STATIC_IP
+        config EXAMPLE_WIFI_PASSWORD
+            string "Wi-Fi password"
+            default "mypassword"
+            help
+                Password of the access point. Leave empty for open networks.
+                Stored in sdkconfig, which git ignores.
 
-    config EXAMPLE_ESPNOW_POWER_SAVE
-        bool "ESP-NOW: duty-cycled receive (wake window / interval)"
-        default n
-        depends on TBFT_TRANSPORT_ESPNOW && TBFT_ESPNOW_IF_STA
-        select ESP_WIFI_STA_DISCONNECTED_PM_ENABLE
-        help
-            ESP-NOW's own power saving ("connectionless module power save"
-            in ESP-IDF): the radio receives only for WAKE_WINDOW ms out of
-            every WAKE_INTERVAL ms; in between the RF is off while the CPU
-            keeps running (modem sleep, no light sleep needed).
-            Senders cannot know when a receiver listens, so set
-            TBFT_ESPNOW_TX_RETRY_SPAN_MS >= WAKE_INTERVAL and
-            TBFT_ESPNOW_TX_RETRY_DELAY_MS well below WAKE_WINDOW.
+        choice EXAMPLE_WIFI_MODEM_PS
+            prompt "Power saving"
+            default EXAMPLE_WIFI_PS_NONE
+            help
+                Station power saving (esp_wifi_set_ps()). None: radio always
+                on, the counterpart of ESP-NOW with receive power saving off.
+                Minimum: wakes every DTIM. Maximum: wakes every listen
+                interval and may miss broadcast frames such as ARP requests.
 
-    config EXAMPLE_ESPNOW_WAKE_WINDOW_MS
-        int "ESP-NOW wake window (ms)"
-        default 50
-        range 0 65535
-        depends on EXAMPLE_ESPNOW_POWER_SAVE
+            config EXAMPLE_WIFI_PS_NONE
+                bool "None (WIFI_PS_NONE)"
+            config EXAMPLE_WIFI_PS_MIN_MODEM
+                bool "Minimum (WIFI_PS_MIN_MODEM)"
+            config EXAMPLE_WIFI_PS_MAX_MODEM
+                bool "Maximum (WIFI_PS_MAX_MODEM)"
+        endchoice
 
-    config EXAMPLE_ESPNOW_WAKE_INTERVAL_MS
-        int "ESP-NOW wake interval (ms)"
-        default 100
-        range 1 65535
-        depends on EXAMPLE_ESPNOW_POWER_SAVE
+        comment "Minimum active time: Component config > Wi-Fi > Minimum active time"
+        depends on !EXAMPLE_WIFI_PS_NONE
+
+        config EXAMPLE_WIFI_LISTEN_INTERVAL
+            int "Listen interval (beacon intervals)"
+            default 3
+            range 1 10
+            depends on EXAMPLE_WIFI_PS_MAX_MODEM
+            help
+                listen_interval of the station: with WIFI_PS_MAX_MODEM it
+                wakes for every this many beacons. Set explicitly so the
+                experiment does not depend on the driver default.
+
+        config EXAMPLE_STATIC_IP
+            bool "Derive a static IP from this board's MAC (no DHCP reservation)"
+            default n
+            help
+                Looks up this board's station MAC in spiffs config_espnow.txt and
+                uses the IP at the same index in config_udp.txt. One firmware
+                then works on every board without router reservations.
+
+        config EXAMPLE_STATIC_IP_NETMASK
+            string "Static IP netmask"
+            default "255.255.255.0"
+            depends on EXAMPLE_STATIC_IP
+
+        config EXAMPLE_STATIC_IP_GATEWAY
+            string "Static IP gateway (router)"
+            default "192.168.100.1"
+            depends on EXAMPLE_STATIC_IP
+    endmenu
+
+    comment "Log level: Component config > Log > Log Level > Default log verbosity"
 
 endmenu

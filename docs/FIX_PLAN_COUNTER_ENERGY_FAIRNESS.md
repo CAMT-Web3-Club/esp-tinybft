@@ -28,21 +28,23 @@
 
 ## 1.1 สถานะการทำงาน (อัปเดตหลังลงมือแก้บน `fix/develop/v0.2.9`)
 
-Build ผ่านแบบไม่มี warning ล่าสุด (2026-11-13, checkout ใหม่ที่ไม่มี `sdkconfig` ค้างในเครื่อง) สำหรับ `counter`: espnow (replica), espnow_ps (client), udp_psnone (client), จุด sweep `enps_r12_w110i200`, `udp_max_l3_a20`, `enb_r12` (replica), `udp_min_mcast` (client) และ `simple_wallet` ทุก build ได้ target esp32c3 และไม่มี `CONFIG_PM_ENABLE` เครื่องมือ `tools/flash.py`, `tools/sweep.py`, `tools/analyze.py` ทดสอบด้วยข้อมูลจำลอง **ยังไม่ได้ทดสอบบนบอร์ดจริง** เกณฑ์ตรวจรับที่ต้องใช้บอร์ดยังเป็นของคนทดสอบ
+**การตั้งค่าย้ายไป `idf.py menuconfig` ทั้งหมด (2026-11-13 ตามที่เจ้าของงานวิจัยขอ):** ทุกค่าของการทดลองเลือกได้ในเมนู TinyBFT Configuration (transport, PHY rate, broadcast, receive power saving ของ ESP-NOW พร้อม preset, multicast ของ UDP) และ Counter Example Configuration (role, คาบ request, channel, Wi-Fi และ power saving ของ UDP) ตรวจรูปแบบ Kconfig ด้วย `kconfcheck` ของ Espressif และทดสอบพฤติกรรม (preset เปลี่ยนค่า window/interval ตามเมื่อยังไม่ได้ตั้งเอง, ค่าที่ซ่อนคำนวณจาก choice, `select`) ด้วย `esp_kconfiglib` 3.12 ตัวเดียวกับที่ `idf.py menuconfig` ใช้ role ค่าเริ่มต้นเป็น *Automatic* คือ image เดียวใช้ได้ทุกบอร์ด บอร์ดหา role ของตัวเองจาก node list ตอนบูต (`Byz_node_is_replica()`) ลบ overlay `sdkconfig.variant.*`, `sdkconfig.role.*`, `sdkconfig.measure`, `sdkconfig.mcast`, `sdkconfig.static_ip`, `sdkconfig.wifi.local.example`, `build_variant.sh`, `tools/sweep.py`, `tools/flash.py` แล้ว แทนด้วย `flash_all.fish` (flash image เดียวกันทุกพอร์ตแบบขนานด้วยคำสั่ง esptool ที่ `idf.py build` พิมพ์) ส่วน `tools/analyze.py` ยังอยู่เป็นตัวช่วยสรุปผล (ไม่บังคับ) และอ่านค่าการตั้งค่าจากบรรทัด `BANNER`
+
+Build ผ่านล่าสุด (2026-11-13, build dir ใหม่ทั้งหมด, ตั้งค่าแบบเดียวกับ menuconfig): ESP-NOW ค่าเริ่มต้น, ESP-NOW 54 Mbps + 110/200, ESP-NOW custom 30/300 + broadcast + role Replica, UDP `PS_MAX` listen 10 + multicast + static IP + role Client และ `simple_wallet` ทุก build ได้ target esp32c3 ไม่มี warning ของ compiler และรายงาน Kconfig เป็น "Finished successfully" (ยกเว้น `simple_wallet` ที่มี warning เดิมจาก `CONFIG_MBEDTLS_ASYMMETRIC_CONTENT_LEN=true` ใน `sdkconfig.defaults` ของมันเอง) ค่า custom ที่ window ไม่สั้นกว่า interval ถูก static assert หยุด build ตามที่ออกแบบ `tools/analyze.py` และ `flash_all.fish` ทดสอบด้วยข้อมูลจำลองและ esptool จำลอง **ยังไม่ได้ทดสอบบนบอร์ดจริง** เกณฑ์ตรวจรับที่ต้องใช้บอร์ดยังเป็นของคนทดสอบ
 
 | งาน | สถานะ | หมายเหตุ |
 |---|---|---|
 | A1 | ทำแล้ว | Kconfig `TBFT_ESPNOW_IF_STA` (ค่าเริ่มต้น) / `_AP`; ต้อง flash ใหม่ทุกบอร์ด |
-| A2 | ทำแล้ว | `EXAMPLE_WIFI_LISTEN_INTERVAL`, variant `udp_psnone`, `BANNER` พิมพ์ทุกค่าที่กำหนดจุดทดลอง (PS, listen interval, rate, retry, wake window/interval, broadcast/multicast, channel, PM, tick rate) |
+| A2 | ทำแล้ว | `EXAMPLE_WIFI_LISTEN_INTERVAL` (แสดงเฉพาะ `PS_MAX`), power saving `None` ของ UDP, `BANNER` พิมพ์ role, ที่มาของ role (`list`/`forced`), node id และทุกค่าที่กำหนดการตั้งค่า (PS, listen interval, rate, retry, wake window/interval, broadcast/multicast, channel, PM, tick rate) |
 | A3 | ทำแล้ว | ใช้ค่ากลาง VC=30000 ms; **เจ้าของงานวิจัยยังต้องยืนยันค่านี้** |
 | A4 | ทำแล้ว | `LWIP_UDP_RECVMBOX_SIZE=16` |
 | A5 | ทำแล้ว | คาบสัมบูรณ์ + `CLIENT_STATS` |
-| A6 | ทำแล้ว | `sdkconfig.measure` ตั้ง log WARN; ลบการพิมพ์ key |
-| A7 | ทำแล้ว | overlay + `build_variant.sh` + README; `sdkconfig.defaults` กำหนด `CONFIG_IDF_TARGET="esp32c3"` ตามวิธีใน `idf-py.rst` ของ ESP-IDF (เดิม build dir ใหม่ใน clone ใหม่ได้ target esp32 เพราะ `targets.cmake` เดา target จาก `sdkconfig` ที่ค้างในเครื่องซึ่ง git ignore ไว้); `tools/flash.py` เลือก image ตาม role จาก MAC ของบอร์ด และ `flash_replicas.fish` เป็น wrapper ของมัน (ทดสอบด้วย esptool จำลอง ยังไม่ได้ flash บอร์ดจริง) |
+| A6 | ทำแล้ว | `sdkconfig.defaults` ตั้ง log WARN และ `TBFT_PRINT_STATS` ให้ทุกการตั้งค่าเท่ากัน; ลบการพิมพ์ key |
+| A7 | ทำแล้ว (เปลี่ยนแนวทาง) | แทน overlay ด้วย `idf.py menuconfig` ตามที่เจ้าของงานวิจัยขอ (ดูย่อหน้าบนสุดของหัวข้อนี้); `sdkconfig.defaults` กำหนด `CONFIG_IDF_TARGET="esp32c3"` ตามวิธีใน `idf-py.rst` ของ ESP-IDF (เดิม build dir ใหม่ใน clone ใหม่ได้ target esp32 เพราะ `targets.cmake` เดา target จาก `sdkconfig` ที่ค้างในเครื่องซึ่ง git ignore ไว้); `flash_all.fish` flash ทุกพอร์ต (ทดสอบด้วย esptool จำลอง ยังไม่ได้ flash บอร์ดจริง) |
 | A8 | ทำแล้ว | `TBFT_STATS` ทุก 60 s (replica) / ต่อ request (client); UDP นับ drop ของ lwIP ไม่ได้ |
-| A9 | ทำแล้ว (ไม่ได้ทดสอบบนบอร์ด) | variant `espnow_ps` = power saving ของ ESP-NOW เอง (modem sleep, ไม่ใช้ light sleep) ผู้ส่ง retry ทุก `TBFT_ESPNOW_TX_RETRY_DELAY_MS` (< window) จนได้ ACK หรือครบ `TBFT_ESPNOW_TX_RETRY_SPAN_MS` (≥ interval) แบบนับเวลา ไม่ใช่นับครั้ง; หลักเดียวกับ application note ของ coin-cell button ของ Espressif (รายละเอียดใน A9) อัตราส่งสำเร็จจริงต้องวัดบนบอร์ด |
-| A10 | ทำแล้ว | `TBFT_ESPNOW_PHY_RATE` (0 = ค่าเริ่มต้น IDF 1 Mbps) |
-| A11 | ทำแล้ว แต่**อยู่นอกการเปรียบเทียบ best-vs-best** | เจ้าของงานวิจัยกำหนด (2026-11-13) ว่า best-vs-best ใช้เฉพาะ mode ของวิทยุ ไม่พึ่ง light sleep จึงไม่มีจุดใดใน `tools/sweep.py` ใช้ `sdkconfig.pm` ทุกบอร์ดรัน CPU 160 MHz คงที่ สิ่งที่ทำไว้ยังใช้กับการทดลองแยกได้: รอบแรกใช้ไม่ได้จริง: replica ตื่นทุก 20 ms จึงไม่ถึงเกณฑ์เข้า light-sleep ที่ tick 100 Hz ตอนนี้รอได้ถึง `TBFT_IDLE_WAIT_MS` (500 ms) และ `sdkconfig.pm` ใช้ชุดค่าที่ Espressif แนะนำสำหรับ ESP32-C3 (tick 1000 Hz, ปิด GPIO/MAC-BB/CPU ตอนหลับ) ข้อควรระวัง: พอร์ต USB Serial/JTAG ใช้ไม่ได้ระหว่าง light-sleep |
+| A9 | ทำแล้ว (ไม่ได้ทดสอบบนบอร์ด) | menuconfig: TinyBFT Configuration > ESP-NOW radio > Receive power saving (Off, 50/100, 110/200, 50/200, Custom) = power saving ของ ESP-NOW เอง (modem sleep, ไม่ใช้ light sleep) transport เรียก API ของ ESP-IDF เอง และคำนวณ retry จาก preset: ส่งซ้ำทุกครึ่ง window (ปัดเป็น tick) จนได้ ACK หรือครบ interval + 20 ms; หลักเดียวกับ application note ของ coin-cell button ของ Espressif (รายละเอียดใน A9) อัตราส่งสำเร็จจริงต้องวัดบนบอร์ด |
+| A10 | ทำแล้ว | menuconfig: ESP-NOW radio > PHY rate เป็นตัวเลือกชื่ออ่านได้ (1, 6, 6.5, 24, 54, 65 Mbps) แปลงเป็นค่า `wifi_phy_rate_t` ใน `TBFT_ESPNOW_PHY_RATE` (ตรวจค่ากับ `esp_wifi_types_generic.h`) |
+| A11 | ทำแล้ว แต่**อยู่นอกการเปรียบเทียบ best-vs-best** | เจ้าของงานวิจัยกำหนด (2026-11-13) ว่า best-vs-best ใช้เฉพาะ mode ของวิทยุ ไม่พึ่ง light sleep จึงไม่มีการตั้งค่าใดในแผน best-vs-best ใช้ `sdkconfig.pm` ทุกบอร์ดรัน CPU 160 MHz คงที่ สิ่งที่ทำไว้ยังใช้กับการทดลองแยกได้: รอบแรกใช้ไม่ได้จริง: replica ตื่นทุก 20 ms จึงไม่ถึงเกณฑ์เข้า light-sleep ที่ tick 100 Hz ตอนนี้รอได้ถึง `TBFT_IDLE_WAIT_MS` (500 ms) และ `sdkconfig.pm` ใช้ชุดค่าที่ Espressif แนะนำสำหรับ ESP32-C3 (tick 1000 Hz, ปิด GPIO/MAC-BB/CPU ตอนหลับ) ข้อควรระวัง: พอร์ต USB Serial/JTAG ใช้ไม่ได้ระหว่าง light-sleep |
 | B1 | ทำแล้ว | รอ send callback ต่อเฟรม, retry 3 ครั้ง, ลบ delay คงที่ |
 | B2 | ทำแล้ว | callback ไม่มี lock/log, fast path เฟรมเดียว |
 | B3 | ทำแล้ว | `TBFT_MS_TO_TICKS_MIN1` |
@@ -239,6 +241,8 @@ for (;;) {
 
 ### A7. จัดการ variant ด้วย overlay และ build dir แยก
 
+> **หมายเหตุ (2026-11-13):** แผนเดิมด้านล่างใช้ overlay ตอนนี้แทนด้วย `idf.py menuconfig` และ role แบบ Automatic แล้ว ดูสถานะใน §1.1 และวิธีใช้ใน `examples/counter/README.md`
+
 **ปัญหา**
 
 - ทุก variant และทุก role ใช้ `sdkconfig` ไฟล์เดียวและ build dir เดียว โดยแก้ค่าด้วยมือ
@@ -301,9 +305,9 @@ idf.py -B build/udp_psmin_replica -D SDKCONFIG=build/udp_psmin_replica/sdkconfig
 
 **สิ่งที่ทำ (ตรวจกับเอกสารและโค้ดของ Espressif แล้ว):**
 
-- `main.c` เรียก API ทั้งสองตัวหลัง `esp_now_init()` ตามลำดับเดียวกับ `examples/wifi/espnow` และ `esp_wifi.h` แนะนำให้ interval เป็นพหุคูณของ 100 ms จุด sweep จึงใช้ 100 และ 200 ms
+- transport ของ ESP-NOW (`src/tbft_transport_espnow.c`) เรียก API ทั้งสองตัวทันทีหลัง register callback ซึ่งอยู่หลัง `esp_now_init()` ของแอป ตรงกับตำแหน่งใน `examples/wifi/espnow` และ `esp_wifi.h` แนะนำให้ interval เป็นพหุคูณของ 100 ms preset จึงใช้ 100 และ 200 ms ส่วน Custom ที่ window ไม่สั้นกว่า interval หรือสั้นเกินกว่าจะ retry ได้ทัน tick จะถูก static assert หยุด build
 - คู่มือ Wi-Fi หัวข้อ "Connectionless Modules Power-saving" ระบุว่าส่งได้ทุกเวลาโดยไม่ต้องตั้งค่าเพิ่ม รับได้เฉพาะใน window และถ้าไม่เรียก API ทั้งสอง window จะเป็นค่าสูงสุด RF จึงเปิดตลอด variant `espnow` ใช้แบบนี้และตั้ง `WIFI_PS_NONE` เหมือน bulb ใน `coin_cell_demo` ของ repo esp-now
-- ESP-IDF ไม่ sync window ให้ ผู้ส่งจึง retry ทุก `TBFT_ESPNOW_TX_RETRY_DELAY_MS` (น้อยกว่า window) จนได้ ACK หรือครบ `TBFT_ESPNOW_TX_RETRY_SPAN_MS` (sweep ใช้ interval + 20 ms) หลักนี้ตรงกับ application note ของ coin-cell button (`examples/coin_cell_demo/switch/docs/button_in_matter_bridging.md` ใน repo esp-now) ซึ่งใช้ bridge จาก `esp-now_bridge_light` ของ esp-matter ที่ตื่น 110 ms ทุก 200 ms ส่วนปุ่มส่งห่างกัน 50 ms รวม 3 ครั้ง เพื่อให้ครอบช่วง 90 ms ที่ bridge หลับ ข้อต่างคือปุ่มใช้ light sleep ระหว่างแต่ละครั้งและ bridge ต่อ AP อยู่ ส่วนระบบนี้รอโดยที่ CPU ยังทำงานและไม่มี AP
+- ESP-IDF ไม่ sync window ให้ ผู้ส่งจึงส่งซ้ำทุกครึ่ง window (ปัดเป็น tick, น้อยกว่า window เสมอ) จนได้ ACK หรือครบ interval + 20 ms (`TBFT_ESPNOW_RETRY_DELAY_MS` / `_SPAN_MS` ใน `src/tbft_config.h`) หลักนี้ตรงกับ application note ของ coin-cell button (`examples/coin_cell_demo/switch/docs/button_in_matter_bridging.md` ใน repo esp-now) ซึ่งใช้ bridge จาก `esp-now_bridge_light` ของ esp-matter ที่ตื่น 110 ms ทุก 200 ms ส่วนปุ่มส่งห่างกัน 50 ms รวม 3 ครั้ง เพื่อให้ครอบช่วง 90 ms ที่ bridge หลับ ข้อต่างคือปุ่มใช้ light sleep ระหว่างแต่ละครั้งและ bridge ต่อ AP อยู่ ส่วนระบบนี้รอโดยที่ CPU ยังทำงานและไม่มี AP
 - วิธีที่เอกสาร ESP-IDF ให้ใช้เพื่อให้ window ตรงกัน คือต่อ AP เดียวกันแล้วส่งใน event `WIFI_EVENT_CONNECTIONLESS_MODULE_WAKE_INTERVAL_START` ต้องมี AP จึงไม่ได้ใช้
 - ข้อสังเกต: คู่มือ Wi-Fi ของ v6.1 อ้างชื่อ `esp_wifi_set_connectionless_interval` ซึ่งไม่มีใน header ฟังก์ชันที่มีจริงคือ `esp_wifi_connectionless_module_set_wake_interval`
 
@@ -322,7 +326,7 @@ ESP-NOW ส่งที่ 1 Mbps เป็นค่าเริ่มต้น 
 
 **การตัดสินใจ (2026-11-13):** ไม่ใช้ในการเปรียบเทียบ best-vs-best เพราะเจ้าของงานวิจัยกำหนดให้เทียบเฉพาะ mode ของวิทยุ `sdkconfig.pm` เก็บไว้สำหรับการทดลองแยก
 
-**ผลต่อรายงาน:** ทุกจุดใน best-vs-best (`PS_MIN`, `PS_MAX` และ `espnow_ps`) เป็นการประหยัดเฉพาะส่วน RF โดย CPU ทำงานที่ 160 MHz ตลอด ต้องระบุในรายงาน
+**ผลต่อรายงาน:** ทุกจุดใน best-vs-best (`PS_MIN`, `PS_MAX` และ receive power saving ของ ESP-NOW) เป็นการประหยัดเฉพาะส่วน RF โดย CPU ทำงานที่ 160 MHz ตลอด ต้องระบุในรายงาน
 
 ## 5. งานกลุ่ม B: ความเสถียรของ connection
 

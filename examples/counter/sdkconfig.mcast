@@ -1,2 +1,0 @@
-# UDP: use IP multicast for broadcasts (needs router/AP support; no MAC ACK)
-CONFIG_TBFT_DISABLE_MULTICAST=n

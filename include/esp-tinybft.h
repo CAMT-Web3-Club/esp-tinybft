@@ -269,6 +269,21 @@ void Byz_replica_run(void);
  */
 int Byz_detect_local_id(const char *config_file);
 
+/**
+ * Tell whether a node of the cluster config file is a replica or a client.
+ *
+ * Entries whose hostname starts with "node" are replicas; they take node ids
+ * 0 .. num_replicas-1 and every later entry is a client.  This is the test
+ * Byz_init_replica() and Byz_init_client() apply, so it can choose which of
+ * the two to call (e.g. with the id from Byz_detect_local_id()).
+ *
+ * @param config_file   Path to the cluster configuration file
+ * @param node_id       Node index (0-based)
+ * @return 1 for a replica, 0 for a client, -1 if the file cannot be parsed
+ *         or node_id is out of range
+ */
+int Byz_node_is_replica(const char *config_file, int node_id);
+
 /** Reset all performance counters. */
 void Byz_reset_stats(void);
 

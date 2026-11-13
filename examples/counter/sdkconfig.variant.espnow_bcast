@@ -1,3 +1,0 @@
-# ESP-NOW: one broadcast frame per TBFT_ALL_REPLICAS send (counterpart of UDP multicast)
-CONFIG_TBFT_TRANSPORT_ESPNOW=y
-CONFIG_TBFT_ESPNOW_BROADCAST=y

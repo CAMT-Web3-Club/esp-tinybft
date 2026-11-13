@@ -1,216 +1,350 @@
 menu "TinyBFT Configuration"
 
-    config TBFT_MAX_MESSAGE_SIZE
-        int "Maximum message size (bytes)"
-        default 1440
-        range 256 4096
-        help
-            Maximum UDP message size in bytes. Must be large enough to hold
-            view-change messages. Should be a multiple of 8 to avoid stack
-            buffer overflow in message alignment padding. Reduce for
-            constrained environments.
-
-    config TBFT_MAX_REPLY_SIZE
-        int "Maximum reply payload size (bytes)"
-        default 1136
-        help
-            Maximum reply payload size. Must be less than TBFT_MAX_MESSAGE_SIZE.
-            Default is 1136 = 1440 (MAX_MESSAGE_SIZE) - 48 (reply header) - 256 (RSA sig).
-
-    config TBFT_BLOCK_SIZE
-        int "State block size (bytes)"
-        default 1024
-        range 16 4096
-        help
-            State page/block size in bytes. Must be a power of 2. Smaller
-            values trade memory efficiency for more tree levels.
-
-    config TBFT_MAX_NUM_REPLICAS
-        int "Maximum number of replicas"
-        default 4
-        range 4 32
-        help
-            Maximum number of replicas supported. Determines size of
-            authenticators (HMAC array) and various static buffers.
-            For f=1 fault tolerance use 4 (n=3f+1).
-
-    config TBFT_WINDOW_SIZE
-        int "Sequence number window size"
-        default 16
-        range 4 64
-        help
-            Number of in-flight sequence numbers. Must be greater than
-            TBFT_CHECKPOINT_INTERVAL and a power of 2.
-
-    config TBFT_CHECKPOINT_INTERVAL
-        int "Checkpoint interval (sequence numbers)"
-        default 8
-        range 1 32
-        help
-            Number of sequence numbers between checkpoints. Must be
-            less than TBFT_WINDOW_SIZE.
-
-    config TBFT_MAX_NUM_CLIENTS
-        int "Maximum number of clients"
-        default 1
-        range 1 16
-        help
-            Maximum number of simultaneous clients. Affects static
-            region allocation in TinyBFT mode.
-
-    config TBFT_MAX_STATE_BLOCKS
-        int "Maximum number of state blocks"
-        default 256
-        help
-            Maximum number of state blocks (state_size / BLOCK_SIZE).
-            Affects CoW bitmap, block_digests, and fetch queue sizing.
-
-    config TBFT_RQUEUE_MAX
-        int "Maximum pending requests in queue"
-        default 8
-        range 4 256
-        help
-            Maximum queued requests before the replica drops new ones.
-            Two queues are allocated (read-write and read-only). Each
-            entry is TBFT_MAX_MESSAGE_SIZE bytes, so total memory is
-            2 * RQUEUE_MAX * MAX_MESSAGE_SIZE.
-
-    config TBFT_NDET_BUF_SIZE
-        int "Non-deterministic choices buffer size (bytes)"
-        default 256
-        range 32 4096
-        help
-            Size of the per-replica buffer for non-deterministic choices.
-            Must be >= ndet_max_len passed to Byz_init_replica.
-
-    config TBFT_P_LEVELS
-        int "Partition tree levels"
-        default 4
-        range 2 8
-        help
-            Maximum depth of the Merkle partition tree over state blocks.
-            More levels allows more state blocks but increases memory.
-
-    config TBFT_ANTI_REPLAY_WINDOW_MS
-        int "Anti-replay window (milliseconds)"
-        default 30000
-        help
-            Messages with timestamps older than this window are rejected.
-            Set to 0 to disable anti-replay checking.
-
-    config TBFT_DISABLE_MULTICAST
-        bool "Disable multicast (use unicast)"
-        default n
-        help
-            When enabled, the library uses unicast UDP for all sends
-            instead of multicast. Useful when multicast is unavailable.
-
     choice TBFT_TRANSPORT_TYPE
-        prompt "Transport backend"
+        prompt "Transport"
         default TBFT_TRANSPORT_UDP
         help
-            Select the transport layer for inter-node communication.
+            Link between the nodes. Every board in a cluster must use the
+            same transport and the matching config file (config_udp.txt or
+            config_espnow.txt).
 
         config TBFT_TRANSPORT_UDP
-            bool "UDP (lwIP sockets)"
+            bool "UDP over Wi-Fi (through an access point)"
             select LWIP_IP4_REASSEMBLY
             select LWIP_IP4_FRAG
             help
-                Standard UDP over IP. Requires WiFi/Ethernet network stack.
-                Supports multicast (unless TBFT_DISABLE_MULTICAST is set).
-                Config file format per node line:
+                UDP over IP (lwIP sockets). The application connects the
+                station to an access point before Byz_init_*().
+                Config file line per node:
                   <hostname> <ip> <port> <pubkey_path>
 
         config TBFT_TRANSPORT_ESPNOW
-            bool "ESP-NOW"
+            bool "ESP-NOW (direct, no access point)"
             help
-                ESP-NOW (v2.0, up to 1470 bytes per packet).
-                Automatic fragmentation for larger messages.
-                Requires WiFi init (host app must call esp_wifi_init).
-                Config file format per node line:
+                ESP-NOW v2.0, up to 1470 bytes per frame; longer messages are
+                fragmented and reassembled. The application calls
+                esp_wifi_init(), esp_wifi_start() and esp_now_init() before
+                Byz_init_*().
+                Config file line per node:
                   <hostname> <mac_address> <pubkey_path>
                 MAC format: xx:xx:xx:xx:xx:xx
     endchoice
 
-    choice TBFT_ESPNOW_IF
-        prompt "ESP-NOW Wi-Fi interface"
+    menu "ESP-NOW radio"
         depends on TBFT_TRANSPORT_ESPNOW
-        default TBFT_ESPNOW_IF_STA
-        help
-            Interface ESP-NOW frames are sent from. ALL boards in a cluster
-            must use the same setting (the peer MAC differs: AP MAC is the
-            station MAC + 1).
 
-        config TBFT_ESPNOW_IF_STA
-            bool "Station (WIFI_MODE_STA)"
+        choice TBFT_ESPNOW_IF
+            prompt "Wi-Fi interface"
+            default TBFT_ESPNOW_IF_STA
             help
-                No beacons, RF not forced on by an AP; the only mode where
-                Wi-Fi power saving / ESP-NOW wake windows can apply.
-                Host app must start Wi-Fi in STA mode (no connect needed).
-        config TBFT_ESPNOW_IF_AP
-            bool "SoftAP (WIFI_MODE_AP)"
-            help
-                Legacy behaviour. The softAP beacons every ~100 ms and keeps
-                the radio on, which inflates energy measurements.
-    endchoice
+                Interface ESP-NOW frames are sent from. All boards in a
+                cluster must use the same setting (the peer MAC differs: the
+                softAP MAC is the station MAC + 1).
 
-    config TBFT_ESPNOW_BROADCAST
-        bool "ESP-NOW: one broadcast frame instead of per-peer unicast"
+            config TBFT_ESPNOW_IF_STA
+                bool "Station (WIFI_MODE_STA)"
+                help
+                    No beacons and no access point keeping the RF on. The only
+                    interface on which receive power saving works. The
+                    application starts Wi-Fi in station mode and does not
+                    connect.
+            config TBFT_ESPNOW_IF_AP
+                bool "SoftAP (WIFI_MODE_AP)"
+                help
+                    Legacy behaviour. The softAP beacons every ~100 ms and
+                    keeps the radio on, which inflates energy measurements.
+        endchoice
+
+        choice TBFT_ESPNOW_RATE
+            prompt "PHY rate"
+            default TBFT_ESPNOW_RATE_IDF_DEFAULT
+            help
+                Rate of every ESP-NOW frame, set per peer with
+                esp_now_set_peer_rate_config() after esp_now_add_peer()
+                (esp_now.h). A higher rate spends less time on air per frame
+                but needs a stronger signal. All boards should use the same
+                rate.
+
+            config TBFT_ESPNOW_RATE_IDF_DEFAULT
+                bool "1 Mbps (ESP-IDF default, rate not set)"
+            config TBFT_ESPNOW_RATE_6M
+                bool "6 Mbps (802.11g)"
+            config TBFT_ESPNOW_RATE_MCS0
+                bool "6.5 Mbps (802.11n MCS0, long GI)"
+            config TBFT_ESPNOW_RATE_24M
+                bool "24 Mbps (802.11g)"
+            config TBFT_ESPNOW_RATE_54M
+                bool "54 Mbps (802.11g)"
+            config TBFT_ESPNOW_RATE_MCS7
+                bool "65 Mbps (802.11n MCS7, long GI)"
+        endchoice
+
+        config TBFT_ESPNOW_PHY_RATE
+            int
+            default 11 if TBFT_ESPNOW_RATE_6M
+            default 16 if TBFT_ESPNOW_RATE_MCS0
+            default 9 if TBFT_ESPNOW_RATE_24M
+            default 12 if TBFT_ESPNOW_RATE_54M
+            default 23 if TBFT_ESPNOW_RATE_MCS7
+            default 0
+            help
+                wifi_phy_rate_t value of the "PHY rate" choice; 0 means the
+                rate is left at the ESP-IDF default. Set by the choice only.
+
+        config TBFT_ESPNOW_BROADCAST
+            bool "Send protocol broadcasts as one broadcast frame (no ACK)"
+            default n
+            help
+                A message to all replicas goes out as ONE frame to
+                FF:FF:FF:FF:FF:FF instead of one unicast per replica.
+                Broadcast frames get no MAC ACK and no retry (the counterpart
+                of UDP multicast). Direct sends (replies, fetch) stay
+                unicast. All boards should use the same setting.
+
+        choice TBFT_ESPNOW_POWER
+            prompt "Receive power saving"
+            depends on TBFT_ESPNOW_IF_STA
+            default TBFT_ESPNOW_POWER_OFF
+            help
+                ESP-NOW's own power saving (ESP-IDF Wi-Fi guide,
+                "Connectionless Modules Power-saving"): the radio receives
+                only during a wake window at the start of every wake
+                interval and is off in between, while the CPU keeps running.
+                This is modem sleep, not light sleep. Sending works at any
+                time. TinyBFT calls esp_now_set_wake_window() and
+                esp_wifi_connectionless_module_set_wake_interval() right
+                after esp_now_init(), as ESP-IDF's examples/wifi/espnow does.
+
+                ESP-IDF does not line up the windows of different boards, so
+                a sender repeats every frame until it is acknowledged: every
+                half window (whole FreeRTOS ticks) for at least one interval
+                plus 20 ms. At the 100 Hz tick that is every 20 ms for 120 ms
+                (50/100), every 50 ms for 220 ms (110/200) and every 20 ms
+                for 220 ms (50/200). Espressif's coin-cell button application
+                note (esp-now repository) uses the same rule against an
+                ESP-NOW bridge that listens 110 ms of every 200 ms.
+
+                All boards must use the same setting.
+
+            config TBFT_ESPNOW_POWER_OFF
+                bool "Off: radio always on"
+            config TBFT_ESPNOW_POWER_W50_I100
+                bool "Listen 50 ms every 100 ms (ESP-IDF example)"
+            config TBFT_ESPNOW_POWER_W110_I200
+                bool "Listen 110 ms every 200 ms (Espressif ESP-NOW bridge)"
+            config TBFT_ESPNOW_POWER_W50_I200
+                bool "Listen 50 ms every 200 ms"
+            config TBFT_ESPNOW_POWER_CUSTOM
+                bool "Custom wake window and interval"
+        endchoice
+
+        config TBFT_ESPNOW_POWER_SAVE
+            bool
+            default y if TBFT_ESPNOW_POWER_W50_I100 || TBFT_ESPNOW_POWER_W110_I200
+            default y if TBFT_ESPNOW_POWER_W50_I200 || TBFT_ESPNOW_POWER_CUSTOM
+            select ESP_WIFI_STA_DISCONNECTED_PM_ENABLE
+            help
+                Set when a receive power-saving mode is chosen. Selects
+                ESP_WIFI_STA_DISCONNECTED_PM_ENABLE, which ESP-IDF needs for
+                the wake window to work on a station that is not connected.
+
+        config TBFT_ESPNOW_WAKE_WINDOW_MS
+            int "Wake window (ms)" if TBFT_ESPNOW_POWER_CUSTOM
+            depends on TBFT_ESPNOW_POWER_SAVE
+            range 20 65535
+            default 110 if TBFT_ESPNOW_POWER_W110_I200
+            default 50
+            help
+                How long the radio listens at the start of every wake
+                interval (esp_now_set_wake_window()). Must be shorter than
+                the interval, and at least 20 ms so that a sender can retry
+                inside it at the 100 Hz tick.
+
+        config TBFT_ESPNOW_WAKE_INTERVAL_MS
+            int "Wake interval (ms)" if TBFT_ESPNOW_POWER_CUSTOM
+            depends on TBFT_ESPNOW_POWER_SAVE
+            range 1 65535
+            default 200 if TBFT_ESPNOW_POWER_W110_I200 || TBFT_ESPNOW_POWER_W50_I200
+            default 100
+            help
+                Period of the wake window
+                (esp_wifi_connectionless_module_set_wake_interval()).
+                esp_wifi.h recommends multiples of 100 ms.
+
+        config TBFT_ESPNOW_TX_RETRIES
+            int "Attempts per frame"
+            default 3
+            range 1 50
+            help
+                Minimum number of attempts per frame; each waits for the
+                MAC-layer result in the send callback. With receive power
+                saving, attempts go on until the time rule of "Receive power
+                saving" is met as well.
+
+        config TBFT_ESPNOW_TX_RETRY_DELAY_MS
+            int "Delay between attempts (ms)"
+            depends on !TBFT_ESPNOW_POWER_SAVE
+            default 10
+            range 1 1000
+            help
+                Rounded to whole FreeRTOS ticks, at least one (10 ms at
+                100 Hz). With receive power saving the delay is derived from
+                the wake window instead.
+    endmenu
+
+    # Deliberately without "depends on TBFT_TRANSPORT_UDP": sdkconfig.defaults
+    # files set it for ESP-NOW builds too, and a dependency would turn that
+    # into a configuration-report notice.
+    config TBFT_DISABLE_MULTICAST
+        bool "UDP: send protocol broadcasts as one datagram per replica (no multicast)"
         default n
-        depends on TBFT_TRANSPORT_ESPNOW
         help
-            TBFT_ALL_REPLICAS sends ONE frame to FF:FF:FF:FF:FF:FF instead of
-            one unicast per replica. Broadcast frames have no MAC ACK and no
-            hardware retry (counterpart of UDP multicast). All boards should
-            use the same setting. Direct sends (replies, fetch) stay unicast.
+            Only used with the UDP transport.
+            y: a message to all replicas is sent as one unicast datagram per
+            replica. n: one IP multicast datagram to the group in the config
+            file; the access point forwards it as a group frame, which
+            receivers do not acknowledge, and some access points drop
+            multicast traffic.
 
-    config TBFT_ESPNOW_TX_RETRIES
-        int "ESP-NOW attempts per frame"
-        default 3
-        range 1 50
-        depends on TBFT_TRANSPORT_ESPNOW
-        help
-            Attempts per frame (each waits for the MAC-layer send result).
-            With receivers duty-cycling (wake window < interval), set
-            TBFT_ESPNOW_TX_RETRY_SPAN_MS as well.
+    menu "Protocol sizes"
 
-    config TBFT_ESPNOW_TX_RETRY_DELAY_MS
-        int "ESP-NOW delay between attempts (ms)"
-        default 10
-        range 1 1000
-        depends on TBFT_TRANSPORT_ESPNOW
-        help
-            Rounded up to one FreeRTOS tick (10 ms at 100 Hz).
+        config TBFT_MAX_MESSAGE_SIZE
+            int "Maximum message size (bytes)"
+            default 1440
+            range 256 4096
+            help
+                Maximum UDP message size in bytes. Must be large enough to hold
+                view-change messages. Should be a multiple of 8 to avoid stack
+                buffer overflow in message alignment padding. Reduce for
+                constrained environments.
 
-    config TBFT_ESPNOW_TX_RETRY_SPAN_MS
-        int "ESP-NOW: keep retrying a frame for at least this long (ms, 0 = off)"
-        default 0
-        range 0 5000
-        depends on TBFT_TRANSPORT_ESPNOW
-        help
-            For receivers that duty-cycle their radio with the ESP-NOW wake
-            window / wake interval.  A frame is retried every
-            TBFT_ESPNOW_TX_RETRY_DELAY_MS until it is acknowledged or this
-            time has passed, even after TBFT_ESPNOW_TX_RETRIES attempts.
-            Set it to the receivers' wake interval plus a margin and keep the
-            retry delay well below their wake window, so one attempt is
-            certain to fall inside a window.  ESP-IDF leaves window
-            synchronisation to the application.  Espressif's coin-cell button
-            application note (esp-now, coin_cell_demo/switch/docs) uses the
-            same rule against an ESP-NOW bridge with a 200 ms interval and a
-            110 ms window: attempts 50 ms apart, enough of them to cover the
-            90 ms the bridge sleeps.  0: stop after TBFT_ESPNOW_TX_RETRIES.
+        config TBFT_MAX_REPLY_SIZE
+            int "Maximum reply payload size (bytes)"
+            default 1136
+            help
+                Maximum reply payload size. Must be less than TBFT_MAX_MESSAGE_SIZE.
+                Default is 1136 = 1440 (MAX_MESSAGE_SIZE) - 48 (reply header) - 256 (RSA sig).
 
-    config TBFT_ESPNOW_PHY_RATE
-        int "ESP-NOW PHY rate (wifi_phy_rate_t value, 0 = IDF default)"
-        default 0
-        range 0 23
-        depends on TBFT_TRANSPORT_ESPNOW
-        help
-            0 keeps the IDF default (1 Mbps). Examples: 11 = 6 Mbps (11g),
-            12 = 54 Mbps, 16 = MCS0 long GI (6.5 Mbps), 23 = MCS7.
-            Applied per peer with esp_now_set_peer_rate_config(). Always
-            report the value used.
+        config TBFT_BLOCK_SIZE
+            int "State block size (bytes)"
+            default 1024
+            range 16 4096
+            help
+                State page/block size in bytes. Must be a power of 2. Smaller
+                values trade memory efficiency for more tree levels.
+
+        config TBFT_MAX_NUM_REPLICAS
+            int "Maximum number of replicas"
+            default 4
+            range 4 32
+            help
+                Maximum number of replicas supported. Determines size of
+                authenticators (HMAC array) and various static buffers.
+                For f=1 fault tolerance use 4 (n=3f+1).
+
+        config TBFT_WINDOW_SIZE
+            int "Sequence number window size"
+            default 16
+            range 4 64
+            help
+                Number of in-flight sequence numbers. Must be greater than
+                TBFT_CHECKPOINT_INTERVAL and a power of 2.
+
+        config TBFT_CHECKPOINT_INTERVAL
+            int "Checkpoint interval (sequence numbers)"
+            default 8
+            range 1 32
+            help
+                Number of sequence numbers between checkpoints. Must be
+                less than TBFT_WINDOW_SIZE.
+
+        config TBFT_MAX_NUM_CLIENTS
+            int "Maximum number of clients"
+            default 1
+            range 1 16
+            help
+                Maximum number of simultaneous clients. Affects static
+                region allocation in TinyBFT mode.
+
+        config TBFT_MAX_STATE_BLOCKS
+            int "Maximum number of state blocks"
+            default 256
+            help
+                Maximum number of state blocks (state_size / BLOCK_SIZE).
+                Affects CoW bitmap, block_digests, and fetch queue sizing.
+
+        config TBFT_RQUEUE_MAX
+            int "Maximum pending requests in queue"
+            default 8
+            range 4 256
+            help
+                Maximum queued requests before the replica drops new ones.
+                Two queues are allocated (read-write and read-only). Each
+                entry is TBFT_MAX_MESSAGE_SIZE bytes, so total memory is
+                2 * RQUEUE_MAX * MAX_MESSAGE_SIZE.
+
+        config TBFT_NDET_BUF_SIZE
+            int "Non-deterministic choices buffer size (bytes)"
+            default 256
+            range 32 4096
+            help
+                Size of the per-replica buffer for non-deterministic choices.
+                Must be >= ndet_max_len passed to Byz_init_replica.
+
+        config TBFT_P_LEVELS
+            int "Partition tree levels"
+            default 4
+            range 2 8
+            help
+                Maximum depth of the Merkle partition tree over state blocks.
+                More levels allows more state blocks but increases memory.
+    endmenu
+
+    menu "Timeouts"
+
+        config TBFT_VIEW_CHANGE_TIMEOUT_US
+            int "View-change timeout (microseconds)"
+            default 5000000
+            range 1000000 60000000
+            help
+                Default view-change timeout period in microseconds.
+                This is the time to wait before triggering a view change
+                when the primary is suspected faulty. Default: 5s (5000000).
+
+        config TBFT_STATUS_TIMEOUT_US
+            int "Status broadcast timeout (microseconds)"
+            default 1000000
+            range 100000 30000000
+            help
+                Default status message broadcast period in microseconds.
+                Status messages help replicas catch up during state transfer.
+                Default: 1s (1000000).
+
+        config TBFT_RECOVERY_TIMEOUT_US
+            int "Recovery/fetch timeout (microseconds)"
+            default 2500000
+            range 100000 30000000
+            help
+                Timeout period for state fetch/recovery in microseconds.
+                If a state block or metadata request doesn't arrive within this
+                window, the replica restarts fetching from a different peer.
+                Default: 2.5s (2500000).
+
+        config TBFT_CLIENT_REPLY_TIMEOUT_MS
+            int "Client reply timeout (milliseconds)"
+            default 10000
+            range 1000 120000
+            help
+                Timeout for waiting for f+1 matching replies after sending
+                a request. Default: 10s (10000ms).
+
+        config TBFT_ANTI_REPLAY_WINDOW_MS
+            int "Anti-replay window (milliseconds)"
+            default 30000
+            help
+                Messages with timestamps older than this window are rejected.
+                Set to 0 to disable anti-replay checking.
+    endmenu
 
     config TBFT_IDLE_WAIT_MS
         int "Replica idle wait (ms)"
@@ -224,45 +358,10 @@ menu "TinyBFT Configuration"
             for automatic light sleep to engage (20 ms at 100 Hz never did).
 
     config TBFT_PRINT_STATS
-        bool "Enable performance statistics"
+        bool "Print statistics lines (TBFT_STATS)"
         default n
         help
-            Compile in statistics counters (throughput, latency).
-
-    config TBFT_VIEW_CHANGE_TIMEOUT_US
-        int "View-change timeout (microseconds)"
-        default 5000000
-        range 1000000 60000000
-        help
-            Default view-change timeout period in microseconds.
-            This is the time to wait before triggering a view change
-            when the primary is suspected faulty. Default: 5s (5000000).
-
-    config TBFT_STATUS_TIMEOUT_US
-        int "Status broadcast timeout (microseconds)"
-        default 1000000
-        range 100000 30000000
-        help
-            Default status message broadcast period in microseconds.
-            Status messages help replicas catch up during state transfer.
-            Default: 1s (1000000).
-
-    config TBFT_RECOVERY_TIMEOUT_US
-        int "Recovery/fetch timeout (microseconds)"
-        default 2500000
-        range 100000 30000000
-        help
-            Timeout period for state fetch/recovery in microseconds.
-            If a state block or metadata request doesn't arrive within this
-            window, the replica restarts fetching from a different peer.
-            Default: 2.5s (2500000).
-
-    config TBFT_CLIENT_REPLY_TIMEOUT_MS
-        int "Client reply timeout (milliseconds)"
-        default 10000
-        range 1000 120000
-        help
-            Timeout for waiting for f+1 matching replies after sending
-            a request. Default: 10s (10000ms).
+            Compile in the statistics counters and print a TBFT_STATS line
+            every 60 s on replicas and after every request on the client.
 
 endmenu

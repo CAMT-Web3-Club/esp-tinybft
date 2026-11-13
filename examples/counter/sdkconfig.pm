@@ -1,10 +1,12 @@
 # NOT part of the best-vs-best comparison: that comparison uses radio modes
-# only and no point of tools/sweep.py applies this file.
+# only (README, "CPU power management").  For a separate experiment, apply it
+# to its own build directory:
+#   SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.pm" idf.py -B build_pm -D SDKCONFIG=build_pm/sdkconfig menuconfig
 #
 # CPU frequency scaling + automatic light sleep, following the ESP32-C3 table
 # of the ESP-IDF v6.1 low-power guide ("Auto Light-sleep Mode").  Only helps
-# when the radio can sleep (UDP PS_MIN/PS_MAX or espnow_ps); with an always-on
-# radio the Wi-Fi driver holds a PM lock and nothing changes.
+# when the radio can sleep (UDP PS_MIN/PS_MAX or ESP-NOW receive power saving);
+# with an always-on radio the Wi-Fi driver holds a PM lock and nothing changes.
 #
 # In light sleep the USB Serial/JTAG port stops answering (the board may
 # disappear from the host and need BOOT+RESET to be flashed again).  Take logs

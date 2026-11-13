@@ -72,14 +72,15 @@ docker run --rm -it --device /dev/ttyACM0 \
   -u $(id -u) -e HOME=/tmp espressif/idf:v6.0.1 \
   idf.py -p /dev/ttyACM0 monitor
 
-# Counter example: role, transport and power-save mode come from overlays,
-# not from sdkconfig.defaults.  Build one image per role into its own dir:
-#   ./build_variant.sh <espnow|espnow_ps|espnow_bcast|udp_psnone|udp_psmin|udp_psmax> <replica|client>
-# and flash every board with the image for its role (chosen by MAC):
-#   python3 tools/flash.py <variant>
+# Counter example: every experiment setting is in idf.py menuconfig
+# (TinyBFT Configuration + Counter Example Configuration).  One image
+# serves all boards (Role: Automatic), flashed to every port with:
+#   ./flash_all.fish
 ```
 
-**Role switching (counter):** replica and client are separate images built by `examples/counter/build_variant.sh <variant> <role>` into `build_<variant>_<role>/`; a bare `idf.py build` there no longer selects a role or transport. `tools/flash.py <variant>` flashes each board with the image for its role (app, bootloader, partition table and SPIFFS). See `examples/counter/README.md`. `espflash` alone does NOT flash the SPIFFS image.
+**Role switching (counter):** `Counter Example Configuration > Role of this board`. The default, *Automatic*, compiles both roles into one image; at boot each board finds itself in the node list (MAC for ESP-NOW, IP for UDP) and runs as a replica if its entry is named `node*` (`Byz_node_is_replica()`), otherwise as the client. *Replica* / *Client* force a role (a board whose entry disagrees restarts with a message). See `examples/counter/README.md`. `espflash` alone does NOT flash the SPIFFS image; use `idf.py flash` or `flash_all.fish`.
+
+**Kconfig changes:** a plain `idf.py build` does not re-run the configuration step when only this component's `Kconfig.projbuild` changed; run `idf.py reconfigure` (or `menuconfig`) first. Check Kconfig style with `python -m kconfcheck <file>` (ESP-IDF's checker, in the IDF Python environment).
 
 ### After making changes
 
@@ -175,8 +176,9 @@ MAC format: `xx:xx:xx:xx:xx:xx` (e.g. `aa:bb:cc:dd:ee:ff`). The parser auto-dete
 When using ESP-NOW, the host application must:
 1. Initialize WiFi (`esp_wifi_init`, `esp_wifi_set_mode`, `esp_wifi_start`)
    - The interface is chosen by `CONFIG_TBFT_ESPNOW_IF_STA` (default) or `CONFIG_TBFT_ESPNOW_IF_AP`; **every board must use the same one**. STA: `esp_wifi_set_mode(WIFI_MODE_STA)`, never connect, set the channel after `esp_wifi_start()`. AP (legacy) uses the softAP MAC = base MAC + 1 and keeps the radio on with beacons.
-2. The ESP-NOW transport registers its own `esp_now_recv_cb` and `esp_now_send_cb`
-3. Peer MAC addresses are registered via `esp_now_add_peer` automatically
+2. Call `esp_now_init()` before `Byz_init_*()`. The ESP-NOW transport then registers its own `esp_now_recv_cb` and `esp_now_send_cb`
+3. Peer MAC addresses are registered via `esp_now_add_peer` automatically (PHY rate from `TBFT_ESPNOW_RATE_*` via `esp_now_set_peer_rate_config()`)
+4. Receive power saving (`TBFT_ESPNOW_POWER_*`, station only) is applied by the transport right after the callbacks: `esp_wifi_set_ps(WIFI_PS_MIN_MODEM)`, `esp_now_set_wake_window()`, `esp_wifi_connectionless_module_set_wake_interval()`. Retry timing follows from it (`TBFT_ESPNOW_RETRY_DELAY_MS` / `_SPAN_MS` in `tbft_config.h`: half window, interval + 20 ms). With it Off the app may set `WIFI_PS_NONE`
 
 ### TinyBFT static memory model
 
@@ -274,9 +276,10 @@ examples/<name>/
 ├── main/
 │   ├── CMakeLists.txt        # registers main.c, embeds SPIFFS image
 │   ├── idf_component.yml     # depends on esp-tinybft (override_path: "../../..")
-│   ├── Kconfig.projbuild     # role select (replica/client), WiFi SSID/PS mode
+│   ├── Kconfig.projbuild     # role (counter: Automatic/Replica/Client), WiFi SSID/PS mode
 │   └── main.c                # app_state, exec_cb, wifi_init, replica_task, client_task
 ├── sdkconfig.defaults         # TinyBFT Kconfig overrides (transport, sizes, window)
+├── flash_all.fish             # (counter only) flash build/ to every /dev/ttyACM* in parallel
 ├── partitions.csv             # custom partition table with SPIFFS
 ├── gen_configs.sh             # generates RSA keys + config_udp.txt + config_espnow.txt
 ├── spiffs_image/              # keys + config files — embedded into SPIFFS at build time
