@@ -18,6 +18,10 @@ A pure-C implementation of [PBFT](https://pmg.csail.mit.edu/papers/osdi99.pdf) (
   version of ESP-IDF v6.0 and later. C files that include `esp-tinybft.h` must
   be compiled as C23 (the IDF default) or as C++.
 - Supported targets: ESP32, ESP32-S2, ESP32-S3, ESP32-C3, ESP32-C6, ESP32-H2
+- An `nvs` partition, initialised with `nvs_flash_init()` before
+  `Byz_init_client()`: the client keeps a boot counter there so that its
+  request ids keep growing across resets (replicas never run a request id
+  twice, so a client whose ids started over would be ignored).
 
 ## Quick Start
 
@@ -59,6 +63,8 @@ Key options:
 | `TBFT_MAX_STATE_BLOCKS` | 256 | Max state blocks for CoW / partition tree |
 | `TBFT_P_LEVELS` | 4 | Merkle partition tree depth |
 | `TBFT_ANTI_REPLAY_WINDOW_MS` | 30000 | Anti-replay window (ms, 0 = disabled) |
+| `TBFT_CLIENT_REPLY_TIMEOUT_MS` | 10000 | How long `Byz_invoke` waits for f+1 matching replies |
+| `TBFT_CLIENT_RETRANSMIT_MS` | 5000 | The client re-sends a request without f+1 replies after this time, then after twice as long, … (0 = never) |
 
 > **For ESP32-C3 constrained deployments**, `TBFT_MAX_MESSAGE_SIZE=1024`, `TBFT_WINDOW_SIZE=8`, `TBFT_CHECKPOINT_INTERVAL=4`, `TBFT_RQUEUE_MAX=4` are recommended (saves ~60KB RAM). See `examples/simple_wallet/sdkconfig.defaults`.
 
@@ -91,7 +97,7 @@ void replica_task(void *arg) {
 }
 ```
 
-> **Important:** Call `Byz_modify(ptr, size)` or `Byz_modify1(ptr)` before writing to any byte of `app_state`. This triggers the copy-on-write snapshot used for state transfer and rollback.
+> **Important:** Call `Byz_modify(ptr, size)` or `Byz_modify1(ptr)` when writing to any byte of `app_state`. It marks the blocks as modified, so the next checkpoint digests them; replicas compare these digests and transfer state by them.
 
 ### Client
 
@@ -99,6 +105,7 @@ void replica_task(void *arg) {
 #include "esp-tinybft.h"
 
 void client_task(void *arg) {
+    // nvs_flash_init() must have run (app_main), see Requirements
     Byz_init_client("config.txt", "priv.der", 0);
 
     Byz_req req;
@@ -107,7 +114,9 @@ void client_task(void *arg) {
     memcpy(req.contents, my_cmd, 64);
     req.size = 64;
 
-    Byz_invoke(&req, &rep, false);  // send + wait for f+1 matching replies
+    // send, re-send while needed, wait for f+1 matching replies; a request
+    // is executed at most once even when it is re-sent
+    Byz_invoke(&req, &rep, false);
 
     // use rep.contents[0..rep.size)
     Byz_free_reply(&rep);
@@ -155,7 +164,7 @@ Public keys are DER files (RSA-2048) stored on SPIFFS. Pass the private key path
 
 The replica enforces the following bounds checks before touching any protocol state:
 
-- **Request handler**: `command_size` is validated non-negative and within message bounds; `cid` must be `>= 0 && < num_principals`
+- **Request handler**: `command_size` is validated non-negative and within message bounds; `cid` must be a client id (`>= num_replicas && < num_principals`)
 - **Prepare / Commit / Checkpoint / Fetch / View-change handlers**: sender id must be `>= 0 && < num_replicas`
 - **Meta-data handler**: `n_parts` validated non-negative and `<= TBFT_P_CHILDREN` before performing the size arithmetic that walks the parts array
 - **View-change handler**: `body_size` validated `>= sizeof(tbft_view_change_rep_t)` and `<= len` before reading the appended RSA signature
@@ -196,7 +205,27 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for full documentation covering
 | 7 | 2 | 5 |
 | 10 | 3 | 7 |
 
+What is handled (checked with the host simulator in `tests/sim`, see `AGENT.md`): replicas and the client booting at different times, crash of the primary (also of two primaries in a row), a replica or the client restarting, and lost messages. Every request runs at most once, in the same order on every replica, and lost messages are re-sent on request rather than on a timer.
+
+Known limits: messages exchanged during a view change carry no proofs, so a *Byzantine* replica can misreport then (a faulty new primary is trusted); a replica that restarts has lost its protocol state and counts toward f until it has caught up.
+
 ## Changelog
+
+### v0.2.9 (branch `fix/develop/v0.2.9`)
+
+PBFT correctness and staggered boot:
+
+| Fix | Description |
+|-----|-------------|
+| In-order execution | A replica never skips a sequence number: it waits for the commit quorum and the pre-prepare, asks for missing messages, or fetches the state of a certified checkpoint |
+| Exactly-once | A replicated client table (last executed request id + reply per client) makes re-sent requests safe; the cached signed reply is re-sent |
+| Client retransmission | `Byz_invoke` re-sends a request without f+1 replies (`TBFT_CLIENT_RETRANSMIT_MS`); request ids continue across client resets (boot epoch in NVS) |
+| View change | Joined only when f+1 replicas ask; New_view re-proposes prepared requests (null requests for gaps) and is accepted from the view's primary without a local quorum, so late or restarted replicas can follow; Status no longer changes the view |
+| Prepare quorum | Prepares come from backups only (the primary's pre-prepare stands for its prepare) |
+| Retransmission | Status-driven: a replica re-sends the New_view, its Checkpoint and its Commit/Pre-prepare/Prepare messages to a peer that lacks them; the 500 ms commit re-send is gone |
+| State transfer | Served from a copy of the checkpointed state and checked against the certified digest before it is used |
+| Key exchange | New_key says which keys the sender holds; a replica whose key is missing answers at once, so a late or restarted replica is ready in about a second |
+| Memory | Unused special-region and checkpoint-region slots removed: `tbft_replica_t` for the counter example is 53,112 bytes instead of 83,112 (plus a 5 KiB checkpoint image on the heap) |
 
 ### v0.2.0
 

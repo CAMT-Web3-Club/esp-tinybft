@@ -104,7 +104,17 @@ docker run --rm -it -v $PWD:/esp-tinybft -w /esp-tinybft/examples/counter \
   idf.py build
 ```
 
-There is no dedicated test target or test suite yet. Runtime logging uses `ESP_LOGI/LOGE/LOGW` with per-file `TAG` constants, visible in `idf.py monitor`.
+**Protocol changes: also run the host simulator.** `tests/sim` builds the component for Linux (shims for FreeRTOS, esp_timer, lwIP and NVS; no RSA) and runs 7 replicas + 1 client as processes over loopback UDP through boot races, staggered boot, crashes, reboots and packet loss. It then checks that all replicas hold the same state and that every request ran exactly once:
+
+```bash
+python3 tests/sim/run.py              # every scenario (about 10 minutes)
+python3 tests/sim/run.py S1 S3 S6b    # selected ones
+python3 tests/sim/run.py --san address,undefined S1 S4   # with sanitizers
+```
+
+It does not replace a run on boards: there is no radio and no real crypto timing (see `tests/sim/README.md`).
+
+Runtime logging uses `ESP_LOGI/LOGE/LOGW` with per-file `TAG` constants, visible in `idf.py monitor`.
 
 ## Architecture
 
@@ -199,14 +209,16 @@ The key design decision: instead of `malloc`/`free` for every protocol message, 
 | Region | File | Contents |
 |--------|------|----------|
 | `tbft_agreement_region_t` | `tbft_agreement_region.*` | `tbft_agreement_slice_t[WINDOW_SIZE]`, each slice holds `tbft_prepared_cert_t` (Pre_prepare + Prepare) + `tbft_commit_cert_t` (Commit) |
-| `tbft_checkpoint_region_t` | `tbft_checkpoint_region.*` | Checkpoint messages per (seqno, replica_id) in `slots[]`, plus `above_window[]` for out-of-window entries |
-| `tbft_special_region_t` | `tbft_special_region.*` | View_change × n, View_change_ack × n², New_view, New_key, Request/Reply per client (uses `TBFT_SR_SLOT` macro with buf+len+valid) |
+| `tbft_checkpoint_region_t` | `tbft_checkpoint_region.*` | Checkpoint messages per (seqno, replica_id) in `slots[]`; a slot is tagged with its seqno and taken over by a newer checkpoint that maps to it |
+| `tbft_special_region_t` | `tbft_special_region.*` | The newest View_change of each replica, the New_view that started the current view, the last signed Reply per client (uses `TBFT_SR_SLOT` macro with buf+len+valid) |
 
 All three regions live directly inside `tbft_replica_t`. Indexing into `agreement_region` is `(seqno - head) & mask` — the window head advances on each stable checkpoint (`tbft_ar_truncate`).
 
+`tbft_ar_truncate` does not erase the slots that fall out of the window. Each slot is tagged with its sequence number and is emptied only when a sequence number of the new window first uses it (`tbft_ar_slice`). Until then `tbft_ar_peek` still returns its messages, so they can be re-sent to a replica that is a little behind. Always check `tbft_ar_in_range` before `tbft_ar_slice`: calling it for an older seqno would take over a live slot.
+
 ### Certificate quorum logic
 
-`tbft_certificate.c` uses a macro `CERT_IMPL(prefix, cert_t, msg_slot_size)` to generate identical quorum logic for Commit, Prepare, and Checkpoint certificates. Each certificate stores up to `f+1` (`TBFT_CERT_MAX_VALS`) distinct message values (beyond that a quorum is guaranteed) and tracks per-sender bits in a `tbft_bitmap_t` (uint64_t). The certificate becomes **complete** when any value accumulates `threshold` (2f+1) matches.
+`tbft_certificate.c` uses a macro `CERT_IMPL(prefix, cert_t, msg_slot_size)` to generate identical quorum logic for Commit, Prepare, and Checkpoint certificates. Each certificate stores up to `f+1` (`TBFT_CERT_MAX_VALS`) distinct message values (beyond that a quorum is guaranteed) and tracks per-sender bits in a `tbft_bitmap_t` (uint64_t). The certificate becomes **complete** when any value accumulates `threshold` matches: 2f+1 for Commit and Checkpoint, 2f for Prepare. Prepares come from backups only (the primary's Pre_prepare stands for its Prepare, and a Prepare from the primary is ignored), so "prepared" means the Pre_prepare plus 2f backups, 2f+1 replicas in all. Counting a Prepare from the primary too would let a faulty primary get two correct replicas prepared on different requests for one seqno.
 
 ### Replica struct layout
 
@@ -218,17 +230,36 @@ Additional important fields:
 - Four timers: `vtimer`, `stimer`, `rtimer`, `ntimer` (all `tbft_itimer_t` wrapping `esp_timer_handle_t`). Timers signal the event group rather than executing directly.
 - Request queues: `rqueue`, `ro_rqueue` (circular FIFOs, `TBFT_RQUEUE_MAX` entries, default 8 via Kconfig)
 - Buffers: `ndet_buf[TBFT_NDET_BUF_SIZE]`, `out_buf[TBFT_MAX_MESSAGE_SIZE]`
+- `sys_state[TBFT_SYS_STATE_SIZE]` — the library's own replicated state: the client table (`tbft_client_entry_t` per client: last executed request id, its seqno and reply). Its blocks follow the application's and are checkpointed and transferred with them.
 - `running` flag, `vtimer_period_us`, `stimer_period_us`
 - Timers are initialised in `tbft_replica_init()` but **not started** — `Byz_init_replica()` sets the correct periods from the config file and starts them
 
 ### Message flow
 
 1. `tbft_replica_run()` loops on `tbft_node_recv()` → dispatches by `hdr->tag` (1–17).
-2. Primary receives a Request → `rqueue_push` → `tbft_replica_send_pre_prepare` builds and broadcasts Pre_prepare with embedded request set + non-det choices + HMAC authenticator.
-3. Backups receive Pre_prepare → store in `ar` → broadcast Prepare.
-4. All receive Prepare → `tbft_ar_add_prepare` → when complete, broadcast Commit.
-5. All receive Commit → `tbft_ar_add_commit` → when complete, `tbft_replica_execute_committed` calls `exec_cb`, sends Reply, and checkpoints every `CHECKPOINT_INTERVAL` seqnos.
-6. On checkpoint: `tbft_state_checkpoint` + broadcast Checkpoint → `tbft_cr_store` → when stable (`2f+1` matches), `tbft_replica_mark_stable` truncates static regions (`ar`, `cr`).
+2. The client broadcasts its Request. Backups forward it once to the primary and start the view-change timer. The primary queues it; `tbft_replica_send_pre_prepare` gives a sequence number to every queued request the window has room for and broadcasts a Pre_prepare (request + non-det choices, digest over both, HMAC authenticator). A request that already ran or already has a sequence number is not ordered again.
+3. Backups store the Pre_prepare and broadcast Prepare. The primary sends no Prepare.
+4. Prepared (Pre_prepare + 2f matching Prepares from backups, own included) → broadcast Commit.
+5. Committed (2f+1 matching Commits) → `tbft_replica_execute_committed` executes strictly in sequence-number order: it stops at the first seqno without its commit quorum or its Pre_prepare and never skips one. The result goes into the client table and, signed, to the client. Every `CHECKPOINT_INTERVAL` seqnos: `tbft_state_checkpoint` + broadcast Checkpoint.
+6. 2f+1 matching Checkpoints make a checkpoint stable: `tbft_replica_mark_stable` moves the window (`ar`, `cr`) if the local state at that seqno has the same digest. A replica that has not executed that far first asks the others for the missing messages and fetches the state if that does not get it there.
+
+### Protocol rules the handlers rely on
+
+**Exactly-once execution.** A request whose id is not above the last one executed for its client (client table, replicated state) is never executed again. If it is that last one, the replica re-sends the reply; the signed message is cached in `sr.reply`, so this costs no RSA signature. This is what makes client retransmission safe.
+
+**Client retransmission and request ids.** `Byz_recv_reply` re-sends the request to every replica after `TBFT_CLIENT_RETRANSMIT_MS`, then after twice as long, and so on until the reply timeout. A request id is `client id | boot epoch | counter`. The boot epoch is a counter kept in NVS (namespace `tbft`), so ids keep growing across client reboots; without it the replicas would ignore a rebooted client. The application must call `nvs_flash_init()` before `Byz_init_client()`.
+
+**Retransmission between replicas (Status).** Status never changes the receiver's view or state (it has no authenticator); it only makes the receiver re-send:
+- to a replica in an older view: the stored, signed New_view of the current view;
+- to a replica that still lacks what the receiver had one Status period earlier, or whose Status has `TBFT_STATUS_WANT` (sent at once when execution is stuck on a missing message): the Checkpoint message of the receiver's stable checkpoint and, for each seqno it still holds, its Commit, the Pre_prepare byte for byte as the primary sent it (so the primary's MAC still verifies) and its Prepare.
+
+A Pre_prepare whose MAC does not verify (relabelled by a New_view, or the primary's key changed) is accepted only when its digest is already fixed by the New_view or by 2f+1 Commits. Pre_prepares, Prepares and Commits of any view but the current one are ignored: a replica moves to a newer view only through its New_view.
+
+**View change.** A replica sends View_change for the next view when its timer expires, and joins a view change once f+1 other replicas ask for a higher view, so one replica alone moves nobody. After sending View_change it sends no Prepare or Commit until a New_view arrives, but it still executes what the others commit. The timer doubles after each attempt that brought no progress. A replica whose view change has no support (f+1 peers still report normal work) keeps its target instead of moving further away. View_change carries the stable checkpoint (seqno and digest) and, for every seqno above it the replica saw prepared or committed, the view and digest. With 2f+1 of them the new primary sends New_view: the highest stable checkpoint (`min`, `min_digest`) and, for each seqno up to the highest one reported, the request prepared in the highest view, or a null request. `nv_install` (new primary and backups alike) keeps Pre_prepare bodies with the right digest, drops the Prepares and Commits of older views and prepares the re-proposed requests again; a replica behind `min` fetches that checkpoint. The new view starts with empty request queues and no pending request: requests that were not ordered come back with the client's retransmission (so a request whose client went away does not keep the view-change timer running).
+
+**Late boot and reboot.** New_key lists which peer keys the sender holds (`have_keys`); a replica whose key is missing there answers with its own New_key, so a replica that boots late or reboots has its keys within about a second instead of waiting for the periodic broadcast. It then gets the current view (New_view), the stable checkpoint (Checkpoint messages, then a state fetch) and the messages of the window through Status.
+
+**Known limits.** View_change entries carry no proof and New_view is not checked against the View_change messages, so a Byzantine replica can lie during a view change (crashes, restarts and message loss are handled). A replica that restarts has lost its protocol state; until it has caught up it counts toward f.
 
 ### Crypto paths
 
@@ -315,21 +346,24 @@ examples/<name>/
 | Region | Key scaling factors |
 |--------|---------------------|
 | `ar` (agreement) | `WINDOW_SIZE × MAX_MESSAGE_SIZE × CERT_MAX_VALS` |
-| `cr` (checkpoint) | `MAX_NUM_REPLICAS² × CKPT_MSG_SIZE` |
-| `sr` (special) | `MAX_NUM_REPLICAS × MAX_MESSAGE_SIZE` (view_change) + `MAX_NUM_REPLICAS²` (vc_ack) |
+| `cr` (checkpoint) | `NUM_CKPT_SLOTS × MAX_NUM_REPLICAS × CKPT_MSG_SIZE` |
+| `sr` (special) | `MAX_NUM_REPLICAS × (352 + 48 × WINDOW_SIZE)` (view_change) + `MAX_NUM_CLIENTS × (MAX_REPLY_SIZE + 316)` (reply cache) |
 | `rqueues` (×2) | `2 × RQUEUE_MAX × MAX_MESSAGE_SIZE` |
+| client table | `MAX_NUM_CLIENTS × (24 + MAX_REPLY_SIZE)`, rounded up to whole blocks |
+
+On the heap, `tbft_state_init` allocates one copy of the whole state (application blocks + client table) for the latest checkpoint image.
 
 **New_key constrains `MAX_MESSAGE_SIZE`**: the message carries `(n-1)` RSA-encrypted HMAC keys plus an RSA signature:
 
 ```
-New_key_bytes = sizeof(tbft_new_key_rep_t)               // 24
+New_key_bytes = sizeof(tbft_new_key_rep_t)               // 32
               + (n - 1) × sizeof(tbft_new_key_slot_t)    // (n-1)×260
               + TBFT_SIG_SIZE                            // 256
 ```
 
-With n=7: `24 + 6×260 + 256 = 1840` — `out_buf` (sized to `TBFT_MAX_MESSAGE_SIZE`) must be ≥ this.
+With n=7: `32 + 6×260 + 256 = 1848` — `out_buf` (sized to `TBFT_MAX_MESSAGE_SIZE`) must be ≥ this.
 
-**Typical ESP32-C3 allocation** (~80 KB free heap): with 7 replicas, keep `WINDOW_SIZE=4` and `MAX_MESSAGE_SIZE=2048` to stay under the limit. Run `memcalc.sh` to verify.
+**Typical ESP32-C3 allocation** (~80 KB free heap): with 7 replicas, keep `WINDOW_SIZE=4` and `MAX_MESSAGE_SIZE=2048` to stay under the limit. With the counter example's settings `tbft_replica_t` is 53,112 bytes plus a 5 KiB checkpoint image. Run `memcalc.sh` to verify (its total matches `sizeof(tbft_replica_t)` for that configuration).
 
 `tbft_config.h` defines all constants from `CONFIG_TBFT_*` Kconfig values and enforces these `_Static_assert` checks:
 
@@ -340,6 +374,7 @@ With n=7: `24 + 6×260 + 256 = 1840` — `out_buf` (sized to `TBFT_MAX_MESSAGE_S
 - `TBFT_MAX_REPLY_SIZE < TBFT_MAX_MESSAGE_SIZE`.
 - `TBFT_MAX_MESSAGE_SIZE % 8 == 0`.
 - `TBFT_P_LEVELS >= 2`.
+- A View_change and a New_view covering `TBFT_WINDOW_SIZE` sequence numbers must fit in `TBFT_MAX_MESSAGE_SIZE` (`tbft_special_region.h`).
 
 Derived constants: `TBFT_DIGEST_SIZE` (32), `TBFT_HMAC_SIZE` (32), `TBFT_SIG_SIZE` (256), `TBFT_AUTH_SIZE`, `TBFT_NUM_CKPT_SLOTS`, `TBFT_MAX_FAULTY`, `TBFT_CERT_MAX_VALS` (f+1), `TBFT_P_CHILDREN`.
 
@@ -357,14 +392,17 @@ Additional Kconfig-sourced constants (with `#ifndef` guards for override):
 
 Every message handler performs bounds and identity checks before touching protocol state:
 
-- `handle_request`: `command_size` validated non-negative and no integer overflow (`command_size <= TBFT_MAX_MESSAGE_SIZE - sizeof(rep) - sizeof(sig)`); `cid >= 0 && cid < num_principals`
+- `handle_request`: `command_size` validated non-negative and no integer overflow (`command_size <= TBFT_MAX_MESSAGE_SIZE - sizeof(rep) - sizeof(sig)`); `cid` must be a client id (`num_replicas <= cid < num_principals`)
 - `handle_prepare`, `handle_commit`, `handle_checkpoint`, `handle_view_change`, `handle_fetch`: sender id validated `>= 0 && < num_replicas`
 - `handle_meta_data`: `n_parts` validated non-negative and `<= TBFT_P_CHILDREN` before the size arithmetic `sizeof(rep) + n_parts * sizeof(tbft_part_info_t) <= len`
-- `handle_view_change`: `body_size >= sizeof(tbft_view_change_rep_t)` and `body_size <= len` before reading the RSA signature
+- `handle_view_change`: `body_size >= sizeof(tbft_view_change_rep_t)` and `body_size <= len` before reading the RSA signature; at most one checkpoint entry and `TBFT_WINDOW_SIZE` request entries, all inside the body
+- `handle_new_view`: signature of the new view's primary; `n_prep == max - min`, at most `TBFT_WINDOW_SIZE` entries, one per seqno `min+1 .. max` in order
 - `send_pre_prepare`: `aligned_needed <= sizeof(r->out_buf)` overflow guard before writing the Pre-prepare message to `out_buf`
 
 ### State transfer (fetch protocol)
 
 When a replica detects it has fallen behind, `tbft_state_start_fetch` sets `in_fetch=true` and enqueues a root-level Fetch. The fetching replica walks the Merkle partition tree (`tbft_ptree_t`) top-down, comparing local digests (`block_digests[]`) to received `Meta_data` messages and requesting only mismatched subtrees, until it reaches leaf-level `Data` messages that overwrite individual `tbft_block_t` entries.
 
-State uses a CoW bitmap (`cowb[]` — array of uint64_t, not a single bitmap) to track dirty blocks. `block_digests[]` holds per-block SHA-256 digests. Checkpoint records are stored in `ckpt_records[]` (max `TBFT_NUM_CKPT_SLOTS`). `last_stable` tracks the highest stable checkpoint seqno.
+State uses a dirty bitmap (`cowb[]` — array of uint64_t, not a single bitmap) to track blocks modified since the last checkpoint. `block_digests[]` holds per-block SHA-256 digests. Checkpoint records (seqno + root digest) are stored in `ckpt_records[]` (max `TBFT_NUM_CKPT_SLOTS`). `last_stable` tracks the highest stable checkpoint seqno.
+
+`tbft_state_checkpoint` also copies every block into `image`. A replica answers Fetch only for the checkpoint its image holds (`tbft_state_can_serve`), and from the image, so the fetcher gets exactly the state that checkpoint's digest covers even while the replier keeps executing. The fetcher knows the certified root digest (from 2f+1 Checkpoint messages or from the New_view) and adopts the fetched state only if its root digest matches (`finish_fetch`); otherwise it fetches again from the next replica. After a timeout it aims at the newest certified checkpoint, or asks another replica.

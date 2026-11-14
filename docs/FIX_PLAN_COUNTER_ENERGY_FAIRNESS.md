@@ -30,7 +30,7 @@
 
 **การตั้งค่าย้ายไป `idf.py menuconfig` ทั้งหมด (2026-11-13 ตามที่เจ้าของงานวิจัยขอ):** ทุกค่าของการทดลองเลือกได้ในเมนู TinyBFT Configuration (transport, PHY rate, broadcast, receive power saving ของ ESP-NOW พร้อม preset, multicast ของ UDP) และ Counter Example Configuration (role, คาบ request, channel, Wi-Fi และ power saving ของ UDP) ตรวจรูปแบบ Kconfig ด้วย `kconfcheck` ของ Espressif และทดสอบพฤติกรรม (preset เปลี่ยนค่า window/interval ตามเมื่อยังไม่ได้ตั้งเอง, ค่าที่ซ่อนคำนวณจาก choice, `select`) ด้วย `esp_kconfiglib` 3.12 ตัวเดียวกับที่ `idf.py menuconfig` ใช้ role ค่าเริ่มต้นเป็น *Automatic* คือ image เดียวใช้ได้ทุกบอร์ด บอร์ดหา role ของตัวเองจาก node list ตอนบูต (`Byz_node_is_replica()`) ลบ overlay `sdkconfig.variant.*`, `sdkconfig.role.*`, `sdkconfig.measure`, `sdkconfig.mcast`, `sdkconfig.static_ip`, `sdkconfig.wifi.local.example`, `build_variant.sh`, `tools/sweep.py`, `tools/flash.py` แล้ว แทนด้วย `flash_all.fish` (flash image เดียวกันทุกพอร์ตแบบขนานด้วยคำสั่ง esptool ที่ `idf.py build` พิมพ์) ส่วน `tools/analyze.py` ยังอยู่เป็นตัวช่วยสรุปผล (ไม่บังคับ) และอ่านค่าการตั้งค่าจากบรรทัด `BANNER`
 
-Build ผ่านล่าสุด (2026-11-13, build dir ใหม่ทั้งหมด, ตั้งค่าแบบเดียวกับ menuconfig): ESP-NOW ค่าเริ่มต้น, ESP-NOW 54 Mbps + 110/200, ESP-NOW custom 30/300 + broadcast + role Replica, UDP `PS_MAX` listen 10 + multicast + static IP + role Client และ `simple_wallet` ทุก build ได้ target esp32c3 ไม่มี warning ของ compiler และรายงาน Kconfig เป็น "Finished successfully" (ยกเว้น `simple_wallet` ที่มี warning เดิมจาก `CONFIG_MBEDTLS_ASYMMETRIC_CONTENT_LEN=true` ใน `sdkconfig.defaults` ของมันเอง) ค่า custom ที่ window ไม่สั้นกว่า interval ถูก static assert หยุด build ตามที่ออกแบบ `tools/analyze.py` และ `flash_all.fish` ทดสอบด้วยข้อมูลจำลองและ esptool จำลอง **ยังไม่ได้ทดสอบบนบอร์ดจริง** เกณฑ์ตรวจรับที่ต้องใช้บอร์ดยังเป็นของคนทดสอบ
+Build ผ่านล่าสุด (2026-11-15 หลังงาน C ในหัวข้อ 6, ESP-IDF 6.1, build dir ใหม่ทั้งหมด, ตั้งค่าแบบเดียวกับ menuconfig): ESP-NOW ค่าเริ่มต้น, ESP-NOW 54 Mbps + 110/200, ESP-NOW custom 30/300 + broadcast + role Replica, UDP `PS_MAX` listen 10 + multicast + role Client และ `simple_wallet` ทุก build ได้ target esp32c3 ไม่มี warning ของ compiler และรายงาน Kconfig เป็น "Finished successfully" `kconfcheck` ผ่านทั้งสามไฟล์ Kconfig ค่า custom ที่ window ไม่สั้นกว่า interval ถูก static assert หยุด build ตามที่ออกแบบ `tools/analyze.py` และ `flash_all.fish` ทดสอบด้วยข้อมูลจำลองและ esptool จำลอง **ยังไม่ได้ทดสอบบนบอร์ดจริง** เกณฑ์ตรวจรับที่ต้องใช้บอร์ดยังเป็นของคนทดสอบ
 
 | งาน | สถานะ | หมายเหตุ |
 |---|---|---|
@@ -55,10 +55,10 @@ Build ผ่านล่าสุด (2026-11-13, build dir ใหม่ทั�
 
 ## 2. ข้อตกลงในการทำงาน
 
-- **Branch:** แตกจาก `devlope/v0.2.9` ใช้ชื่อรูปแบบ `fix/develop/<version>` เช่น `fix/develop/v0.2.9` (ยังไม่ได้สร้าง)
+- **Branch:** แตกจาก `devlope/v0.2.9` ใช้ชื่อรูปแบบ `fix/develop/<version>` คือ `fix/develop/v0.2.9`
 - **Build และตรวจ:** ทำตาม `AGENT.md` หัวข้อ "After making changes" ต้อง build ทั้ง `examples/counter` และ `examples/simple_wallet` เพราะงาน A1, B1, B2 และ B7 กระทบทั้งสองตัวอย่าง
 - **ห้ามเปิด timestamp anti-replay กลับมา** เหตุผลอยู่ใน `AGENT.md` หัวข้อ "Anti-replay design"
-- **ห้ามเปลี่ยน wire format ของ message** ในรอบนี้
+- **ห้ามเปลี่ยน wire format ของ message** ในงาน A และ B (งาน C ในหัวข้อ 6 เปลี่ยนแล้วตามที่เจ้าของงานวิจัยขอ ต้อง flash firmware เดียวกันทุกบอร์ด)
 - **หนึ่งงานต่อหนึ่ง commit** และถ้าการแก้มีผลกับ variant เดียว ให้ระบุใน commit message กับ README ของ example
 - **ห้าม commit SSID และรหัสผ่าน Wi-Fi** (ดู A7)
 
@@ -468,20 +468,46 @@ static bool espnow_tx_frame(tbft_espnow_t *enow, const uint8_t *mac,
 
 **เกณฑ์ตรวจรับ:** ส่ง request ที่ `op` ไม่ถูกต้องหนึ่งครั้ง แล้ว request ปกติถัดไปยังสำเร็จ
 
-## 6. ประเด็นระดับ protocol ที่ไม่แก้ในรอบนี้
+## 6. ความถูกต้องระดับ protocol (C1–C6): แก้แล้ว
 
-ประเด็นเหล่านี้อยู่นอกขอบเขต connection แต่ทำให้ข้อความหายหนึ่งครั้งกลายเป็นงาน RSA และ broadcast ชุดใหญ่ run ที่เกิดเหตุการณ์เหล่านี้ต้องแยกรายงาน โดยใช้ตัวนับจาก A8
+เดิมหัวข้อนี้คือ "ประเด็นระดับ protocol ที่ไม่แก้ในรอบนี้" เจ้าของงานวิจัยขอให้แก้ (2026-11-14) โดยเน้นความถูกต้องและความเสถียรก่อน ส่วน security เป็นรอง และต้องรองรับ replica กับ client ที่ boot ไม่พร้อมกัน แก้บน `fix/develop/v0.2.9` แล้ว รายละเอียดของกลไกอยู่ใน `AGENT.md` หัวข้อ "Protocol rules the handlers rely on" และ `docs/ARCHITECTURE.md` หัวข้อ 7, 11.4, 12 และ 14
 
-| ID | ประเด็น | ตำแหน่ง |
+| ID | ปัญหาเดิม | แก้อย่างไร |
 |---|---|---|
-| C1 | view-change ซ้ำจาก replica ตัวเดียวทำให้ตัวอื่นขยับ view โดยไม่ต้องมี quorum | `src/tbft_replica.c:1185-1232` |
-| C2 | Status ไม่มี authenticator แต่ทำให้ replica ขยับ view ตามได้ | `src/tbft_replica.c:1626-1698` |
-| C3 | replica ข้าม seqno ที่ยังไม่ commit หรือไม่มี pre-prepare แล้วซ่อม state ด้วย fetch ภายหลัง | `src/tbft_replica.c:2237-2265` |
-| C4 | ไม่มีการกัน request ที่ `rid` เก่ากว่าที่ execute ไปแล้ว จึง execute ซ้ำได้ | `src/tbft_replica.c:607-609`, `:643-668` |
-| C5 | commit ถูกส่งซ้ำตามเงื่อนไขเวลา 500 ms ปริมาณข้อความจึงขึ้นกับ latency ของแต่ละ variant | `src/tbft_replica.c:1089-1093` |
-| C6 | client ส่ง request ครั้งเดียวแล้วรอ ไม่มีการส่งซ้ำ | `src/tbft_libbyz.c:562-628`, `:782-787` |
+| C1 | view-change จาก replica ตัวเดียวทำให้ตัวอื่นขยับ view โดยไม่ต้องมี quorum | replica ร่วม view change เมื่อ replica อื่นอย่างน้อย f+1 ตัวขอ view ที่สูงกว่าเท่านั้น (เลือก view ต่ำสุดที่ f+1 ตัวนั้นขอ ตามกฎของ PBFT) และ new primary ต้องถือ View_change 2f+1 ฉบับก่อนส่ง New_view |
+| C2 | Status ไม่มี authenticator แต่ทำให้ replica ขยับ view ตามได้ | Status ไม่เปลี่ยน view หรือ state ของผู้รับอีก ใช้บอกว่าผู้ส่งขาดอะไร แล้วผู้รับส่งของที่ขาดให้ (New_view ที่เซ็นแล้ว, Checkpoint, Commit/Pre-prepare/Prepare) |
+| C3 | replica ข้าม seqno ที่ยังไม่ commit หรือไม่มี pre-prepare | execute ตามลำดับ seqno อย่างเคร่งครัด หยุดที่ seqno แรกที่ยังไม่ครบ quorum หรือยังไม่มี pre-prepare แล้วขอข้อความที่ขาดทันที (Status ที่มี flag `TBFT_STATUS_WANT`) ไม่ข้ามอีก; New_view เสนอ request ที่ prepared แล้วซ้ำใน view ใหม่และใส่ null request ในช่องว่าง; ถ้าตามข้อความไม่ทันจึง fetch state ของ checkpoint ที่ quorum รับรองแล้ว |
+| C4 | execute request ซ้ำได้ | ตาราง client (rid ล่าสุดที่ execute และ reply ของแต่ละ client) เป็นส่วนหนึ่งของ state ที่ replicate, checkpoint และ fetch; request ที่ rid ไม่มากกว่าค่าในตารางไม่ถูก execute อีก ถ้าเป็นตัวล่าสุดจะส่ง reply เดิมซ้ำจาก cache (ไม่เซ็น RSA ใหม่) |
+| C5 | commit ถูกส่งซ้ำตามเวลา 500 ms | เอาออก การส่งซ้ำเกิดเมื่อ Status บอกว่ามีคนขาดข้อความเท่านั้น run ที่ไม่มีข้อความหายจึงมีจำนวนข้อความต่อ request เท่ากันทุก variant |
+| C6 | client ส่ง request ครั้งเดียว | client ส่ง request ซ้ำไปทุก replica หลัง `TBFT_CLIENT_RETRANSMIT_MS` (ค่าเริ่มต้น 5000 ms แล้วเพิ่มเป็นสองเท่าทุกครั้ง) ปลอดภัยเพราะ C4; rid ไม่ย้อนเมื่อ client reboot เพราะเก็บ boot epoch ไว้ใน NVS |
 
-**คำเตือนสำหรับ C6:** อย่าเพิ่มการส่งซ้ำฝั่ง client ก่อนแก้ C4 เพราะจะทำให้ request ถูก execute ซ้ำได้
+**ปัญหาที่พบเพิ่มระหว่างแก้ (แก้แล้วเช่นกัน)**
+
+| ID | ปัญหา | แก้อย่างไร |
+|---|---|---|
+| C7 | primary ส่ง Prepare และถูกนับใน quorum 2f ด้วย primary ที่ผิดพลาดจึงทำให้ replica ที่ถูกต้องสองตัว prepared คนละ request ที่ seqno เดียวกันได้ | Prepare มาจาก backup เท่านั้น: prepared = pre-prepare + Prepare 2f ฉบับจาก backup (2f+1 replica รวม primary) ตาม PBFT; run ปกติ primary จึงส่งน้อยลงหนึ่ง broadcast ต่อ request |
+| C8 | New_view ต้องมี View_change ครบ 2f+1 ฉบับในเครื่องผู้รับ replica ที่ boot ช้าหรือพลาดข้อความจึงตามไม่ทัน; Pre-prepare จาก view ที่สูงกว่าทำให้ replica กระโดด view และล้าง log | รับ New_view ที่ primary ของ view นั้นเซ็น และส่ง New_view ซ้ำให้ replica ที่ยังอยู่ view เก่าผ่าน Status; Pre-prepare/Prepare/Commit รับเฉพาะ view ปัจจุบัน |
+| C9 | fetch ส่ง state ปัจจุบันของผู้ส่ง แต่ผู้รับเทียบกับ digest ของ checkpoint | ผู้ส่งตอบจากสำเนา state ของ checkpoint (image) และผู้รับตรวจ root digest กับค่าที่ quorum รับรองก่อนใช้ ถ้าไม่ตรงจะ fetch ใหม่จาก replica อื่น |
+| C10 | replica ที่ boot ช้าหรือ reboot รอ New_key ของตัวอื่นได้ถึง 60 s | New_key บอกว่าผู้ส่งมี key ของใครแล้ว (`have_keys`) replica ที่ key ของตัวเองหายจากรายการจะตอบทันที ใน simulator replica ที่ reboot ได้ key ครบ 2f ใน 1 s (เดิม 30 s) |
+| C11 | digest ของ Pre-prepare ไม่คลุม non-deterministic choices; `tbft_cr_winning_digest` คืน digest ของ checkpoint อื่นที่ map ลงช่องเดียวกันได้ | digest คลุมทั้ง request และ non-det; ตรวจ seqno ของช่องก่อนคืนค่า |
+
+**ข้อจำกัดที่ยังเหลือ (ด้าน security ซึ่งตกลงให้เป็นรอง):** View_change ไม่มี proof (prepared certificate) และ New_view ไม่ถูกตรวจกับ View_change ที่ใช้สร้าง replica ที่เป็น Byzantine จึงรายงานเท็จช่วง view change ได้ ส่วน crash, reboot, boot ช้า และข้อความหาย รับมือได้แล้ว replica ที่ reboot เสีย state ของ protocol ไปและนับเป็นหนึ่งใน f จนกว่าจะตามทัน
+
+**ผลต่อการทดลองพลังงาน**
+
+- wire format เปลี่ยน (New_view มี digest ของ checkpoint, New_key มี `have_keys`, Status มี flag, digest ของ Pre-prepare คลุม non-det) ต้อง flash firmware เดียวกันทุกบอร์ด
+- run ปกติ: primary ไม่ส่ง Prepare และไม่มีการส่ง commit ซ้ำตามเวลาแล้ว Status ยังส่งทุก 5 s และ New_key ทุก 60 s เท่าเดิม
+- การส่งซ้ำทุกแบบมีตัวนับ: `commit_resent` (replica) และ `req_resent` (client) ใน `TBFT_STATS` และ `tools/analyze.py` แสดงเป็นคอลัมน์ resent/run run ที่ค่าไม่เป็นศูนย์มีข้อความหายแล้วถูกกู้คืน ควรรายงานแยก
+- client รอ reply 20 s ต่อ request (`sdkconfig.defaults`) และส่ง request ซ้ำที่ 5 s และ 15 s ถ้า latency ปกติของ variant ใดเกิน 5 s ให้เพิ่ม *Client request retransmission interval* ใน menuconfig (TinyBFT Configuration > Timeouts) โดยทุก variant ต้องใช้ค่าเดียวกัน
+- หน่วยความจำ: `tbft_replica_t` ของ counter เหลือ 53,112 byte (เดิม 83,112) เพราะลบช่องที่ไม่ได้ใช้ใน special region และ checkpoint region บวก heap 5 KiB สำหรับสำเนา state ของ checkpoint
+
+**การทดสอบ**
+
+- simulator บน Linux (`tests/sim`, วิธีใช้ใน `AGENT.md`): 7 replica + 1 client เป็น process แยกกัน ใช้ UDP transport จริงบน loopback ทดสอบ boot race, boot ช้า 0–30 s, primary crash (หนึ่งและสองตัวพร้อมกัน), primary crash แล้วกลับมา, replica reboot, client reboot และข้อความหาย 5%/10% แล้วตรวจว่า state ทุก replica ตรงกันและทุก request execute ครั้งเดียว
+- ก่อนแก้ (commit `ab0a090`, timeout สั้นของ simulator: view change 3 s): boot race และ boot ช้าไม่มี request สำเร็จเลยใน 3 นาที ข้อความหาย 10% ทำให้ replica สองกลุ่ม execute request คนละตัวที่ seqno เดียวกัน และ replica ที่ reboot ข้าม seqno สองตัว
+- หลังแก้: ผ่านทุก scenario ใน seed 1, 2 และ 4 รวมทั้ง build แบบ sanitizer (address, undefined) และกับ timeout เท่าบอร์ด (view change 30 s, Status 5 s) ก็ผ่านทุก scenario: boot race ไม่มี view change เลย (ก่อนแก้มี 6 ครั้งและ request ล้มเหลว 2 ตัว) boot ช้า 0–30 s ไม่มี view change (ก่อนแก้ 4 ครั้งและล้มเหลว 4 ตัว) request ที่ยังล้มเหลวคือตัวที่ค้างอยู่ตอน primary crash เพราะ client รอ reply 20 s แต่ view change ใช้อย่างน้อย 30 s และตัวแรกของ scenario ที่ client เริ่มก่อน replica ทุกตัว
+- build ESP-IDF 6.1 ผ่านตามหัวข้อ 1.1
+- **ยังไม่ได้ทดสอบบนบอร์ดจริง** simulator ไม่มีวิทยุ ไม่มี RSA จริง และจังหวะเวลาไม่ใช่ของ ESP32-C3
 
 ## 7. ระเบียบวิธีการวัด
 
