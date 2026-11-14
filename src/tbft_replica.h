@@ -40,6 +40,23 @@ typedef struct {
     int count;
 } tbft_rqueue_t;
 
+/* Client table entry: the last request executed for one client and its
+ * reply.  The table lives in the library part of the replicated state
+ * (tbft_state blocks after the application's), so checkpoints cover it and a
+ * state fetch brings it along: every replica agrees which requests already
+ * ran, never executes one twice, and can answer a retransmitted request. */
+typedef struct {
+    tbft_req_id_t last_rid;    /* last executed request id, 0 = none */
+    tbft_seqno_t  seqno;       /* sequence number it executed at */
+    int32_t       reply_len;   /* bytes in reply[]; -1 = rejected, no reply */
+    int32_t       _pad;
+    uint8_t       reply[TBFT_MAX_REPLY_SIZE];
+} tbft_client_entry_t;
+
+static constexpr size_t TBFT_SYS_STATE_SIZE =
+    (TBFT_MAX_NUM_CLIENTS * sizeof(tbft_client_entry_t) + TBFT_BLOCK_SIZE - 1)
+    / TBFT_BLOCK_SIZE * TBFT_BLOCK_SIZE;
+
 /* Execution callback: called when a request is committed and ready to execute */
 typedef int (*tbft_exec_cb_t)(const void *req, int req_len,
                               void *rep, int *rep_len,
@@ -60,10 +77,7 @@ typedef struct {
 
     /* Sequence number state */
     tbft_seqno_t  seqno;                  /* next seqno to assign (primary) */
-    int           last_assigned_cid;      /* last cid assigned a seqno (dedup) */
-    tbft_req_id_t last_assigned_rid;      /* last rid assigned a seqno (dedup) */
     tbft_seqno_t  last_stable;            /* last stable checkpoint seqno */
-    int64_t       last_ckpt_throttle_us;   /* last time we sent catch-up checkpoints */
     int64_t       last_fetch_throttle_us;   /* last time we initiated a state fetch */
     tbft_seqno_t  last_prepared;          /* highest prepared seqno */
     tbft_seqno_t  last_executed;          /* highest committed + executed */
@@ -73,6 +87,33 @@ typedef struct {
     tbft_req_id_t last_received_rid[TBFT_MAX_NUM_REPLICAS + TBFT_MAX_NUM_CLIENTS];
     tbft_req_id_t last_executed_rid[TBFT_MAX_NUM_REPLICAS + TBFT_MAX_NUM_CLIENTS];
     tbft_req_id_t last_forwarded_rid[TBFT_MAX_NUM_REPLICAS + TBFT_MAX_NUM_CLIENTS];
+    /* Primary: highest request id of each client given a sequence number */
+    tbft_req_id_t last_assigned_rid[TBFT_MAX_NUM_REPLICAS + TBFT_MAX_NUM_CLIENTS];
+
+    /* Library part of the replicated state: tbft_client_entry_t per client */
+    alignas(8) uint8_t sys_state[TBFT_SYS_STATE_SIZE];
+
+    /* View change: highest view each replica asked for in a View_change.
+     * A replica joins a view change only when f+1 others ask for one. */
+    tbft_view_t   vc_view_seen[TBFT_MAX_NUM_REPLICAS];
+    int           vc_backoff_shift;       /* consecutive view changes without progress */
+
+    /* Latest Status of each replica (drives retransmission) */
+    tbft_view_t   peer_view[TBFT_MAX_NUM_REPLICAS];
+    bool          peer_in_vc[TBFT_MAX_NUM_REPLICAS];
+    int64_t       peer_status_us[TBFT_MAX_NUM_REPLICAS];
+    /* Our own progress at the time of each replica's previous Status */
+    tbft_seqno_t  peer_seen_top[TBFT_MAX_NUM_REPLICAS];
+    tbft_seqno_t  peer_seen_stable[TBFT_MAX_NUM_REPLICAS];
+    int64_t       retx_us[TBFT_MAX_NUM_REPLICAS];   /* last retransmission to each */
+    int64_t       last_ask_us;                      /* last Status asking for a missing message */
+    /* A checkpoint the quorum certified before we executed that far: when
+     * we learned of it (we ask for the missing messages first and fetch the
+     * state only if that does not get us there) */
+    tbft_seqno_t  stable_wait_seqno;
+    int64_t       stable_wait_us;
+    int64_t       last_nk_reply_us;                 /* last New_key sent on request */
+    int64_t       reply_sent_us[TBFT_MAX_NUM_CLIENTS]; /* last reply sent to each client */
 
     /* Request queues */
     tbft_rqueue_t rqueue;    /* read-write requests */
@@ -218,12 +259,6 @@ void tbft_replica_send_new_key(tbft_replica_t *r);
 
 /** Primary: assign seqno and broadcast Pre_prepare for queued requests */
 void tbft_replica_send_pre_prepare(tbft_replica_t *r);
-
-/** Broadcast Prepare for sequence number @p n */
-void tbft_replica_send_prepare(tbft_replica_t *r, tbft_seqno_t n);
-
-/** Broadcast Commit for sequence number @p n */
-void tbft_replica_send_commit(tbft_replica_t *r, tbft_seqno_t n);
 
 /** Execute all committed-but-unexecuted requests in order */
 void tbft_replica_execute_committed(tbft_replica_t *r);

@@ -15,7 +15,44 @@ void tbft_ar_init(tbft_agreement_region_t *ar,
         tbft_prepared_cert_init(&ar->slices[i].prepared_cert,
                                 prepare_threshold);
         tbft_commit_cert_init(&ar->slices[i].commit_cert, commit_threshold);
+        ar->slices[i].prep_view = -1;
     }
+}
+
+static void slot_reset_view_info(tbft_agreement_slice_t *sl)
+{
+    sl->nv_expect = false;
+    tbft_digest_zero(&sl->nv_digest);
+    sl->prep_view = -1;
+    tbft_digest_zero(&sl->prep_digest);
+}
+
+void tbft_ar_slice_assign(tbft_agreement_slice_t *sl, tbft_seqno_t n)
+{
+    tbft_prepared_cert_clear(&sl->prepared_cert);
+    tbft_commit_cert_clear(&sl->commit_cert);
+    sl->commit_sent_us = 0;
+    slot_reset_view_info(sl);
+    sl->seqno = n;
+}
+
+void tbft_ar_new_view_slot(tbft_agreement_region_t *ar, tbft_seqno_t seqno)
+{
+    if (!tbft_ar_in_range(ar, seqno)) return;
+    tbft_agreement_slice_t *sl = tbft_ar_slice(ar, seqno);
+    tbft_prepared_cert_clear_prepares(&sl->prepared_cert);
+    tbft_commit_cert_clear(&sl->commit_cert);
+    sl->commit_sent_us = 0;
+    sl->nv_expect = false;
+    tbft_digest_zero(&sl->nv_digest);
+}
+
+bool tbft_ar_replace_pp(tbft_agreement_region_t *ar, tbft_seqno_t seqno,
+                        const void *pp_buf, int pp_len)
+{
+    if (!tbft_ar_in_range(ar, seqno)) return false;
+    tbft_agreement_slice_t *sl = tbft_ar_slice(ar, seqno);
+    return tbft_prepared_cert_replace_pp(&sl->prepared_cert, pp_buf, pp_len);
 }
 
 /* --------------------------------------------------------------------------
@@ -119,27 +156,10 @@ void tbft_ar_truncate(tbft_agreement_region_t *ar, tbft_seqno_t new_head)
 {
     if (new_head <= ar->head) return;
 
-    tbft_seqno_t old_head   = ar->head;
-    tbft_seqno_t full_delta = new_head - old_head;
-
-    /* Cap the CLEAR loop to WINDOW_SIZE to prevent iterating billions
-     * of times on a large fetch jump.  The circular buffer only has
-     * WINDOW_SIZE slots, so clearing all of them is sufficient. */
-    tbft_seqno_t delta = full_delta;
-    if (delta > TBFT_WINDOW_SIZE) delta = TBFT_WINDOW_SIZE;
-
-    for (tbft_seqno_t i = 0; i < delta; i++) {
-        int idx = (int)((ar->head_idx + (int)i) & ar->mask);
-        tbft_prepared_cert_clear(&ar->slices[idx].prepared_cert);
-        tbft_commit_cert_clear(&ar->slices[idx].commit_cert);
-        ar->slices[idx].commit_sent_us = 0;
-    }
-
-    /* Advance the circular pointer by the FULL jump so the head lands
-     * at new_head.  Using the capped delta here (ar->head + delta)
-     * would leave the head far behind new_head when the jump exceeds
-     * the window, causing tbft_ar_in_range() to permanently reject all
-     * consensus messages. */
-    ar->head_idx = (int)((ar->head_idx + (int)full_delta) & ar->mask);
+    /* The slots that fall out of the window are not erased here: each keeps
+     * its messages until a sequence number of the new window takes it over
+     * (tbft_ar_slice), so they can still be re-sent to a replica that is
+     * behind (tbft_ar_peek). */
+    ar->head_idx = (int)((ar->head_idx + (new_head - ar->head)) & ar->mask);
     ar->head     = new_head;
 }

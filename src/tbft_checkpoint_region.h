@@ -8,11 +8,11 @@
 /* --------------------------------------------------------------------------
  * checkpoint_region — static storage for Checkpoint messages (section 7).
  *
- * Two sub-regions:
- *  1. Normal checkpoint slots: indexed by (seqno/interval) % num_slots
- *     Each slot holds one Checkpoint message per replica (MAX_NUM_REPLICAS).
- *  2. Above-window slots: one per replica, for checkpoints from replicas
- *     that are ahead of the current window.
+ * Checkpoint slots indexed by (seqno/interval) % num_slots; each holds one
+ * Checkpoint message per replica (MAX_NUM_REPLICAS) for the seqno it is
+ * tagged with.  A checkpoint far ahead of this replica takes over the slot it
+ * maps to, so a replica that fell behind still collects the certificate it
+ * needs to fetch the state.
  * -------------------------------------------------------------------------- */
 
 /* Raw bytes for one Checkpoint message on the wire */
@@ -41,7 +41,6 @@ typedef struct {
 /** The checkpoint region */
 typedef struct {
     tbft_ckpt_slot_t  slots[TBFT_NUM_CKPT_SLOTS];
-    tbft_ckpt_slot_t  above_window[TBFT_MAX_NUM_REPLICAS];
     int               num_replicas;
     int               threshold;  /* 2f+1 */
 } tbft_checkpoint_region_t;
@@ -86,24 +85,6 @@ int tbft_cr_count(const tbft_checkpoint_region_t *cr, tbft_seqno_t seqno);
  */
 const tbft_digest_t *tbft_cr_winning_digest(const tbft_checkpoint_region_t *cr,
                                              tbft_seqno_t seqno);
-
-/* --------------------------------------------------------------------------
- * Above-window checkpoint operations
- * -------------------------------------------------------------------------- */
-
-/**
- * Store an above-window Checkpoint from @p replica_id.
- */
-void tbft_cr_store_above_window(tbft_checkpoint_region_t *cr,
-                                tbft_node_id_t replica_id,
-                                const void *msg, int msg_len);
-
-/**
- * Load the above-window Checkpoint for @p replica_id.
- */
-const uint8_t *tbft_cr_load_above_window(const tbft_checkpoint_region_t *cr,
-                                          tbft_node_id_t replica_id,
-                                          int *len_out);
 
 /* --------------------------------------------------------------------------
  * Garbage collection

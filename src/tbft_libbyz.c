@@ -15,6 +15,7 @@
 
 #include "esp_timer.h"
 #include "esp_task_wdt.h"
+#include "nvs.h"
 #if CONFIG_TBFT_TRANSPORT_UDP
 #include "lwip/sockets.h"
 #include "lwip/inet.h"
@@ -506,6 +507,50 @@ static int setup_principals(tbft_node_t *node, const tbft_config_t *cfg,
  * Client API
  * -------------------------------------------------------------------------- */
 
+/* The request being worked on: kept so that it can be re-sent. */
+static uint8_t       s_req_buf[TBFT_MAX_MESSAGE_SIZE];
+static int           s_req_len = 0;
+static tbft_req_id_t s_req_rid = 0;
+static uint32_t      s_req_resent = 0;   /* retransmissions, for TBFT_STATS */
+
+/* Request ids must keep growing across client reboots: every replica
+ * remembers the last request it ran for each client and ignores older ones.
+ * A request id is therefore
+ *   client id (16 bits) | boot epoch (24 bits) | request counter (24 bits)
+ * where the boot epoch is a counter kept in NVS and incremented at each
+ * Byz_init_client().  The application must have called nvs_flash_init(). */
+static constexpr int      TBFT_RID_COUNTER_BITS = 24;
+static constexpr uint64_t TBFT_RID_COUNTER_MASK = (1ULL << TBFT_RID_COUNTER_BITS) - 1;
+
+static uint32_t client_boot_epoch(int client_id)
+{
+    char key[NVS_KEY_NAME_MAX_SIZE];
+    snprintf(key, sizeof(key), "cl_epoch%d", client_id);
+
+    nvs_handle_t h;
+    esp_err_t err = nvs_open("tbft", NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "client: NVS not available (%s): request ids restart at every boot,"
+                 " so after a reboot the replicas ignore this client until its ids pass"
+                 " the last one they executed. Call nvs_flash_init() first.",
+                 esp_err_to_name(err));
+        return 0;
+    }
+    uint32_t epoch = 0;
+    err = nvs_get_u32(h, key, &epoch);
+    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGW(TAG, "client: reading the boot epoch failed (%s)", esp_err_to_name(err));
+    }
+    epoch++;
+    err = nvs_set_u32(h, key, epoch);
+    if (err == ESP_OK) err = nvs_commit(h);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "client: storing the boot epoch failed (%s)", esp_err_to_name(err));
+    }
+    nvs_close(h);
+    return epoch;
+}
+
 int Byz_init_client(const char *config_file, const char *priv_config,
                     int local_id, uint16_t port)
 {
@@ -551,8 +596,13 @@ int Byz_init_client(const char *config_file, const char *priv_config,
     s_is_replica = false;
     s_reply_count = 0;
     memset(s_replies, 0, sizeof(s_replies));
+    s_req_len = 0;
+    s_req_rid = 0;
 
-    ESP_LOGI(TAG, "client %d initialised", local_id);
+    uint32_t epoch = client_boot_epoch(local_id);
+    s_client->rid_counter = (uint64_t)epoch << TBFT_RID_COUNTER_BITS;
+
+    ESP_LOGI(TAG, "client %d initialised (boot epoch %lu)", local_id, (unsigned long)epoch);
     return 0;
 }
 
@@ -576,15 +626,22 @@ int Byz_send_request(Byz_req *req, bool read_only)
         }
     }
 
-    /* Build Request message. Use a static buffer to avoid stack overflow
-     * on tasks with limited stack size (TBFT_MAX_MESSAGE_SIZE can be large). */
-    static uint8_t out[TBFT_MAX_MESSAGE_SIZE];
+    /* Build Request message in a static buffer (TBFT_MAX_MESSAGE_SIZE is too
+     * large for a task stack); it is kept for retransmission. */
+    uint8_t *out = s_req_buf;
+    s_req_len = 0;
+    if ((s_client->rid_counter & TBFT_RID_COUNTER_MASK) == TBFT_RID_COUNTER_MASK) {
+        /* request counter used up: continue in a new epoch */
+        s_client->rid_counter =
+            (uint64_t)client_boot_epoch(s_client->node_id) << TBFT_RID_COUNTER_BITS;
+    }
     tbft_request_rep_t *rep = (tbft_request_rep_t *)out;
     rep->hdr.tag      = TBFT_MSG_REQUEST;
     rep->hdr.extra    = (int16_t)(read_only ? 1 : 0);
     rep->cid          = s_client->node_id;
     rep->rid          = tbft_node_new_rid(s_client);
     rep->replier      = TBFT_ALL_REPLICAS;
+    s_req_rid         = rep->rid;
 
     /* Check the size before touching req->contents.  A negative size would
      * wrap to a huge size_t and pass a plain comparison; ckd_add (C23
@@ -634,6 +691,7 @@ int Byz_send_request(Byz_req *req, bool read_only)
         memset(out + total, 0, (size_t)(rep->hdr.size - total));
     }
 
+    s_req_len = rep->hdr.size;
     return tbft_node_send(s_client, out, (size_t)rep->hdr.size,
                           TBFT_ALL_REPLICAS) > 0 ? 0 : -1;
 }
@@ -645,11 +703,26 @@ int Byz_recv_reply(Byz_rep *rep)
     int f = s_client->max_faulty;
     int needed = f + 1; /* f+1 matching replies from DISTINCT replicas */
     int num_replicas = s_client->num_replicas;
-    tbft_req_id_t expected_rid = ((tbft_req_id_t)(uint64_t)s_client->node_id << 48) | s_client->rid_counter;
+    tbft_req_id_t expected_rid = s_req_rid;
     int64_t deadline_us = esp_timer_get_time()
         + (int64_t)TBFT_CLIENT_REPLY_TIMEOUT_MS * 1000LL;
 
+    /* PBFT: a client without f+1 matching replies re-sends its request to
+     * every replica.  That is what carries a request over a lost message or
+     * a view change; replicas answer a request that already ran from their
+     * reply cache.  The interval doubles after every re-send. */
+    int64_t retx_us      = (int64_t)TBFT_CLIENT_RETRANSMIT_MS * 1000LL;
+    int64_t next_retx_us = esp_timer_get_time() + retx_us;
+
     while (esp_timer_get_time() < deadline_us) {
+        if (retx_us > 0 && s_req_len > 0 && esp_timer_get_time() >= next_retx_us) {
+            ESP_LOGW(TAG, "rid=%llu: %d of %d matching replies so far - re-sending the request",
+                     (unsigned long long)expected_rid, s_reply_count, needed);
+            tbft_node_send(s_client, s_req_buf, (size_t)s_req_len, TBFT_ALL_REPLICAS);
+            s_req_resent++;
+            retx_us *= 2;
+            next_retx_us = esp_timer_get_time() + retx_us;
+        }
         uint8_t buf[TBFT_MAX_MESSAGE_SIZE];
         tbft_node_id_t src_hint = -1;
         int n = tbft_node_recv(s_client, buf, sizeof(buf), &src_hint);
@@ -1025,13 +1098,14 @@ void Byz_print_stats(void)
         tbft_transport_stats_t t;
         tbft_transport_get_stats(s_client->transport, &t);
         ESP_LOGW(TAG, "TBFT_STATS id=%d tx=%lu tx_frames=%lu tx_fail=%lu tx_qfull=%lu rx=%lu "
-                 "rx_drop=%lu rx_frag_drop=%lu rx_reply=%lu heap=%lu heap_min=%lu",
+                 "rx_drop=%lu rx_frag_drop=%lu rx_reply=%lu req_resent=%lu heap=%lu heap_min=%lu",
                  (int)s_client->node_id, (unsigned long)t.tx_msgs,
                  (unsigned long)t.tx_frames,
                  (unsigned long)t.tx_fail, (unsigned long)t.tx_queue_full,
                  (unsigned long)t.rx_msgs, (unsigned long)t.rx_drop,
                  (unsigned long)t.rx_frag_drop,
                  (unsigned long)t.rx_by_tag[TBFT_MSG_REPLY],
+                 (unsigned long)s_req_resent,
                  (unsigned long)esp_get_free_heap_size(),
                  (unsigned long)esp_get_minimum_free_heap_size());
     }

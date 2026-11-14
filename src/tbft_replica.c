@@ -100,8 +100,13 @@ static void stimer_cb(void *arg)
 
 static void tbft_replica_reset_forwarded_requests(tbft_replica_t *r)
 {
+    /* A new view starts with no pending request: requests that were not
+     * ordered come back with the client's retransmission (and then start the
+     * view-change timer again).  A request whose client gave up or went away
+     * must not keep the timer running in every later view. */
     for (int i = 0; i < r->node.num_principals; i++) {
         r->last_forwarded_rid[i] = r->last_executed_rid[i];
+        r->last_received_rid[i]  = r->last_executed_rid[i];
     }
     /* Clear the request queue so stale entries from prior views
      * don't block fresh client requests.  Without this, a queue
@@ -166,7 +171,8 @@ int tbft_replica_init(tbft_replica_t *r,
     tbft_sr_init(&r->sr, n, num_clients);
 
     /* Init state */
-    if (tbft_state_init(&r->state, state_mem, state_size) != 0) {
+    if (tbft_state_init(&r->state, state_mem, state_size,
+                        r->sys_state, TBFT_SYS_STATE_SIZE) != 0) {
         tbft_node_free(&r->node);
         return -1;
     }
@@ -188,7 +194,6 @@ int tbft_replica_init(tbft_replica_t *r,
     /* Sequence number initialisation */
     r->seqno                    = 1;
     r->last_stable              = 0;
-    r->last_ckpt_throttle_us    = 0;
     r->last_fetch_throttle_us    = 0;
     r->last_prepared            = 0;
     r->last_executed            = 0;
@@ -248,28 +253,654 @@ void tbft_replica_free(tbft_replica_t *r)
  * -------------------------------------------------------------------------- */
 
 static void handle_status(tbft_replica_t *r, const void *msg, int len);
-static void tbft_replica_start_fetch(tbft_replica_t *r, tbft_seqno_t seqno, int replier);
+static void send_view_change_to(tbft_replica_t *r, tbft_view_t target);
+static void maybe_send_new_view(tbft_replica_t *r);
 
-static void tbft_replica_start_fetch(tbft_replica_t *r, tbft_seqno_t seqno, int replier)
+static void tbft_replica_start_fetch(tbft_replica_t *r, tbft_seqno_t seqno, int replier,
+                                     const tbft_digest_t *digest)
 {
     r->stat_fetch_started++;
-    tbft_state_start_fetch(&r->state, seqno, replier);
+    tbft_digest_t target;
+    if (digest) target = *digest;   /* may point into r->state */
+    tbft_state_start_fetch(&r->state, seqno, replier, digest ? &target : nullptr);
 
     /* Send initial fetch request(s) */
     int level, index;
     while (tbft_state_next_fetch_req(&r->state, &level, &index)) {
         tbft_fetch_rep_t *fr = (tbft_fetch_rep_t *)r->out_buf;
-        fr->hdr.tag   = TBFT_MSG_FETCH;
-        fr->hdr.extra = 0;
+        fr->hdr.tag     = TBFT_MSG_FETCH;
+        fr->hdr.extra   = 0;
         fr->last_stable = r->last_stable;
-        fr->c         = r->state.fetch_seqno;
-        fr->level     = level;
-        fr->index     = index;
-        fr->id        = r->node.node_id;
-        fr->hdr.size  = tbft_msg_align((int32_t)sizeof(*fr));
+        fr->c           = r->state.fetch_seqno;
+        fr->level       = level;
+        fr->index       = index;
+        fr->id          = r->node.node_id;
+        fr->hdr.size    = tbft_msg_align((int32_t)sizeof(*fr));
         tbft_node_send(&r->node, r->out_buf, (size_t)fr->hdr.size,
                        r->state.fetch_replier);
     }
+}
+
+/* --------------------------------------------------------------------------
+ * Helpers shared by the handlers below
+ * -------------------------------------------------------------------------- */
+
+static int count_fresh_keys(const tbft_replica_t *r)
+{
+    int keys_ok = 0;
+    for (int i = 0; i < r->node.num_replicas; i++) {
+        if (i == r->node.node_id) continue;
+        if (r->node.principals[i] && r->node.principals[i]->keys_fresh) keys_ok++;
+    }
+    return keys_ok;
+}
+
+static bool digest_is_zero(const tbft_digest_t *d)
+{
+    tbft_digest_t zero;
+    tbft_digest_zero(&zero);
+    return tbft_digest_equal(d, &zero);
+}
+
+/* Client table index of client @p cid, or -1 when @p cid is not a client.
+ * Clients follow the replicas in the node list. */
+static int client_index(const tbft_replica_t *r, int cid)
+{
+    if (cid < r->node.num_replicas || cid >= r->node.num_principals) return -1;
+    int idx = cid - r->node.num_replicas;
+    return idx < TBFT_MAX_NUM_CLIENTS ? idx : -1;
+}
+
+static tbft_client_entry_t *client_entry(tbft_replica_t *r, int idx)
+{
+    return (tbft_client_entry_t *)r->sys_state + idx;
+}
+
+/* Mark the state blocks that hold client entry @p idx as modified. */
+static void client_entry_touch(tbft_replica_t *r, int idx)
+{
+    size_t off   = (size_t)idx * sizeof(tbft_client_entry_t);
+    int    first = r->state.app_blocks + (int)(off / TBFT_BLOCK_SIZE);
+    int    last  = r->state.app_blocks +
+                   (int)((off + sizeof(tbft_client_entry_t) - 1) / TBFT_BLOCK_SIZE);
+    for (int b = first; b <= last; b++) {
+        tbft_state_cow_single(&r->state, b);
+    }
+}
+
+/* Bring the per-client counters kept outside the replicated state in line
+ * with the client table (after a state fetch replaced it). */
+static void sync_executed_rids(tbft_replica_t *r)
+{
+    for (int cid = r->node.num_replicas; cid < r->node.num_principals; cid++) {
+        int idx = client_index(r, cid);
+        if (idx < 0) continue;
+        tbft_req_id_t rid = client_entry(r, idx)->last_rid;
+        if (rid > r->last_executed_rid[cid]) r->last_executed_rid[cid] = rid;
+        if (rid > r->last_assigned_rid[cid]) r->last_assigned_rid[cid] = rid;
+    }
+}
+
+static constexpr int64_t TBFT_REPLY_RESEND_MIN_US = 1'000'000;
+static constexpr int64_t TBFT_ASK_INTERVAL_US     = 1'000'000;
+
+/* Send client @p cid the reply recorded in its entry @p e.  The signed
+ * message is cached in the special region, so a retransmitted request is
+ * answered again without another RSA signature. */
+static void send_reply(tbft_replica_t *r, int cid, const tbft_client_entry_t *e, bool first)
+{
+    int idx = client_index(r, cid);
+    if (idx < 0 || e->reply_len < 0 || e->reply_len > TBFT_MAX_REPLY_SIZE) return;
+
+    int64_t now = esp_timer_get_time();
+    if (!first) {
+        /* Copies of the request that arrive right after it ran (forwarded
+         * by backups) are not retransmissions: the client has its reply. */
+        if (now - r->reply_sent_us[idx] < TBFT_REPLY_RESEND_MIN_US) return;
+        r->reply_sent_us[idx] = now;
+        int cached_len = 0;
+        const uint8_t *cached = tbft_sr_load_reply(&r->sr, idx, &cached_len);
+        if (cached && cached_len >= (int)sizeof(tbft_reply_rep_t) &&
+            ((const tbft_reply_rep_t *)cached)->rid == e->last_rid) {
+            ESP_LOGI(TAG, "re-sending reply: cid=%d rid=%llu", cid,
+                     (unsigned long long)e->last_rid);
+            tbft_node_send(&r->node, cached, (size_t)cached_len, cid);
+            return;
+        }
+    }
+
+    memset(r->out_buf, 0, sizeof(r->out_buf));
+    tbft_reply_rep_t *reply = (tbft_reply_rep_t *)r->out_buf;
+    reply->hdr.tag          = TBFT_MSG_REPLY;
+    reply->hdr.extra        = 0;
+    reply->hdr.timestamp_us = 0;
+    reply->view             = r->node.view;
+    reply->seqno            = e->seqno;
+    reply->cid              = cid;
+    reply->rid              = e->last_rid;
+    reply->reply_size       = e->reply_len;
+    memcpy(r->out_buf + sizeof(*reply), e->reply, (size_t)e->reply_len);
+    reply->hdr.size = tbft_msg_align((int32_t)(sizeof(*reply) + (size_t)e->reply_len));
+    if ((size_t)reply->hdr.size + sizeof(tbft_sig_t) > sizeof(r->out_buf)) return;
+
+    /* Sign the reply so the client can verify authenticity */
+    tbft_sig_t *sig = (tbft_sig_t *)(r->out_buf + reply->hdr.size);
+    if (tbft_node_gen_sig(&r->node, r->out_buf, (size_t)reply->hdr.size, sig) != 0) {
+        ESP_LOGE(TAG, "reply signing failed for cid=%d rid=%llu - dropping reply", cid,
+                 (unsigned long long)e->last_rid);
+        return;
+    }
+    int32_t total = reply->hdr.size + (int32_t)sizeof(tbft_sig_t);
+    r->reply_sent_us[idx] = now;
+    (void)tbft_sr_store_reply(&r->sr, idx, r->out_buf, total);
+    ESP_LOGI(TAG, "%s reply: cid=%d rid=%llu seqno=%lld size=%d",
+             first ? "sending" : "re-sending", cid, (unsigned long long)e->last_rid,
+             (long long)e->seqno, (int)total);
+    if (first && r->recv_reply_cb) {
+        r->recv_reply_cb(r->out_buf, total, cid);
+    }
+    tbft_node_send(&r->node, r->out_buf, (size_t)total, cid);
+}
+
+/* View-change timer period: the configured one, doubled for every view
+ * change in a row that brought no progress (capped). */
+static int64_t vtimer_period(const tbft_replica_t *r)
+{
+    int shift = r->vc_backoff_shift > 6 ? 6 : r->vc_backoff_shift;
+    int64_t period = r->vtimer_period_us << shift;
+    int64_t cap    = r->vtimer_period_us * TBFT_VC_BACKOFF_MAX_MULT;
+    return period < cap ? period : cap;
+}
+
+/* Run the view-change timer only while a request waits for execution
+ * (restarting it: called when a request has just executed). */
+static void update_vtimer(tbft_replica_t *r)
+{
+    if (tbft_replica_has_pending_requests(r)) {
+        tbft_itimer_start(&r->vtimer, vtimer_period(r));
+    } else {
+        tbft_itimer_stop(&r->vtimer);
+    }
+}
+
+/* Peers whose recent Status shows them working normally in our view or a
+ * later one. */
+static int peers_working(const tbft_replica_t *r)
+{
+    int64_t now = esp_timer_get_time();
+    int k = 0;
+    for (int i = 0; i < r->node.num_replicas; i++) {
+        if (i == r->node.node_id || r->peer_status_us[i] == 0) continue;
+        if (now - r->peer_status_us[i] > 3 * r->stimer_period_us) continue;
+        if (!r->peer_in_vc[i] && r->peer_view[i] >= r->node.view) k++;
+    }
+    return k;
+}
+
+/* Build our Prepare for (@p view, @p n, @p digest) in out_buf; returns its
+ * length. */
+static int32_t build_prepare(tbft_replica_t *r, tbft_view_t view, tbft_seqno_t n,
+                             const tbft_digest_t *digest)
+{
+    tbft_prepare_rep_t *prep = (tbft_prepare_rep_t *)r->out_buf;
+    prep->hdr.tag          = TBFT_MSG_PREPARE;
+    prep->hdr.extra        = 0;
+    prep->hdr.timestamp_us = esp_timer_get_time();
+    prep->view             = view;
+    prep->seqno            = n;
+    prep->digest           = *digest;
+    prep->id               = r->node.node_id;
+    prep->_pad             = 0;
+    tbft_auth_t *auth = (tbft_auth_t *)(r->out_buf + sizeof(*prep));
+    /* hdr.size is covered by the MAC: set it first */
+    prep->hdr.size = tbft_msg_align((int32_t)(sizeof(*prep) + sizeof(tbft_auth_t)));
+    tbft_node_gen_auth(&r->node, r->out_buf, sizeof(*prep), auth);
+    return prep->hdr.size;
+}
+
+/* Build our Commit for (@p view, @p n, @p digest) in out_buf; returns its
+ * length. */
+static int32_t build_commit(tbft_replica_t *r, tbft_view_t view, tbft_seqno_t n,
+                            const tbft_digest_t *digest)
+{
+    tbft_commit_rep_t *cm = (tbft_commit_rep_t *)r->out_buf;
+    cm->hdr.tag          = TBFT_MSG_COMMIT;
+    cm->hdr.extra        = 0;
+    cm->hdr.timestamp_us = esp_timer_get_time();
+    cm->view             = view;
+    cm->seqno            = n;
+    cm->digest           = *digest;   /* PBFT: commit must include the digest */
+    cm->id               = r->node.node_id;
+    cm->_pad             = 0;
+    tbft_auth_t *auth = (tbft_auth_t *)(r->out_buf + sizeof(*cm));
+    cm->hdr.size = tbft_msg_align((int32_t)(sizeof(*cm) + sizeof(tbft_auth_t)));
+    tbft_node_gen_auth(&r->node, r->out_buf, sizeof(*cm), auth);
+    return cm->hdr.size;
+}
+
+/* Broadcast our Prepare for @p n (once per view). */
+static void send_prepare(tbft_replica_t *r, tbft_seqno_t n)
+{
+    int pp_len = 0;
+    const uint8_t *pp_buf = tbft_ar_load_pp(&r->ar, n, &pp_len);
+    if (!pp_buf) return;
+    tbft_digest_t digest = ((const tbft_pre_prepare_rep_t *)pp_buf)->digest;
+
+    int32_t len = build_prepare(r, r->node.view, n, &digest);
+    if (!tbft_ar_add_my_prepare(&r->ar, n, r->out_buf, len, r->node.node_id)) return;
+    tbft_node_send(&r->node, r->out_buf, (size_t)len, TBFT_ALL_REPLICAS);
+    ESP_LOGI(TAG, "sent prepare seqno=%lld", (long long)n);
+}
+
+/* Broadcast our Commit for @p n (once per view). */
+static void send_commit(tbft_replica_t *r, tbft_seqno_t n)
+{
+    int pp_len = 0;
+    const uint8_t *pp_buf = tbft_ar_load_pp(&r->ar, n, &pp_len);
+    if (!pp_buf) return;
+    tbft_digest_t digest = ((const tbft_pre_prepare_rep_t *)pp_buf)->digest;
+
+    int32_t len = build_commit(r, r->node.view, n, &digest);
+    if (!tbft_ar_add_my_commit(&r->ar, n, r->out_buf, len, r->node.node_id)) return;
+    tbft_ar_slice(&r->ar, n)->commit_sent_us = esp_timer_get_time();
+    tbft_node_send(&r->node, r->out_buf, (size_t)len, TBFT_ALL_REPLICAS);
+    ESP_LOGI(TAG, "sent commit seqno=%lld", (long long)n);
+}
+
+/* Send our Checkpoint message for @p seqno (when we hold its digest). */
+static void send_checkpoint_to(tbft_replica_t *r, tbft_seqno_t seqno, int dest)
+{
+    tbft_digest_t digest;
+    if (seqno <= 0 || !tbft_state_get_checkpoint_digest(&r->state, seqno, &digest)) return;
+    tbft_checkpoint_rep_t *ckpt = (tbft_checkpoint_rep_t *)r->out_buf;
+    ckpt->hdr.tag          = TBFT_MSG_CHECKPOINT;
+    ckpt->hdr.extra        = 0;
+    ckpt->hdr.timestamp_us = esp_timer_get_time();
+    ckpt->seqno            = seqno;
+    ckpt->digest           = digest;
+    ckpt->id               = r->node.node_id;
+    ckpt->_pad             = 0;
+    /* hdr.size is covered by the MAC: set it first */
+    ckpt->hdr.size = tbft_msg_align((int32_t)(sizeof(*ckpt) + sizeof(tbft_auth_t)));
+    tbft_auth_t *auth = (tbft_auth_t *)(r->out_buf + sizeof(*ckpt));
+    tbft_node_gen_auth(&r->node, r->out_buf, sizeof(*ckpt), auth);
+    tbft_node_send(&r->node, r->out_buf, (size_t)ckpt->hdr.size, dest);
+}
+
+/* Broadcast our Status: view, what we executed, and whether we are in a
+ * view change.  Peers answer it with what we are missing. */
+static void send_status(tbft_replica_t *r, int16_t flags)
+{
+    tbft_status_rep_t *st = (tbft_status_rep_t *)r->out_buf;
+    st->hdr.tag          = TBFT_MSG_STATUS;
+    st->hdr.extra        = (int16_t)(flags | (r->vi.in_progress ? TBFT_STATUS_IN_VC : 0));
+    st->hdr.size         = tbft_msg_align((int32_t)sizeof(*st));
+    st->hdr.timestamp_us = esp_timer_get_time();
+    st->view             = r->node.view;
+    st->last_stable      = r->last_stable;
+    st->last_prepared    = r->last_prepared;
+    st->last_executed    = r->last_executed;
+    st->id               = r->node.node_id;
+    st->_pad             = 0;
+    tbft_node_send(&r->node, r->out_buf, (size_t)st->hdr.size, TBFT_ALL_REPLICAS);
+}
+
+/* Execution is stuck on a sequence number whose messages we lack: ask the
+ * others for them now rather than at the next periodic Status. */
+static void ask_for_missing(tbft_replica_t *r)
+{
+    int64_t now = esp_timer_get_time();
+    if (r->last_ask_us != 0 && now - r->last_ask_us < TBFT_ASK_INTERVAL_US) return;
+    r->last_ask_us = now;
+    ESP_LOGI(TAG, "asking for missing messages above seqno=%lld", (long long)r->last_executed);
+    send_status(r, TBFT_STATUS_WANT);
+}
+
+/* Give @p peer what we still hold for seqnos (from, to] of the current view
+ * (also below our window, until those slots are reused): our commit, the
+ * pre-prepare exactly as the primary sent it (its MAC still verifies), and
+ * our prepare. */
+static void retransmit_to(tbft_replica_t *r, int peer, tbft_seqno_t from, tbft_seqno_t to)
+{
+    for (tbft_seqno_t n = from + 1; n <= to; n++) {
+        const tbft_agreement_slice_t *sl = tbft_ar_peek(&r->ar, n);
+        if (!sl || sl->prepared_cert.pp_len <= 0) continue;
+        const tbft_pre_prepare_rep_t *pp =
+            (const tbft_pre_prepare_rep_t *)sl->prepared_cert.pp_buf;
+        if (pp->view != r->node.view) continue;
+        tbft_digest_t digest = pp->digest;
+        /* Commits first: once the peer holds 2f+1 of them it also accepts a
+         * pre-prepare whose MAC no longer verifies (relabelled by a New_view). */
+        if (tbft_bitmap_test(&sl->commit_cert.bmap, r->node.node_id)) {
+            int32_t len = build_commit(r, pp->view, n, &digest);
+            tbft_node_send(&r->node, r->out_buf, (size_t)len, peer);
+            r->stat_commit_resent++;
+        }
+        if (pp->rset_size > 0) {   /* null requests come with the New_view */
+            tbft_node_send(&r->node, sl->prepared_cert.pp_buf,
+                           (size_t)sl->prepared_cert.pp_len, peer);
+        }
+        if (tbft_bitmap_test(&sl->prepared_cert.pc.bmap, r->node.node_id)) {
+            int32_t len = build_prepare(r, pp->view, n, &digest);
+            tbft_node_send(&r->node, r->out_buf, (size_t)len, peer);
+        }
+    }
+}
+
+/* Highest checkpoint with 2f+1 matching Checkpoint messages, or 0. */
+static tbft_seqno_t newest_stable_ckpt(const tbft_replica_t *r)
+{
+    tbft_seqno_t best = 0;
+    for (int i = 0; i < TBFT_NUM_CKPT_SLOTS; i++) {
+        const tbft_ckpt_slot_t *s = &r->cr.slots[i];
+        if (s->seqno > best && s->match_count >= r->cr.threshold) best = s->seqno;
+    }
+    return best;
+}
+
+/* Checkpoint @p seqno is certified (2f+1 matching Checkpoint messages, or
+ * fixed by a New_view) and our state at it matches: move the window. */
+static void install_stable(tbft_replica_t *r, tbft_seqno_t seqno)
+{
+    if (seqno < r->last_stable) return;
+    bool advanced = seqno > r->last_stable;
+    tbft_state_mark_stable(&r->state, seqno);
+    r->last_stable = seqno;
+    r->stable_wait_seqno = 0;
+    if (r->last_prepared < seqno) r->last_prepared = seqno;
+    tbft_ar_truncate(&r->ar, seqno + 1);
+    tbft_cr_truncate(&r->cr, seqno);
+    update_vtimer(r);
+    if (advanced) ESP_LOGI(TAG, "marked stable seqno=%lld", (long long)seqno);
+}
+
+/* Fetch the state of checkpoint @p seqno, whose root digest is @p digest.
+ * Throttled; a fetch already aiming at this or a later checkpoint is kept.
+ * @return true if a fetch was started */
+static bool start_fetch(tbft_replica_t *r, tbft_seqno_t seqno, const tbft_digest_t *digest)
+{
+    if (tbft_state_in_fetch(&r->state) && r->state.fetch_seqno >= seqno) return false;
+    int64_t now = esp_timer_get_time();
+    if (r->last_fetch_throttle_us != 0 && now - r->last_fetch_throttle_us < 500000LL) {
+        return false;
+    }
+    r->last_fetch_throttle_us = now;
+    int replier = tbft_node_primary(&r->node, r->node.view);
+    if (replier == r->node.node_id) replier = (replier + 1) % r->node.num_replicas;
+    tbft_replica_start_fetch(r, seqno, replier, digest);
+    return true;
+}
+
+/* All blocks of the fetched checkpoint arrived: check and adopt them. */
+static void finish_fetch(tbft_replica_t *r, tbft_seqno_t seqno)
+{
+    tbft_digest_t want;
+    bool have_want = false;
+    if (r->state.fetch_has_digest) {
+        want = r->state.fetch_digest;
+        have_want = true;
+    } else {
+        const tbft_digest_t *w = tbft_cr_winning_digest(&r->cr, seqno);
+        if (w) {
+            want = *w;
+            have_want = true;
+        }
+    }
+    if (!have_want || !tbft_digest_equal(tbft_state_root_digest(&r->state), &want)) {
+        int replier = (r->state.fetch_replier + 1) % r->node.num_replicas;
+        if (replier == r->node.node_id) replier = (replier + 1) % r->node.num_replicas;
+        ESP_LOGW(TAG, "fetched state for seqno=%lld does not match its certified digest"
+                 " - fetching again from replica %d", (long long)seqno, replier);
+        tbft_replica_start_fetch(r, seqno, replier, have_want ? &want : nullptr);
+        return;
+    }
+    tbft_state_install_fetched(&r->state, seqno);
+    r->last_executed = seqno;   /* later seqnos execute again from the window */
+    if (r->last_prepared < seqno) r->last_prepared = seqno;
+    sync_executed_rids(r);
+    install_stable(r, seqno);
+    if (r->seqno <= seqno) r->seqno = seqno + 1;
+    ESP_LOGW(TAG, "state transfer complete at seqno=%lld", (long long)seqno);
+    tbft_replica_execute_committed(r);
+    tbft_seqno_t newest = newest_stable_ckpt(r);
+    if (newest > r->last_stable) tbft_replica_mark_stable(r, newest);
+    /* the window moved: propose what waits in the queue */
+    if (tbft_replica_is_primary(r)) tbft_replica_send_pre_prepare(r);
+}
+
+/* Validate the body of a pre-prepare: digest over the request set and the
+ * non-deterministic choices, and the embedded client request with its
+ * signature.  Null request sets only come from a New_view. */
+static bool pp_body_valid(tbft_replica_t *r, const tbft_pre_prepare_rep_t *pp,
+                          const uint8_t *msg)
+{
+    if (pp->rset_size <= 0) {
+        ESP_LOGW(TAG, "pp: empty request set rejected");
+        return false;
+    }
+    const uint8_t *req_set = msg + sizeof(*pp);
+    tbft_digest_t computed;
+    tbft_msg_digest(req_set, (size_t)pp->rset_size + (size_t)pp->non_det_size, &computed);
+    if (!tbft_digest_equal(&pp->digest, &computed)) {
+        ESP_LOGW(TAG, "pp: digest mismatch");
+        return false;
+    }
+    /* Re-verify the embedded client RSA signature: a Byzantine primary must
+     * not be able to inject requests the client never signed. */
+    if ((size_t)pp->rset_size < sizeof(tbft_request_rep_t) + sizeof(tbft_sig_t)) {
+        ESP_LOGW(TAG, "pp: embedded request too short (%d)", (int)pp->rset_size);
+        return false;
+    }
+    const tbft_request_rep_t *ereq = (const tbft_request_rep_t *)req_set;
+    if (ereq->hdr.tag != TBFT_MSG_REQUEST) {
+        ESP_LOGW(TAG, "pp: embedded message is not a Request (tag=%d)", (int)ereq->hdr.tag);
+        return false;
+    }
+    if (ereq->command_size < 0 ||
+        (size_t)ereq->command_size >
+            (size_t)pp->rset_size - sizeof(tbft_request_rep_t) - sizeof(tbft_sig_t)) {
+        ESP_LOGW(TAG, "pp: embedded command_size %d doesn't fit in rset_size %d",
+                 (int)ereq->command_size, (int)pp->rset_size);
+        return false;
+    }
+    if (client_index(r, ereq->cid) < 0) {
+        ESP_LOGW(TAG, "pp: embedded request from non-client id %d", (int)ereq->cid);
+        return false;
+    }
+    size_t sig_off = sizeof(tbft_request_rep_t) + (size_t)ereq->command_size;
+    /* hdr+rep+cmd+sig <= rset_size; up to 7 bytes of 8-byte alignment padding */
+    if (sig_off + sizeof(tbft_sig_t) > (size_t)pp->rset_size ||
+        (size_t)pp->rset_size - sig_off - sizeof(tbft_sig_t) > 7) {
+        ESP_LOGW(TAG, "pp: embedded request size mismatch (sig_off=%zu, rset=%d)",
+                 sig_off, (int)pp->rset_size);
+        return false;
+    }
+    const tbft_sig_t *ereq_sig = (const tbft_sig_t *)(req_set + sig_off);
+    if (!tbft_node_verify_sig(&r->node, (tbft_node_id_t)ereq->cid, ereq, sig_off, ereq_sig)) {
+        ESP_LOGW(TAG, "pp: embedded request signature invalid from cid=%d", (int)ereq->cid);
+        return false;
+    }
+    if (ereq->rid > r->last_received_rid[ereq->cid]) {
+        r->last_received_rid[ereq->cid] = ereq->rid;
+    }
+    return true;
+}
+
+/* After a pre-prepare, prepare or commit for @p n: record the request as
+ * prepared in this view, send our commit once prepared, execute once
+ * committed. */
+static void check_prepared_committed(tbft_replica_t *r, tbft_seqno_t n)
+{
+    if (!tbft_ar_in_range(&r->ar, n)) return;
+    tbft_agreement_slice_t *sl = tbft_ar_slice(&r->ar, n);
+    bool prepared  = tbft_ar_prepared(&r->ar, n);
+    bool committed = tbft_ar_committed(&r->ar, n);
+    if (prepared && n > r->last_prepared) r->last_prepared = n;
+
+    int pp_len = 0;
+    const uint8_t *pp_buf = tbft_ar_load_pp(&r->ar, n, &pp_len);
+    if (pp_buf) {
+        const tbft_pre_prepare_rep_t *pp = (const tbft_pre_prepare_rep_t *)pp_buf;
+        bool certified = prepared;
+        if (!certified && committed) {
+            const tbft_commit_rep_t *win =
+                (const tbft_commit_rep_t *)tbft_commit_cert_cvalue(&sl->commit_cert);
+            certified = win && tbft_digest_equal(&win->digest, &pp->digest);
+        }
+        if (certified && r->node.view >= sl->prep_view) {
+            sl->prep_view   = r->node.view;   /* reported in our View_change */
+            sl->prep_digest = pp->digest;
+        }
+    }
+
+    /* After sending a View_change a replica sends no prepare or commit until
+     * the next view starts: its View_change must stay a complete account of
+     * what it prepared.  It still executes what others commit. */
+    if (prepared && !r->vi.in_progress &&
+        !tbft_bitmap_test(&sl->commit_cert.bmap, r->node.node_id)) {
+        send_commit(r, n);
+        committed = tbft_ar_committed(&r->ar, n);
+    }
+    if (committed) {
+        tbft_replica_execute_committed(r);
+    }
+}
+
+/* Execute the request of @p pp at sequence number @p n; null requests are
+ * no-ops and a request its client already ran is not run again. */
+static void execute_one(tbft_replica_t *r, tbft_seqno_t n, const tbft_pre_prepare_rep_t *pp)
+{
+    int req_len = pp->rset_size;
+    if (req_len == 0) {
+        ESP_LOGI(TAG, "execute: seqno=%lld null request", (long long)n);
+        return;
+    }
+    const uint8_t *req_bytes = (const uint8_t *)pp + sizeof(*pp);
+    const uint8_t *ndet      = req_bytes + req_len;
+    const tbft_request_rep_t *req = (const tbft_request_rep_t *)req_bytes;
+    int idx = req_len >= (int)sizeof(*req) ? client_index(r, req->cid) : -1;
+    if (idx < 0) {
+        ESP_LOGW(TAG, "execute: seqno=%lld malformed request - no-op", (long long)n);
+        return;
+    }
+    tbft_client_entry_t *e = client_entry(r, idx);
+    if (req->rid <= e->last_rid) {
+        ESP_LOGI(TAG, "execute: seqno=%lld cid=%d rid=%llu ran already - no-op",
+                 (long long)n, req->cid, (unsigned long long)req->rid);
+        return;
+    }
+
+    ESP_LOGI(TAG, "execute: calling exec_cb for seqno=%lld req_len=%d",
+             (long long)n, req_len);
+    memset(r->out_buf, 0, sizeof(r->out_buf));
+    uint8_t *rep_payload = r->out_buf + sizeof(tbft_reply_rep_t);
+    int      rep_len     = 0;
+    bool     ro          = (req->hdr.extra & TBFT_REQUEST_RO_FLAG) != 0;
+    int rc = r->exec_cb
+        ? r->exec_cb(req_bytes, req_len, rep_payload, &rep_len,
+                     (void *)ndet, pp->non_det_size, req->cid, ro)
+        : -1;
+
+    /* Record the outcome in the replicated client table (identical on every
+     * correct replica), then answer the client from it. */
+    client_entry_touch(r, idx);
+    e->last_rid = req->rid;
+    e->seqno    = n;
+    if (rc != 0 || rep_len < 0 || rep_len > TBFT_MAX_REPLY_SIZE) {
+        if (rc == 0) {
+            ESP_LOGE(TAG, "execute: reply of %d bytes exceeds TBFT_MAX_REPLY_SIZE", rep_len);
+        } else {
+            ESP_LOGW(TAG, "exec_cb rejected seqno=%lld - no reply", (long long)n);
+        }
+        e->reply_len = -1;
+        memset(e->reply, 0, sizeof(e->reply));
+    } else {
+        e->reply_len = rep_len;
+        memcpy(e->reply, rep_payload, (size_t)rep_len);
+        memset(e->reply + rep_len, 0, sizeof(e->reply) - (size_t)rep_len);
+    }
+    if (req->rid > r->last_executed_rid[req->cid]) {
+        r->last_executed_rid[req->cid] = req->rid;
+    }
+    send_reply(r, req->cid, e, true);
+}
+
+/* Checkpoint at @p n: record the state digest and broadcast our Checkpoint. */
+static void take_checkpoint(tbft_replica_t *r, tbft_seqno_t n)
+{
+    tbft_state_checkpoint(&r->state, n);
+
+    tbft_checkpoint_rep_t *ckpt = (tbft_checkpoint_rep_t *)r->out_buf;
+    ckpt->hdr.tag          = TBFT_MSG_CHECKPOINT;
+    ckpt->hdr.extra        = 0;
+    ckpt->hdr.timestamp_us = esp_timer_get_time();
+    ckpt->seqno            = n;
+    ckpt->digest           = *tbft_state_root_digest(&r->state);
+    ckpt->id               = r->node.node_id;
+    ckpt->_pad             = 0;
+    tbft_auth_t *auth = (tbft_auth_t *)(r->out_buf + sizeof(*ckpt));
+    /* hdr.size is covered by the MAC: set it first */
+    ckpt->hdr.size = tbft_msg_align((int32_t)(sizeof(*ckpt) + sizeof(tbft_auth_t)));
+    tbft_node_gen_auth(&r->node, r->out_buf, sizeof(*ckpt), auth);
+
+    /* Store our own checkpoint before the broadcast (a spoofed message with
+     * our id must not bypass authentication in handle_checkpoint). */
+    bool self_stable = tbft_cr_store(&r->cr, n, r->node.node_id, r->out_buf, ckpt->hdr.size);
+    tbft_node_send(&r->node, r->out_buf, (size_t)ckpt->hdr.size, TBFT_ALL_REPLICAS);
+    ESP_LOGI(TAG, "broadcast checkpoint at seqno=%lld", (long long)n);
+    if (self_stable) {
+        tbft_replica_mark_stable(r, n);
+    }
+}
+
+/* View-change timer expired. */
+static void handle_vtimer(tbft_replica_t *r)
+{
+    int keys_ok = count_fresh_keys(r);
+    if (keys_ok < r->node.threshold - 1) {
+        /* Without the keys, prepares and commits cannot be verified, so a
+         * view change now would be spurious. */
+        ESP_LOGD(TAG, "view-change suppressed: keys=%d/%d", keys_ok, r->node.threshold - 1);
+        update_vtimer(r);
+        return;
+    }
+    if (r->vi.in_progress && peers_working(r) >= r->node.max_faulty + 1) {
+        /* f+1 others still work in the view we want to leave: wait until
+         * they time out too (they will ask for the same view) rather than
+         * moving further away.  Repeat our View_change in case it was lost. */
+        int vc_len = 0;
+        const uint8_t *vc = tbft_sr_load_vc(&r->sr, r->node.node_id, &vc_len);
+        if (vc) tbft_node_send(&r->node, vc, (size_t)vc_len, TBFT_ALL_REPLICAS);
+        tbft_itimer_start(&r->vtimer, vtimer_period(r));
+        ESP_LOGI(TAG, "view change to %lld waits: %d replicas still work in view %lld",
+                 (long long)r->vi.target_view, peers_working(r), (long long)r->node.view);
+        return;
+    }
+    ESP_LOGW(TAG, "view-change timeout in view %lld (keys=%d/%d)",
+             (long long)r->node.view, keys_ok, r->node.threshold - 1);
+    tbft_replica_send_view_change(r);
+}
+
+/* The current fetch got no answer in time: aim at the newest certified
+ * checkpoint, or ask another replica. */
+static void fetch_timeout(tbft_replica_t *r)
+{
+    tbft_seqno_t newest = newest_stable_ckpt(r);
+    if (newest > r->state.fetch_seqno) {
+        ESP_LOGW(TAG, "fetch of seqno=%lld timed out - fetching stable checkpoint %lld",
+                 (long long)r->state.fetch_seqno, (long long)newest);
+        tbft_digest_t target = *tbft_cr_winning_digest(&r->cr, newest);
+        r->last_fetch_throttle_us = 0;
+        (void)start_fetch(r, newest, &target);
+        return;
+    }
+    int replier = (r->state.fetch_replier + 1) % r->node.num_replicas;
+    if (replier == r->node.node_id) replier = (replier + 1) % r->node.num_replicas;
+    ESP_LOGW(TAG, "fetch timeout at seqno=%lld - asking replica %d",
+             (long long)r->state.fetch_seqno, replier);
+    tbft_digest_t target = r->state.fetch_digest;
+    bool has_target = r->state.fetch_has_digest;
+    tbft_replica_start_fetch(r, r->state.fetch_seqno, replier, has_target ? &target : nullptr);
 }
 
 void tbft_replica_print_stats(const tbft_replica_t *r)
@@ -313,19 +944,16 @@ void tbft_replica_run(tbft_replica_t *r)
     /* Time-bounded key barrier: wait up to 60s for at least 2*f remote keys.
      * To achieve a quorum of 2f+1 (including ourselves), we only need 2f remote
      * keys ready. Requiring all n-1 keys would completely break f-fault tolerance
-     * if even a single node is offline or fails to complete key exchange. */
+     * if even a single node is offline or fails to complete key exchange.
+     * Our New_key asks the others to answer with theirs, so a replica that
+     * boots into a running cluster gets its keys within seconds. */
     {
         const int needed = 2 * r->node.max_faulty;
         TickType_t key_deadline = xTaskGetTickCount() + pdMS_TO_TICKS(60000);
         TickType_t last_nk = xTaskGetTickCount();
         ESP_LOGI(TAG, "waiting for at least %d HMAC keys to start consensus (timeout=60s)", needed);
         while (xTaskGetTickCount() < key_deadline) {
-            int keys_ok = 0;
-            for (int i = 0; i < r->node.num_replicas; i++) {
-                if (i == r->node.node_id) continue;
-                if (r->node.principals[i] && r->node.principals[i]->keys_fresh)
-                    keys_ok++;
-            }
+            int keys_ok = count_fresh_keys(r);
             if (keys_ok >= needed) {
                 ESP_LOGI(TAG, "at least %d HMAC keys ready (%d total), breaking barrier early", needed, keys_ok);
                 break;
@@ -348,14 +976,8 @@ void tbft_replica_run(tbft_replica_t *r)
             }
             vTaskDelay(pdMS_TO_TICKS(10));
         }
-        int keys_ok = 0;
-        for (int i = 0; i < r->node.num_replicas; i++) {
-            if (i == r->node.node_id) continue;
-            if (r->node.principals[i] && r->node.principals[i]->keys_fresh)
-                keys_ok++;
-        }
         ESP_LOGI(TAG, "key barrier complete: %d/%d keys ready",
-                 keys_ok, r->node.num_replicas - 1);
+                 count_fresh_keys(r), r->node.num_replicas - 1);
     }
     /* Subscribe this task to the task watchdog so we can periodically feed it.
      * The default timeout is CONFIG_ESP_TASK_WDT_TIMEOUT_S (typically 5s). */
@@ -367,6 +989,7 @@ void tbft_replica_run(tbft_replica_t *r)
 #endif
 
     TickType_t last_nk_send = xTaskGetTickCount();
+    TickType_t nk_period    = pdMS_TO_TICKS(5000);
 #if CONFIG_TBFT_PRINT_STATS
     TickType_t last_stats = xTaskGetTickCount();
 #endif
@@ -395,22 +1018,28 @@ void tbft_replica_run(tbft_replica_t *r)
         }
 #endif
 
-        /* Periodically re-broadcast New_key to help late-joining nodes.
-         * Send every 2s if we're missing keys, every 10s once ready. */
+        /* Periodically re-broadcast New_key (it tells the others which keys
+         * we still lack, and they answer): every 5s below the 2f keys
+         * consensus needs; with those but not all, 5s doubling up to 60s (a
+         * lost New_key is recovered quickly, a replica that is down costs
+         * little); every 60s with all keys. */
         {
-            int keys_ok = 0;
-            for (int i = 0; i < r->node.num_replicas; i++) {
-                if (i == r->node.node_id) continue;
-                if (r->node.principals[i] && r->node.principals[i]->keys_fresh) {
-                    keys_ok++;
-                }
+            int keys_ok = count_fresh_keys(r);
+            TickType_t interval = pdMS_TO_TICKS(5000);
+            if (keys_ok >= r->node.num_replicas - 1) {
+                interval  = pdMS_TO_TICKS(60000);
+                nk_period = pdMS_TO_TICKS(5000);
+            } else if (keys_ok >= r->node.threshold - 1) {
+                interval = nk_period;
             }
-            TickType_t interval = (keys_ok >= r->node.threshold - 1)
-                ? pdMS_TO_TICKS(60000) : pdMS_TO_TICKS(5000);
             TickType_t now = xTaskGetTickCount();
             if (now - last_nk_send >= interval) {
                 tbft_replica_send_new_key(r);
                 last_nk_send = now;
+                if (keys_ok >= r->node.threshold - 1 && nk_period < pdMS_TO_TICKS(60000)) {
+                    nk_period *= 2;
+                    if (nk_period > pdMS_TO_TICKS(60000)) nk_period = pdMS_TO_TICKS(60000);
+                }
             }
         }
 
@@ -421,63 +1050,22 @@ void tbft_replica_run(tbft_replica_t *r)
                 pdTRUE,   /* clear on exit */
                 pdFALSE,  /* wait for any bit */
                 0);   /* poll only: blocking happens in tbft_node_wait() below */
-            /* Suppress view-change timeouts until we have enough HMAC keys.
-             * Without keys, Prepare/Commit messages fail verification, so
-             * view-changes would be triggered spuriously. */
-            {
-                int keys_ok = 0;
-                for (int i = 0; i < r->node.num_replicas; i++) {
-                    if (i == r->node.node_id) continue;
-                    if (r->node.principals[i] && r->node.principals[i]->keys_fresh) {
-                        keys_ok++;
-                    }
-                }
-                if (keys_ok >= r->node.threshold - 1 && (bits & TBFT_EVT_VTIMER)) {
-                    ESP_LOGW(TAG, "view-change timeout in view %lld (keys=%d/%d)",
-                             (long long)r->node.view, keys_ok, r->node.threshold - 1);
-                    tbft_replica_send_view_change(r);
-                } else if (bits & TBFT_EVT_VTIMER) {
-                    ESP_LOGD(TAG, "view-change suppressed: keys=%d/%d — re-arming",
-                             keys_ok, r->node.threshold - 1);
-                    /* Re-arm the one-shot timer if there are still pending requests. */
-                    if (tbft_replica_has_pending_requests(r)) {
-                        tbft_itimer_start(&r->vtimer, r->vtimer_period_us);
-                    } else {
-                        tbft_itimer_stop(&r->vtimer);
-                    }
-                }
+            if (bits & TBFT_EVT_VTIMER) {
+                handle_vtimer(r);
             }
             if (bits & TBFT_EVT_STIMER) {
-                /* Broadcast a Status message */
-                tbft_status_rep_t *st = (tbft_status_rep_t *)r->out_buf;
-                st->hdr.tag           = TBFT_MSG_STATUS;
-                st->hdr.extra         = 0;
-                st->hdr.size          = tbft_msg_align((int32_t)sizeof(*st));
-                st->view              = r->node.view;
-                st->last_stable       = r->last_stable;
-                st->last_prepared     = r->last_prepared;
-                st->last_executed     = r->last_executed;
-                st->id                = r->node.node_id;
-                st->_pad              = 0;
-                st->hdr.timestamp_us  = esp_timer_get_time();
-                tbft_node_send(&r->node, r->out_buf, (size_t)st->hdr.size,
-                               TBFT_ALL_REPLICAS);
-
-                /* Restart status timer */
+                send_status(r, 0);
                 tbft_itimer_start(&r->stimer, r->stimer_period_us);
+                /* requests that waited for room in the window */
+                if (tbft_replica_is_primary(r)) tbft_replica_send_pre_prepare(r);
+                /* a checkpoint the quorum certified ahead of us */
+                tbft_seqno_t newest = newest_stable_ckpt(r);
+                if (newest > r->last_stable) tbft_replica_mark_stable(r, newest);
             }
         }
 
-        /* Check for fetch timeout — retry with different replier */
         if (tbft_state_in_fetch(&r->state) && tbft_state_fetch_timedout(&r->state)) {
-            ESP_LOGW(TAG, "fetch timeout at seqno=%lld — restarting",
-                     (long long)r->state.fetch_seqno);
-            /* Pick a different replier */
-            int new_replier = (r->state.fetch_replier + 1) % r->node.num_replicas;
-            if (new_replier == r->node.node_id) {
-                new_replier = (new_replier + 1) % r->node.num_replicas;
-            }
-            tbft_replica_start_fetch(r, r->state.fetch_seqno, new_replier);
+            fetch_timeout(r);
         }
 
         tbft_node_id_t src_id = -1;
@@ -506,48 +1094,26 @@ void tbft_replica_run(tbft_replica_t *r)
             continue;
         }
 
-        /* Until we have the sender's HMAC session key, only process non-HMAC messages.
-         * View_change and New_view use RSA signatures, so they can be processed immediately.
-         * Pre_prepare, Prepare, Commit, and Checkpoint use HMAC authenticators, so we must
-         * have the sender's session key before we can verify and accept them. This prevents
-         * both silent verification failure drops and state corruption. */
-        if (hdr->tag == TBFT_MSG_PRE_PREPARE) {
-            const tbft_pre_prepare_rep_t *pp = (const tbft_pre_prepare_rep_t *)r->node.recv_buf;
-            int primary_id = tbft_node_primary(&r->node, pp->view);
-            if (primary_id != r->node.node_id) {
-                tbft_principal_t *p = r->node.principals[primary_id];
-                if (!p || !p->keys_fresh) {
-                    ESP_LOGD(TAG, "dropping PP from primary %d: key not fresh", primary_id);
-                    continue;
-                }
+        /* Until we have the sender's HMAC session key, Prepare, Commit and
+         * Checkpoint messages (HMAC-authenticated) cannot be verified: drop
+         * them here instead of failing verification later.  Pre-prepares go
+         * through: one re-sent by another replica may be accepted on the
+         * strength of a commit quorum (see handle_pre_prepare). */
+        if (hdr->tag == TBFT_MSG_PREPARE || hdr->tag == TBFT_MSG_COMMIT ||
+            hdr->tag == TBFT_MSG_CHECKPOINT) {
+            int sender_id = -1;
+            if (hdr->tag == TBFT_MSG_PREPARE && n >= (int)sizeof(tbft_prepare_rep_t)) {
+                sender_id = ((const tbft_prepare_rep_t *)r->node.recv_buf)->id;
+            } else if (hdr->tag == TBFT_MSG_COMMIT && n >= (int)sizeof(tbft_commit_rep_t)) {
+                sender_id = ((const tbft_commit_rep_t *)r->node.recv_buf)->id;
+            } else if (hdr->tag == TBFT_MSG_CHECKPOINT &&
+                       n >= (int)sizeof(tbft_checkpoint_rep_t)) {
+                sender_id = ((const tbft_checkpoint_rep_t *)r->node.recv_buf)->id;
             }
-        } else if (hdr->tag == TBFT_MSG_PREPARE) {
-            const tbft_prepare_rep_t *prep = (const tbft_prepare_rep_t *)r->node.recv_buf;
-            int sender_id = prep->id;
             if (sender_id >= 0 && sender_id < r->node.num_replicas) {
                 tbft_principal_t *p = r->node.principals[sender_id];
                 if (!p || !p->keys_fresh) {
-                    ESP_LOGD(TAG, "dropping PREP from %d: key not fresh", sender_id);
-                    continue;
-                }
-            }
-        } else if (hdr->tag == TBFT_MSG_COMMIT) {
-            const tbft_commit_rep_t *cm = (const tbft_commit_rep_t *)r->node.recv_buf;
-            int sender_id = cm->id;
-            if (sender_id >= 0 && sender_id < r->node.num_replicas) {
-                tbft_principal_t *p = r->node.principals[sender_id];
-                if (!p || !p->keys_fresh) {
-                    ESP_LOGD(TAG, "dropping COMMIT from %d: key not fresh", sender_id);
-                    continue;
-                }
-            }
-        } else if (hdr->tag == TBFT_MSG_CHECKPOINT) {
-            const tbft_checkpoint_rep_t *ckpt = (const tbft_checkpoint_rep_t *)r->node.recv_buf;
-            int sender_id = ckpt->id;
-            if (sender_id >= 0 && sender_id < r->node.num_replicas) {
-                tbft_principal_t *p = r->node.principals[sender_id];
-                if (!p || !p->keys_fresh) {
-                    ESP_LOGD(TAG, "dropping CKPT from %d: key not fresh", sender_id);
+                    ESP_LOGD(TAG, "dropping tag %d from %d: key not fresh", hdr->tag, sender_id);
                     continue;
                 }
             }
@@ -622,74 +1188,87 @@ void tbft_replica_handle_request(tbft_replica_t *r, const void *msg, int len)
         ESP_LOGW(TAG, "request: invalid command_size %d", req->command_size);
         return;
     }
-
-    if (req->cid < 0 || req->cid >= r->node.num_principals) {
-        ESP_LOGW(TAG, "request: invalid client id %d (num_principals=%d)",
-                 req->cid, r->node.num_principals);
+    int idx = client_index(r, req->cid);
+    if (idx < 0) {
+        ESP_LOGW(TAG, "request: id %d is not a client (num_replicas=%d, num_principals=%d)",
+                 req->cid, r->node.num_replicas, r->node.num_principals);
         return;
     }
 
+    /* Copies of a request we already know (the client broadcasts and
+     * retransmits, backups forward) are settled first, without the costly
+     * signature check.
+     *
+     * Executed already: never run it again; answer the latest one from the
+     * reply cache. */
+    const tbft_client_entry_t *e = client_entry(r, idx);
+    if (req->rid <= e->last_rid) {
+        if (req->rid == e->last_rid) {
+            send_reply(r, req->cid, e, false);
+        }
+        return;
+    }
+    if (!r->vi.in_progress) {
+        if (tbft_replica_is_primary(r)) {
+            /* It has a sequence number: in flight.  Replicas missing its
+             * pre-prepare get it through Status. */
+            if (req->rid <= r->last_assigned_rid[req->cid]) {
+                ESP_LOGD(TAG, "request in flight: cid=%d rid=%llu", req->cid,
+                         (unsigned long long)req->rid);
+                return;
+            }
+        } else if (req->rid <= r->last_forwarded_rid[req->cid]) {
+            return;   /* forwarded to the primary already; the timer runs */
+        }
+    }
+
     /* Verify request signature */
-    int sig_offset = (int)(sizeof(*req) + req->command_size);
+    int sig_offset = (int)(sizeof(*req) + (size_t)req->command_size);
     if (len < sig_offset + (int)sizeof(tbft_sig_t)) {
         ESP_LOGW(TAG, "request: missing signature");
         return;
     }
     const tbft_sig_t *sig = (const tbft_sig_t *)((const uint8_t *)msg + sig_offset);
     if (!tbft_node_verify_sig(&r->node, (tbft_node_id_t)req->cid,
-                              req, sig_offset, sig)) {
+                              req, (size_t)sig_offset, sig)) {
         ESP_LOGW(TAG, "request: signature verification failed from client %d",
                  req->cid);
         return;
     }
-
     if (req->rid > r->last_received_rid[req->cid]) {
         r->last_received_rid[req->cid] = req->rid;
     }
+    /* During a view change the request waits for the next primary, which
+     * gets it from the client's retransmission (the view-change timer runs). */
+    if (r->vi.in_progress) return;
 
-    /* If we are not the primary, forward to the primary only (unicast).
-     * The client already broadcasts to all replicas, so the primary likely
-     * received the request directly — this forward is a fallback in case
-     * the client's direct send to the primary failed.  Unicasting (not
-     * broadcasting) prevents the exponential forwarding storm that occurs
-     * when every replica re-broadcasts every forwarded request.
-     *
-     * IMPORTANT: Do NOT restart the view-change timer here.  Restarting
-     * on every forwarding creates a livelock: if the client sends faster
-     * than the timer period, the timer never expires and the cluster
-     * is stuck with a faulty primary forever.  The timer is restarted
-     * when actual progress is observed (pre-prepare, checkpoint, etc.). */
+    /* Backups forward each request to the primary once (the client
+     * broadcasts, so this is a fallback for a lost direct send) and start
+     * the view-change timer, which retransmissions do not restart: a client
+     * retransmitting faster than the timer must not keep a faulty primary
+     * in place. */
     if (!tbft_replica_is_primary(r)) {
         int primary = tbft_node_primary(&r->node, r->node.view);
         ESP_LOGD(TAG, "forwarding request to primary %d (view=%lld)",
                  primary, (long long)r->node.view);
         tbft_node_send(&r->node, msg, (size_t)len, primary);
-
-        if (req->rid > r->last_forwarded_rid[req->cid]) {
-            r->last_forwarded_rid[req->cid] = req->rid;
-        }
-
-        if (r->last_forwarded_rid[req->cid] > r->last_executed_rid[req->cid]) {
-            if (!tbft_itimer_is_running(&r->vtimer)) {
-                ESP_LOGI(TAG, "vtimer started on backup: pending request from cid=%d rid=%llu",
-                         req->cid, (unsigned long long)req->rid);
-                tbft_itimer_start(&r->vtimer, r->vtimer_period_us);
-            }
+        r->last_forwarded_rid[req->cid] = req->rid;
+        if (!tbft_itimer_is_running(&r->vtimer)) {
+            ESP_LOGI(TAG, "vtimer started on backup: pending request from cid=%d rid=%llu",
+                     req->cid, (unsigned long long)req->rid);
+            tbft_itimer_start(&r->vtimer, vtimer_period(r));
         }
         return;
     }
 
-    /* Primary: deduplicate by (cid, rid) before enqueuing.
-     * Multiple copies of the same request can arrive — once from the
-     * client's broadcast and again from each replica's forward. */
     bool ro = (req->hdr.extra & TBFT_REQUEST_RO_FLAG) != 0;
     tbft_rqueue_t *q = ro ? &r->ro_rqueue : &r->rqueue;
     for (int i = 0; i < q->count; i++) {
-        int idx = (q->head + i) % TBFT_RQUEUE_MAX;
-        const tbft_request_rep_t *existing =
-            (const tbft_request_rep_t *)q->entries[idx].buf;
+        int qi = (q->head + i) % TBFT_RQUEUE_MAX;
+        const tbft_request_rep_t *existing = (const tbft_request_rep_t *)q->entries[qi].buf;
         if (existing->cid == req->cid && existing->rid == req->rid) {
-            ESP_LOGD(TAG, "request dedup: cid=%d rid=%llu", req->cid, (unsigned long long)req->rid);
+            ESP_LOGD(TAG, "request dedup: cid=%d rid=%llu", req->cid,
+                     (unsigned long long)req->rid);
             return;
         }
     }
@@ -702,8 +1281,6 @@ void tbft_replica_handle_request(tbft_replica_t *r, const void *msg, int len)
 
     ESP_LOGI(TAG, "enqueued request: cid=%d rid=%llu (queue count=%d), trying pre-prepare",
              req->cid, (unsigned long long)req->rid, q->count);
-
-    /* Try to send a pre-prepare if window allows */
     tbft_replica_send_pre_prepare(r);
 }
 
@@ -719,36 +1296,22 @@ void tbft_replica_handle_pre_prepare(tbft_replica_t *r, const void *msg, int len
     }
     const tbft_pre_prepare_rep_t *pp = (const tbft_pre_prepare_rep_t *)msg;
 
-    /* Determine expected primary for this view BEFORE any state changes. */
-    int expected_primary = tbft_node_primary(&r->node, pp->view);
-
-    /* Reject if wrong view — but note if the pre-prepare is from a
-     * higher view (primary is ahead of this replica). */
+    /* Only the current view counts: a replica behind in view installs the
+     * newer view from its New_view (re-sent on Status), never from a
+     * pre-prepare. */
     if (pp->view != r->node.view) {
-        if (pp->view > r->node.view) {
-            ESP_LOGI(TAG, "pp: higher view %lld (current=%lld), will advance after auth check",
-                     (long long)pp->view, (long long)r->node.view);
-        } else {
-            ESP_LOGW(TAG, "pp: wrong view (got=%lld, expected=%lld)",
-                     (long long)pp->view, (long long)r->node.view);
-            return;
-        }
+        ESP_LOGD(TAG, "pp: view %lld, current %lld - ignored",
+                 (long long)pp->view, (long long)r->node.view);
+        return;
     }
-
-    /* Must come from current primary */
-    if (r->node.node_id == expected_primary) return; /* primary ignores own PP */
-
-    /* Check sequence number is in window */
-    if (!tbft_replica_in_window(r, pp->seqno)) {
-        ESP_LOGW(TAG, "pp seqno %lld out of window (last_stable=%lld)",
+    if (!tbft_replica_in_window(r, pp->seqno) || !tbft_ar_in_range(&r->ar, pp->seqno)) {
+        ESP_LOGD(TAG, "pp seqno %lld out of window (last_stable=%lld)",
                  (long long)pp->seqno, (long long)r->last_stable);
         return;
     }
+    if (pp->seqno <= r->last_executed) return;   /* executed already */
 
-    /* Validate embedded sizes to prevent integer overflow in auth_offset.
-     * rset_size and non_det_size must be non-negative and their sum must
-     * leave room for the struct header, authenticator, and fit within the
-     * received message length. */
+    /* rset_size and non_det_size must be non-negative and fit the message */
     if (pp->rset_size < 0 || pp->non_det_size < 0) {
         ESP_LOGW(TAG, "pp: negative embedded size rset=%d ndet=%d",
                  (int)pp->rset_size, (int)pp->non_det_size);
@@ -756,165 +1319,70 @@ void tbft_replica_handle_pre_prepare(tbft_replica_t *r, const void *msg, int len
     }
     if ((int64_t)sizeof(*pp) + pp->rset_size + pp->non_det_size +
         (int64_t)sizeof(tbft_auth_t) > len) {
-        ESP_LOGW(TAG, "pp: embedded sizes exceed message length (need=%lld, have=%d)",
-                 (long long)(sizeof(*pp) + pp->rset_size + pp->non_det_size + sizeof(tbft_auth_t)), len);
+        ESP_LOGW(TAG, "pp: embedded sizes exceed message length (have=%d)", len);
+        return;
+    }
+    int auth_offset = (int)(sizeof(*pp) + (size_t)pp->rset_size + (size_t)pp->non_det_size);
+
+    /* Authenticated by the primary's MAC.  A pre-prepare re-sent by another
+     * replica carries the primary's original authenticator, so it verifies
+     * the same way. */
+    int primary = tbft_node_primary(&r->node, pp->view);
+    bool mac_ok = false;
+    if (primary != r->node.node_id) {
+        const tbft_principal_t *pp_primary = r->node.principals[primary];
+        int slot = tbft_node_auth_slot_index(&r->node, primary);
+        if (pp_primary && pp_primary->keys_fresh && slot >= 0) {
+            const tbft_auth_t *auth = (const tbft_auth_t *)((const uint8_t *)msg + auth_offset);
+            mac_ok = tbft_node_verify_auth(&r->node, primary, msg, (size_t)auth_offset,
+                                           &auth->slots[slot], pp->hdr.timestamp_us);
+        }
+    }
+    /* Without it, accept only a request a quorum already fixed for this
+     * seqno: the New_view's choice, or the digest of 2f+1 commits. */
+    tbft_agreement_slice_t *sl = tbft_ar_slice(&r->ar, pp->seqno);
+    bool fixed = sl->nv_expect && tbft_digest_equal(&sl->nv_digest, &pp->digest);
+    if (!fixed && tbft_ar_committed(&r->ar, pp->seqno)) {
+        const tbft_commit_rep_t *win =
+            (const tbft_commit_rep_t *)tbft_commit_cert_cvalue(&sl->commit_cert);
+        fixed = win && tbft_digest_equal(&win->digest, &pp->digest);
+    }
+    if (!mac_ok && !fixed) {
+        ESP_LOGD(TAG, "pp: seqno=%lld neither authenticated by primary %d nor fixed"
+                 " by a quorum", (long long)pp->seqno, primary);
+        return;
+    }
+    if (sl->nv_expect && !tbft_digest_equal(&sl->nv_digest, &pp->digest)) {
+        ESP_LOGW(TAG, "pp: seqno=%lld conflicts with the New_view", (long long)pp->seqno);
         return;
     }
 
-    /* Verify authenticator from the primary */
-    int auth_offset = (int)(sizeof(*pp) + pp->rset_size + pp->non_det_size);
-    if (len < auth_offset + (int)sizeof(tbft_auth_t)) {
-        ESP_LOGW(TAG, "pp: missing authenticator");
-        return;
-    }
-    {
-        int slot = tbft_node_auth_slot_index(&r->node, expected_primary);
-        if (slot < 0) {
-            ESP_LOGW(TAG, "pp: invalid auth slot for primary %d", expected_primary);
+    int have_len = 0;
+    const tbft_pre_prepare_rep_t *have =
+        (const tbft_pre_prepare_rep_t *)tbft_ar_load_pp(&r->ar, pp->seqno, &have_len);
+    if (!have || !tbft_digest_equal(&have->digest, &pp->digest)) {
+        if (have && have->view == pp->view && !fixed) {
+            ESP_LOGW(TAG, "pp: conflicting pre-prepare for seqno=%lld", (long long)pp->seqno);
             return;
         }
-        const tbft_auth_t *auth =
-            (const tbft_auth_t *)((const uint8_t *)msg + auth_offset);
-        ESP_LOGD(TAG, "pp: verifying MAC from primary %d, slot=%d, ts=%lld, auth_offset=%d, msg_len=%d, rset=%d, ndet=%d, hdr[0..7]=%02x%02x%02x%02x%02x%02x%02x%02x",
-                 expected_primary, slot, (long long)pp->hdr.timestamp_us, auth_offset, len,
-                 (int)pp->rset_size, (int)pp->non_det_size,
-                 ((uint8_t*)msg)[0], ((uint8_t*)msg)[1], ((uint8_t*)msg)[2], ((uint8_t*)msg)[3],
-                 ((uint8_t*)msg)[4], ((uint8_t*)msg)[5], ((uint8_t*)msg)[6], ((uint8_t*)msg)[7]);
-        if (!tbft_node_verify_auth(&r->node, expected_primary, msg,
-                                   (size_t)auth_offset,
-                                   &auth->slots[slot],
-                                   pp->hdr.timestamp_us)) {
-            ESP_LOGW(TAG, "pp: MAC verification failed from primary %d",
-                     expected_primary);
+        if (!pp_body_valid(r, pp, (const uint8_t *)msg)) return;
+        if (!tbft_ar_replace_pp(&r->ar, pp->seqno, msg, len)) {
+            ESP_LOGW(TAG, "pp: failed to store seqno=%lld", (long long)pp->seqno);
             return;
         }
+        ESP_LOGI(TAG, "pp accepted: seqno=%lld view=%lld%s", (long long)pp->seqno,
+                 (long long)pp->view, mac_ok ? "" : " (fixed by a quorum)");
     }
 
-    /* Only advance view after successful sender and MAC verification */
-    if (pp->view > r->node.view) {
-        r->node.view = pp->view;
-        r->node.cur_primary = tbft_node_primary(&r->node, r->node.view);
-        tbft_replica_reset_forwarded_requests(r);
-        if (r->last_prepared < r->last_stable) {
-            r->last_prepared = r->last_stable;
-        }
-        if (r->last_executed < r->last_stable) {
-            r->last_executed = r->last_stable;
-        }
-        tbft_cr_truncate(&r->cr, r->last_stable);
-        tbft_ar_init(&r->ar, r->ar.prepare_threshold, r->ar.commit_threshold);
-        r->ar.head = r->last_stable + 1;
-        r->last_prepared = r->last_executed;
-        tbft_itimer_stop(&r->vtimer);
-        tbft_vi_reset(&r->vi, r->node.view + 1);
-        r->vi.in_progress = false;
-        if (tbft_replica_has_pending_requests(r)) {
-            tbft_itimer_start(&r->vtimer, r->vtimer_period_us);
-        } else {
-            tbft_itimer_stop(&r->vtimer);
-        }
+    /* The next seqno this replica would assign as primary stays above it */
+    if (r->seqno < pp->seqno + 1) r->seqno = pp->seqno + 1;
+
+    /* Backups prepare (the primary's pre-prepare stands for its own); not
+     * after sending a View_change. */
+    if (!r->vi.in_progress && !tbft_replica_is_primary(r)) {
+        send_prepare(r, pp->seqno);
     }
-
-    /* Reject empty request sets.  A zero rset_size would bypass the
-     * digest and client-signature re-verification below, allowing a
-     * Byzantine primary to inject a pre-prepare with no actual request. */
-    if (pp->rset_size == 0) {
-        ESP_LOGW(TAG, "pp: empty request set (rset_size=0) rejected");
-        return;
-    }
-
-    /* Verify request set digest */
-    if (pp->rset_size > 0) {
-        const uint8_t *req_set = (const uint8_t *)msg + sizeof(*pp);
-        tbft_digest_t computed;
-        tbft_msg_digest(req_set, (size_t)pp->rset_size, &computed);
-        if (!tbft_digest_equal(&pp->digest, &computed)) {
-            ESP_LOGW(TAG, "pp: request set digest mismatch");
-            return;
-        }
-
-        /* Re-verify the embedded client RSA signature.  Without this, a
-         * Byzantine primary could inject forged requests attributed to
-         * arbitrary clients — backups would accept the PP (digest matches,
-         * HMAC from primary is valid), prepare, commit, and execute an
-         * operation the client never signed.  PBFT safety assumes client
-         * authorisation is cryptographically tied to each request; do NOT
-         * trust the primary's claim that the embedded bytes are well-formed. */
-        if ((size_t)pp->rset_size < sizeof(tbft_request_rep_t) + sizeof(tbft_sig_t)) {
-            ESP_LOGW(TAG, "pp: embedded request too short (%d)",
-                     (int)pp->rset_size);
-            return;
-        }
-        const tbft_request_rep_t *ereq =
-            (const tbft_request_rep_t *)req_set;
-        if (ereq->hdr.tag != TBFT_MSG_REQUEST) {
-            ESP_LOGW(TAG, "pp: embedded message is not a Request (tag=%d)",
-                     (int)ereq->hdr.tag);
-            return;
-        }
-        if (ereq->command_size < 0 ||
-            (size_t)ereq->command_size >
-                (size_t)pp->rset_size - sizeof(tbft_request_rep_t) - sizeof(tbft_sig_t)) {
-            ESP_LOGW(TAG, "pp: embedded command_size %d doesn't fit in rset_size %d",
-                     (int)ereq->command_size, (int)pp->rset_size);
-            return;
-        }
-        if (ereq->cid < 0 || ereq->cid >= r->node.num_principals) {
-            ESP_LOGW(TAG, "pp: embedded invalid cid %d", (int)ereq->cid);
-            return;
-        }
-        size_t sig_off = sizeof(tbft_request_rep_t) + (size_t)ereq->command_size;
-        /* The embedded request must fit within rset_size: hdr+rep+cmd+sig
-         * ≤ rset_size.  The client aligns messages to 8 bytes with zero
-         * padding, so rset_size may be slightly larger than the exact
-         * data size.  Allow up to 7 bytes of alignment padding. */
-        if (sig_off + sizeof(tbft_sig_t) > (size_t)pp->rset_size ||
-            (size_t)pp->rset_size - sig_off - sizeof(tbft_sig_t) > 7) {
-            ESP_LOGW(TAG, "pp: embedded request size mismatch (sig_off=%zu, rset=%d)",
-                     sig_off, (int)pp->rset_size);
-            return;
-        }
-        const tbft_sig_t *ereq_sig =
-            (const tbft_sig_t *)(req_set + sig_off);
-        if (!tbft_node_verify_sig(&r->node, (tbft_node_id_t)ereq->cid,
-                                  ereq, sig_off, ereq_sig)) {
-            ESP_LOGW(TAG, "pp: embedded request signature invalid from cid=%d",
-                     (int)ereq->cid);
-            return;
-        }
-        if (ereq->rid > r->last_received_rid[ereq->cid]) {
-            r->last_received_rid[ereq->cid] = ereq->rid;
-        }
-    }
-
-    /* Store in agreement region */
-    if (!tbft_ar_store_pp(&r->ar, pp->seqno, msg, len)) {
-        ESP_LOGW(TAG, "pp: failed to store in agreement region seqno=%lld",
-                 (long long)pp->seqno);
-        return;
-    }
-
-    ESP_LOGI(TAG, "pp accepted: seqno=%lld view=%lld from primary %d",
-             (long long)pp->seqno, (long long)pp->view, expected_primary);
-
-    /* Do NOT restart the vtimer on every pre-prepare. The vtimer on backups
-     * should only run when the backup has actively forwarded a request to the
-     * primary (line 505).  Restarting it on every pre-prepare means a backup
-     * that receives a pre-prepare and then sees 5s of idle time will trigger
-     * a spurious view-change — even though the primary is working correctly. */
-
-    /* Do NOT update last_prepared here. Backups should only advance last_prepared
-     * when they verify a quorum of prepares (completing the Prepared Certificate). */
-
-    /* Keep sequence numbers monotonic with the accepted pre-prepare sequence number.
-     * Since the primary has proposed pp->seqno, the next sequence number to propose
-     * must be at least pp->seqno + 1. */
-    if (r->seqno < pp->seqno + 1) {
-        r->seqno = pp->seqno + 1;
-    }
-
-    /* Send prepare */
-    tbft_replica_send_prepare(r, pp->seqno);
+    check_prepared_committed(r, pp->seqno);
 }
 
 /* --------------------------------------------------------------------------
@@ -930,12 +1398,12 @@ void tbft_replica_handle_prepare(tbft_replica_t *r, const void *msg, int len)
     const tbft_prepare_rep_t *prep = (const tbft_prepare_rep_t *)msg;
 
     if (prep->view != r->node.view) {
-        ESP_LOGW(TAG, "prepare: wrong view (got=%lld, expected=%lld)",
+        ESP_LOGD(TAG, "prepare: view %lld, current %lld - ignored",
                  (long long)prep->view, (long long)r->node.view);
         return;
     }
-    if (!tbft_replica_in_window(r, prep->seqno)) {
-        ESP_LOGW(TAG, "prepare: seqno %lld out of window", (long long)prep->seqno);
+    if (!tbft_replica_in_window(r, prep->seqno) || !tbft_ar_in_range(&r->ar, prep->seqno)) {
+        ESP_LOGD(TAG, "prepare: seqno %lld out of window", (long long)prep->seqno);
         return;
     }
 
@@ -944,49 +1412,37 @@ void tbft_replica_handle_prepare(tbft_replica_t *r, const void *msg, int len)
         ESP_LOGW(TAG, "prepare: invalid sender id %d", sender);
         return;
     }
-    /* Accept prepares from all replicas including the primary.
-     * The primary broadcasts its prepare after sending pre-prepare,
-     * and backups need it to reach the f+1 prepare threshold. */
     if (sender == r->node.node_id) return;
+    /* PBFT: prepares come from backups; the primary's pre-prepare stands for
+     * its prepare.  Counting a prepare from the primary as well would let a
+     * faulty primary get two correct replicas prepared on different requests
+     * for one seqno. */
+    if (sender == tbft_node_primary(&r->node, prep->view)) return;
 
     int slot = tbft_node_auth_slot_index(&r->node, sender);
     if (slot < 0) {
         ESP_LOGW(TAG, "prepare: invalid auth slot for sender %d", sender);
         return;
     }
-
-    const tbft_msg_hdr_t *hdr = (const tbft_msg_hdr_t *)msg;
     const tbft_auth_t *auth = (const tbft_auth_t *)((const uint8_t *)msg + sizeof(*prep));
     if (!tbft_node_verify_auth(&r->node, sender, msg, sizeof(*prep),
-                               &auth->slots[slot], hdr->timestamp_us)) {
+                               &auth->slots[slot], prep->hdr.timestamp_us)) {
         ESP_LOGW(TAG, "prepare: MAC verification failed from %d", sender);
         return;
     }
 
-    /* If we already have the corresponding Pre_prepare, require the Prepare's
-     * digest to match it — otherwise this Prepare is either for a different
-     * request (Byzantine) or we are the one with a tampered PP.  Reject here
-     * before storing so the certificate's f+1 value slots are not poisoned
-     * with bogus digests. */
+    /* With the pre-prepare at hand, a prepare must carry its digest.  A
+     * prepare that arrives before the pre-prepare is kept (backups prepare
+     * as soon as they have the pre-prepare, so theirs often overtake ours):
+     * the certificate tracks up to f+1 values, so f faulty replicas cannot
+     * crowd out the correct one, and "prepared" needs the pre-prepare with
+     * the same digest. */
     int pp_len = 0;
     const uint8_t *pp_bytes = tbft_ar_load_pp(&r->ar, prep->seqno, &pp_len);
-    if (pp_bytes && pp_len >= (int)sizeof(tbft_pre_prepare_rep_t)) {
-        const tbft_pre_prepare_rep_t *pp =
-            (const tbft_pre_prepare_rep_t *)pp_bytes;
-        if (!tbft_digest_equal(&pp->digest, &prep->digest)) {
-            ESP_LOGW(TAG, "prepare: digest mismatch from %d seqno=%lld",
-                     sender, (long long)prep->seqno);
-            return;
-        }
-    }
-
-    /* HIGH FIX H2: Verify Pre_prepare exists BEFORE storing prepare in the
-     * agreement region.  If we stored first and then returned on missing PP,
-     * the prepare would remain in the AR, polluting certificate slots with
-     * junk for seqnos that have no pre-prepare. */
-    if (!pp_bytes) {
-        ESP_LOGW(TAG, "prepare: no pre-prepare for seqno=%lld",
-                 (long long)prep->seqno);
+    if (pp_bytes &&
+        !tbft_digest_equal(&((const tbft_pre_prepare_rep_t *)pp_bytes)->digest, &prep->digest)) {
+        ESP_LOGW(TAG, "prepare: digest mismatch from %d seqno=%lld",
+                 sender, (long long)prep->seqno);
         return;
     }
 
@@ -996,40 +1452,14 @@ void tbft_replica_handle_prepare(tbft_replica_t *r, const void *msg, int len)
                  sender, (long long)prep->seqno);
         return;
     }
-
-    bool accepted = tbft_ar_add_prepare(&r->ar, prep->seqno, msg, len, sender);
-    if (!accepted) {
+    if (!tbft_ar_add_prepare(&r->ar, prep->seqno, msg, len, sender)) {
         ESP_LOGW(TAG, "prepare: rejected by agreement region seqno=%lld",
                  (long long)prep->seqno);
         return;
     }
-
     ESP_LOGI(TAG, "prepare accepted: seqno=%lld from replica %d",
              (long long)prep->seqno, sender);
-
-    /* Debug: check prepared state */
-    int pp_len2 = 0;
-    const uint8_t *pp2 = tbft_ar_load_pp(&r->ar, prep->seqno, &pp_len2);
-    bool is_prep = tbft_ar_prepared(&r->ar, prep->seqno);
-    ESP_LOGD(TAG, "prepare debug: seqno=%lld has_pp=%d prepared=%d",
-             (long long)prep->seqno, pp2 ? 1 : 0, is_prep ? 1 : 0);
-
-    /* Check if prepared — if so, update last_prepared, send commit and check for execution */
-    if (is_prep) {
-        if (prep->seqno > r->last_prepared) {
-            r->last_prepared = prep->seqno;
-        }
-        if (!tbft_bitmap_test(&sl->commit_cert.bmap, r->node.node_id)) {
-            ESP_LOGI(TAG, "prepared seqno=%lld, sending commit",
-                     (long long)prep->seqno);
-            tbft_replica_send_commit(r, prep->seqno);
-        }
-        if (tbft_ar_committed(&r->ar, prep->seqno)) {
-            ESP_LOGI(TAG, "prepared and committed seqno=%lld, executing",
-                     (long long)prep->seqno);
-            tbft_replica_execute_committed(r);
-        }
-    }
+    check_prepared_committed(r, prep->seqno);
 }
 
 /* --------------------------------------------------------------------------
@@ -1045,12 +1475,12 @@ void tbft_replica_handle_commit(tbft_replica_t *r, const void *msg, int len)
     const tbft_commit_rep_t *cm = (const tbft_commit_rep_t *)msg;
 
     if (cm->view != r->node.view) {
-        ESP_LOGW(TAG, "commit: wrong view (got=%lld, expected=%lld)",
+        ESP_LOGD(TAG, "commit: view %lld, current %lld - ignored",
                  (long long)cm->view, (long long)r->node.view);
         return;
     }
-    if (!tbft_replica_in_window(r, cm->seqno)) {
-        ESP_LOGW(TAG, "commit: seqno %lld out of window", (long long)cm->seqno);
+    if (!tbft_replica_in_window(r, cm->seqno) || !tbft_ar_in_range(&r->ar, cm->seqno)) {
+        ESP_LOGD(TAG, "commit: seqno %lld out of window", (long long)cm->seqno);
         return;
     }
 
@@ -1066,36 +1496,24 @@ void tbft_replica_handle_commit(tbft_replica_t *r, const void *msg, int len)
         ESP_LOGW(TAG, "commit: invalid auth slot for sender %d", sender);
         return;
     }
-
-    const tbft_msg_hdr_t *hdr = (const tbft_msg_hdr_t *)msg;
     const tbft_auth_t *auth = (const tbft_auth_t *)((const uint8_t *)msg + sizeof(*cm));
     if (!tbft_node_verify_auth(&r->node, sender, msg, sizeof(*cm),
-                               &auth->slots[slot], hdr->timestamp_us)) {
+                               &auth->slots[slot], cm->hdr.timestamp_us)) {
         ESP_LOGW(TAG, "commit: MAC verification failed from %d", sender);
         return;
     }
 
-    /* If we have the PP, require cm->digest == pp->digest.  PBFT commits must
-     * be for the same value as the pre-prepare they follow.
-     *
-     * If the PP has not arrived yet (network reordering or loss), store the
-     * commit now — the certificate's multi-value tracking (f+1 slots for f
-     * faulty replicas) ensures Byzantine commits with wrong digests cannot
-     * prevent the correct digest from reaching the 2f+1 quorum (pigeonhole
-     * principle).  Digest verification is repeated at execution time when
-     * the PP is guaranteed to be available. */
-    {
-        int pp_len = 0;
-        const uint8_t *pp_bytes = tbft_ar_load_pp(&r->ar, cm->seqno, &pp_len);
-        if (pp_bytes && pp_len >= (int)sizeof(tbft_pre_prepare_rep_t)) {
-            const tbft_pre_prepare_rep_t *pp =
-                (const tbft_pre_prepare_rep_t *)pp_bytes;
-            if (!tbft_digest_equal(&pp->digest, &cm->digest)) {
-                ESP_LOGW(TAG, "commit: digest mismatch from %d seqno=%lld",
-                         sender, (long long)cm->seqno);
-                return;
-            }
-        }
+    /* With the pre-prepare at hand, a commit must carry its digest.  Without
+     * it the commit is kept: the certificate tracks up to f+1 values, so f
+     * faulty replicas cannot keep the correct digest from its 2f+1 quorum,
+     * and execution checks the pre-prepare against the quorum's digest. */
+    int pp_len = 0;
+    const uint8_t *pp_bytes = tbft_ar_load_pp(&r->ar, cm->seqno, &pp_len);
+    if (pp_bytes &&
+        !tbft_digest_equal(&((const tbft_pre_prepare_rep_t *)pp_bytes)->digest, &cm->digest)) {
+        ESP_LOGW(TAG, "commit: digest mismatch from %d seqno=%lld",
+                 sender, (long long)cm->seqno);
+        return;
     }
 
     tbft_agreement_slice_t *sl = tbft_ar_slice(&r->ar, cm->seqno);
@@ -1104,40 +1522,14 @@ void tbft_replica_handle_commit(tbft_replica_t *r, const void *msg, int len)
                  sender, (long long)cm->seqno);
         return;
     }
-
-    bool accepted = tbft_ar_add_commit(&r->ar, cm->seqno, msg, len, sender);
-    if (!accepted) {
+    if (!tbft_ar_add_commit(&r->ar, cm->seqno, msg, len, sender)) {
         ESP_LOGW(TAG, "commit: rejected by agreement region seqno=%lld",
                  (long long)cm->seqno);
         return;
     }
-
     ESP_LOGI(TAG, "commit accepted: seqno=%lld from replica %d",
              (long long)cm->seqno, sender);
-
-    /* If we are prepared for this seqno, re-broadcast our own commit.
-     * Our commit may have been lost (UDP/ESP-NOW are unreliable), and
-     * receiving another replica's commit signals the cluster is
-     * approaching the committed state — re-sending ours helps close
-     * the gap and avoid a view-change timeout.
-     *
-     * To prevent a massive broadcast storm / infinite loop, we only re-send if:
-     * 1. We are prepared, but NOT yet committed-local. (Once committed-local, we do not need to re-send).
-     * 2. At least 500ms has elapsed since the last time we sent/re-sent our commit for this seqno.
-     */
-    if (tbft_ar_prepared(&r->ar, cm->seqno) && !tbft_ar_committed(&r->ar, cm->seqno)) {
-        int64_t now = esp_timer_get_time();
-        if (now - sl->commit_sent_us >= 500000) { /* 500ms cooldown rate limit */
-            tbft_replica_send_commit(r, cm->seqno);
-        }
-    }
-
-    /* Check if committed-local */
-    if (tbft_ar_committed(&r->ar, cm->seqno)) {
-        ESP_LOGI(TAG, "committed seqno=%lld, executing",
-                 (long long)cm->seqno);
-        tbft_replica_execute_committed(r);
-    }
+    check_prepared_committed(r, cm->seqno);
 }
 
 /* --------------------------------------------------------------------------
@@ -1159,32 +1551,32 @@ void tbft_replica_handle_checkpoint(tbft_replica_t *r, const void *msg, int len)
                  (long long)ckpt->seqno, (int)TBFT_CHECKPOINT_INTERVAL);
         return;
     }
+    if (ckpt->seqno <= r->last_stable) return;   /* stable already */
 
     /* Never trust ckpt->id from the wire as proof of identity.
-     * Our own checkpoint is stored directly in execute_committed at send time,
-     * so any network message claiming to be from us is ignored here. */
+     * Our own checkpoint is stored when we take it, so any network message
+     * claiming to be from us is ignored here. */
     tbft_node_id_t sender = ckpt->id;
     if (sender < 0 || sender >= r->node.num_replicas) return;
-    if (sender == r->node.node_id) return; /* already stored at send time */
+    if (sender == r->node.node_id) return;
 
     int slot = tbft_node_auth_slot_index(&r->node, sender);
     if (slot < 0) return;
 
-    const tbft_msg_hdr_t *hdr = (const tbft_msg_hdr_t *)msg;
     const tbft_auth_t *auth = (const tbft_auth_t *)((const uint8_t *)msg + sizeof(*ckpt));
     /* The MAC was computed over the checkpoint body only (not the auth),
      * so verify over sizeof(*ckpt), not hdr->size which includes auth. */
     if (!tbft_node_verify_auth(&r->node, sender, msg, sizeof(*ckpt),
-                               &auth->slots[slot], hdr->timestamp_us)) {
+                               &auth->slots[slot], ckpt->hdr.timestamp_us)) {
         ESP_LOGW(TAG, "checkpoint: MAC verification failed from %d", sender);
         return;
     }
 
-    bool stable = tbft_cr_store(&r->cr, ckpt->seqno, sender, msg, len);
-
-    if (stable) {
-        ESP_LOGI(TAG, "stable checkpoint at seqno=%lld",
-                 (long long)ckpt->seqno);
+    (void)tbft_cr_store(&r->cr, ckpt->seqno, sender, msg, len);
+    /* Also when the message repeats one we hold (re-sent through Status): a
+     * replica that is behind tries again to reach the certified state. */
+    if (tbft_cr_winning_digest(&r->cr, ckpt->seqno)) {
+        ESP_LOGI(TAG, "stable checkpoint at seqno=%lld", (long long)ckpt->seqno);
         tbft_replica_mark_stable(r, ckpt->seqno);
     }
 }
@@ -1193,18 +1585,46 @@ void tbft_replica_handle_checkpoint(tbft_replica_t *r, const void *msg, int len)
  * View-change handler
  * -------------------------------------------------------------------------- */
 
+/* PBFT: join a view change once f+1 other replicas ask for a view above
+ * ours, aiming at the lowest of the views those f+1 ask for.  A single
+ * faulty or confused replica therefore moves nobody. */
+static void maybe_join_view_change(tbft_replica_t *r)
+{
+    tbft_view_t floor = r->vi.in_progress ? r->vi.target_view : r->node.view;
+    tbft_view_t views[TBFT_MAX_NUM_REPLICAS];
+    int k = 0;
+    for (int i = 0; i < r->node.num_replicas; i++) {
+        if (i == r->node.node_id) continue;
+        if (r->vc_view_seen[i] > floor) views[k++] = r->vc_view_seen[i];
+    }
+    int need = r->node.max_faulty + 1;
+    if (k < need) return;
+    /* the need-th largest requested view */
+    for (int i = 0; i < need; i++) {
+        for (int j = i + 1; j < k; j++) {
+            if (views[j] > views[i]) {
+                tbft_view_t t = views[i];
+                views[i] = views[j];
+                views[j] = t;
+            }
+        }
+    }
+    ESP_LOGW(TAG, "%d replicas ask for a view change: joining view %lld",
+             k, (long long)views[need - 1]);
+    send_view_change_to(r, views[need - 1]);
+}
+
 void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len)
 {
     if (len < (int)sizeof(tbft_view_change_rep_t)) return;
     const tbft_view_change_rep_t *vc = (const tbft_view_change_rep_t *)msg;
 
-    /* Validate sender id before using it */
     tbft_node_id_t sender_id = (tbft_node_id_t)vc->id;
     if (sender_id < 0 || sender_id >= r->node.num_replicas) return;
+    if (sender_id == r->node.node_id) return;
+    if (vc->v <= r->node.view) return;   /* stale */
 
-    /* Verify RSA signature.  hdr.size is the body length (without the sig).
-     * The sender appends the sig after the body but does not include it in
-     * hdr.size, so the total wire size is hdr.size + TBFT_SIG_SIZE. */
+    /* hdr.size is the body length; the RSA signature follows it. */
     int32_t body_size = vc->hdr.size;
     if (body_size < (int32_t)sizeof(tbft_view_change_rep_t) || body_size > len) {
         ESP_LOGW(TAG, "view-change: invalid body_size %d", (int)body_size);
@@ -1214,575 +1634,361 @@ void tbft_replica_handle_view_change(tbft_replica_t *r, const void *msg, int len
         ESP_LOGW(TAG, "view-change: missing RSA signature from %d", sender_id);
         return;
     }
+    int32_t total = body_size + (int32_t)sizeof(tbft_sig_t);
+    if (total > TBFT_VC_MSG_MAX_SIZE ||
+        vc->n_ckpts < 0 || vc->n_ckpts > 1 || vc->n_reqs < 0 || vc->n_reqs > TBFT_WINDOW_SIZE ||
+        (int64_t)sizeof(*vc) + (int64_t)vc->n_ckpts * (int64_t)sizeof(tbft_vc_ckpt_t) +
+            (int64_t)vc->n_reqs * (int64_t)sizeof(tbft_vc_req_info_t) > body_size) {
+        ESP_LOGW(TAG, "view-change: malformed entry counts from %d", sender_id);
+        return;
+    }
     const tbft_sig_t *sig = (const tbft_sig_t *)((const uint8_t *)msg + body_size);
     if (!tbft_node_verify_sig(&r->node, sender_id, msg, (size_t)body_size, sig)) {
-        ESP_LOGW(TAG, "view-change: RSA signature verification failed from %d",
-                 sender_id);
+        ESP_LOGW(TAG, "view-change: RSA signature verification failed from %d", sender_id);
         return;
     }
 
-    bool collected = tbft_vi_collect_vc(&r->vi, sender_id, msg, len);
-    if (!collected) {
-        if (vc->v > r->node.view) {
-            /* Advance view when receiving a view-change for a higher view.
-             * Do NOT send a catch-up view-change here — that creates a cascade
-             * where each node overshoots to V+1, causing others to jump to V+2,
-             * etc. Just update our view and let the new primary (if we have
-             * enough VCs) send the New_view message. */
-            r->node.view = vc->v;
-            r->node.cur_primary = tbft_node_primary(&r->node, vc->v);
-            tbft_replica_reset_forwarded_requests(r);
-            /* Keep sequence numbers contiguous and preserve executed/prepared progress */
-            tbft_seqno_t start_seq = r->last_stable;
-            if (r->last_prepared > start_seq) start_seq = r->last_prepared;
-            if (r->last_executed > start_seq) start_seq = r->last_executed;
-            if (r->seqno < start_seq + 1) {
-                r->seqno = start_seq + 1;
-            }
-            if (r->last_prepared < r->last_stable) {
-                r->last_prepared = r->last_stable;
-            }
-            if (r->last_executed < r->last_stable) {
-                r->last_executed = r->last_stable;
-            }
-            tbft_cr_truncate(&r->cr, r->last_stable);
-            tbft_ar_init(&r->ar, r->ar.prepare_threshold, r->ar.commit_threshold);
-            r->ar.head = r->last_stable + 1;
-            r->last_prepared = r->last_executed;
-            ESP_LOGI(TAG, "sync view to %lld (from vc of %d), seqno reset to %lld",
-                     (long long)vc->v, sender_id, (long long)r->seqno);
-            /* REMOVED: catch-up view-change cascade accelerator.
-             * The old code here called tbft_replica_send_view_change(r) which
-             * computed target = r->node.view + 1 = V + 1, overshooting the
-             * received view and triggering a cascade to ever-higher views. */
-            /* Restart the vtimer with backoff to give the new primary
-             * for this view a fair chance without resetting to 1×. */
-            tbft_itimer_stop(&r->vtimer);
-            if (tbft_replica_has_pending_requests(r)) {
-                int shift = (int)(vc->v - r->node.view);
-                if (shift < 1) shift = 1;
-                if (shift > 6) shift = 6;
-                int64_t period = r->vtimer_period_us * (1LL << shift);
-                if (period > r->vtimer_period_us * TBFT_VC_BACKOFF_MAX_MULT) {
-                    period = r->vtimer_period_us * TBFT_VC_BACKOFF_MAX_MULT;
-                }
-                tbft_itimer_start(&r->vtimer, period);
-            }
-        }
-        return;
+    if (vc->v > r->vc_view_seen[sender_id]) {
+        r->vc_view_seen[sender_id] = vc->v;
     }
+    (void)tbft_vi_collect_vc(&r->vi, sender_id, msg, total);
+    ESP_LOGI(TAG, "view-change from %d for view %lld (target %lld: %d/%d)",
+             sender_id, (long long)vc->v, (long long)r->vi.target_view,
+             r->vi.n_received, r->vi.threshold);
 
-    if (vc->v > r->vi.target_view) {
-        tbft_vi_reset(&r->vi, vc->v);
-        tbft_vi_collect_vc(&r->vi, vc->id, msg, len);
-        if (vc->v == r->vi.target_view && tbft_vi_has_quorum(&r->vi)) {
-            /* Sync vi state so subsequent New_view for this view validates */
-            r->vi.target_view = vc->v;
-            r->vi.in_progress = false;
-            /* Restart the vtimer with backoff to give the new primary
-             * for this view a fair chance without resetting to 1×. */
-            tbft_itimer_stop(&r->vtimer);
-            if (tbft_replica_has_pending_requests(r)) {
-                int shift = (int)(vc->v - r->node.view);
-                if (shift < 1) shift = 1;
-                if (shift > 6) shift = 6;
-                int64_t period = r->vtimer_period_us * (1LL << shift);
-                if (period > r->vtimer_period_us * TBFT_VC_BACKOFF_MAX_MULT) {
-                    period = r->vtimer_period_us * TBFT_VC_BACKOFF_MAX_MULT;
-                }
-                tbft_itimer_start(&r->vtimer, period);
-            }
-        }
-        return;
-    }
-
-    /* C1 FIX: Check quorum after EVERY successful VC collection, including
-     * when tbft_vi_collect_vc advanced target_view to a higher value.
-     * Previously this was inside an `if (!collect_vc)` block, so if a VC
-     * for a higher view caused target_view to reset+advance, the quorum
-     * check was skipped and the new primary would never send New_view. */
-    int new_primary = tbft_node_primary(&r->node, r->vi.target_view);
-    if (new_primary == r->node.node_id && tbft_vi_has_quorum(&r->vi)) {
-        /* Build and send New_view */
-        tbft_seqno_t min_s, max_s;
-        tbft_vi_compute_min_max(&r->vi, &min_s, &max_s);
-
-        /* CRITICAL FIX: Include prepared certificate proofs in New_view.
-         * PBFT requires the new primary to prove which requests were prepared
-         * in the previous view. We collect prepared request info from all
-         * 2f+1 view-changes and find seqnos with 2f+1 matching digests. */
-        typedef struct {
-            tbft_seqno_t seqno;
-            tbft_digest_t digest;
-            int count;
-        } prep_count_t;
-
-        /* Static to avoid stack overflow with large TBFT_WINDOW_SIZE.
-         * Safe: handle_view_change only runs in the single replica event loop task. */
-        static prep_count_t counts[TBFT_WINDOW_SIZE];
-        int n_counts = 0;
-        memset(counts, 0, sizeof(counts));
-
-        for (int i = 0; i < r->node.num_replicas; i++) {
-            if (!r->vi.received[i]) continue;
-            int vc_len = 0;
-            const uint8_t *vc_msg = tbft_sr_load_vc(&r->sr, i, &vc_len);
-            if (!vc_msg) continue;
-            const tbft_view_change_rep_t *vc_rep =
-                (const tbft_view_change_rep_t *)vc_msg;
-
-            /* Validate that the claimed arrays fit within the actual message
-             * length.  A Byzantine replica can inflate n_ckpts/n_reqs beyond
-             * the stored message size, causing ptr to advance past valid data
-             * and read garbage (or OOB) as req_info entries.
-             * Use int64_t for the multiplications to prevent signed overflow
-             * before the bounds check (signed overflow with plain int could
-             * wrap to a small positive, bypassing the < 0 guard). */
-            if (vc_rep->n_ckpts < 0 || vc_rep->n_reqs < 0) continue;
-            if (vc_rep->n_ckpts > TBFT_WINDOW_SIZE || vc_rep->n_reqs > TBFT_WINDOW_SIZE) continue;
-            int64_t ckpts_bytes = (int64_t)vc_rep->n_ckpts * (int64_t)sizeof(tbft_vc_ckpt_t);
-            int64_t reqs_bytes  = (int64_t)vc_rep->n_reqs  * (int64_t)sizeof(tbft_vc_req_info_t);
-            int64_t header_sz   = (int64_t)sizeof(tbft_view_change_rep_t);
-            if (vc_len < (int)(header_sz + ckpts_bytes + reqs_bytes)) continue;
-
-            /* Parse embedded req_info array */
-            const uint8_t *ptr = vc_msg + (ptrdiff_t)header_sz;
-            if (vc_rep->n_ckpts > 0) {
-                ptr += (ptrdiff_t)ckpts_bytes;
-            }
-            const tbft_vc_req_info_t *reqs =
-                (const tbft_vc_req_info_t *)ptr;
-
-            for (int j = 0; j < vc_rep->n_reqs; j++) {
-                if (reqs[j].seqno < min_s || reqs[j].seqno > max_s) continue;
-
-                int k;
-                for (k = 0; k < n_counts; k++) {
-                    if (counts[k].seqno == reqs[j].seqno &&
-                        tbft_digest_equal(&counts[k].digest, &reqs[j].digest)) {
-                        counts[k].count++;
-                        break;
-                    }
-                }
-                if (k == n_counts && n_counts < TBFT_WINDOW_SIZE) {
-                    counts[n_counts].seqno = reqs[j].seqno;
-                    counts[n_counts].digest = reqs[j].digest;
-                    counts[n_counts].count = 1;
-                    n_counts++;
-                }
-            }
-        }
-
-        /* Build New_view message */
-        tbft_new_view_rep_t *nv = (tbft_new_view_rep_t *)r->out_buf;
-        nv->hdr.tag          = TBFT_MSG_NEW_VIEW;
-        nv->hdr.extra        = 0;
-        nv->hdr.timestamp_us = esp_timer_get_time();
-        nv->v       = r->vi.target_view;  /* C1 FIX: use target_view, not vc->v */
-        nv->min     = min_s;
-        nv->max     = max_s;
-        nv->has_sig = 1;
-
-        uint8_t *body_ptr = r->out_buf + sizeof(*nv);
-        const uint8_t *body_end = r->out_buf + sizeof(r->out_buf) - sizeof(tbft_sig_t);
-        int n_proofs = 0;
-
-        /* Append prepared proofs with quorum.
-         * Guard each iteration: writing past body_end would overflow out_buf. */
-        for (int k = 0; k < n_counts; k++) {
-            if (counts[k].count >= r->node.threshold) {
-                if (body_ptr + sizeof(tbft_vc_req_info_t) > body_end) {
-                    ESP_LOGE(TAG, "new-view: out_buf full, truncating proofs at %d", n_proofs);
-                    break;
-                }
-                tbft_vc_req_info_t *proof = (tbft_vc_req_info_t *)body_ptr;
-                proof->seqno = counts[k].seqno;
-                proof->last_view = r->node.view > 0 ? (r->node.view - 1) : 0;
-                proof->digest = counts[k].digest;
-                body_ptr += sizeof(tbft_vc_req_info_t);
-                n_proofs++;
-            }
-        }
-        nv->n_prep = n_proofs;
-
-        int32_t body_size = tbft_msg_align((int32_t)(body_ptr - r->out_buf));
-        nv->hdr.size = body_size;
-
-        if ((size_t)body_size + sizeof(tbft_sig_t) > sizeof(r->out_buf)) {
-            ESP_LOGE(TAG, "new-view: out_buf too small for signature");
-            return;
-        }
-        tbft_sig_t *sig = (tbft_sig_t *)(r->out_buf + body_size);
-        if (tbft_node_gen_sig(&r->node, r->out_buf, (size_t)body_size, sig) != 0) {
-            ESP_LOGE(TAG, "new-view: failed to sign; refusing to send");
-            return;
-        }
-
-        int32_t total_size = body_size + (int32_t)sizeof(tbft_sig_t);
-        tbft_node_send(&r->node, r->out_buf, (size_t)total_size,
-                       TBFT_ALL_REPLICAS);
-        ESP_LOGI(TAG, "sent new-view v=%lld min=%lld max=%lld n_prep=%d",
-                 (long long)r->vi.target_view, (long long)min_s, (long long)max_s, n_proofs);
-
-        /* Install the new view locally immediately so we can start acting
-         * as primary even before loopback receipt. */
-        r->node.view = r->vi.target_view;
-        r->node.cur_primary = tbft_node_primary(&r->node, r->node.view);
-        tbft_replica_reset_forwarded_requests(r);
-        /* Compute a monotonic seqno strictly inside the active window.
-         * nv->max = last_stable + WINDOW_SIZE (= upper window bound), so
-         * nv->max + 1 is OUTSIDE the window [last_stable+1, last_stable+WINDOW_SIZE].
-         * Instead, start from nv->min and advance past any prepared proofs
-         * or local progress to maintain linearizability. */
-        {
-            tbft_seqno_t start_seq = nv->min;
-            if (r->last_prepared > start_seq) start_seq = r->last_prepared;
-            if (r->last_executed > start_seq) start_seq = r->last_executed;
-            if (nv->n_prep > 0) {
-                const uint8_t *proofs_ptr = r->out_buf + sizeof(*nv);
-                for (int p = 0; p < nv->n_prep; p++) {
-                    const tbft_vc_req_info_t *proof =
-                        (const tbft_vc_req_info_t *)(proofs_ptr + p * sizeof(tbft_vc_req_info_t));
-                    if (proof->seqno > start_seq) start_seq = proof->seqno;
-                }
-            }
-            r->seqno = start_seq + 1;
-        }
-        if (nv->min > r->last_stable)   r->last_stable   = nv->min;
-        tbft_state_mark_stable(&r->state, nv->min);
-        if (nv->min > r->last_executed) r->last_executed = nv->min;
-        if (nv->min > r->last_prepared) r->last_prepared = nv->min;
-        tbft_cr_truncate(&r->cr, nv->min);
-        tbft_ar_init(&r->ar, r->ar.prepare_threshold, r->ar.commit_threshold);
-        r->ar.head = nv->min + 1;
-        r->last_prepared = r->last_executed;
-        tbft_itimer_stop(&r->vtimer);
-        tbft_vi_reset(&r->vi, r->node.view + 1);
-        r->vi.in_progress = false;
-        if (tbft_replica_has_pending_requests(r)) {
-            tbft_itimer_start(&r->vtimer, r->vtimer_period_us);
-        } else {
-            tbft_itimer_stop(&r->vtimer);
-        }
-    }
+    maybe_join_view_change(r);
+    maybe_send_new_view(r);
 }
 
 /* --------------------------------------------------------------------------
  * New-view handler
  * -------------------------------------------------------------------------- */
 
+/* Install view nv->v as its New_view fixes it (new primary and backups
+ * alike): the stable checkpoint min, and for every seqno min+1..max the
+ * request to re-propose (or a null request).  Pre-prepare bodies and the
+ * prepared records survive; prepares and commits of older views do not.
+ * @p nv points at the stored copy in the special region. */
+static void nv_install(tbft_replica_t *r, const tbft_new_view_rep_t *nv)
+{
+    const tbft_vc_req_info_t *o = (const tbft_vc_req_info_t *)(nv + 1);
+
+    r->node.view        = nv->v;
+    r->node.cur_primary = tbft_node_primary(&r->node, nv->v);
+    tbft_replica_reset_forwarded_requests(r);
+    r->vi.in_progress = false;
+    tbft_vi_set_target(&r->vi, nv->v + 1);
+    bool primary = tbft_replica_is_primary(r);
+
+    /* 1. The stable checkpoint the view starts from */
+    tbft_seqno_t h = nv->min;
+    if (h > r->last_stable) {
+        tbft_digest_t mine;
+        if (r->last_executed >= h &&
+            tbft_state_get_checkpoint_digest(&r->state, h, &mine) &&
+            tbft_digest_equal(&mine, &nv->min_digest)) {
+            install_stable(r, h);
+        } else {
+            /* Behind (or diverged): the window moves now and the state at h
+             * comes by fetch; execution resumes once it is in place. */
+            r->last_stable = h;
+            if (r->last_prepared < h) r->last_prepared = h;
+            tbft_ar_truncate(&r->ar, h + 1);
+            tbft_cr_truncate(&r->cr, h);
+            tbft_digest_t target = nv->min_digest;
+            r->last_fetch_throttle_us = 0;
+            (void)start_fetch(r, h, &target);
+        }
+    }
+
+    /* 2. The window starts over in the new view.  Bodies outside the
+     *    re-proposed range belong to requests no quorum prepared: drop them
+     *    so the new primary can use those seqnos. */
+    for (tbft_seqno_t n = r->ar.head; n < r->ar.head + TBFT_WINDOW_SIZE; n++) {
+        tbft_ar_new_view_slot(&r->ar, n);
+        if (n <= h || n > nv->max) (void)tbft_ar_replace_pp(&r->ar, n, nullptr, 0);
+    }
+
+    /* 3. The re-proposed requests, from local bodies where we have them */
+    for (int i = 0; i < nv->n_prep; i++) {
+        tbft_seqno_t n = h + 1 + i;
+        if (!tbft_ar_in_range(&r->ar, n)) continue;
+        tbft_agreement_slice_t *sl = tbft_ar_slice(&r->ar, n);
+        sl->nv_expect = true;
+        sl->nv_digest = o[i].digest;
+
+        if (o[i].last_view == TBFT_NV_NULL || digest_is_zero(&o[i].digest)) {
+            tbft_pre_prepare_rep_t null_pp = {};
+            null_pp.hdr.tag  = TBFT_MSG_PRE_PREPARE;
+            null_pp.hdr.size = (int32_t)sizeof(null_pp);
+            null_pp.view     = nv->v;
+            null_pp.seqno    = n;
+            tbft_digest_zero(&null_pp.digest);
+            (void)tbft_ar_replace_pp(&r->ar, n, &null_pp, (int)sizeof(null_pp));
+        } else {
+            int pp_len = 0;
+            uint8_t *pp_buf = (uint8_t *)tbft_ar_load_pp(&r->ar, n, &pp_len);
+            tbft_pre_prepare_rep_t *have = (tbft_pre_prepare_rep_t *)pp_buf;
+            if (have && tbft_digest_equal(&have->digest, &o[i].digest)) {
+                have->view = nv->v;   /* the same request, pre-prepared anew */
+            } else {
+                (void)tbft_ar_replace_pp(&r->ar, n, nullptr, 0);   /* comes via Status */
+            }
+        }
+        if (!primary) send_prepare(r, n);
+    }
+
+    /* 4. Sequence numbers and requests the new view already orders */
+    tbft_seqno_t top = nv->max > h ? nv->max : h;
+    if (r->last_executed > top) top = r->last_executed;
+    r->seqno = top + 1;
+    for (int cid = 0; cid < r->node.num_principals; cid++) {
+        r->last_assigned_rid[cid] = r->last_executed_rid[cid];
+    }
+    sync_executed_rids(r);
+    for (int i = 0; i < nv->n_prep; i++) {
+        int pp_len = 0;
+        const uint8_t *pp_buf = tbft_ar_load_pp(&r->ar, h + 1 + i, &pp_len);
+        const tbft_pre_prepare_rep_t *pp = (const tbft_pre_prepare_rep_t *)pp_buf;
+        if (!pp || pp->rset_size < (int32_t)sizeof(tbft_request_rep_t)) continue;
+        const tbft_request_rep_t *rq = (const tbft_request_rep_t *)(pp_buf + sizeof(*pp));
+        if (client_index(r, rq->cid) >= 0 && rq->rid > r->last_assigned_rid[rq->cid]) {
+            r->last_assigned_rid[rq->cid] = rq->rid;
+        }
+    }
+
+    r->stat_new_view++;
+    update_vtimer(r);
+    ESP_LOGW(TAG, "installed view %lld, primary=%d (stable=%lld, re-proposed %d)",
+             (long long)nv->v, r->node.cur_primary, (long long)h, (int)nv->n_prep);
+
+    if (primary) {
+        tbft_replica_send_pre_prepare(r);
+    }
+}
+
+/* New primary holding 2f+1 View_change messages for its view: decide what
+ * the view re-proposes and send New_view. */
+static void maybe_send_new_view(tbft_replica_t *r)
+{
+    if (!r->vi.in_progress) return;
+    tbft_view_t v = r->vi.target_view;
+    if (tbft_node_primary(&r->node, v) != r->node.node_id) return;
+    if (!tbft_vi_has_quorum(&r->vi)) return;
+
+    /* h = the highest stable checkpoint among the view-changes */
+    tbft_seqno_t  h = 0;
+    tbft_digest_t hd;
+    tbft_digest_zero(&hd);
+    for (int i = 0; i < r->node.num_replicas; i++) {
+        if (!r->vi.received[i]) continue;
+        int vc_len = 0;
+        const uint8_t *m = tbft_sr_load_vc(&r->sr, i, &vc_len);
+        if (!m) continue;
+        const tbft_view_change_rep_t *vc = (const tbft_view_change_rep_t *)m;
+        if (vc->ls <= h || vc->n_ckpts < 1) continue;
+        const tbft_vc_ckpt_t *ck = (const tbft_vc_ckpt_t *)(m + sizeof(*vc));
+        if (ck->seqno != vc->ls) continue;
+        h  = vc->ls;
+        hd = ck->digest;
+    }
+
+    /* For each seqno above h: the request prepared in the highest view */
+    struct { bool set; tbft_view_t view; tbft_digest_t digest; } best[TBFT_WINDOW_SIZE] = {};
+    tbft_seqno_t max_n = h;
+    for (int i = 0; i < r->node.num_replicas; i++) {
+        if (!r->vi.received[i]) continue;
+        int vc_len = 0;
+        const uint8_t *m = tbft_sr_load_vc(&r->sr, i, &vc_len);
+        if (!m) continue;
+        const tbft_view_change_rep_t *vc = (const tbft_view_change_rep_t *)m;
+        const tbft_vc_req_info_t *reqs = (const tbft_vc_req_info_t *)
+            (m + sizeof(*vc) + (size_t)vc->n_ckpts * sizeof(tbft_vc_ckpt_t));
+        for (int j = 0; j < vc->n_reqs; j++) {
+            tbft_seqno_t s = reqs[j].seqno;
+            if (s <= h || s > h + TBFT_WINDOW_SIZE) continue;
+            int k = (int)(s - h - 1);
+            if (!best[k].set || reqs[j].last_view > best[k].view) {
+                best[k].set    = true;
+                best[k].view   = reqs[j].last_view;
+                best[k].digest = reqs[j].digest;
+            }
+            if (s > max_n) max_n = s;
+        }
+    }
+
+    tbft_new_view_rep_t *nv = (tbft_new_view_rep_t *)r->out_buf;
+    memset(r->out_buf, 0, sizeof(r->out_buf));
+    nv->hdr.tag          = TBFT_MSG_NEW_VIEW;
+    nv->hdr.timestamp_us = esp_timer_get_time();
+    nv->v          = v;
+    nv->min        = h;
+    nv->max        = max_n;
+    nv->n_prep     = (int32_t)(max_n - h);
+    nv->has_sig    = 1;
+    nv->min_digest = hd;
+    tbft_vc_req_info_t *o = (tbft_vc_req_info_t *)(r->out_buf + sizeof(*nv));
+    for (int i = 0; i < nv->n_prep; i++) {
+        o[i].seqno     = h + 1 + i;
+        o[i].last_view = best[i].set ? best[i].view : TBFT_NV_NULL;
+        if (best[i].set) {
+            o[i].digest = best[i].digest;
+        } else {
+            tbft_digest_zero(&o[i].digest);
+        }
+    }
+    int32_t body_size = tbft_msg_align((int32_t)(sizeof(*nv) +
+                                       (size_t)nv->n_prep * sizeof(tbft_vc_req_info_t)));
+    nv->hdr.size = body_size;
+    if ((size_t)body_size + sizeof(tbft_sig_t) > sizeof(r->out_buf)) {
+        ESP_LOGE(TAG, "new-view: out_buf too small");
+        return;
+    }
+    tbft_sig_t *sig = (tbft_sig_t *)(r->out_buf + body_size);
+    if (tbft_node_gen_sig(&r->node, r->out_buf, (size_t)body_size, sig) != 0) {
+        ESP_LOGE(TAG, "new-view: failed to sign; refusing to send");
+        return;
+    }
+    int32_t total = body_size + (int32_t)sizeof(tbft_sig_t);
+    /* Kept: re-sent to replicas still in an older view (see handle_status) */
+    if (!tbft_sr_store_nv(&r->sr, r->out_buf, total)) {
+        ESP_LOGE(TAG, "new-view: cannot store (%d bytes)", (int)total);
+        return;
+    }
+    tbft_node_send(&r->node, r->out_buf, (size_t)total, TBFT_ALL_REPLICAS);
+    ESP_LOGW(TAG, "sent new-view v=%lld min=%lld max=%lld",
+             (long long)v, (long long)h, (long long)max_n);
+
+    int nv_len = 0;
+    nv_install(r, (const tbft_new_view_rep_t *)tbft_sr_load_nv(&r->sr, &nv_len));
+}
+
 void tbft_replica_handle_new_view(tbft_replica_t *r, const void *msg, int len)
 {
     if (len < (int)sizeof(tbft_new_view_rep_t)) return;
     const tbft_new_view_rep_t *nv = (const tbft_new_view_rep_t *)msg;
+    /* PBFT: a replica that sent a View_change for view t accepts New_view
+     * for t or later only; otherwise any view above the current one. */
+    tbft_view_t lowest = r->vi.in_progress ? r->vi.target_view : r->node.view + 1;
+    if (nv->v < lowest) return;
 
-    /* Verify it's for the view we expect */
-    if (nv->v < r->node.view) return;
-
-    if (!tbft_vi_verify_nv(&r->vi, nv, len)) {
-        ESP_LOGW(TAG, "new-view verification failed for v=%lld",
-                 (long long)nv->v);
-        return;
-    }
-
-    /* Signature is mandatory — an unsigned or malformed New_view would let
-     * any attacker drive our view and primary.  The signature covers the
-     * full body (hdr.size bytes, including any prepared-entries) so an
-     * attacker cannot mutate the trailing payload without invalidating it.
-     * hdr.size is the body length; the sig is appended but NOT included in
-     * hdr.size, so total wire = hdr.size + TBFT_SIG_SIZE. */
+    /* Signature of the new primary over the body (hdr.size bytes) is
+     * mandatory; the signature follows the body. */
     if (!nv->has_sig) {
-        ESP_LOGW(TAG, "new-view: unsigned message rejected (v=%lld)",
-                 (long long)nv->v);
+        ESP_LOGW(TAG, "new-view: unsigned message rejected (v=%lld)", (long long)nv->v);
         return;
     }
-
     int32_t body_size = nv->hdr.size;
-    if (body_size < (int32_t)sizeof(tbft_new_view_rep_t) || body_size > len) {
-        ESP_LOGW(TAG, "new-view: invalid body_size=%d len=%d",
-                 (int)body_size, len);
+    if (body_size < (int32_t)sizeof(tbft_new_view_rep_t) || body_size > len ||
+        len < body_size + (int)sizeof(tbft_sig_t)) {
+        ESP_LOGW(TAG, "new-view: invalid size (body=%d len=%d)", (int)body_size, len);
         return;
     }
-    if (len < body_size + (int)sizeof(tbft_sig_t)) {
-        ESP_LOGW(TAG, "new-view: missing signature (body=%d len=%d)",
-                 (int)body_size, len);
+    if (nv->min < 0 || nv->max < nv->min || nv->n_prep != nv->max - nv->min ||
+        nv->n_prep > TBFT_WINDOW_SIZE ||
+        (size_t)body_size < sizeof(*nv) + (size_t)nv->n_prep * sizeof(tbft_vc_req_info_t)) {
+        ESP_LOGW(TAG, "new-view: malformed (min=%lld max=%lld n_prep=%d)",
+                 (long long)nv->min, (long long)nv->max, (int)nv->n_prep);
         return;
     }
-    const tbft_sig_t *sig =
-        (const tbft_sig_t *)((const uint8_t *)msg + body_size);
+    const tbft_vc_req_info_t *o = (const tbft_vc_req_info_t *)(nv + 1);
+    for (int i = 0; i < nv->n_prep; i++) {
+        if (o[i].seqno != nv->min + 1 + i) {
+            ESP_LOGW(TAG, "new-view: entry %d has seqno %lld", i, (long long)o[i].seqno);
+            return;
+        }
+    }
     int new_primary = tbft_node_primary(&r->node, nv->v);
-    if (!tbft_node_verify_sig(&r->node, new_primary,
-                              msg, (size_t)body_size, sig)) {
+    const tbft_sig_t *sig = (const tbft_sig_t *)((const uint8_t *)msg + body_size);
+    if (!tbft_node_verify_sig(&r->node, new_primary, msg, (size_t)body_size, sig)) {
         ESP_LOGW(TAG, "new-view: signature verification failed (v=%lld primary=%d)",
                  (long long)nv->v, new_primary);
         return;
     }
 
-    /* Validate n_prep bounds before processing prepared proofs. */
-    if (nv->n_prep < 0 || nv->n_prep > TBFT_WINDOW_SIZE) {
-        ESP_LOGW(TAG, "new-view: invalid n_prep=%d", nv->n_prep);
+    /* A signed New_view is accepted without holding 2f+1 View_change
+     * messages here: a replica that missed some, or booted late, must still
+     * be able to follow the view.  (Known limit: its choices are not checked
+     * against the View_change messages, so a faulty new primary is trusted.) */
+    int total = body_size + (int)sizeof(tbft_sig_t);
+    if (!tbft_sr_store_nv(&r->sr, msg, total)) {
+        ESP_LOGW(TAG, "new-view: cannot store (%d bytes)", total);
         return;
     }
-
-    /* Install new view */
-    r->node.view        = nv->v;
-    r->node.cur_primary = tbft_node_primary(&r->node, nv->v);
-    tbft_replica_reset_forwarded_requests(r);
-
-    /* Compute a monotonic seqno strictly inside the active window.
-     * nv->max = last_stable + WINDOW_SIZE (= upper window bound), so
-     * nv->max + 1 is OUTSIDE the window.  Start from nv->min and
-     * advance past local progress and prepared proofs. */
-    {
-        tbft_seqno_t start_seq = nv->min;
-        if (r->last_prepared > start_seq) start_seq = r->last_prepared;
-        if (r->last_executed > start_seq) start_seq = r->last_executed;
-        if (nv->n_prep > 0) {
-            const uint8_t *proofs_ptr = (const uint8_t *)msg + sizeof(*nv);
-            for (int p = 0; p < nv->n_prep; p++) {
-                const tbft_vc_req_info_t *proof =
-                    (const tbft_vc_req_info_t *)(proofs_ptr + p * sizeof(tbft_vc_req_info_t));
-                if (proof->seqno > start_seq) start_seq = proof->seqno;
-            }
-        }
-        r->seqno = start_seq + 1;
-    }
-    /* Advance local markers to nv->min so tbft_replica_in_window is consistent
-     * with ar.head = nv->min + 1.  nv->min is the highest stable checkpoint
-     * seqno proven by the view-change quorum, so advancing is safe. */
-    if (nv->min > r->last_stable)   r->last_stable   = nv->min;
-    tbft_state_mark_stable(&r->state, nv->min);
-    if (nv->min > r->last_executed) r->last_executed = nv->min;
-    if (nv->min > r->last_prepared) r->last_prepared = nv->min;
-    tbft_cr_truncate(&r->cr, nv->min);
-    /* Re-init clears all slice bitmaps/hashes from the old view.
-     * Patching head after init is safe: all slices are clean. */
-    tbft_ar_init(&r->ar, r->ar.prepare_threshold, r->ar.commit_threshold);
-    r->ar.head = nv->min + 1;
-
-    /* When nv->min is 0 (no stable checkpoint) but nv->n_prep carries
-     * prepared seqnos from a prior view, r->seqno can land beyond the
-     * window [nv->min+1, nv->min+1+WINDOW_SIZE).  Advance the head so
-     * the primary can propose within range rather than being permanently
-     * blocked with "pre-prepare: seqno out of window". */
-    if (r->seqno >= r->ar.head + TBFT_WINDOW_SIZE) {
-        ESP_LOGI(TAG, "new-view: advancing window head from %lld"
-                 " to %lld for seqno coverage",
-                 (long long)r->ar.head, (long long)r->seqno);
-        tbft_ar_truncate(&r->ar, r->seqno);
-        r->last_stable   = r->seqno - 1;
-        r->last_executed = r->last_stable;
-        r->last_prepared = r->last_stable;
-    }
-    r->last_prepared = r->last_executed;
-    if (tbft_replica_is_primary(r)) {
-        ESP_LOGI(TAG, "new primary: seqno reset to %lld", (long long)r->seqno);
-    } else {
-        ESP_LOGD(TAG, "replica %d: seqno reset to %lld for view %lld",
-                 r->node.node_id, (long long)r->seqno, (long long)nv->v);
-    }
-
-    /* Process prepared proofs from New_view to recover unexecuted requests.
-     * PBFT requires the new primary to prove which requests were prepared
-     * in the previous view. We log the proofs for observability; the new
-     * primary will re-send pre-prepares for unexecuted seqnos via normal
-     * operation once it starts. */
-    if (nv->n_prep > 0) {
-        const uint8_t *proofs = (const uint8_t *)msg + sizeof(*nv);
-        int n_prep = nv->n_prep;
-        size_t proofs_size = (size_t)n_prep * sizeof(tbft_vc_req_info_t);
-        if ((size_t)len < sizeof(*nv) + proofs_size) {
-            ESP_LOGW(TAG, "new-view: message too short for n_prep=%d (len=%d)", n_prep, len);
-            return;
-        }
-        for (int p = 0; p < n_prep; p++) {
-            const tbft_vc_req_info_t *proof =
-                (const tbft_vc_req_info_t *)(proofs + p * sizeof(tbft_vc_req_info_t));
-            if (proof->seqno > r->last_executed &&
-                proof->seqno <= nv->max) {
-                ESP_LOGI(TAG, "new-view: prepared seqno=%lld digest=[...%02x] from view %lld",
-                         (long long)proof->seqno, proof->digest.bytes[0],
-                         (long long)proof->last_view);
-            }
-        }
-    }
-
-    /* Stop view-change timer and restart it with backoff.
-     * The base-period restart from the old code (vtimer_period_us)
-     * defeated the exponential backoff — every new-view install
-     * reset the timer to 1×, so send_view_change's doubled period
-     * never survived more than one view. */
-    tbft_itimer_stop(&r->vtimer);
-    tbft_vi_reset(&r->vi, nv->v + 1);
-    r->vi.in_progress = false;
-
-    if (tbft_replica_has_pending_requests(r)) {
-        int shift = (int)(nv->v - r->node.view);
-        if (shift < 1) shift = 1;
-        if (shift > 6) shift = 6;
-        int64_t period = r->vtimer_period_us * (1LL << shift);
-        if (period > r->vtimer_period_us * TBFT_VC_BACKOFF_MAX_MULT) {
-            period = r->vtimer_period_us * TBFT_VC_BACKOFF_MAX_MULT;
-        }
-        tbft_itimer_start(&r->vtimer, period);
-    } else {
-        tbft_itimer_stop(&r->vtimer);
-    }
-
-    r->stat_new_view++;
-    ESP_LOGI(TAG, "installed new view %lld, primary=%d",
-             (long long)nv->v, r->node.cur_primary);
+    int nv_len = 0;
+    nv_install(r, (const tbft_new_view_rep_t *)tbft_sr_load_nv(&r->sr, &nv_len));
 }
 
 /* --------------------------------------------------------------------------
  * Status handler
  * --------------------------------------------------------------------------
- * NOTE: STATUS messages carry NO authenticator (HMAC or signature).  An on-path
- * attacker can inject spurious status messages to trigger unnecessary state
- * fetches.  The protocol tolerates this — state-fetch targets are verified
- * via Meta_data/Data digest checks so a wrong fetch can't corrupt local
- * state.
- *
- * View advancement (st->view > local view): the replica catches up to the
- * peer's view and restarts the vtimer.  No view-change is sent here — the
- * vtimer will trigger a proper view-change if the new primary fails to
- * make progress, following the normal view-change protocol.
+ * Status only triggers retransmission; it never changes this replica's view
+ * or state (it carries no authenticator, and one replica's claim must move
+ * nobody).  A replica behind in view gets the New_view of ours; one that
+ * still lacks what we had a Status period ago gets it: our Checkpoint
+ * message when it is behind our stable checkpoint (2f+1 of those make it
+ * fetch the state) and the commits, pre-prepares and prepares we hold above
+ * that.
  * -------------------------------------------------------------------------- */
+
+static constexpr int64_t TBFT_RETX_INTERVAL_US = 500'000;
 
 static void handle_status(tbft_replica_t *r, const void *msg, int len)
 {
     if (len < (int)sizeof(tbft_status_rep_t)) return;
     const tbft_status_rep_t *st = (const tbft_status_rep_t *)msg;
+    int p = st->id;
+    if (p < 0 || p >= r->node.num_replicas || p == r->node.node_id) return;
 
-    if (st->id < 0 || st->id >= r->node.num_replicas) return;
-    if (st->id == r->node.node_id) return;
+    int64_t now = esp_timer_get_time();
+    /* Compare with what we had when this replica's previous Status came: a
+     * Status is a snapshot, and a request in flight when it was taken is not
+     * a gap.  A replica we have not heard from lately (it just booted), or
+     * one that says it is stuck, is compared with what we have now. */
+    bool known = r->peer_status_us[p] != 0 &&
+                 now - r->peer_status_us[p] <= 3 * r->stimer_period_us &&
+                 !(st->hdr.extra & TBFT_STATUS_WANT);
+    /* the highest seqno we executed, prepared or hold a pre-prepare for */
+    tbft_seqno_t my_top = r->last_executed > r->last_prepared ? r->last_executed
+                                                              : r->last_prepared;
+    if (r->seqno - 1 > my_top) my_top = r->seqno - 1;
+    tbft_seqno_t seen_top    = known ? r->peer_seen_top[p]    : my_top;
+    tbft_seqno_t seen_stable = known ? r->peer_seen_stable[p] : r->last_stable;
+    r->peer_seen_top[p]    = my_top;
+    r->peer_seen_stable[p] = r->last_stable;
+    r->peer_view[p]        = st->view;
+    r->peer_in_vc[p]       = (st->hdr.extra & TBFT_STATUS_IN_VC) != 0;
+    r->peer_status_us[p]   = now;
+
+    if (now - r->retx_us[p] < TBFT_RETX_INTERVAL_US) return;
 
     if (st->view < r->node.view) {
-        ESP_LOGW(TAG, "status from %d: sender view=%lld < local view=%lld",
-                 st->id, (long long)st->view, (long long)r->node.view);
+        /* Behind in view: the signed New_view of our view lets it install it. */
+        int nv_len = 0;
+        const uint8_t *nv = tbft_sr_load_nv(&r->sr, &nv_len);
+        if (nv && ((const tbft_new_view_rep_t *)nv)->v == r->node.view) {
+            r->retx_us[p] = now;
+            tbft_node_send(&r->node, nv, (size_t)nv_len, p);
+            ESP_LOGI(TAG, "re-sent new-view %lld to replica %d (in view %lld)",
+                     (long long)r->node.view, p, (long long)st->view);
+        }
+        return;
+    }
+    if (st->view > r->node.view || r->vi.in_progress || tbft_state_in_fetch(&r->state)) {
         return;
     }
 
-    if (st->view > r->node.view) {
-        ESP_LOGI(TAG, "status from %d: peer view=%lld last_stable=%lld last_exec=%lld"
-                 " | local view=%lld last_stable=%lld",
-                 st->id, (long long)st->view, (long long)st->last_stable,
-                 (long long)st->last_executed,
-                 (long long)r->node.view, (long long)r->last_stable);
-        /* Catch up: advance to the peer's view and restart the vtimer.
-         * Do NOT call tbft_replica_send_view_change here — it would
-         * propose view+1 (leapfrogging past this view), leaving the
-         * replica out of sync with peers that are still at the current
-         * view.  Instead, advance the view, reset any in-progress
-         * view-change that may have been targeting an older view, and
-         * let the normal vtimer trigger a proper view-change if the
-         * new primary fails to make progress. */
-        r->node.view = st->view;
-        r->node.cur_primary = tbft_node_primary(&r->node, st->view);
-        tbft_replica_reset_forwarded_requests(r);
-        if (r->vi.in_progress) {
-            tbft_vi_reset(&r->vi, st->view + 1);
-            r->vi.in_progress = false;
-        }
-        /* Re-initialise agreement and checkpoint regions for the new view.
-         * This mirrors the cleanup in handle_pre_prepare (lines 660-662).
-         * Without it, stale slice data from the old view could pollute
-         * certificate tracking in the new view. */
-        tbft_cr_truncate(&r->cr, r->last_stable);
-        tbft_ar_init(&r->ar, r->ar.prepare_threshold, r->ar.commit_threshold);
-        r->ar.head = r->last_stable + 1;
-        r->last_prepared = r->last_executed;
-
-        /* Keep sequence numbers contiguous and preserve executed/prepared progress */
-        tbft_seqno_t start_seq = r->last_stable;
-        if (r->last_prepared > start_seq) start_seq = r->last_prepared;
-        if (r->last_executed > start_seq) start_seq = r->last_executed;
-        if (r->seqno < start_seq + 1) {
-            r->seqno = start_seq + 1;
-        }
-        ESP_LOGI(TAG, "status view catch-up to %lld, seqno reset to %lld",
-                 (long long)st->view, (long long)r->seqno);
-
-        /* If we're behind in state (e.g. freshly booted into a running
-         * cluster), immediately fetch so we can participate in consensus.
-         * Without this, a node with last_stable=0 catches up the view
-         * but never its state, and the in-order-execution requirement
-         * (execute: seqno=1 not committed yet) blocks all new requests. */
-        if (st->last_stable > r->last_stable && !r->state.in_fetch) {
-            int replier = tbft_node_primary(&r->node, st->view);
-            ESP_LOGI(TAG, "view catch-up triggered state fetch to seqno=%lld"
-                     " from primary %d", (long long)st->last_stable, replier);
-            /* Stagger fetch starts to avoid all replicas fetching at once. */
-            r->last_fetch_throttle_us = esp_timer_get_time();
-            tbft_replica_start_fetch(r, st->last_stable, replier);
-        }
-
-        /* Use exponential backoff so the view-change timer grows with each
-         * successive failure.  Without this, Status-based view catch-up
-         * resets the timer to 1× base every cycle, and the backoff in
-         * send_view_change never takes effect. */
-        int view_gap = (int)(st->view - r->node.view);
-        int shift = view_gap;
-        if (shift < 1) shift = 1;
-        if (shift > 6) shift = 6;
-        int64_t period = r->vtimer_period_us * (1LL << shift);
-        if (period > r->vtimer_period_us * TBFT_VC_BACKOFF_MAX_MULT) {
-            period = r->vtimer_period_us * TBFT_VC_BACKOFF_MAX_MULT;
-        }
-        tbft_itimer_stop(&r->vtimer);
-        if (tbft_replica_has_pending_requests(r)) {
-            tbft_itimer_start(&r->vtimer, period);
-        } else {
-            tbft_itimer_stop(&r->vtimer);
-        }
+    if (st->last_stable < seen_stable) {
+        r->retx_us[p] = now;
+        send_checkpoint_to(r, r->last_stable, p);
     }
-
-    if (st->last_executed > r->last_executed
-        && (!r->state.in_fetch || st->last_stable > r->state.fetch_seqno)
-        && st->last_executed - r->last_executed > TBFT_CHECKPOINT_INTERVAL) {
-        /* Rate-limit fetch starts to avoid flooding. */
-        int64_t now = esp_timer_get_time();
-        if (now - r->last_fetch_throttle_us >= 500000LL) {
-            r->last_fetch_throttle_us = now;
-            tbft_replica_start_fetch(r, st->last_stable, st->id);
-        }
-    }
-
-    /* Check if peer B (st->id) is behind our execution or stable point.
-     * If so, send B our checkpoint messages for all checkpoints B is missing.
-     *
-     * Throttle: when every peer responds to the same Status broadcast in a
-     * burst, sending checkpoints to each one creates amplification.  Rate-
-     * limit to one batch per 500 ms to break the storm while still helping
-     * lagging replicas catch up within a few Status cycles. */
-    {
-        int64_t now_us = esp_timer_get_time();
-        if (now_us - r->last_ckpt_throttle_us < 500000LL) return;
-        r->last_ckpt_throttle_us = now_us;
-    }
-    tbft_seqno_t start_seq = ((st->last_stable / TBFT_CHECKPOINT_INTERVAL) + 1) * TBFT_CHECKPOINT_INTERVAL;
-    for (tbft_seqno_t seqno = start_seq;
-         seqno <= r->last_executed;
-         seqno += TBFT_CHECKPOINT_INTERVAL) {
-        
-        tbft_digest_t digest;
-        if (tbft_state_get_checkpoint_digest(&r->state, seqno, &digest)) {
-            tbft_checkpoint_rep_t *ckpt = (tbft_checkpoint_rep_t *)r->out_buf;
-            ckpt->hdr.tag  = TBFT_MSG_CHECKPOINT;
-            ckpt->hdr.extra = 0;
-            ckpt->hdr.timestamp_us = esp_timer_get_time();
-            ckpt->seqno    = seqno;
-            ckpt->digest   = digest;
-            ckpt->id       = r->node.node_id;
-            ckpt->hdr.size = tbft_msg_align((int32_t)(sizeof(*ckpt) + sizeof(tbft_auth_t)));
-            
-            tbft_auth_t *auth = (tbft_auth_t *)(r->out_buf + sizeof(*ckpt));
-            tbft_node_gen_auth(&r->node, r->out_buf, sizeof(*ckpt), auth);
-            
-            tbft_node_send(&r->node, r->out_buf, (size_t)ckpt->hdr.size, st->id);
-            ESP_LOGI(TAG, "sent checkpoint for seqno %lld to lagging replica %d",
-                     (long long)seqno, st->id);
-        }
+    tbft_seqno_t from = st->last_executed;
+    if (from < r->ar.head - TBFT_WINDOW_SIZE - 1) from = r->ar.head - TBFT_WINDOW_SIZE - 1;
+    if (st->last_executed < seen_top && from < my_top) {
+        r->retx_us[p] = now;
+        ESP_LOGI(TAG, "replica %d is behind (executed %lld): re-sending %lld..%lld",
+                 p, (long long)st->last_executed, (long long)from + 1, (long long)my_top);
+        retransmit_to(r, p, from, my_top);
     }
 }
 
@@ -1799,98 +2005,77 @@ void tbft_replica_handle_fetch(tbft_replica_t *r, const void *msg, int len)
         ESP_LOGW(TAG, "fetch: invalid sender id %d", fetch->id);
         return;
     }
+    /* Serve only the checkpoint whose image we keep, so the fetcher gets
+     * exactly the state that checkpoint's digest covers; others are left to
+     * a replica that has them (the fetcher moves on after a timeout). */
+    if (!tbft_state_can_serve(&r->state, fetch->c)) {
+        ESP_LOGD(TAG, "fetch: cannot serve seqno=%lld (image at %lld)",
+                 (long long)fetch->c, (long long)r->state.image_seqno);
+        return;
+    }
 
-    /* Respond with Meta_data for the requested level/index */
     int level = fetch->level;
     int index = fetch->index;
-
-    /* Validate level and index as non-negative before using them for array
-     * indexing.  A negative value from a malicious peer would bypass the
-     * upper-bound checks (e.g. -1 >= p_levels is false, but the negative
-     * value would then be used as an array index). */
+    /* Non-negative before any array indexing (a negative value would pass
+     * the upper-bound checks below). */
     if (level < 0 || index < 0) {
         ESP_LOGW(TAG, "fetch: negative level=%d or index=%d", level, index);
         return;
     }
-
     if (level >= r->state.ptree.dims.p_levels) return;
 
     if (level == r->state.ptree.dims.p_levels - 1) {
-        /* Send TBFT_MSG_DATA containing the requested block */
+        /* Data message with the requested block */
         if (index >= r->state.num_blocks) return;
-
-        /* Validate Data message fits in out_buf before construction.
-         * TBFT_BLOCK_SIZE is user-configurable and may exceed
-         * TBFT_MAX_MESSAGE_SIZE when combined with headers. */
-        {
-            size_t needed = sizeof(tbft_data_rep_t) + (size_t)TBFT_BLOCK_SIZE;
-            if (needed > sizeof(r->out_buf)) {
-                ESP_LOGE(TAG, "handle_fetch: Data response too large for out_buf"
-                         " (%zu > %zu)", needed, sizeof(r->out_buf));
-                return;
-            }
+        size_t needed = sizeof(tbft_data_rep_t) + (size_t)TBFT_BLOCK_SIZE;
+        if (needed > sizeof(r->out_buf)) {
+            ESP_LOGE(TAG, "handle_fetch: Data response too large for out_buf (%zu > %zu)",
+                     needed, sizeof(r->out_buf));
+            return;
         }
-
         tbft_data_rep_t *data_rep = (tbft_data_rep_t *)r->out_buf;
         data_rep->hdr.tag     = TBFT_MSG_DATA;
         data_rep->hdr.extra   = 0;
         data_rep->seqno       = fetch->c;
         data_rep->block_index = index;
+        data_rep->_pad        = 0;
         data_rep->digest      = r->state.ptree.ptree[level][index].digest;
-
-        uint8_t *payload = r->out_buf + sizeof(*data_rep);
-        memcpy(payload, r->state.mem + (size_t)index * TBFT_BLOCK_SIZE, TBFT_BLOCK_SIZE);
-
-        int32_t body_size = (int32_t)(sizeof(*data_rep) + TBFT_BLOCK_SIZE);
-        data_rep->hdr.size = tbft_msg_align(body_size);
-
+        memcpy(r->out_buf + sizeof(*data_rep), tbft_state_image_block(&r->state, index),
+               TBFT_BLOCK_SIZE);
+        data_rep->hdr.size = tbft_msg_align((int32_t)(sizeof(*data_rep) + TBFT_BLOCK_SIZE));
         tbft_node_send(&r->node, r->out_buf, (size_t)data_rep->hdr.size, fetch->id);
         return;
     }
 
-    int pchildren = r->state.ptree.dims.p_children;
-    int n_children = tbft_ptree_nodes_at_level(level + 1, pchildren);
+    int pchildren   = r->state.ptree.dims.p_children;
+    int n_children  = tbft_ptree_nodes_at_level(level + 1, pchildren);
     int first_child = index * pchildren;
-    int count = pchildren;
-    if (first_child + count > n_children) {
-        count = n_children - first_child;
-    }
+    int count       = pchildren;
+    if (first_child + count > n_children) count = n_children - first_child;
     if (count <= 0) return;
 
-    /* Validate Meta_data message fits in out_buf before construction.
-     * Even with TBFT_P_CHILDREN tuned to avoid overflow, the dynamic
-     * count at sub-root levels can produce edge-case overruns. */
-    {
-        size_t needed = sizeof(tbft_meta_data_rep_t) + (size_t)count * sizeof(tbft_part_info_t);
-        if (needed > sizeof(r->out_buf)) {
-            ESP_LOGE(TAG, "handle_fetch: Meta_data response too large for out_buf"
-                     " (%zu > %zu)", needed, sizeof(r->out_buf));
-            return;
-        }
+    size_t needed = sizeof(tbft_meta_data_rep_t) + (size_t)count * sizeof(tbft_part_info_t);
+    if (needed > sizeof(r->out_buf)) {
+        ESP_LOGE(TAG, "handle_fetch: Meta_data response too large for out_buf (%zu > %zu)",
+                 needed, sizeof(r->out_buf));
+        return;
     }
-
-    /* Build Meta_data response */
-    uint8_t *out = r->out_buf;
-    tbft_meta_data_rep_t *md = (tbft_meta_data_rep_t *)out;
-    md->hdr.tag  = TBFT_MSG_META_DATA;
+    tbft_meta_data_rep_t *md = (tbft_meta_data_rep_t *)r->out_buf;
+    md->hdr.tag   = TBFT_MSG_META_DATA;
     md->hdr.extra = 0;
-    md->seqno    = fetch->c;
-    md->level    = level;
-    md->index    = index;
-    md->n_parts  = count;
-
-    tbft_part_info_t *parts =
-        (tbft_part_info_t *)(out + sizeof(tbft_meta_data_rep_t));
+    md->seqno     = fetch->c;
+    md->level     = level;
+    md->index     = index;
+    md->n_parts   = count;
+    md->_pad      = 0;
+    tbft_part_info_t *parts = (tbft_part_info_t *)(r->out_buf + sizeof(*md));
     for (int c = 0; c < count; c++) {
         int cidx = first_child + c;
         parts[c].digest  = r->state.ptree.ptree[level + 1][cidx].digest;
         parts[c].version = (int32_t)r->state.ptree.ptree[level + 1][cidx].version;
     }
-
-    int32_t total = (int32_t)(sizeof(*md) + (size_t)count * sizeof(tbft_part_info_t));
-    md->hdr.size = tbft_msg_align(total);
-
-    tbft_node_send(&r->node, out, (size_t)md->hdr.size, fetch->id);
+    md->hdr.size = tbft_msg_align((int32_t)needed);
+    tbft_node_send(&r->node, r->out_buf, (size_t)md->hdr.size, fetch->id);
 }
 
 /* --------------------------------------------------------------------------
@@ -1931,10 +2116,10 @@ void tbft_replica_handle_meta_data(tbft_replica_t *r, const void *msg, int len)
             }
         }
         if (all_done) {
+            tbft_seqno_t seqno = r->state.fetch_seqno;
             tbft_state_fetch_complete(&r->state);
-            ESP_LOGI(TAG, "state fetch completed for seqno=%lld, marking stable",
-                     (long long)r->state.fetch_seqno);
-            tbft_replica_mark_stable(r, r->state.fetch_seqno);
+            ESP_LOGI(TAG, "state fetch completed for seqno=%lld", (long long)seqno);
+            finish_fetch(r, seqno);
             return;
         }
     }
@@ -1943,14 +2128,14 @@ void tbft_replica_handle_meta_data(tbft_replica_t *r, const void *msg, int len)
     int level, index;
     while (tbft_state_next_fetch_req(&r->state, &level, &index)) {
         tbft_fetch_rep_t *fr = (tbft_fetch_rep_t *)r->out_buf;
-        fr->hdr.tag   = TBFT_MSG_FETCH;
-        fr->hdr.extra = 0;
+        fr->hdr.tag     = TBFT_MSG_FETCH;
+        fr->hdr.extra   = 0;
         fr->last_stable = r->last_stable;
-        fr->c         = r->state.fetch_seqno;
-        fr->level     = level;
-        fr->index     = index;
-        fr->id        = r->node.node_id;
-        fr->hdr.size  = tbft_msg_align((int32_t)sizeof(*fr));
+        fr->c           = r->state.fetch_seqno;
+        fr->level       = level;
+        fr->index       = index;
+        fr->id          = r->node.node_id;
+        fr->hdr.size    = tbft_msg_align((int32_t)sizeof(*fr));
         tbft_node_send(&r->node, r->out_buf, (size_t)fr->hdr.size,
                        r->state.fetch_replier);
     }
@@ -1970,8 +2155,8 @@ void tbft_replica_handle_data(tbft_replica_t *r, const void *msg, int len)
     tbft_state_handle_data(&r->state, data_rep, block_data);
 
     if (!tbft_state_in_fetch(&r->state)) {
-        ESP_LOGI(TAG, "state fetch completed for seqno=%lld, marking stable", (long long)fetch_seqno);
-        tbft_replica_mark_stable(r, fetch_seqno);
+        ESP_LOGI(TAG, "state fetch completed for seqno=%lld", (long long)fetch_seqno);
+        finish_fetch(r, fetch_seqno);
     }
 }
 
@@ -1987,654 +2172,300 @@ void tbft_replica_send_pre_prepare(tbft_replica_t *r)
     /* Only require that we have at least threshold-1 peers with fresh keys.
      * The self-test already verifies each key on import, so no additional
      * settling delay is needed. */
-    {
-        int keys_ok = 0;
-        for (int i = 0; i < r->node.num_replicas; i++) {
-            if (i == r->node.node_id) continue;
-            if (r->node.principals[i] && r->node.principals[i]->keys_fresh)
-                keys_ok++;
+    if (count_fresh_keys(r) < r->node.threshold - 1) return;
+
+    /* Assign a sequence number to every queued request the window has room
+     * for.  A request already ordered (in flight or executed) is dropped:
+     * the client broadcasts and retransmits, and backups forward. */
+    while (tbft_replica_in_window(r, r->seqno)) {
+        tbft_rqueue_t *src_queue = &r->rqueue;
+        tbft_rqueue_entry_t *req = rqueue_front(src_queue);
+        if (!req) {
+            src_queue = &r->ro_rqueue;
+            req = rqueue_front(src_queue);
         }
-        if (keys_ok < r->node.threshold - 1) {
-            return;
-        }
-    }
+        if (!req) break;
 
-    /* Track which queue the request came from so we pop from the right one
-     * after successfully building and broadcasting the Pre_prepare. */
-    tbft_rqueue_t *src_queue = &r->rqueue;
-    tbft_rqueue_entry_t *req = rqueue_front(src_queue);
-    if (!req) {
-        src_queue = &r->ro_rqueue;
-        req = rqueue_front(src_queue);
-    }
-    if (!req) {
-        /* No pending requests — stop the view-change timer so it doesn't
-         * fire during idle periods.  The client sends every ~30s, so a 5s
-         * timer would constantly trigger spurious view-changes. */
-        tbft_itimer_stop(&r->vtimer);
-        return;
-    }
-
-    /* Restart the vtimer now that we're actively working on a request. */
-    tbft_itimer_start(&r->vtimer, r->vtimer_period_us);
-
-    /* CRITICAL FIX: Dedup by request ID.  The same request can arrive
-     * multiple times: once from the client's broadcast, then forwarded
-     * by each non-primary replica.  Without dedup here, the primary
-     * would assign a different seqno to each duplicate, rapidly draining
-     * the sequence window and preventing consensus. */
-    {
         const tbft_request_rep_t *rr = (const tbft_request_rep_t *)req->buf;
-        if (rr->cid == r->last_assigned_cid && rr->rid == r->last_assigned_rid) {
-            /* Already assigned a seqno for this request — drop duplicate. */
+        int idx = client_index(r, rr->cid);
+        if (idx < 0 || rr->rid <= r->last_assigned_rid[rr->cid] ||
+            rr->rid <= client_entry(r, idx)->last_rid) {
             rqueue_pop(src_queue);
-            /* Check the other queue too */
-            tbft_rqueue_entry_t *next_req = rqueue_front(src_queue);
-            if (!next_req) {
-                src_queue = (src_queue == &r->rqueue) ? &r->ro_rqueue : &r->rqueue;
-                next_req = rqueue_front(src_queue);
-            }
-            if (!next_req) return;
-            const tbft_request_rep_t *rr2 = (const tbft_request_rep_t *)next_req->buf;
-            if (rr2->cid == r->last_assigned_cid && rr2->rid == r->last_assigned_rid) {
-                rqueue_pop(src_queue);
-                return;  /* all dups */
-            }
-            req = next_req;
+            continue;
         }
-    }
 
-    /* Check window */
-    if (!tbft_replica_in_window(r, r->seqno)) {
-        ESP_LOGW(TAG, "pre-prepare: seqno=%lld out of window (last_stable=%lld, window=%d)",
-                 (long long)r->seqno, (long long)r->last_stable, TBFT_WINDOW_SIZE);
-        return;
-    }
+        /* Compute non-deterministic choices */
+        int ndet_len = 0;
+        if (r->comp_ndet_cb) {
+            r->comp_ndet_cb(r->seqno, r->ndet_buf, &ndet_len, r->ndet_max_len);
+        }
+        if (ndet_len < 0 || ndet_len > r->ndet_max_len) {
+            ESP_LOGE(TAG, "pre-prepare: invalid non-deterministic data length %d", ndet_len);
+            ndet_len = 0;
+        }
 
-    /* Compute request set digest */
-    tbft_digest_t rset_digest;
-    tbft_msg_digest(req->buf, (size_t)req->len, &rset_digest);
+        /* Guard against buffer overflow before building the message */
+        size_t needed = sizeof(tbft_pre_prepare_rep_t) + (size_t)req->len
+                      + (size_t)ndet_len + sizeof(tbft_auth_t);
+        size_t aligned_needed = (needed + 7u) & ~(size_t)7u;
+        if (aligned_needed > sizeof(r->out_buf)) {
+            ESP_LOGE(TAG, "pre-prepare: request too large to embed, dropping (%zu > %zu)",
+                     aligned_needed, sizeof(r->out_buf));
+            rqueue_pop(src_queue);
+            continue;
+        }
 
-    /* Compute non-deterministic choices */
-    int ndet_len = 0;
-    if (r->comp_ndet_cb) {
-        r->comp_ndet_cb(r->seqno, r->ndet_buf, &ndet_len, r->ndet_max_len);
-    }
+        /* MEDIUM FIX M1: Clear out_buf before message construction to prevent
+         * stale data from leaking into authenticator computation or padding. */
+        memset(r->out_buf, 0, sizeof(r->out_buf));
 
-    /* MEDIUM FIX M3: Bounds check before int16_t truncation */
-    if (ndet_len > INT16_MAX) {
-        ESP_LOGE(TAG, "pre-prepare: ndet_len %d exceeds INT16_MAX", ndet_len);
-        ndet_len = INT16_MAX;
-    }
+        tbft_pre_prepare_rep_t *pp = (tbft_pre_prepare_rep_t *)r->out_buf;
+        pp->hdr.tag          = TBFT_MSG_PRE_PREPARE;
+        pp->hdr.extra        = 0;
+        pp->hdr.timestamp_us = esp_timer_get_time();
+        pp->view             = r->node.view;
+        pp->seqno            = r->seqno;
+        pp->rset_size        = req->len;
+        pp->non_det_size     = (int16_t)ndet_len;
 
-    /* Guard against buffer overflow before building the message */
-    size_t needed = sizeof(tbft_pre_prepare_rep_t) + (size_t)req->len
-                  + (size_t)ndet_len + sizeof(tbft_auth_t);
-    size_t aligned_needed = (needed + 7u) & ~7u;
-    if (aligned_needed > sizeof(r->out_buf)) {
-        ESP_LOGE(TAG, "pre-prepare: request too large to embed, dropping (%zu > %zu)", aligned_needed, sizeof(r->out_buf));
+        /* Append request set and non-det choices; the digest covers both, so
+         * nobody can alter the non-deterministic choices in transit. */
+        uint8_t *ptr = r->out_buf + sizeof(*pp);
+        memcpy(ptr, req->buf, (size_t)req->len);
+        ptr += req->len;
+        memcpy(ptr, r->ndet_buf, (size_t)ndet_len);
+        ptr += ndet_len;
+        tbft_msg_digest(r->out_buf + sizeof(*pp), (size_t)req->len + (size_t)ndet_len,
+                        &pp->digest);
+
+        /* Authenticator.  The header's size field is covered by the MAC:
+         * set it before computing the MAC. */
+        tbft_auth_t *auth = (tbft_auth_t *)ptr;
+        int32_t msg_len_before_auth = (int32_t)(ptr - r->out_buf);
+        pp->hdr.size = tbft_msg_align(msg_len_before_auth + (int32_t)sizeof(tbft_auth_t));
+        tbft_node_gen_auth(&r->node, r->out_buf, (size_t)msg_len_before_auth, auth);
+
+        if (!tbft_ar_store_pp(&r->ar, r->seqno, r->out_buf, pp->hdr.size)) {
+            ESP_LOGE(TAG, "pre-prepare: cannot store seqno=%lld", (long long)r->seqno);
+            break;
+        }
+        tbft_node_send(&r->node, r->out_buf, (size_t)pp->hdr.size, TBFT_ALL_REPLICAS);
+        ESP_LOGI(TAG, "sent pre-prepare seqno=%lld view=%lld (rset=%d, ndet=%d, total=%d)",
+                 (long long)r->seqno, (long long)r->node.view,
+                 req->len, ndet_len, pp->hdr.size);
+
+        /* The primary sends no Prepare: its pre-prepare stands for it. */
+        r->last_assigned_rid[rr->cid] = rr->rid;
         rqueue_pop(src_queue);
-        return;
+        r->seqno++;
     }
 
-    /* MEDIUM FIX M1: Clear out_buf before message construction to prevent
-     * stale data from leaking into authenticator computation or padding. */
-    memset(r->out_buf, 0, sizeof(r->out_buf));
-
-    /* Build Pre_prepare message */
-    tbft_pre_prepare_rep_t *pp = (tbft_pre_prepare_rep_t *)r->out_buf;
-    pp->hdr.tag        = TBFT_MSG_PRE_PREPARE;
-    pp->hdr.extra      = 0;
-    pp->hdr.timestamp_us = esp_timer_get_time();
-    pp->view         = r->node.view;
-    pp->seqno        = r->seqno;
-    pp->digest       = rset_digest;
-    pp->rset_size    = req->len;
-    pp->non_det_size = (int16_t)ndet_len;
-
-    /* Append request set, non-det choices, then authenticator */
-    uint8_t *ptr = r->out_buf + sizeof(*pp);
-    memcpy(ptr, req->buf, (size_t)req->len);
-    ptr += req->len;
-    memcpy(ptr, r->ndet_buf, (size_t)ndet_len);
-    ptr += ndet_len;
-
-    /* Debug: auth offset (key material must never be logged) */
-    {
-        int auth_off = (int)(ptr - r->out_buf);
-        ESP_LOGD(TAG, "send_pp: tag=%d extra=%d size=%d ts=%lld, hdr[0..7]=%02x%02x%02x%02x%02x%02x%02x%02x, auth_offset=%d",
-                 pp->hdr.tag, pp->hdr.extra, pp->hdr.size,
-                 (long long)pp->hdr.timestamp_us,
-                 r->out_buf[0], r->out_buf[1], r->out_buf[2], r->out_buf[3],
-                 r->out_buf[4], r->out_buf[5], r->out_buf[6], r->out_buf[7],
-                 auth_off);
-    }
-
-    /* Authenticator */
-    tbft_auth_t *auth = (tbft_auth_t *)ptr;
-    int32_t msg_len_before_auth = (int32_t)(ptr - r->out_buf);
-
-    /* CRITICAL FIX: Set the message size BEFORE computing the HMAC.
-     * The header's size field is part of the message bytes covered by
-     * the MAC. If set after gen_auth, the sender signs size=0 but the
-     * receiver verifies with the actual size → MAC mismatch. */
-    pp->hdr.size = tbft_msg_align(msg_len_before_auth + (int32_t)sizeof(tbft_auth_t));
-
-    tbft_node_gen_auth(&r->node, r->out_buf, (size_t)msg_len_before_auth,
-                       auth);
-    ptr += sizeof(tbft_auth_t);
-
-    /* Store in agreement region */
-    tbft_ar_store_pp(&r->ar, r->seqno, r->out_buf, pp->hdr.size);
-
-    /* Broadcast */
-    tbft_node_send(&r->node, r->out_buf, (size_t)pp->hdr.size,
-                   TBFT_ALL_REPLICAS);
-
-    ESP_LOGI(TAG, "sent pre-prepare seqno=%lld view=%lld (rset=%d, ndet=%d, total=%d)",
-             (long long)r->seqno, (long long)r->node.view,
-             req->len, ndet_len, pp->hdr.size);
-
-    /* The primary's pre-prepare implicitly serves as its own Prepare.
-     * Add a self-prepare to the certificate so the primary counts toward
-     * the f+1 prepare threshold needed to reach the prepared state.
-     * Also broadcast the prepare to all replicas so backups can reach
-     * "prepared" state (they need f+1 prepares including the primary's). */
-    {
-        tbft_prepare_rep_t *prep = (tbft_prepare_rep_t *)r->out_buf;
-        prep->hdr.tag   = TBFT_MSG_PREPARE;
-        prep->hdr.extra = 0;
-        prep->hdr.timestamp_us = esp_timer_get_time();
-        prep->view      = r->node.view;
-        prep->seqno     = r->seqno;
-        prep->digest    = rset_digest;
-        prep->id        = r->node.node_id;
-
-        tbft_auth_t *auth2 = (tbft_auth_t *)(r->out_buf + sizeof(*prep));
-        prep->hdr.size = tbft_msg_align(
-            (int32_t)(sizeof(*prep) + sizeof(tbft_auth_t)));
-        tbft_node_gen_auth(&r->node, r->out_buf, sizeof(*prep), auth2);
-
-        tbft_ar_add_my_prepare(&r->ar, r->seqno, r->out_buf, prep->hdr.size,
-                               r->node.node_id);
-
-        tbft_node_send(&r->node, r->out_buf, (size_t)prep->hdr.size,
-                       TBFT_ALL_REPLICAS);
-    }
-
-    /* Mark this request ID as assigned to prevent duplicate seqno. */
-    {
-        const tbft_request_rep_t *rr_final = (const tbft_request_rep_t *)req->buf;
-        r->last_assigned_cid = rr_final->cid;
-        r->last_assigned_rid = rr_final->rid;
-    }
-
-    rqueue_pop(src_queue);
-
-    /* The primary's last_prepared is advanced in tbft_replica_handle_prepare
-     * once backup prepares are processed and the Prepared Certificate is complete.
-     * This avoids prematurely advancing last_prepared before a quorum is reached. */
-
-    r->seqno++;
-
-    /* Reset view-change timer — primary is active */
-    if (tbft_replica_has_pending_requests(r)) {
-        tbft_itimer_start(&r->vtimer, r->vtimer_period_us);
-    } else {
+    if (!tbft_replica_has_pending_requests(r)) {
+        /* No pending requests — stop the view-change timer so it doesn't
+         * fire during idle periods. */
         tbft_itimer_stop(&r->vtimer);
+    } else if (!tbft_itimer_is_running(&r->vtimer)) {
+        tbft_itimer_start(&r->vtimer, vtimer_period(r));
     }
 }
 
-void tbft_replica_send_prepare(tbft_replica_t *r, tbft_seqno_t n)
-{
-    /* Primary does not send Prepare */
-    if (tbft_replica_is_primary(r)) return;
 
-    /* Get the stored pre-prepare digest */
-    int pp_len = 0;
-    const uint8_t *pp_buf = tbft_ar_load_pp(&r->ar, n, &pp_len);
-    if (!pp_buf) return;
-    const tbft_pre_prepare_rep_t *pp = (const tbft_pre_prepare_rep_t *)pp_buf;
-
-    tbft_prepare_rep_t *prep = (tbft_prepare_rep_t *)r->out_buf;
-    prep->hdr.tag   = TBFT_MSG_PREPARE;
-    prep->hdr.extra = 0;
-    prep->hdr.timestamp_us = esp_timer_get_time();
-    prep->view      = r->node.view;
-    prep->seqno     = n;
-    prep->digest    = pp->digest;
-    prep->id        = r->node.node_id;
-
-    tbft_auth_t *auth = (tbft_auth_t *)(r->out_buf + sizeof(*prep));
-    prep->hdr.size = tbft_msg_align(
-        (int32_t)(sizeof(*prep) + sizeof(tbft_auth_t)));
-    tbft_node_gen_auth(&r->node, r->out_buf, sizeof(*prep), auth);
-
-    /* Store own prepare; bail if already sent (duplicate PP delivery) */
-    if (!tbft_ar_add_my_prepare(&r->ar, n, r->out_buf, prep->hdr.size,
-                                r->node.node_id)) {
-        return;
-    }
-
-    tbft_node_send(&r->node, r->out_buf, (size_t)prep->hdr.size,
-                   TBFT_ALL_REPLICAS);
-    ESP_LOGI(TAG, "sent prepare seqno=%lld", (long long)n);
-}
-
-void tbft_replica_send_commit(tbft_replica_t *r, tbft_seqno_t n)
-{
-    /* Get the digest from the stored pre-prepare */
-    int pp_len = 0;
-    const uint8_t *pp_buf = tbft_ar_load_pp(&r->ar, n, &pp_len);
-    if (!pp_buf) return;
-    const tbft_pre_prepare_rep_t *pp = (const tbft_pre_prepare_rep_t *)pp_buf;
-
-    tbft_commit_rep_t *cm = (tbft_commit_rep_t *)r->out_buf;
-    cm->hdr.tag   = TBFT_MSG_COMMIT;
-    cm->hdr.extra = 0;
-    cm->hdr.timestamp_us = esp_timer_get_time();
-    cm->view      = r->node.view;
-    cm->seqno     = n;
-    cm->digest    = pp->digest;  /* PBFT: commit must include the digest */
-    cm->id        = r->node.node_id;
-
-    tbft_auth_t *auth = (tbft_auth_t *)(r->out_buf + sizeof(*cm));
-    cm->hdr.size = tbft_msg_align(
-        (int32_t)(sizeof(*cm) + sizeof(tbft_auth_t)));
-    tbft_node_gen_auth(&r->node, r->out_buf, sizeof(*cm), auth);
-
-    bool first_send = tbft_ar_add_my_commit(&r->ar, n, r->out_buf, cm->hdr.size,
-                                            r->node.node_id);
-
-    if (tbft_ar_in_range(&r->ar, n)) {
-        tbft_agreement_slice_t *sl = tbft_ar_slice(&r->ar, n);
-        sl->commit_sent_us = esp_timer_get_time();
-    }
-
-    tbft_node_send(&r->node, r->out_buf, (size_t)cm->hdr.size,
-                   TBFT_ALL_REPLICAS);
-    if (!first_send) r->stat_commit_resent++;
-    ESP_LOGI(TAG, "%s commit seqno=%lld",
-             first_send ? "sent" : "re-sent", (long long)n);
-}
 
 void tbft_replica_execute_committed(tbft_replica_t *r)
 {
-    /* Execute in sequence-number order.
-     * Loop bound: <= last_prepared (not +1) to avoid executing a slot that
-     * has not yet been prepared. */
-    for (tbft_seqno_t n = r->last_executed + 1;
-         n <= r->last_prepared;
-         n++) {
+    /* PBFT executes strictly in sequence-number order.  A seqno without its
+     * commit quorum or pre-prepare stops execution until retransmission
+     * (Status) or a state fetch fills the gap: skipping it would make this
+     * replica's state, and the replies it sends, diverge. */
+    if (tbft_state_in_fetch(&r->state)) return;   /* the state is being replaced */
+
+    for (;;) {
+        tbft_seqno_t n = r->last_executed + 1;
+        if (!tbft_replica_in_window(r, n) || !tbft_ar_in_range(&r->ar, n)) break;
         if (!tbft_ar_committed(&r->ar, n)) {
-            /* Seqno was skipped by a prior view-change (the new primary
-             * advanced past it after certifying f+1 replicas prepared it).
-             * The new-view should re-propose such seqnos, but the current
-             * implementation does not.  Continue past the gap rather than
-             * breaking, so later committed seqnos can execute and the
-             * cluster can form stable checkpoints. */
-            ESP_LOGI(TAG, "execute: seqno=%lld not committed (skipped by"
-                     " view-change), continuing to next",
-                     (long long)n);
-            r->last_executed = n;
-            continue;
+            /* a later seqno committed already: this one's messages got lost */
+            for (tbft_seqno_t m = n + 1; tbft_ar_in_range(&r->ar, m); m++) {
+                if (tbft_ar_committed(&r->ar, m)) {
+                    ask_for_missing(r);
+                    break;
+                }
+            }
+            break;
         }
 
         int pp_len = 0;
         const uint8_t *pp_buf = tbft_ar_load_pp(&r->ar, n, &pp_len);
         if (!pp_buf) {
-            /* UDP transport can drop the pre-prepare (592B) while
-             * smaller Prepare/Commit (264B) messages arrive and form
-             * a commit quorum.  Without the pre-prepare we can't
-             * execute, but continuing (instead of breaking) lets
-             * later seqnos with intact pre-prepares execute.
-             * The missing seqno's state will be corrected at the
-             * next stable checkpoint via fetch. */
-            ESP_LOGW(TAG, "execute: no pre-prepare for seqno=%lld"
-                     " — continuing", (long long)n);
-            r->last_executed = n;
-            continue;
-        }
-
-        const tbft_pre_prepare_rep_t *pp =
-            (const tbft_pre_prepare_rep_t *)pp_buf;
-
-        /* Defence-in-depth: verify the commit quorum's winning digest
-         * matches the PP digest.  This catches Byzantine commits that
-         * were accepted before the PP arrived and happen to reach quorum
-         * with a wrong digest (impossible under pigeonhole with f+1
-         * slots and only f faulty replicas, but checked anyway).
-         * Poisoned seqnos are skipped; subsequent in-window seqnos
-         * can still execute. */
-        {
-            tbft_agreement_slice_t *sl = tbft_ar_slice(&r->ar, n);
-            const uint8_t *winning_cm =
-                tbft_commit_cert_cvalue(&sl->commit_cert);
-            if (winning_cm) {
-                const tbft_commit_rep_t *cm_win =
-                    (const tbft_commit_rep_t *)winning_cm;
-                if (!tbft_digest_equal(&pp->digest, &cm_win->digest)) {
-                    ESP_LOGW(TAG, "execute: commit digest mismatch for seqno=%lld — skipping",
-                             (long long)n);
-                    r->last_executed = n;
-                    continue;
-                }
-            }
-        }
-
-        const uint8_t *req_bytes =
-            (const uint8_t *)pp_buf + sizeof(*pp);
-        int req_len   = pp->rset_size;
-        int ndet_len  = pp->non_det_size;
-        const uint8_t *ndet = req_bytes + req_len;
-
-        /* Execute */
-        if (r->exec_cb && req_len >= (int)sizeof(tbft_request_rep_t)) {
-            ESP_LOGI(TAG, "execute: calling exec_cb for seqno=%lld req_len=%d",
-                     (long long)n, req_len);
-            const tbft_request_rep_t *req_rep =
-                (const tbft_request_rep_t *)req_bytes;
-
-            /* Use r->out_buf for reply; max reply payload fits inside.
-             * Zero the buffer first so padding bytes between the reply
-             * payload and the aligned hdr.size do not leak stack/heap
-             * garbage into the RSA-signed data. */
-            memset(r->out_buf, 0, sizeof(r->out_buf));
-            tbft_reply_rep_t *reply = (tbft_reply_rep_t *)r->out_buf;
-            uint8_t *rep_payload    = r->out_buf + sizeof(*reply);
-            int      rep_len        = 0;
-            bool     ro = (req_rep->hdr.extra & TBFT_REQUEST_RO_FLAG) != 0;
-
-            int rc = r->exec_cb(req_bytes, req_len,
-                                rep_payload, &rep_len,
-                                (void *)ndet, ndet_len,
-                                req_rep->cid, ro);
-
-            if (rc != 0) {
-                /* Rejected by the application (API: "-1 to reject, no reply
-                 * sent").  Every replica rejects the same request
-                 * deterministically, so treat the seqno as executed and move
-                 * on; breaking here would retry the same seqno forever. */
-                ESP_LOGW(TAG, "exec_cb rejected seqno=%lld - skipping reply",
-                         (long long)n);
-                goto exec_done;
-            }
-
-            /* Validate reply length AFTER exec_cb has set it */
-            if (rep_len < 0 || sizeof(*reply) + (size_t)rep_len + TBFT_SIG_SIZE > sizeof(r->out_buf)) {
-                ESP_LOGE(TAG, "reply too large for out_buf (%d + %d + %d > %zu)",
-                         (int)sizeof(*reply), rep_len, (int)TBFT_SIG_SIZE, sizeof(r->out_buf));
-                break;
-            }
-                reply->hdr.tag          = TBFT_MSG_REPLY;
-                reply->hdr.extra        = 0;
-                reply->hdr.timestamp_us = 0;
-                reply->view             = r->node.view;
-                reply->seqno      = n;
-                reply->cid        = req_rep->cid;
-                reply->rid        = req_rep->rid;
-                reply->reply_size = rep_len;
-
-                int32_t body_sz = (int32_t)(sizeof(*reply) + (size_t)rep_len);
-                reply->hdr.size = tbft_msg_align(body_sz);
-
-                /* Sign the reply so the client can verify authenticity */
-                tbft_sig_t *sig = (tbft_sig_t *)(r->out_buf + reply->hdr.size);
-                int32_t total = reply->hdr.size;
-                if (reply->hdr.size + (int32_t)sizeof(tbft_sig_t)
-                        <= (int32_t)sizeof(r->out_buf)) {
-                    if (tbft_node_gen_sig(&r->node, r->out_buf,
-                                          (size_t)reply->hdr.size, sig) == 0) {
-                        total = reply->hdr.size + (int32_t)sizeof(tbft_sig_t);
-                    } else {
-                        ESP_LOGE(TAG, "reply signing failed for seqno=%lld — dropping reply",
-                                 (long long)n);
-                        break;
-                    }
-                } else {
-                    ESP_LOGE(TAG, "reply exceeds buffer after signing — dropping");
-                    break;
-                }
-
-                ESP_LOGI(TAG, "sending reply: cid=%d rid=%llu seqno=%lld size=%d",
-                         req_rep->cid, (unsigned long long)req_rep->rid,
-                         (long long)n, total);
-
-                if (r->recv_reply_cb) {
-                    r->recv_reply_cb(r->out_buf, total, req_rep->cid);
-                }
-                tbft_node_send(&r->node, r->out_buf, (size_t)total,
-                               req_rep->cid);
-        } else {
-            ESP_LOGW(TAG, "execute: exec_cb=%p req_len=%d sizeof(req)=%d — skipping exec for seqno=%lld",
-                     r->exec_cb, req_len, (int)sizeof(tbft_request_rep_t), (long long)n);
-        }
-
-exec_done:
-        if (req_len >= (int)sizeof(tbft_request_rep_t)) {
-            const tbft_request_rep_t *req_rep = (const tbft_request_rep_t *)req_bytes;
-            if (req_rep->rid > r->last_executed_rid[req_rep->cid]) {
-                r->last_executed_rid[req_rep->cid] = req_rep->rid;
-            }
-        }
-
-        r->last_executed = n;
-        r->stat_executed++;
-
-        /* Checkpoint at intervals */
-        if ((n % TBFT_CHECKPOINT_INTERVAL) == 0) {
-            tbft_state_checkpoint(&r->state, n);
-
-            /* Build and broadcast Checkpoint */
-            tbft_checkpoint_rep_t *ckpt =
-                (tbft_checkpoint_rep_t *)r->out_buf;
-            ckpt->hdr.tag  = TBFT_MSG_CHECKPOINT;
-            ckpt->hdr.extra = 0;
-            ckpt->hdr.timestamp_us = esp_timer_get_time();
-            ckpt->seqno    = n;
-            ckpt->digest   = *tbft_state_root_digest(&r->state);
-            ckpt->id       = r->node.node_id;
-            tbft_auth_t *auth =
-                (tbft_auth_t *)(r->out_buf + sizeof(*ckpt));
-            /* CRITICAL FIX: Set hdr.size BEFORE computing HMAC, same as
-             * pre-prepare, prepare, and commit. The size field is part of
-             * the message covered by the MAC. */
-            ckpt->hdr.size = tbft_msg_align(
-                (int32_t)(sizeof(*ckpt) + sizeof(tbft_auth_t)));
-            tbft_node_gen_auth(&r->node, r->out_buf,
-                               sizeof(*ckpt), auth);
-
-            /* Store our own checkpoint NOW, before broadcast.
-             * This prevents a spoofed message with id==node_id from
-             * bypassing auth in handle_checkpoint (which ignores self). */
-            bool self_stable = tbft_cr_store(&r->cr, n, r->node.node_id,
-                                             r->out_buf, ckpt->hdr.size);
-
-            tbft_node_send(&r->node, r->out_buf,
-                           (size_t)ckpt->hdr.size, TBFT_ALL_REPLICAS);
-
-            if (self_stable) {
-                tbft_replica_mark_stable(r, n);
-            }
-
-            ESP_LOGI(TAG, "broadcast checkpoint at seqno=%lld",
+            ESP_LOGI(TAG, "execute: seqno=%lld committed, waiting for its pre-prepare",
                      (long long)n);
+            ask_for_missing(r);
+            break;
+        }
+        const tbft_pre_prepare_rep_t *pp = (const tbft_pre_prepare_rep_t *)pp_buf;
+        tbft_agreement_slice_t *sl = tbft_ar_slice(&r->ar, n);
+        const tbft_commit_rep_t *win =
+            (const tbft_commit_rep_t *)tbft_commit_cert_cvalue(&sl->commit_cert);
+        if (!win || !tbft_digest_equal(&pp->digest, &win->digest)) {
+            ESP_LOGW(TAG, "execute: seqno=%lld pre-prepare differs from the commit quorum"
+                     " - waiting for the right one", (long long)n);
+            ask_for_missing(r);
+            break;
+        }
+
+        execute_one(r, n, pp);
+        r->last_executed = n;
+        if (r->last_prepared < n) r->last_prepared = n;
+        r->stat_executed++;
+        r->vc_backoff_shift = 0;   /* progress */
+
+        if ((n % TBFT_CHECKPOINT_INTERVAL) == 0) {
+            take_checkpoint(r, n);
         }
     }
-    if (tbft_replica_has_pending_requests(r)) {
-        tbft_itimer_start(&r->vtimer, r->vtimer_period_us);
-    } else {
-        tbft_itimer_stop(&r->vtimer);
-    }
+    update_vtimer(r);
 }
 
 void tbft_replica_mark_stable(tbft_replica_t *r, tbft_seqno_t seqno)
 {
     if (seqno <= r->last_stable) return;
-
     const tbft_digest_t *winning = tbft_cr_winning_digest(&r->cr, seqno);
-    if (winning) {
-        const tbft_digest_t *local = tbft_state_root_digest(&r->state);
-        if (!tbft_digest_equal(winning, local)) {
-            ESP_LOGW(TAG, "stable ckpt digest mismatch at seqno=%lld — starting fetch",
-                     (long long)seqno);
-            if (!r->state.in_fetch || seqno > r->state.fetch_seqno) {
-                /* Rate-limit fetch initiation to prevent a checkpoint
-                 * mismatch detected by all replicas simultaneously from
-                 * flooding the network.  The throttle is on the INITIATOR
-                 * side — the replica that needs data paces its requests
-                 * rather than silently dropping them at the responder.
-                 * 500ms between fetch starts gives the network time to
-                 * deliver the response before the next request. */
-                int64_t now_us = esp_timer_get_time();
-                if (now_us - r->last_fetch_throttle_us < 500000LL) return;
-                r->last_fetch_throttle_us = now_us;
+    if (!winning) return;
+    tbft_digest_t target = *winning;
 
-                tbft_replica_start_fetch(r, seqno,
-                                        tbft_node_primary(&r->node, r->node.view));
-            }
+    /* The quorum discards its messages up to a stable checkpoint, so a
+     * replica that has not executed that far must fetch the state.  Execute
+     * first: often the missing seqnos are committed here already. */
+    if (r->last_executed < seqno) {
+        tbft_replica_execute_committed(r);
+        if (seqno <= r->last_stable) return;   /* became stable meanwhile */
+    }
+
+    tbft_digest_t mine;
+    if (r->last_executed >= seqno &&
+        tbft_state_get_checkpoint_digest(&r->state, seqno, &mine)) {
+        if (tbft_digest_equal(&target, &mine)) {
+            install_stable(r, seqno);
+            /* the window moved: propose what waits in the queue */
+            if (tbft_replica_is_primary(r)) tbft_replica_send_pre_prepare(r);
             return;
         }
+        if (start_fetch(r, seqno, &target)) {
+            ESP_LOGE(TAG, "checkpoint seqno=%lld: local state differs from the quorum"
+                     " - fetching", (long long)seqno);
+        }
+        return;
     }
 
-    tbft_state_mark_stable(&r->state, seqno);
-    r->last_stable = seqno;
-
-    /* Advance execution and prepared markers to the stable checkpoint.
-     * After a state fetch, the application state matches this checkpoint
-     * but last_executed and last_prepared can lag behind (stuck at 0 on a
-     * freshly-booted node that jumped from seqno 0 to 1000).  Without this,
-     * the execution loop starts far below the agreement window head and
-     * either finds uncommitted gaps or falls permanently out of range. */
-    if (r->last_prepared < seqno) r->last_prepared = seqno;
-    if (r->last_executed < seqno) r->last_executed = seqno;
-
-    /* Truncate static regions */
-    tbft_ar_truncate(&r->ar, seqno + 1);
-    tbft_cr_truncate(&r->cr, seqno);
-
-    /* Reset view-change timer — stable progress */
-    if (tbft_replica_has_pending_requests(r)) {
-        tbft_itimer_start(&r->vtimer, r->vtimer_period_us);
-    } else {
-        tbft_itimer_stop(&r->vtimer);
+    /* Behind.  The others keep the messages of the last checkpoint period
+     * for a while: ask for them first, and fetch the state only if that has
+     * not brought us there half a Status period later. */
+    int64_t now = esp_timer_get_time();
+    if (r->stable_wait_seqno == 0) r->stable_wait_us = now;   /* just fell behind */
+    r->stable_wait_seqno = seqno;
+    if (!tbft_state_in_fetch(&r->state) && now - r->stable_wait_us < r->stimer_period_us / 2) {
+        ask_for_missing(r);
+        return;
     }
-
-    ESP_LOGI(TAG, "marked stable seqno=%lld", (long long)seqno);
+    if (start_fetch(r, seqno, &target)) {
+        ESP_LOGW(TAG, "checkpoint seqno=%lld is stable at the quorum, executed here up to"
+                 " %lld - fetching", (long long)seqno, (long long)r->last_executed);
+    }
 }
 
 void tbft_replica_send_view_change(tbft_replica_t *r)
 {
-    tbft_view_t target = r->node.view + 1;
-    if (r->vi.target_view > target) {
-        target = r->vi.target_view;
-    }
+    /* Timer expiry: ask for the next view, or for the one after a view
+     * change that did not complete in time. */
+    tbft_view_t target = r->vi.in_progress ? r->vi.target_view + 1 : r->node.view + 1;
+    send_view_change_to(r, target);
+}
 
-    if (r->vi.target_view != target) {
-        tbft_vi_reset(&r->vi, target);
-    }
+static void send_view_change_to(tbft_replica_t *r, tbft_view_t target)
+{
+    tbft_vi_set_target(&r->vi, target);
     r->vi.in_progress = true;
 
+    memset(r->out_buf, 0, sizeof(r->out_buf));
     uint8_t *ptr = r->out_buf;
-
-    /* Ensure the fixed-size header + optional ckpt fits before writing */
-    size_t min_size = sizeof(tbft_view_change_rep_t) + sizeof(tbft_vc_ckpt_t) + sizeof(tbft_sig_t);
-    if (min_size > sizeof(r->out_buf)) {
-        ESP_LOGE(TAG, "send_view_change: buffer too small");
-        return;
-    }
-
     tbft_view_change_rep_t *vc = (tbft_view_change_rep_t *)ptr;
-    vc->hdr.tag   = TBFT_MSG_VIEW_CHANGE;
-    vc->hdr.extra = 0;
-    vc->v         = target;
-    vc->ls        = r->last_stable;
-    vc->id        = r->node.node_id;
-
+    vc->hdr.tag          = TBFT_MSG_VIEW_CHANGE;
+    vc->hdr.extra        = 0;
+    vc->hdr.timestamp_us = esp_timer_get_time();
+    vc->v                = target;
+    vc->ls               = r->last_stable;
+    vc->id               = r->node.node_id;
+    vc->_pad             = 0;
+    vc->n_ckpts          = 0;
+    vc->n_reqs           = 0;
     ptr += sizeof(*vc);
 
-    vc->n_ckpts = 0;
-    vc->n_reqs  = 0;
-
+    /* Our stable checkpoint with its state digest (while it is still being
+     * fetched, the digest the fetch aims at) */
+    tbft_digest_t ls_digest;
+    bool have_ls = false;
     if (r->last_stable > 0) {
-        const tbft_digest_t *root = tbft_state_root_digest(&r->state);
+        if (tbft_state_get_checkpoint_digest(&r->state, r->last_stable, &ls_digest)) {
+            have_ls = true;
+        } else if (tbft_state_in_fetch(&r->state) && r->state.fetch_has_digest &&
+                   r->state.fetch_seqno == r->last_stable) {
+            ls_digest = r->state.fetch_digest;
+            have_ls   = true;
+        }
+    }
+    if (have_ls) {
         tbft_vc_ckpt_t *ckpt = (tbft_vc_ckpt_t *)ptr;
         ckpt->seqno  = r->last_stable;
-        ckpt->digest = *root;
+        ckpt->digest = ls_digest;
         ptr += sizeof(*ckpt);
         vc->n_ckpts = 1;
     }
 
-    /* Guard the max_reqs subtraction: if ptr has already advanced past the
-     * space budget, a plain (size_t)-(size_t) underflows to a huge unsigned
-     * value and the loop would iterate unbounded. */
-    size_t consumed_bytes = (size_t)(ptr - r->out_buf);
-    size_t budget_bytes   = sizeof(r->out_buf) - sizeof(tbft_sig_t);
-    int max_reqs = 0;
-    if (consumed_bytes < budget_bytes) {
-        max_reqs = (int)((budget_bytes - consumed_bytes) /
-                         sizeof(tbft_vc_req_info_t));
-    }
-    for (tbft_seqno_t s = r->last_stable + 1; s <= r->last_prepared; s++) {
-        if (tbft_ar_in_range(&r->ar, s) && tbft_ar_prepared(&r->ar, s)) {
-            if (vc->n_reqs >= TBFT_WINDOW_SIZE || vc->n_reqs >= max_reqs) break;
-            int pp_len = 0;
-            const uint8_t *pp_buf = tbft_ar_load_pp(&r->ar, s, &pp_len);
-            if (pp_buf) {
-                const tbft_pre_prepare_rep_t *pp =
-                    (const tbft_pre_prepare_rep_t *)pp_buf;
-                tbft_vc_req_info_t *req = (tbft_vc_req_info_t *)ptr;
-                req->seqno     = s;
-                req->last_view = r->node.view;
-                req->digest    = pp->digest;
-                ptr += sizeof(*req);
-                vc->n_reqs++;
-            }
+    /* Every seqno above it that we saw prepared or committed, with the
+     * highest view that happened in: the new primary re-proposes these. */
+    for (tbft_seqno_t s = r->last_stable + 1; s <= r->last_stable + TBFT_WINDOW_SIZE; s++) {
+        if (!tbft_ar_in_range(&r->ar, s)) continue;
+        const tbft_agreement_slice_t *sl = tbft_ar_slice(&r->ar, s);
+        if (sl->prep_view < 0) continue;
+        if ((size_t)(ptr - r->out_buf) + sizeof(tbft_vc_req_info_t) + sizeof(tbft_sig_t)
+                > sizeof(r->out_buf)) {
+            break;
         }
+        tbft_vc_req_info_t *req = (tbft_vc_req_info_t *)ptr;
+        req->seqno     = s;
+        req->last_view = sl->prep_view;
+        req->digest    = sl->prep_digest;
+        ptr += sizeof(*req);
+        vc->n_reqs++;
     }
 
     vc->hdr.size = tbft_msg_align((int32_t)(ptr - r->out_buf));
-
-    /* Append RSA signature over the body (hdr.size bytes).
-     * The body length is stored in hdr.size; the signature follows but is
-     * NOT included in hdr.size so receivers can locate it as msg + hdr.size.
-     *
-     * SECURITY: View-change messages MUST be signed.  An unsigned view-change
-     * could be injected by any network attacker to trigger a view transition.
-     * If signing fails, abort — do not fall back to sending unsigned. */
     int32_t body_size  = vc->hdr.size;
     int32_t total_size = body_size + (int32_t)sizeof(tbft_sig_t);
     if (total_size > (int32_t)sizeof(r->out_buf)) {
         ESP_LOGE(TAG, "send_view_change: out_buf too small for signature");
         return;
     }
+    /* View-change messages MUST be signed: abort rather than send unsigned. */
     tbft_sig_t *sig = (tbft_sig_t *)(r->out_buf + body_size);
     if (tbft_node_gen_sig(&r->node, r->out_buf, (size_t)body_size, sig) != 0) {
-        ESP_LOGE(TAG, "send_view_change: failed to sign — refusing to send unsigned");
+        ESP_LOGE(TAG, "send_view_change: failed to sign - refusing to send unsigned");
         return;
     }
-
     tbft_node_send(&r->node, r->out_buf, (size_t)total_size, TBFT_ALL_REPLICAS);
-
     r->stat_view_change_sent++;
-    ESP_LOGI(TAG, "sent view-change to view %lld", (long long)target);
+    ESP_LOGW(TAG, "sent view-change to view %lld (ls=%lld, %d prepared)",
+             (long long)target, (long long)r->last_stable, (int)vc->n_reqs);
 
-    if (!r->vi.received[r->node.node_id]) {
-        tbft_vi_collect_vc(&r->vi, r->node.node_id, r->out_buf, total_size);
+    (void)tbft_vi_collect_vc(&r->vi, r->node.node_id, r->out_buf, total_size);
+    if (target > r->vc_view_seen[r->node.node_id]) {
+        r->vc_view_seen[r->node.node_id] = target;
     }
 
-    /* Exponential backoff: each consecutive view change doubles the
-     * vtimer period relative to the base, capped at MAX_MULT.
-     * The shift is bounded by the view-gap so the timer grows with
-     * each successive failure rather than resetting to 2x every time. */
-    int shift = (int)(target - r->node.view);
-    if (shift < 1) shift = 1;
-    if (shift > 6) shift = 6;
-    int64_t next_period = r->vtimer_period_us * (1LL << shift);
-    if (next_period > r->vtimer_period_us * TBFT_VC_BACKOFF_MAX_MULT) {
-        next_period = r->vtimer_period_us * TBFT_VC_BACKOFF_MAX_MULT;
-    }
-    tbft_itimer_start(&r->vtimer, next_period);
+    /* Wait longer for each view change in a row without progress. */
+    if (r->vc_backoff_shift < 6) r->vc_backoff_shift++;
+    tbft_itimer_start(&r->vtimer, vtimer_period(r));
+
+    maybe_send_new_view(r);
 }
 
 /* --------------------------------------------------------------------------
@@ -2656,10 +2487,19 @@ void tbft_replica_send_new_key(tbft_replica_t *r)
     }
 
     tbft_new_key_rep_t *nk = (tbft_new_key_rep_t *)r->out_buf;
-    nk->hdr.tag   = TBFT_MSG_NEW_KEY;
-    nk->hdr.extra = 0;
-    nk->id        = local_id;
-    nk->n_keys    = 0;
+    nk->hdr.tag          = TBFT_MSG_NEW_KEY;
+    nk->hdr.extra        = 0;
+    nk->hdr.timestamp_us = esp_timer_get_time();
+    nk->id               = local_id;
+    nk->n_keys           = 0;
+    /* The keys we hold: a replica whose key is missing here answers with
+     * its New_key (e.g. after we rebooted or booted late). */
+    nk->have_keys        = 0;
+    for (int i = 0; i < n; i++) {
+        if (i != local_id && r->node.principals[i] && r->node.principals[i]->keys_fresh) {
+            nk->have_keys |= 1ULL << i;
+        }
+    }
 
     tbft_new_key_slot_t *slots =
         (tbft_new_key_slot_t *)(r->out_buf + sizeof(*nk));
@@ -2757,6 +2597,17 @@ void tbft_replica_handle_new_key(tbft_replica_t *r, const void *msg, int len)
 
     tbft_principal_t *p = r->node.principals[sender_id];
     if (!p) return;
+
+    /* The sender lacks our key (it rebooted or booted late): answer with our
+     * New_key, at most every 2 s (one broadcast serves every such replica). */
+    if (!(nk->have_keys & (1ULL << r->node.node_id))) {
+        int64_t now = esp_timer_get_time();
+        if (r->last_nk_reply_us == 0 || now - r->last_nk_reply_us >= 2000000LL) {
+            r->last_nk_reply_us = now;
+            ESP_LOGI(TAG, "replica %d lacks our key: re-sending New_key", sender_id);
+            tbft_replica_send_new_key(r);
+        }
+    }
 
     int expected_len = (int)(sizeof(*nk)
                              + (size_t)nk->n_keys * sizeof(tbft_new_key_slot_t));

@@ -57,7 +57,8 @@ static tbft_ckpt_record_t *ckpt_slot_for(tbft_state_t *s, tbft_seqno_t seqno)
  * Lifecycle
  * -------------------------------------------------------------------------- */
 
-int tbft_state_init(tbft_state_t *state, void *mem, size_t size)
+int tbft_state_init(tbft_state_t *state, void *mem, size_t size,
+                    void *sys_mem, size_t sys_size)
 {
     memset(state, 0, sizeof(*state));
 
@@ -65,15 +66,22 @@ int tbft_state_init(tbft_state_t *state, void *mem, size_t size)
         ESP_LOGE(TAG, "invalid state memory: ptr=%p size=%zu", mem, size);
         return -1;
     }
+    if ((sys_size % TBFT_BLOCK_SIZE) != 0 || (sys_size > 0 && !sys_mem)) {
+        ESP_LOGE(TAG, "invalid library state memory: ptr=%p size=%zu", sys_mem, sys_size);
+        return -1;
+    }
 
-    state->mem       = (uint8_t *)mem;
-    state->mem_size  = size;
-    state->num_blocks = (int)(size / TBFT_BLOCK_SIZE);
+    state->mem        = (uint8_t *)mem;
+    state->mem_size   = size;
+    state->app_blocks = (int)(size / TBFT_BLOCK_SIZE);
+    state->sys_mem    = (uint8_t *)sys_mem;
+    state->num_blocks = state->app_blocks + (int)(sys_size / TBFT_BLOCK_SIZE);
     state->fetch_timeout_us = TBFT_RECOVERY_TIMEOUT_US;
 
     if (state->num_blocks > TBFT_MAX_STATE_BLOCKS) {
-        ESP_LOGE(TAG, "too many blocks: %d > %d",
-                 state->num_blocks, TBFT_MAX_STATE_BLOCKS);
+        ESP_LOGE(TAG, "too many blocks: %d application + %d library > "
+                 "TBFT_MAX_STATE_BLOCKS %d", state->app_blocks,
+                 state->num_blocks - state->app_blocks, TBFT_MAX_STATE_BLOCKS);
         return -1;
     }
 
@@ -84,33 +92,23 @@ int tbft_state_init(tbft_state_t *state, void *mem, size_t size)
         return -1;
     }
 
-    /* Pre-allocate each checkpoint record's snapshot array to num_blocks
-     * entries.  Every block can change at most once per checkpoint interval,
-     * so num_blocks is a hard upper bound.  This avoids realloc() in the
-     * CoW hot path and the OOM-induced abort it would otherwise require. */
-    for (int i = 0; i < TBFT_NUM_CKPT_SLOTS; i++) {
-        state->ckpt_records[i].old_blocks =
-            (tbft_cow_entry_t *)calloc((size_t)state->num_blocks,
-                                       sizeof(tbft_cow_entry_t));
-        if (!state->ckpt_records[i].old_blocks) {
-            ESP_LOGE(TAG, "state init: OOM allocating CoW snapshot array "
-                          "(%d blocks * %zu bytes)",
-                     state->num_blocks, sizeof(tbft_cow_entry_t));
-            for (int j = 0; j < i; j++) {
-                free(state->ckpt_records[j].old_blocks);
-                state->ckpt_records[j].old_blocks = nullptr;
-            }
-            tbft_ptree_free(&state->ptree);
-            return -1;
-        }
-        state->ckpt_records[i].num_old_blocks = 0;
+    state->image = (uint8_t *)malloc((size_t)state->num_blocks * TBFT_BLOCK_SIZE);
+    if (!state->image) {
+        ESP_LOGE(TAG, "state init: OOM allocating the %d-block checkpoint image",
+                 state->num_blocks);
+        tbft_ptree_free(&state->ptree);
+        return -1;
     }
 
-    ESP_LOGI(TAG, "state init: %d blocks (%zu bytes), CoW reserve "
-                  "%d slots * %d blocks * %zu bytes",
-             state->num_blocks, size,
-             TBFT_NUM_CKPT_SLOTS, state->num_blocks,
-             sizeof(tbft_cow_entry_t));
+    /* Checkpoint 0: the initial state every replica starts from. */
+    for (int i = 0; i < state->num_blocks; i++) {
+        tbft_state_cow_single(state, i);
+    }
+    tbft_state_checkpoint(state, 0);
+
+    ESP_LOGI(TAG, "state init: %d blocks (%d application + %d library, %zu bytes each)",
+             state->num_blocks, state->app_blocks,
+             state->num_blocks - state->app_blocks, (size_t)TBFT_BLOCK_SIZE);
     return 0;
 }
 
@@ -118,13 +116,8 @@ void tbft_state_free(tbft_state_t *state)
 {
     tbft_ptree_free(&state->ptree);
 
-    /* Free checkpoint record snapshots */
-    for (int i = 0; i < TBFT_NUM_CKPT_SLOTS; i++) {
-        if (state->ckpt_records[i].old_blocks) {
-            free(state->ckpt_records[i].old_blocks);
-            state->ckpt_records[i].old_blocks = nullptr;
-        }
-    }
+    free(state->image);
+    state->image = nullptr;
     memset(state, 0, sizeof(*state));
 }
 
@@ -135,38 +128,7 @@ void tbft_state_free(tbft_state_t *state)
 void tbft_state_cow_single(tbft_state_t *state, int bindex)
 {
     if (bindex < 0 || bindex >= state->num_blocks) return;
-    if (cow_test(state, bindex)) return; /* already snapshotted */
-
-    /* Find the active (most recent) checkpoint record */
-    tbft_ckpt_record_t *rec = ckpt_slot_for(state, state->last_stable);
-
-    if (!rec->old_blocks) {
-        /* Should not happen: old_blocks is pre-allocated in tbft_state_init
-         * and freed only on shutdown.  Log and bail out non-fatally — the
-         * missing snapshot merely means we cannot roll back THIS checkpoint
-         * on view change; consensus can still advance via state transfer. */
-        ESP_LOGW(TAG, "cow_single: snapshot buffer missing, skipping block %d",
-                 bindex);
-        return;
-    }
-    if (rec->num_old_blocks >= state->num_blocks) {
-        /* Every block already snapshotted — indicates a rapid write pattern
-         * on all blocks without an intervening checkpoint.  The CoW bitmap
-         * prevents duplicates, so hitting this branch should be impossible. */
-        ESP_LOGW(TAG, "cow_single: snapshot array full, skipping block %d",
-                 bindex);
-        return;
-    }
-
-    /* Save the current block into the pre-allocated slot */
-    int n = rec->num_old_blocks;
-    rec->old_blocks[n].block_idx = bindex;
-    memcpy(rec->old_blocks[n].data,
-           state->mem + (size_t)bindex * TBFT_BLOCK_SIZE,
-           TBFT_BLOCK_SIZE);
-    rec->num_old_blocks++;
-
-    cow_set(state, bindex);
+    cow_set(state, bindex);   /* digest recomputed at the next checkpoint */
 }
 
 void tbft_state_cow(tbft_state_t *state, void *mem, size_t size)
@@ -202,7 +164,7 @@ void tbft_state_checkpoint(tbft_state_t *state, tbft_seqno_t seqno)
     for (int i = 0; i < state->num_blocks; i++) {
         if (!cow_test(state, i)) continue;
 
-        const uint8_t *block = state->mem + (size_t)i * TBFT_BLOCK_SIZE;
+        const uint8_t *block = tbft_state_block(state, i);
         tbft_msg_digest(block, TBFT_BLOCK_SIZE, &state->block_digests[i]);
         if (tbft_ptree_update_leaf(&state->ptree, i, &state->block_digests[i],
                                    seqno) != 0) {
@@ -212,18 +174,16 @@ void tbft_state_checkpoint(tbft_state_t *state, tbft_seqno_t seqno)
         }
     }
 
-    /* CRITICAL FIX: Do NOT free old_blocks here. The CoW-saved blocks
-     * represent the state at last_stable and are needed for rollback during
-     * view-change. Freeing them here makes rollback a silent no-op.
-     *
-     * Instead, we reset the CoW bitmap and keep the old_blocks intact.
-     * The old_blocks will be freed only when mark_stable advances past
-     * this checkpoint (in tbft_state_mark_stable). */
     tbft_ckpt_record_t *rec = ckpt_slot_for(state, seqno);
     rec->seqno       = seqno;
     rec->root_digest = *tbft_ptree_root_digest(&state->ptree);
     rec->valid       = true;
-    /* Do NOT free old_blocks or reset num_old_blocks here! */
+
+    for (int i = 0; i < state->num_blocks; i++) {
+        memcpy(state->image + (size_t)i * TBFT_BLOCK_SIZE,
+               tbft_state_block(state, i), TBFT_BLOCK_SIZE);
+    }
+    state->image_seqno = seqno;
 
     /* Reset CoW bitmap for next checkpoint interval */
     cow_zero(state);
@@ -234,51 +194,9 @@ const tbft_digest_t *tbft_state_root_digest(const tbft_state_t *state)
     return tbft_ptree_root_digest(&state->ptree);
 }
 
-tbft_seqno_t tbft_state_rollback(tbft_state_t *state)
-{
-    tbft_ckpt_record_t *rec = ckpt_slot_for(state, state->last_stable);
-    if (!rec->valid) {
-        ESP_LOGW(TAG, "rollback: no valid checkpoint record");
-        return 0;
-    }
-
-    /* Restore old blocks */
-    for (int i = 0; i < rec->num_old_blocks; i++) {
-        int bidx = rec->old_blocks[i].block_idx;
-        memcpy(state->mem + (size_t)bidx * TBFT_BLOCK_SIZE,
-               rec->old_blocks[i].data, TBFT_BLOCK_SIZE);
-
-        /* Rebuild leaf digest */
-        tbft_msg_digest(state->mem + (size_t)bidx * TBFT_BLOCK_SIZE,
-                        TBFT_BLOCK_SIZE, &state->block_digests[bidx]);
-        if (tbft_ptree_update_leaf(&state->ptree, bidx,
-                                   &state->block_digests[bidx],
-                                   rec->seqno) != 0) {
-            ESP_LOGW(TAG, "rollback: failed to rebuild leaf %d at seqno=%lld",
-                     bidx, (long long)rec->seqno);
-        }
-    }
-
-    cow_zero(state);
-    return rec->seqno;
-}
-
 void tbft_state_mark_stable(tbft_state_t *state, tbft_seqno_t stable_seqno)
 {
     if (stable_seqno <= state->last_stable) return;
-
-    /* CRITICAL FIX: Unconditionally reset num_old_blocks for the target
-     * checkpoint slot. The slot may have stale CoW data from a previous
-     * cycle (when it was used as a CoW target via ckpt_slot_for(last_stable)
-     * at a different last_stable value). The valid+seqno guard only catches
-     * the case where the slot was a checkpoint target with a different seqno,
-     * but misses the case where it was only a CoW target (valid=false). */
-    tbft_ckpt_record_t *new_rec = ckpt_slot_for(state, stable_seqno);
-    if (new_rec->old_blocks) {
-        new_rec->num_old_blocks = 0;
-        memset(new_rec->old_blocks, 0,
-               (size_t)state->num_blocks * sizeof(tbft_cow_entry_t));
-    }
 
     state->last_stable = stable_seqno;
 }
@@ -287,9 +205,30 @@ void tbft_state_mark_stable(tbft_state_t *state, tbft_seqno_t stable_seqno)
  * Fetch protocol
  * -------------------------------------------------------------------------- */
 
-void tbft_state_start_fetch(tbft_state_t *state, tbft_seqno_t seqno,
-                            int replier)
+/* Bring the digests of blocks modified since the last checkpoint up to date,
+ * so a fetch compares the CURRENT content with the replier's checkpoint and
+ * also replaces blocks this replica changed after its own checkpoint. */
+static void refresh_dirty_digests(tbft_state_t *state)
 {
+    for (int i = 0; i < state->num_blocks; i++) {
+        if (!cow_test(state, i)) continue;
+        tbft_msg_digest(tbft_state_block(state, i), TBFT_BLOCK_SIZE,
+                        &state->block_digests[i]);
+        tbft_ptree_update_leaf(&state->ptree, i, &state->block_digests[i],
+                               state->image_seqno);
+    }
+}
+
+void tbft_state_start_fetch(tbft_state_t *state, tbft_seqno_t seqno,
+                            int replier, const tbft_digest_t *target_digest)
+{
+    refresh_dirty_digests(state);
+    state->fetch_has_digest = target_digest != nullptr;
+    if (target_digest) {
+        state->fetch_digest = *target_digest;
+    } else {
+        tbft_digest_zero(&state->fetch_digest);
+    }
     state->in_fetch         = true;
     state->fetch_seqno      = seqno;
     state->fetch_replier    = replier;
@@ -421,7 +360,7 @@ void tbft_state_handle_data(tbft_state_t *state,
     }
 
     /* Write block to state */
-    memcpy(state->mem + (size_t)bidx * TBFT_BLOCK_SIZE,
+    memcpy(tbft_state_block(state, bidx),
            block_data, TBFT_BLOCK_SIZE);
     state->block_digests[bidx] = computed;
     if (tbft_ptree_update_leaf(&state->ptree, bidx, &computed, rep->seqno) != 0) {
@@ -472,6 +411,17 @@ bool tbft_state_next_fetch_req(tbft_state_t *state, int *level, int *index)
         }
     }
     return false;
+}
+
+void tbft_state_install_fetched(tbft_state_t *state, tbft_seqno_t seqno)
+{
+    /* Every block now holds the fetched checkpoint: recompute all digests
+     * and make it this replica's latest checkpoint (and served image). */
+    for (int i = 0; i < state->num_blocks; i++) {
+        cow_set(state, i);
+    }
+    tbft_state_checkpoint(state, seqno);
+    if (seqno > state->last_stable) state->last_stable = seqno;
 }
 
 void tbft_state_fetch_complete(tbft_state_t *state)

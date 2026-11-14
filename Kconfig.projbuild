@@ -338,6 +338,21 @@ menu "TinyBFT Configuration"
                 Timeout for waiting for f+1 matching replies after sending
                 a request. Default: 10s (10000ms).
 
+        config TBFT_CLIENT_RETRANSMIT_MS
+            int "Client request retransmission interval (milliseconds)"
+            default 5000
+            range 0 120000
+            help
+                A client that has not collected f+1 matching replies re-sends
+                its request to every replica after this time, then after
+                twice as long, and so on until the reply timeout expires.
+                This is what lets a request survive a lost message or a view
+                change. Replicas never execute a request twice: one that has
+                already run is answered from the reply cache.
+
+                Keep it above the normal request latency, otherwise a healthy
+                run carries extra traffic. 0 disables retransmission.
+
         config TBFT_ANTI_REPLAY_WINDOW_MS
             int "Anti-replay window (milliseconds)"
             default 30000

@@ -56,28 +56,6 @@ const uint8_t *tbft_sr_load_vc(const tbft_special_region_t *sr,
     SR_LOAD(sr->view_change[from_replica], len_out);
 }
 
-void tbft_sr_clear_vc(tbft_special_region_t *sr)
-{
-    for (int i = 0; i < TBFT_MAX_NUM_REPLICAS; i++) {
-        sr->view_change[i].valid = false;
-        sr->view_change[i].len   = 0;
-    }
-}
-
-/* --------------------------------------------------------------------------
- * View-change ack
- * -------------------------------------------------------------------------- */
-
-bool tbft_sr_store_vc_ack(tbft_special_region_t *sr,
-                          tbft_node_id_t sender, tbft_node_id_t vc_sender,
-                          const void *msg, int msg_len)
-{
-    if (sender < 0 || sender >= TBFT_MAX_NUM_REPLICAS) return false;
-    if (vc_sender < 0 || vc_sender >= TBFT_MAX_NUM_REPLICAS) return false;
-    SR_STORE(sr->vc_ack[sender][vc_sender], msg, msg_len,
-             sizeof(tbft_vc_ack_rep_t));
-}
-
 /* --------------------------------------------------------------------------
  * New-view
  * -------------------------------------------------------------------------- */
@@ -94,26 +72,8 @@ const uint8_t *tbft_sr_load_nv(const tbft_special_region_t *sr, int *len_out)
 }
 
 /* --------------------------------------------------------------------------
- * Request / Reply
+ * Reply cache
  * -------------------------------------------------------------------------- */
-
-bool tbft_sr_store_request(tbft_special_region_t *sr,
-                           int client_idx,
-                           const void *msg, int msg_len)
-{
-    if (client_idx < 0 || client_idx >= TBFT_MAX_NUM_CLIENTS) return false;
-    SR_STORE(sr->request[client_idx], msg, msg_len, TBFT_REQ_MSG_MAX_SIZE);
-}
-
-const uint8_t *tbft_sr_load_request(const tbft_special_region_t *sr,
-                                    int client_idx, int *len_out)
-{
-    if (client_idx < 0 || client_idx >= TBFT_MAX_NUM_CLIENTS) {
-        if (len_out) *len_out = 0;
-        return nullptr;
-    }
-    SR_LOAD(sr->request[client_idx], len_out);
-}
 
 bool tbft_sr_store_reply(tbft_special_region_t *sr,
                          int client_idx,

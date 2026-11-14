@@ -36,6 +36,13 @@ void tbft_prepared_cert_init(tbft_prepared_cert_t *cert, int prepare_threshold);
 
 void tbft_prepared_cert_clear(tbft_prepared_cert_t *cert);
 
+/** Drop the prepares but keep the pre-prepare (new view). */
+void tbft_prepared_cert_clear_prepares(tbft_prepared_cert_t *cert);
+
+/** Replace the stored pre-prepare (pp_len 0 removes it). */
+bool tbft_prepared_cert_replace_pp(tbft_prepared_cert_t *cert,
+                                   const void *pp_buf, int pp_len);
+
 /**
  * Store a received Pre_prepare.
  * @return true if accepted (no pre-prepare was already stored)

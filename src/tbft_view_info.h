@@ -8,9 +8,9 @@
  * View_info — manages the view-change protocol state (section 9).
  *
  * Tracks:
- *  - Which view-change messages have been received
- *  - Whether we have enough (2f+1) to construct a New_view
- *  - Computes (min, max) seqno range for the new view
+ *  - The newest View_change of each replica (stored in the special region)
+ *  - Which of them are for the target view, and whether there are 2f+1
+ *    (enough for the target view's primary to send New_view)
  * -------------------------------------------------------------------------- */
 
 typedef struct {
@@ -41,17 +41,19 @@ void tbft_vi_init(tbft_view_info_t *vi, int num_replicas, int threshold,
                   tbft_special_region_t *sr);
 
 /**
- * Reset for a new view-change round.
+ * Aim at @p target_view, counting the stored View_change messages (the
+ * newest one of each replica) that are for exactly that view.
  */
-void tbft_vi_reset(tbft_view_info_t *vi, tbft_view_t new_target_view);
+void tbft_vi_set_target(tbft_view_info_t *vi, tbft_view_t target_view);
 
 /* --------------------------------------------------------------------------
  * View-change collection
  * -------------------------------------------------------------------------- */
 
 /**
- * Record a received View_change message from @p sender_id.
- * @return true if the message was newly accepted
+ * Store a View_change message from @p sender_id unless an older one
+ * replaces a newer: each replica keeps only its newest View_change.
+ * @return true if the message is for the current target view
  */
 bool tbft_vi_collect_vc(tbft_view_info_t *vi,
                         tbft_node_id_t sender_id,
@@ -62,34 +64,3 @@ bool tbft_vi_collect_vc(tbft_view_info_t *vi,
  */
 bool tbft_vi_has_quorum(const tbft_view_info_t *vi);
 
-/* --------------------------------------------------------------------------
- * New-view computation
- * -------------------------------------------------------------------------- */
-
-/**
- * Compute min and max sequence numbers from the collected view-changes.
- * min = max of all last_stable values
- * max = min of (last_stable + WINDOW_SIZE) across all view-changes
- */
-void tbft_vi_compute_min_max(const tbft_view_info_t *vi,
-                             tbft_seqno_t *min_out, tbft_seqno_t *max_out);
-
-/**
- * Verify that a received New_view message is consistent with the collected
- * view-change messages.
- * @return true if valid
- */
-bool tbft_vi_verify_nv(const tbft_view_info_t *vi,
-                       const tbft_new_view_rep_t *nv, int nv_len);
-
-/* --------------------------------------------------------------------------
- * View-change ack
- * -------------------------------------------------------------------------- */
-
-/**
- * Store a View_change_ack received from @p sender for vc from @p vc_sender.
- */
-void tbft_vi_collect_vc_ack(tbft_view_info_t *vi,
-                             tbft_node_id_t sender,
-                             tbft_node_id_t vc_sender,
-                             const void *msg, int msg_len);

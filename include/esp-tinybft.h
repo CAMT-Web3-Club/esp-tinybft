@@ -154,6 +154,11 @@ typedef void (*Byz_recv_reply_cb)(Byz_rep *reply, int cid);
 /**
  * Initialise the BFT client.
  *
+ * The client keeps a boot counter in NVS (namespace "tbft") so that its
+ * request ids keep growing across resets: replicas never execute a request
+ * id that is not above the last one they executed for this client.  Call
+ * nvs_flash_init() before this function.
+ *
  * @param config_file   Path to the cluster configuration file
  * @param priv_config   Path to the private key / identity file
  * @param local_id      Node slot this client occupies in the config
@@ -175,7 +180,7 @@ int Byz_init_client(const char *config_file, const char *priv_config,
 int Byz_alloc_request(Byz_req *req, int size);
 
 /**
- * Send the request to the primary replica.
+ * Send the request to every replica (it is kept for re-sending).
  *
  * @param req       Populated request buffer
  * @param read_only True if the request is read-only (no state modification)
@@ -184,7 +189,10 @@ int Byz_alloc_request(Byz_req *req, int size);
 int Byz_send_request(Byz_req *req, bool read_only);
 
 /**
- * Wait for f+1 matching replies.
+ * Wait for f+1 matching replies, re-sending the request to every replica
+ * after TBFT_CLIENT_RETRANSMIT_MS, then after twice as long, and so on,
+ * until TBFT_CLIENT_REPLY_TIMEOUT_MS.  A replica executes a request at most
+ * once and answers a re-sent one from its reply cache.
  *
  * @param rep  Receives the agreed reply
  * @return 0 on success, -1 on timeout or mismatch

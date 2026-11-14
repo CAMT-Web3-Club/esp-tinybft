@@ -184,11 +184,21 @@ typedef struct [[gnu::packed]] {
 typedef struct [[gnu::packed]] {
     tbft_msg_hdr_t  hdr;
     tbft_view_t     v;        /* new view number */
-    tbft_seqno_t    min;      /* max of all last_stable values in view-changes */
-    tbft_seqno_t    max;      /* min of (last_stable + window) across view-changes */
-    int32_t         n_prep;   /* number of prepared entries */
+    tbft_seqno_t    min;      /* highest stable checkpoint among the view-changes */
+    tbft_seqno_t    max;      /* highest sequence number the new view re-proposes */
+    int32_t         n_prep;   /* entries following: one per seqno min+1 .. max */
     int32_t         has_sig;  /* 1 if signature follows */
+    tbft_digest_t   min_digest; /* state digest of the checkpoint at min */
 } tbft_new_view_rep_t;
+
+/* hdr.extra flags */
+/** Status from a replica whose view change is in progress. */
+static constexpr int16_t TBFT_STATUS_IN_VC  = 0x1;
+/** Status from a replica whose execution is stuck on a missing message:
+ *  re-send now what it lacks. */
+static constexpr int16_t TBFT_STATUS_WANT   = 0x2;
+/** last_view of a New_view entry that re-proposes a null request. */
+static constexpr tbft_view_t TBFT_NV_NULL = -1;
 
 /* --------------------------------------------------------------------------
  * View_change_ack  (tag = 10)  Replica → New Primary
@@ -215,6 +225,9 @@ typedef struct [[gnu::packed]] {
     tbft_msg_hdr_t  hdr;
     int32_t         id;       /* sender's replica id */
     int32_t         n_keys;   /* number of tbft_new_key_slot_t entries */
+    uint64_t        have_keys; /* bit i: the sender holds replica i's key; a
+                                * replica whose bit is clear answers with its
+                                * own New_key */
 } tbft_new_key_rep_t;
 
 /** One encrypted-key slot inside a New_key message */

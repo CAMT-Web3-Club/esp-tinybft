@@ -19,6 +19,29 @@ void tbft_prepared_cert_clear(tbft_prepared_cert_t *cert)
     tbft_prepare_cert_init(&cert->pc, thr);
 }
 
+void tbft_prepared_cert_clear_prepares(tbft_prepared_cert_t *cert)
+{
+    tbft_prepare_cert_clear(&cert->pc);
+}
+
+bool tbft_prepared_cert_replace_pp(tbft_prepared_cert_t *cert,
+                                   const void *pp_buf, int pp_len)
+{
+    if (pp_len == 0) {
+        cert->pp_len = 0;
+        return true;
+    }
+    if (pp_len < (int)sizeof(tbft_pre_prepare_rep_t) || pp_len > TBFT_PP_MAX_SIZE) {
+        return false;
+    }
+    if ((const uint8_t *)pp_buf != cert->pp_buf) {
+        memmove(cert->pp_buf, pp_buf, (size_t)pp_len);
+    }
+    cert->pp_len    = pp_len;
+    cert->t_sent_us = esp_timer_get_time();
+    return true;
+}
+
 bool tbft_prepared_cert_add_pp(tbft_prepared_cert_t *cert,
                                const void *pp_buf, int pp_len)
 {

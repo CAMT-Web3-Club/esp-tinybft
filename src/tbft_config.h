@@ -78,6 +78,12 @@
 #define TBFT_CLIENT_REPLY_TIMEOUT_MS  CONFIG_TBFT_CLIENT_REPLY_TIMEOUT_MS
 #endif
 
+/* Interval after which a client re-sends a request that has no f+1 matching
+ * replies yet (doubled after each re-send); 0 = never re-send. */
+#ifndef TBFT_CLIENT_RETRANSMIT_MS
+#define TBFT_CLIENT_RETRANSMIT_MS     CONFIG_TBFT_CLIENT_RETRANSMIT_MS
+#endif
+
 #ifndef TBFT_IDLE_WAIT_MS
 #define TBFT_IDLE_WAIT_MS            CONFIG_TBFT_IDLE_WAIT_MS
 #endif

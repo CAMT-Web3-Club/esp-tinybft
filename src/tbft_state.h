@@ -17,19 +17,11 @@
  * Note: TBFT_MAX_STATE_BLOCKS, TBFT_NUM_CKPT_SLOTS are defined in tbft_config.h
  * -------------------------------------------------------------------------- */
 
-/* One snapshot of a block saved before modification (for CoW) */
-typedef struct {
-    int       block_idx;
-    uint8_t   data[TBFT_BLOCK_SIZE];
-} tbft_cow_entry_t;
-
-/* One checkpoint record (snapshot at a stable seqno) */
+/* One checkpoint record: the state digest at a checkpoint seqno */
 typedef struct {
     tbft_seqno_t    seqno;
     tbft_digest_t   root_digest;      /* state digest at this seqno */
-    tbft_cow_entry_t *old_blocks;     /* heap array of block snapshots */
-    int              num_old_blocks;
-    bool             valid;
+    bool            valid;
 } tbft_ckpt_record_t;
 
 /* State fetch request entry */
@@ -42,10 +34,14 @@ typedef struct {
 typedef struct {
     /* Application state */
     uint8_t      *mem;           /* pointer to application-managed memory */
-    size_t        mem_size;      /* total state bytes */
-    int           num_blocks;    /* mem_size / TBFT_BLOCK_SIZE */
+    size_t        mem_size;      /* application state bytes */
+    int           app_blocks;    /* mem_size / TBFT_BLOCK_SIZE */
+    /* Library state (client table), checkpointed and transferred exactly
+     * like application blocks; it follows them in block numbering. */
+    uint8_t      *sys_mem;
+    int           num_blocks;    /* app_blocks + system blocks */
 
-    /* Copy-on-Write bitmap (bit i = block i has been snapshotted) */
+    /* Dirty bitmap (bit i = block i modified since the last checkpoint) */
     tbft_bitmap_t cowb[TBFT_MAX_STATE_BLOCKS / 64 + 1];
 
     /* Partition tree */
@@ -70,6 +66,16 @@ typedef struct {
     int               fetch_replier;  /* replica id we're fetching from */
     tbft_bitmap_t     fetch_received[(TBFT_MAX_STATE_BLOCKS + 63) / 64]; /* blocks already received */
 
+    /* Target of the fetch: the root digest the fetched state must have */
+    bool              fetch_has_digest;
+    tbft_digest_t     fetch_digest;
+
+    /* Copy of every block at the latest checkpoint (image_seqno); served to
+     * replicas that fetch that checkpoint, so they get exactly the state the
+     * checkpoint digest covers even while this replica executes further. */
+    uint8_t          *image;
+    tbft_seqno_t      image_seqno;
+
     /* Stable seqno (updated when checkpoints become stable) */
     tbft_seqno_t      last_stable;
 } tbft_state_t;
@@ -79,13 +85,25 @@ typedef struct {
  * -------------------------------------------------------------------------- */
 
 /**
- * Initialise state with the application's memory region.
- * @param state   State to initialise
- * @param mem     Application memory buffer
- * @param size    Buffer size (must be a multiple of TBFT_BLOCK_SIZE)
+ * Initialise state with the application's memory region plus the library's
+ * own replicated region (blocks app_blocks .. num_blocks-1).
+ * @param state     State to initialise
+ * @param mem       Application memory buffer
+ * @param size      Buffer size (must be a multiple of TBFT_BLOCK_SIZE)
+ * @param sys_mem   Library memory buffer (may be nullptr if sys_size is 0)
+ * @param sys_size  Its size (a multiple of TBFT_BLOCK_SIZE)
  * @return 0 on success, -1 on error
  */
-int tbft_state_init(tbft_state_t *state, void *mem, size_t size);
+int tbft_state_init(tbft_state_t *state, void *mem, size_t size,
+                    void *sys_mem, size_t sys_size);
+
+/** Address of block @p i, application or library region. */
+static inline uint8_t *tbft_state_block(const tbft_state_t *state, int i)
+{
+    return i < state->app_blocks
+        ? state->mem + (size_t)i * TBFT_BLOCK_SIZE
+        : state->sys_mem + (size_t)(i - state->app_blocks) * TBFT_BLOCK_SIZE;
+}
 
 /**
  * Release resources held by state.
@@ -97,13 +115,13 @@ void tbft_state_free(tbft_state_t *state);
  * -------------------------------------------------------------------------- */
 
 /**
- * Mark block @p bindex for Copy-on-Write before the application modifies it.
- * Saves the current block to the most recent checkpoint's old_blocks list.
+ * Mark block @p bindex as modified (call before or after changing it); its
+ * digest is recomputed at the next checkpoint.
  */
 void tbft_state_cow_single(tbft_state_t *state, int bindex);
 
 /**
- * Mark all blocks in [mem, mem+size) for CoW.
+ * Mark all application blocks in [mem, mem+size) as modified.
  * @param mem  Pointer within the state buffer
  * @param size Number of bytes to cover
  */
@@ -117,8 +135,8 @@ void tbft_state_cow(tbft_state_t *state, void *mem, size_t size);
  * Take a checkpoint at @p seqno:
  *  - Compute SHA-256 for all modified blocks (where cowb[i] = 1)
  *  - Update partition tree
- *  - Store CheckpointRecord
- *  - Reset CoW bitmap
+ *  - Store CheckpointRecord and copy the state into the served image
+ *  - Reset the dirty bitmap
  */
 void tbft_state_checkpoint(tbft_state_t *state, tbft_seqno_t seqno);
 
@@ -127,11 +145,6 @@ void tbft_state_checkpoint(tbft_state_t *state, tbft_seqno_t seqno);
  */
 const tbft_digest_t *tbft_state_root_digest(const tbft_state_t *state);
 
-/**
- * Rollback state to the last stable checkpoint.
- * @return seqno of the stable checkpoint restored
- */
-tbft_seqno_t tbft_state_rollback(tbft_state_t *state);
 
 /**
  * Mark a checkpoint as stable across the network.
@@ -147,7 +160,24 @@ void tbft_state_mark_stable(tbft_state_t *state, tbft_seqno_t stable_seqno);
  * Begin fetching state for checkpoint @p seqno from replica @p replier.
  */
 void tbft_state_start_fetch(tbft_state_t *state, tbft_seqno_t seqno,
-                            int replier);
+                            int replier, const tbft_digest_t *target_digest);
+
+/** After a completed fetch: adopt the fetched state as checkpoint @p seqno. */
+void tbft_state_install_fetched(tbft_state_t *state, tbft_seqno_t seqno);
+
+/** True when this replica can serve checkpoint @p seqno to a fetcher. */
+static inline bool tbft_state_can_serve(const tbft_state_t *state,
+                                        tbft_seqno_t seqno)
+{
+    return !state->in_fetch && state->image && state->image_seqno == seqno;
+}
+
+/** Block @p i of the image served for checkpoint image_seqno. */
+static inline const uint8_t *tbft_state_image_block(const tbft_state_t *state,
+                                                    int i)
+{
+    return state->image + (size_t)i * TBFT_BLOCK_SIZE;
+}
 
 /**
  * Handle an incoming Meta_data message during fetch.

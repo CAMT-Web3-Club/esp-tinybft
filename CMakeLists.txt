@@ -34,6 +34,7 @@ idf_component_register(
         spiffs
         esp_wifi
         efuse
+        nvs_flash
 )
 
 # C23: the sources use nullptr, constexpr, static_assert, [[attributes]] and
