@@ -23,6 +23,7 @@
 #endif
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include <stdckdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -33,17 +34,17 @@
 #include "esp_efuse.h"
 #endif
 
-static const char *TAG = "tbft_libbyz";
+static constexpr char TAG[] = "tbft_libbyz";
 
-_Static_assert(sizeof(tbft_request_rep_t) == BYZ_REQ_HEADER_SIZE,
-               "BYZ_REQ_HEADER_SIZE must match tbft_request_rep_t");
+static_assert(sizeof(tbft_request_rep_t) == BYZ_REQ_HEADER_SIZE,
+              "BYZ_REQ_HEADER_SIZE must match tbft_request_rep_t");
 
 /* --------------------------------------------------------------------------
  * Module-level singletons
  * -------------------------------------------------------------------------- */
 
-static tbft_replica_t *s_replica  = NULL;  /* allocated on Byz_init_replica */
-static tbft_node_t    *s_client   = NULL;  /* allocated on Byz_init_client  */
+static tbft_replica_t *s_replica  = nullptr;  /* allocated on Byz_init_replica */
+static tbft_node_t    *s_client   = nullptr;  /* allocated on Byz_init_client  */
 static bool            s_is_replica = false;
 
 /* Reply collection state for clients.
@@ -144,7 +145,7 @@ static int parse_config(const char *path, tbft_config_t *cfg)
             goto fail;
         }
 
-        bool is_mac = (strchr(field2, ':') != NULL);
+        bool is_mac = (strchr(field2, ':') != nullptr);
 
         /* Validate: file format must match the compiled-in transport */
 #if CONFIG_TBFT_TRANSPORT_UDP
@@ -304,18 +305,18 @@ fail:
  */
 static uint8_t *load_key_file(const char *path, size_t *len_out)
 {
-    if (!path) return NULL;
+    if (!path) return nullptr;
     FILE *f = fopen(path, "rb");
-    if (!f) return NULL;
+    if (!f) return nullptr;
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
     fseek(f, 0, SEEK_SET);
-    if (sz <= 0) { fclose(f); return NULL; }
+    if (sz <= 0) { fclose(f); return nullptr; }
 
     uint8_t *buf = (uint8_t *)malloc((size_t)sz);
-    if (!buf) { fclose(f); return NULL; }
+    if (!buf) { fclose(f); return nullptr; }
     if (fread(buf, 1, (size_t)sz, f) != (size_t)sz) {
-        free(buf); fclose(f); return NULL;
+        free(buf); fclose(f); return nullptr;
     }
     fclose(f);
     *len_out = (size_t)sz;
@@ -370,7 +371,7 @@ static int setup_principals(tbft_node_t *node, const tbft_config_t *cfg,
                 if (node->principals[j]) {
                     tbft_principal_free(node->principals[j]);
                     free(node->principals[j]);
-                    node->principals[j] = NULL;
+                    node->principals[j] = nullptr;
                 }
             }
             return -1;
@@ -419,7 +420,7 @@ static int setup_principals(tbft_node_t *node, const tbft_config_t *cfg,
                 if (node->principals[j]) {
                     tbft_principal_free(node->principals[j]);
                     free(node->principals[j]);
-                    node->principals[j] = NULL;
+                    node->principals[j] = nullptr;
                 }
             }
             return -1;
@@ -435,7 +436,7 @@ static int setup_principals(tbft_node_t *node, const tbft_config_t *cfg,
                 if (node->principals[j]) {
                     tbft_principal_free(node->principals[j]);
                     free(node->principals[j]);
-                    node->principals[j] = NULL;
+                    node->principals[j] = nullptr;
                 }
             }
             return -1;
@@ -461,7 +462,7 @@ static int setup_principals(tbft_node_t *node, const tbft_config_t *cfg,
                         if (node->principals[j]) {
                             tbft_principal_free(node->principals[j]);
                             free(node->principals[j]);
-                            node->principals[j] = NULL;
+                            node->principals[j] = nullptr;
                         }
                     }
                     return -1;
@@ -490,7 +491,7 @@ static int setup_principals(tbft_node_t *node, const tbft_config_t *cfg,
                         if (node->principals[j]) {
                             tbft_principal_free(node->principals[j]);
                             free(node->principals[j]);
-                            node->principals[j] = NULL;
+                            node->principals[j] = nullptr;
                         }
                     }
                     return -1;
@@ -536,14 +537,14 @@ int Byz_init_client(const char *config_file, const char *priv_config,
                        (int64_t)cfg.auth_timeout_ms * 1000LL,
                        bind_port) != 0) {
         free(s_client);
-        s_client = NULL;
+        s_client = nullptr;
         return -1;
     }
 
     if (setup_principals(s_client, &cfg, priv_config, local_id) != 0) {
         tbft_node_free(s_client);
         free(s_client);
-        s_client = NULL;
+        s_client = nullptr;
         return -1;
     }
 
@@ -570,7 +571,7 @@ int Byz_send_request(Byz_req *req, bool read_only)
     /* Drain any stale replies or other messages in the transport queue */
     if (!s_is_replica) {
         static uint8_t dummy[TBFT_MAX_MESSAGE_SIZE];
-        while (tbft_node_recv(s_client, dummy, sizeof(dummy), NULL) > 0) {
+        while (tbft_node_recv(s_client, dummy, sizeof(dummy), nullptr) > 0) {
             /* discard */
         }
     }
@@ -584,18 +585,24 @@ int Byz_send_request(Byz_req *req, bool read_only)
     rep->cid          = s_client->node_id;
     rep->rid          = tbft_node_new_rid(s_client);
     rep->replier      = TBFT_ALL_REPLICAS;
+
+    /* Check the size before touching req->contents.  A negative size would
+     * wrap to a huge size_t and pass a plain comparison; ckd_add (C23
+     * <stdckdint.h>) reports any wrap-around of the sum. */
+    size_t total_len;
+    if (req->size < 0 ||
+        ckd_add(&total_len, sizeof(*rep), (size_t)req->size) ||
+        ckd_add(&total_len, total_len, (size_t)TBFT_SIG_SIZE) ||
+        total_len > TBFT_MAX_MESSAGE_SIZE) {
+        return -1;
+    }
     rep->command_size = req->size;
 
     tbft_msg_digest(req->contents, (size_t)req->size, &rep->od);
 
-    /* Bounds check BEFORE computing total to avoid signed overflow UB. */
-    if (sizeof(*rep) + (size_t)req->size + TBFT_SIG_SIZE > TBFT_MAX_MESSAGE_SIZE) {
-        return -1;
-    }
-
     /* Set header size and timestamp BEFORE signing — the signature covers
      * the full header (including hdr.size) so it must have its final value. */
-    int32_t total = (int32_t)(sizeof(*rep) + (size_t)req->size + TBFT_SIG_SIZE);
+    int32_t total = (int32_t)total_len;
     rep->hdr.size = tbft_msg_align(total);
     rep->hdr.timestamp_us = esp_timer_get_time();
 
@@ -724,7 +731,7 @@ int Byz_recv_reply(Byz_rep *rep)
          * accumulate enough count with the old approach. O(n²) is fine
          * because num_replicas ≤ TBFT_MAX_NUM_REPLICAS (≤ 4). */
         int match = 0;
-        const uint8_t *winning_payload = NULL;
+        const uint8_t *winning_payload = nullptr;
         int winning_payload_len = 0;
 
         for (int i = 0; i < num_replicas; i++) {
@@ -801,7 +808,7 @@ void Byz_free_request(Byz_req *req)
 {
     if (req && req->contents) {
         free(req->contents);
-        req->contents = NULL;
+        req->contents = nullptr;
         req->size = 0;
     }
 }
@@ -810,7 +817,7 @@ void Byz_free_reply(Byz_rep *rep)
 {
     if (rep && rep->contents) {
         free(rep->contents);
-        rep->contents = NULL;
+        rep->contents = nullptr;
         rep->size = 0;
     }
 }
@@ -826,9 +833,9 @@ void Byz_reset_client(void)
  * -------------------------------------------------------------------------- */
 
 /* Internal exec adapter translating between Byz_* and internal types */
-static Byz_exec_cb        s_exec_cb        = NULL;
-static Byz_comp_ndet_cb   s_comp_ndet_cb   = NULL;
-static Byz_recv_reply_cb  s_recv_reply_cb  = NULL;
+static Byz_exec_cb        s_exec_cb        = nullptr;
+static Byz_comp_ndet_cb   s_comp_ndet_cb   = nullptr;
+static Byz_recv_reply_cb  s_recv_reply_cb  = nullptr;
 
 static int exec_adapter(const void *req, int req_len,
                         void *rep, int *rep_len,
@@ -914,13 +921,13 @@ int Byz_init_replica(const char *config_file, const char *priv_config,
         bind_port,
         mem, mem_size,
         exec_adapter,
-        s_comp_ndet_cb ? comp_ndet_adapter : NULL,
+        s_comp_ndet_cb ? comp_ndet_adapter : nullptr,
         ndet_max_len,
-        recv_reply_cb ? recv_reply_adapter : NULL);
+        recv_reply_cb ? recv_reply_adapter : nullptr);
 
     if (ret != 0) {
         free(s_replica);
-        s_replica = NULL;
+        s_replica = nullptr;
         return -1;
     }
 
@@ -944,7 +951,7 @@ int Byz_init_replica(const char *config_file, const char *priv_config,
     if (setup_principals(&s_replica->node, &cfg, priv_config, local_id) != 0) {
         tbft_replica_free(s_replica);
         free(s_replica);
-        s_replica = NULL;
+        s_replica = nullptr;
         return -1;
     }
 

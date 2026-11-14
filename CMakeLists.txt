@@ -35,3 +35,9 @@ idf_component_register(
         esp_wifi
         efuse
 )
+
+# C23: the sources use nullptr, constexpr, static_assert, [[attributes]] and
+# <stdckdint.h>.  ESP-IDF >= 6.0 already compiles C as -std=gnu23
+# (docs/en/api-guides/c.rst, "C Version"); pinning it the way that page
+# describes keeps this component on C23 even if a project changes the default.
+target_compile_options(${COMPONENT_LIB} PRIVATE -std=gnu23)

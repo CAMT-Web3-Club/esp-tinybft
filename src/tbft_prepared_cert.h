@@ -3,7 +3,6 @@
 #include "tbft_types.h"
 #include "tbft_message.h"
 #include "tbft_certificate.h"
-#include <stdbool.h>
 
 /* --------------------------------------------------------------------------
  * Prepared_cert — combines a Pre_prepare with a Certificate<Prepare>.
@@ -15,7 +14,7 @@
  * -------------------------------------------------------------------------- */
 
 /* Maximum size for an in-memory pre-prepare (header + request set + auth) */
-#define TBFT_PP_MAX_SIZE  TBFT_MAX_MESSAGE_SIZE
+static constexpr int TBFT_PP_MAX_SIZE = TBFT_MAX_MESSAGE_SIZE;
 
 typedef struct tbft_prepared_cert {
     /* Pre-prepare storage */
@@ -68,23 +67,23 @@ bool tbft_prepared_cert_add_my_prepare(tbft_prepared_cert_t *cert,
 bool tbft_prepared_cert_is_complete(const tbft_prepared_cert_t *cert);
 
 /**
- * Returns a pointer to the stored Pre_prepare bytes, or NULL.
+ * Returns a pointer to the stored Pre_prepare bytes, or nullptr.
  */
 static inline const uint8_t *tbft_prepared_cert_pp(
         const tbft_prepared_cert_t *cert)
 {
-    return cert->pp_len > 0 ? cert->pp_buf : NULL;
+    return cert->pp_len > 0 ? cert->pp_buf : nullptr;
 }
 
 /**
- * Returns a pointer to the stored Pre_prepare rep, or NULL.
+ * Returns a pointer to the stored Pre_prepare rep, or nullptr.
  */
 static inline const tbft_pre_prepare_rep_t *tbft_prepared_cert_pp_rep(
         const tbft_prepared_cert_t *cert)
 {
     return cert->pp_len > 0
            ? (const tbft_pre_prepare_rep_t *)cert->pp_buf
-           : NULL;
+           : nullptr;
 }
 
 /* --------------------------------------------------------------------------

@@ -29,16 +29,14 @@
 #include "freertos/task.h"
 #include <string.h>
 
-static const char *TAG = "tbft_replica";
+static constexpr char TAG[] = "tbft_replica";
 
 /* Low #8 FIX: Named constants for magic numbers */
-#define TBFT_INIT_DRAIN_LIMIT     64   /* max messages to drain after New_key broadcast */
-#define TBFT_KEY_DRAIN_LIMIT      32   /* max messages to drain during key confirmation */
-#define TBFT_YIELD_THRESHOLD      16   /* message loop iterations before cooperative yield */
-#define TBFT_VC_BACKOFF_MAX_MULT  60   /* max multiplier for view-change timeout backoff */
+static constexpr int TBFT_YIELD_THRESHOLD     = 16;  /* message loop iterations before cooperative yield */
+static constexpr int TBFT_VC_BACKOFF_MAX_MULT = 60;  /* max multiplier for view-change timeout backoff */
 
 /* M2 FIX: Read-only request flag in hdr.extra field */
-#define TBFT_REQUEST_RO_FLAG      0x1
+static constexpr int TBFT_REQUEST_RO_FLAG = 0x1;
 
 /* --------------------------------------------------------------------------
  * Request queue helpers
@@ -62,7 +60,7 @@ static bool rqueue_push(tbft_rqueue_t *q, const void *buf, int len, bool ro) {
 }
 
 static tbft_rqueue_entry_t *rqueue_front(tbft_rqueue_t *q) {
-    if (q->count == 0) return NULL;
+    if (q->count == 0) return nullptr;
     return &q->entries[q->head];
 }
 
@@ -239,7 +237,7 @@ void tbft_replica_free(tbft_replica_t *r)
     /* rtimer/ntimer are not initialised — nothing to free */
     if (r->evt_group) {
         vEventGroupDelete(r->evt_group);
-        r->evt_group = NULL;
+        r->evt_group = nullptr;
     }
     tbft_state_free(&r->state);
     tbft_node_free(&r->node);
@@ -362,7 +360,7 @@ void tbft_replica_run(tbft_replica_t *r)
     /* Subscribe this task to the task watchdog so we can periodically feed it.
      * The default timeout is CONFIG_ESP_TASK_WDT_TIMEOUT_S (typically 5s). */
 #if CONFIG_ESP_TASK_WDT_EN
-    esp_err_t err = esp_task_wdt_add(NULL);
+    esp_err_t err = esp_task_wdt_add(nullptr);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "failed to subscribe to task WDT: %d", err);
     }
@@ -602,7 +600,7 @@ void tbft_replica_run(tbft_replica_t *r)
      * Without this, the WDT subsystem still expects feeds from a dead task,
      * eventually triggering a spurious system reset. */
 #if CONFIG_ESP_TASK_WDT_EN
-    esp_task_wdt_delete(NULL);
+    esp_task_wdt_delete(nullptr);
 #endif
 }
 

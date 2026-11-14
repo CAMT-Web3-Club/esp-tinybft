@@ -5,7 +5,6 @@
 #include "tbft_principal.h"
 #include "tbft_transport.h"
 #include "tbft_itimer.h"
-#include <stdbool.h>
 
 /* --------------------------------------------------------------------------
  * Node — base for all PBFT participants (both replicas and clients).
@@ -96,7 +95,7 @@ int tbft_node_send(tbft_node_t *node, const void *buf, size_t len,
  * @param node     This node
  * @param buf      Output buffer
  * @param buf_len  Size of @p buf (must be at least TBFT_MAX_MESSAGE_SIZE for normal use)
- * @param src_id   If non-NULL, receives the apparent sender id (best-effort)
+ * @param src_id   If non-nullptr, receives the apparent sender id (best-effort)
  * @return number of bytes received, 0 if nothing available, -1 on error
  */
 int tbft_node_recv(tbft_node_t *node, void *buf, size_t buf_len, tbft_node_id_t *src_id);
@@ -136,7 +135,7 @@ void tbft_node_gen_auth(tbft_node_t *node, const void *msg, size_t msg_len,
  * @param timestamp_us  Message timestamp for anti-replay
  * @return true if valid and not a replay
  */
-bool tbft_node_verify_auth(tbft_node_t *node, tbft_node_id_t sender_id,
+[[nodiscard]] bool tbft_node_verify_auth(tbft_node_t *node, tbft_node_id_t sender_id,
                            const void *msg, size_t msg_len,
                            const tbft_mac_t *mac, int64_t timestamp_us);
 
@@ -147,13 +146,13 @@ bool tbft_node_verify_auth(tbft_node_t *node, tbft_node_id_t sender_id,
 /**
  * Sign data with the local node's private key.
  */
-int tbft_node_gen_sig(tbft_node_t *node, const void *msg, size_t msg_len,
+[[nodiscard]] int tbft_node_gen_sig(tbft_node_t *node, const void *msg, size_t msg_len,
                       tbft_sig_t *sig);
 
 /**
  * Verify a signature with principal @p sender_id's public key.
  */
-bool tbft_node_verify_sig(tbft_node_t *node, tbft_node_id_t sender_id,
+[[nodiscard]] bool tbft_node_verify_sig(tbft_node_t *node, tbft_node_id_t sender_id,
                           const void *msg, size_t msg_len,
                           const tbft_sig_t *sig);
 

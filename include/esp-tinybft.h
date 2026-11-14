@@ -59,7 +59,7 @@
  *   // local_id identifies which replica slot (0..num_nodes-1) this board is
  *   Byz_init_replica("config.txt", "priv.txt", 0,
  *                    app_state, sizeof(app_state),
- *                    exec_cb, NULL, 0, NULL, 0);
+ *                    exec_cb, nullptr, 0, nullptr, 0);
  *   Byz_replica_run();  // blocks — run in a FreeRTOS task
  * @endcode
  *
@@ -69,8 +69,14 @@
  */
 
 #include <stdint.h>
-#include <stdbool.h>
 #include <stddef.h>
+
+/* Written in C23: bool, nullptr and static_assert are keywords there.
+ * ESP-IDF >= 6.0 compiles C as -std=gnu23 by default
+ * (docs/en/api-guides/c.rst); C++ callers are fine as well. */
+#if !defined(__cplusplus) && (!defined(__STDC_VERSION__) || __STDC_VERSION__ < 202311L)
+#error "esp-tinybft needs C23 (ESP-IDF >= 6.0 builds C with -std=gnu23) or C++"
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -218,10 +224,10 @@ void Byz_reset_client(void);
  *                      (ESP-NOW only; WiFi must be started first).
  * @param mem           Application state buffer (must remain valid)
  * @param mem_size      State buffer size (multiple of BLOCK_SIZE)
- * @param exec_cb       Execution callback (must not be NULL)
- * @param comp_ndet_cb  Non-deterministic choices callback (may be NULL)
+ * @param exec_cb       Execution callback (must not be nullptr)
+ * @param comp_ndet_cb  Non-deterministic choices callback (may be nullptr)
  * @param ndet_max_len  Max bytes for non-deterministic choices
- * @param recv_reply_cb Reply notification callback (may be NULL)
+ * @param recv_reply_cb Reply notification callback (may be nullptr)
  * @param port          UDP port (0 = from config file)
  * @return 0 on success, -1 on error
  */

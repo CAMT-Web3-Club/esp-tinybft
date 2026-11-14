@@ -4,7 +4,6 @@
 #include "tbft_message.h"
 #include "tbft_partition.h"
 #include "esp_timer.h"
-#include <stdbool.h>
 
 /* --------------------------------------------------------------------------
  * State — manages the replica's application state (section 5 / State).

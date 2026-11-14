@@ -14,6 +14,9 @@ A pure-C implementation of [PBFT](https://pmg.csail.mit.edu/papers/osdi99.pdf) (
 ## Requirements
 
 - ESP-IDF v6.0 or later (MbedTLS 4.x / PSA Crypto)
+- C23: the sources are written in GNU C23 (`-std=gnu23`), the default C
+  version of ESP-IDF v6.0 and later. C files that include `esp-tinybft.h` must
+  be compiled as C23 (the IDF default) or as C++.
 - Supported targets: ESP32, ESP32-S2, ESP32-S3, ESP32-C3, ESP32-C6, ESP32-H2
 
 ## Quick Start

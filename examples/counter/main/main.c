@@ -21,7 +21,7 @@
 #include "esp_pm.h"
 #endif
 
-#define TAG "counter"
+static constexpr char TAG[] = "counter";
 
 #if CONFIG_TBFT_TRANSPORT_UDP && CONFIG_EXAMPLE_STATIC_IP
 /* Return the 0-based node index whose MAC matches this board in
@@ -118,7 +118,7 @@ static void apply_static_ip(esp_netif_t *netif) {
 #include "freertos/event_groups.h"
 
 static EventGroupHandle_t s_wifi_event_group;
-#define WIFI_CONNECTED_BIT BIT0
+static constexpr EventBits_t WIFI_CONNECTED_BIT = BIT0;
 
 static void wifi_event_handler(void *arg, esp_event_base_t base,
                                int32_t id, void *data)
@@ -145,40 +145,40 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
 #endif
 
 #if CONFIG_PM_ENABLE
-#define EXAMPLE_PM 1
+static constexpr int EXAMPLE_PM = 1;
 #else
-#define EXAMPLE_PM 0
+static constexpr int EXAMPLE_PM = 0;
 #endif
 
 /* Role (menuconfig "Role of this board"): read from the node list at boot,
  * or forced.  A forced image only contains the code of its role. */
 #if CONFIG_EXAMPLE_ROLE_AUTO
-#define EXAMPLE_ROLE_FROM "list"
+static constexpr char EXAMPLE_ROLE_FROM[] = "list";
 #else
-#define EXAMPLE_ROLE_FROM "forced"
+static constexpr char EXAMPLE_ROLE_FROM[] = "forced";
 #endif
 #ifdef CONFIG_EXAMPLE_CLIENT_REQUEST_INTERVAL_MS
-#define EXAMPLE_REQ_INTERVAL_MS CONFIG_EXAMPLE_CLIENT_REQUEST_INTERVAL_MS
+static constexpr int EXAMPLE_REQ_INTERVAL_MS = CONFIG_EXAMPLE_CLIENT_REQUEST_INTERVAL_MS;
 #else
-#define EXAMPLE_REQ_INTERVAL_MS 0
+static constexpr int EXAMPLE_REQ_INTERVAL_MS = 0;
 #endif
 
 #if CONFIG_TBFT_TRANSPORT_ESPNOW
-#define EXAMPLE_CONFIG_FILE "/spiffs/config_espnow.txt"
+static constexpr char EXAMPLE_CONFIG_FILE[] = "/spiffs/config_espnow.txt";
 #else
-#define EXAMPLE_CONFIG_FILE "/spiffs/config_udp.txt"
+static constexpr char EXAMPLE_CONFIG_FILE[] = "/spiffs/config_udp.txt";
 #endif
 
 static int32_t counter_state[4096 / sizeof(int32_t)];
 
-typedef struct {
+typedef struct [[gnu::packed]] {
     uint8_t op;
-} __attribute__((packed)) counter_req_t;
+} counter_req_t;
 
-typedef struct {
+typedef struct [[gnu::packed]] {
     int32_t value;
     int8_t status;
-} __attribute__((packed)) counter_rep_t;
+} counter_rep_t;
 
 int exec_cb(Byz_req *in, Byz_rep *out, Byz_buffer *ndet, int cid, bool ro) {
     if (in->size < BYZ_REQ_HEADER_SIZE) return -1;
@@ -206,39 +206,40 @@ int exec_cb(Byz_req *in, Byz_rep *out, Byz_buffer *ndet, int cid, bool ro) {
     return 0;
 }
 
+/* Banner fields.  Each transport prints only its own, hence [[maybe_unused]]. */
 #if CONFIG_TBFT_DISABLE_MULTICAST
-#define EXAMPLE_MCAST 0
+[[maybe_unused]] static constexpr int EXAMPLE_MCAST = 0;
 #else
-#define EXAMPLE_MCAST 1
+[[maybe_unused]] static constexpr int EXAMPLE_MCAST = 1;
 #endif
 #if CONFIG_EXAMPLE_STATIC_IP
-#define EXAMPLE_STATIC_IP_ON 1
+[[maybe_unused]] static constexpr int EXAMPLE_STATIC_IP_ON = 1;
 #else
-#define EXAMPLE_STATIC_IP_ON 0
+[[maybe_unused]] static constexpr int EXAMPLE_STATIC_IP_ON = 0;
 #endif
 #if CONFIG_TBFT_ESPNOW_BROADCAST
-#define EXAMPLE_BCAST 1
+[[maybe_unused]] static constexpr int EXAMPLE_BCAST = 1;
 #else
-#define EXAMPLE_BCAST 0
+[[maybe_unused]] static constexpr int EXAMPLE_BCAST = 0;
 #endif
 #if CONFIG_TBFT_ESPNOW_POWER_SAVE
-#define EXAMPLE_EN_WINDOW   CONFIG_TBFT_ESPNOW_WAKE_WINDOW_MS
-#define EXAMPLE_EN_INTERVAL CONFIG_TBFT_ESPNOW_WAKE_INTERVAL_MS
+[[maybe_unused]] static constexpr int EXAMPLE_EN_WINDOW   = CONFIG_TBFT_ESPNOW_WAKE_WINDOW_MS;
+[[maybe_unused]] static constexpr int EXAMPLE_EN_INTERVAL = CONFIG_TBFT_ESPNOW_WAKE_INTERVAL_MS;
 #else
-#define EXAMPLE_EN_WINDOW   0      /* 0/0 = receiver always on */
-#define EXAMPLE_EN_INTERVAL 0
+[[maybe_unused]] static constexpr int EXAMPLE_EN_WINDOW   = 0;  /* 0/0 = receiver always on */
+[[maybe_unused]] static constexpr int EXAMPLE_EN_INTERVAL = 0;
 #endif
 #if CONFIG_EXAMPLE_WIFI_PS_MAX_MODEM
-#define EXAMPLE_LISTEN_INTERVAL CONFIG_EXAMPLE_WIFI_LISTEN_INTERVAL
+[[maybe_unused]] static constexpr int EXAMPLE_LISTEN_INTERVAL = CONFIG_EXAMPLE_WIFI_LISTEN_INTERVAL;
 #else
-#define EXAMPLE_LISTEN_INTERVAL 0  /* only used with WIFI_PS_MAX_MODEM */
+[[maybe_unused]] static constexpr int EXAMPLE_LISTEN_INTERVAL = 0;  /* only used with WIFI_PS_MAX_MODEM */
 #endif
 
 /* Printed at WARN so it survives CONFIG_LOG_DEFAULT_LEVEL_WARN: proves which
  * configuration each board runs (every menuconfig setting of the experiment,
  * plus the role found in the node list and the node id). */
 static void print_banner(bool replica, int local_id) {
-    uint8_t mac[6] = {0};
+    uint8_t mac[6] = {};
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
     uint8_t ch = 0; wifi_second_chan_t sc;
     esp_wifi_get_channel(&ch, &sc);
@@ -294,7 +295,7 @@ static void wifi_init(void) {
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
         WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, sta_netif, &h1));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
-        IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL, &h2));
+        IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, nullptr, &h2));
     wifi_config_t wifi_cfg = {
         .sta = { .ssid = CONFIG_EXAMPLE_WIFI_SSID,
                  .password = CONFIG_EXAMPLE_WIFI_PASSWORD,
@@ -363,7 +364,7 @@ static void wifi_init(void) {
 /* A node that cannot find itself in the config would otherwise sit idle with
  * the radio on, silently invalidating any energy measurement. Retry a few
  * times (DHCP/IP may lag), then reboot loudly. */
-static void fatal_reboot(const char *what) {
+[[noreturn]] static void fatal_reboot(const char *what) {
     for (int i = 0; i < 3; i++) {
         ESP_LOGE(TAG, "%s - check this board's entry in %s and the role "
                  "(menuconfig: Counter Example Configuration > Role of this "
@@ -384,7 +385,6 @@ static int detect_local_id_or_reboot(const char *config_file) {
     }
     ESP_LOGE(TAG, "giving up: restarting");
     esp_restart();
-    return -1;
 }
 
 #if !CONFIG_EXAMPLE_ROLE_CLIENT
@@ -401,7 +401,7 @@ static void replica_task(void *arg) {
     int ret = Byz_init_replica(config_file, priv_config,
                                local_id,
                                counter_state, sizeof(counter_state),
-                               exec_cb, NULL, 0, NULL, 0);
+                               exec_cb, nullptr, 0, nullptr, 0);
     if (ret != 0) {
         fatal_reboot("Byz_init_replica failed");
     }
@@ -430,7 +430,7 @@ static void client_task(void *arg) {
     ESP_LOGI(TAG, "Client running...");
 
 #if CONFIG_ESP_TASK_WDT_EN
-    esp_task_wdt_add(NULL);
+    esp_task_wdt_add(nullptr);
 #endif
 
     const TickType_t period = pdMS_TO_TICKS(CONFIG_EXAMPLE_CLIENT_REQUEST_INTERVAL_MS);
@@ -513,7 +513,7 @@ void app_main(void) {
 
     esp_vfs_spiffs_conf_t conf = {
       .base_path = "/spiffs",
-      .partition_label = NULL,
+      .partition_label = nullptr,
       .max_files = 5,
       .format_if_mount_failed = true
     };
@@ -556,11 +556,11 @@ void app_main(void) {
 
 #if !CONFIG_EXAMPLE_ROLE_CLIENT
     if (listed_replica == 1) {
-        xTaskCreate(replica_task, "replica_task", 8192, (void *)(intptr_t)local_id, 5, NULL);
+        xTaskCreate(replica_task, "replica_task", 8192, (void *)(intptr_t)local_id, 5, nullptr);
         return;
     }
 #endif
 #if !CONFIG_EXAMPLE_ROLE_REPLICA
-    xTaskCreate(client_task, "client_task", 8192, (void *)(intptr_t)local_id, 5, NULL);
+    xTaskCreate(client_task, "client_task", 8192, (void *)(intptr_t)local_id, 5, nullptr);
 #endif
 }

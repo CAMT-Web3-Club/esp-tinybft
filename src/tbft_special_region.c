@@ -26,7 +26,7 @@ void tbft_sr_init(tbft_special_region_t *sr,
     do {                                                     \
         if (!(slot).valid) {                                 \
             if (lenout) *(lenout) = 0;                       \
-            return NULL;                                     \
+            return nullptr;                                     \
         }                                                    \
         if (lenout) *(lenout) = (slot).len;                  \
         return (slot).buf;                                   \
@@ -51,7 +51,7 @@ const uint8_t *tbft_sr_load_vc(const tbft_special_region_t *sr,
 {
     if (from_replica < 0 || from_replica >= TBFT_MAX_NUM_REPLICAS) {
         if (len_out) *len_out = 0;
-        return NULL;
+        return nullptr;
     }
     SR_LOAD(sr->view_change[from_replica], len_out);
 }
@@ -110,7 +110,7 @@ const uint8_t *tbft_sr_load_request(const tbft_special_region_t *sr,
 {
     if (client_idx < 0 || client_idx >= TBFT_MAX_NUM_CLIENTS) {
         if (len_out) *len_out = 0;
-        return NULL;
+        return nullptr;
     }
     SR_LOAD(sr->request[client_idx], len_out);
 }
@@ -128,7 +128,7 @@ const uint8_t *tbft_sr_load_reply(const tbft_special_region_t *sr,
 {
     if (client_idx < 0 || client_idx >= TBFT_MAX_NUM_CLIENTS) {
         if (len_out) *len_out = 0;
-        return NULL;
+        return nullptr;
     }
     SR_LOAD(sr->reply[client_idx], len_out);
 }

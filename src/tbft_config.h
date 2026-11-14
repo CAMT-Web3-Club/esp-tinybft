@@ -103,10 +103,10 @@
 #if CONFIG_TBFT_ESPNOW_POWER_SAVE
 #define TBFT_ESPNOW_RETRY_DELAY_MS  TBFT_WHOLE_TICKS_MS(CONFIG_TBFT_ESPNOW_WAKE_WINDOW_MS / 2)
 #define TBFT_ESPNOW_RETRY_SPAN_MS   (CONFIG_TBFT_ESPNOW_WAKE_INTERVAL_MS + 20)
-_Static_assert(CONFIG_TBFT_ESPNOW_WAKE_WINDOW_MS < CONFIG_TBFT_ESPNOW_WAKE_INTERVAL_MS,
-               "ESP-NOW wake window must be shorter than the wake interval");
-_Static_assert(TBFT_ESPNOW_RETRY_DELAY_MS < CONFIG_TBFT_ESPNOW_WAKE_WINDOW_MS,
-               "ESP-NOW wake window too short for the FreeRTOS tick: a retry could skip it");
+static_assert(CONFIG_TBFT_ESPNOW_WAKE_WINDOW_MS < CONFIG_TBFT_ESPNOW_WAKE_INTERVAL_MS,
+              "ESP-NOW wake window must be shorter than the wake interval");
+static_assert(TBFT_ESPNOW_RETRY_DELAY_MS < CONFIG_TBFT_ESPNOW_WAKE_WINDOW_MS,
+              "ESP-NOW wake window too short for the FreeRTOS tick: a retry could skip it");
 #else
 #define TBFT_ESPNOW_RETRY_DELAY_MS  TBFT_WHOLE_TICKS_MS(CONFIG_TBFT_ESPNOW_TX_RETRY_DELAY_MS)
 #define TBFT_ESPNOW_RETRY_SPAN_MS   0
@@ -144,36 +144,36 @@ _Static_assert(TBFT_ESPNOW_RETRY_DELAY_MS < CONFIG_TBFT_ESPNOW_WAKE_WINDOW_MS,
  * Static assertions (compile-time validation)
  * -------------------------------------------------------------------------- */
 
-_Static_assert(TBFT_BLOCK_SIZE > 0 &&
-               (TBFT_BLOCK_SIZE & (TBFT_BLOCK_SIZE - 1)) == 0,
-               "TBFT_BLOCK_SIZE must be a positive power of two");
+static_assert(TBFT_BLOCK_SIZE > 0 &&
+              (TBFT_BLOCK_SIZE & (TBFT_BLOCK_SIZE - 1)) == 0,
+              "TBFT_BLOCK_SIZE must be a positive power of two");
 
-_Static_assert(TBFT_WINDOW_SIZE > TBFT_CHECKPOINT_INTERVAL,
-               "TBFT_WINDOW_SIZE must be greater than TBFT_CHECKPOINT_INTERVAL");
+static_assert(TBFT_WINDOW_SIZE > TBFT_CHECKPOINT_INTERVAL,
+              "TBFT_WINDOW_SIZE must be greater than TBFT_CHECKPOINT_INTERVAL");
 
-_Static_assert(TBFT_WINDOW_SIZE > 0 &&
-               (TBFT_WINDOW_SIZE & (TBFT_WINDOW_SIZE - 1)) == 0,
-               "TBFT_WINDOW_SIZE must be a positive power of two");
+static_assert(TBFT_WINDOW_SIZE > 0 &&
+              (TBFT_WINDOW_SIZE & (TBFT_WINDOW_SIZE - 1)) == 0,
+              "TBFT_WINDOW_SIZE must be a positive power of two");
 
-_Static_assert(TBFT_MAX_NUM_REPLICAS >= 4,
-               "Need at least 4 replicas for BFT (n = 3f+1, f >= 1)");
+static_assert(TBFT_MAX_NUM_REPLICAS >= 4,
+              "Need at least 4 replicas for BFT (n = 3f+1, f >= 1)");
 
-_Static_assert(TBFT_MAX_NUM_REPLICAS <= 64,
-               "tbft_bitmap_t is uint64_t; bumping this above 64 silently drops "
-               "sender accounting (tbft_bitmap_set/test become no-ops) and allows "
-               "Byzantine re-voting to forge certificate quorums");
+static_assert(TBFT_MAX_NUM_REPLICAS <= 64,
+              "tbft_bitmap_t is uint64_t; bumping this above 64 silently drops "
+              "sender accounting (tbft_bitmap_set/test become no-ops) and allows "
+              "Byzantine re-voting to forge certificate quorums");
 
-_Static_assert(TBFT_CHECKPOINT_INTERVAL >= 1,
-               "TBFT_CHECKPOINT_INTERVAL must be >= 1 (division by zero in slot_index)");
+static_assert(TBFT_CHECKPOINT_INTERVAL >= 1,
+              "TBFT_CHECKPOINT_INTERVAL must be >= 1 (division by zero in slot_index)");
 
-_Static_assert(TBFT_MAX_REPLY_SIZE < TBFT_MAX_MESSAGE_SIZE,
-               "TBFT_MAX_REPLY_SIZE must be less than TBFT_MAX_MESSAGE_SIZE");
+static_assert(TBFT_MAX_REPLY_SIZE < TBFT_MAX_MESSAGE_SIZE,
+              "TBFT_MAX_REPLY_SIZE must be less than TBFT_MAX_MESSAGE_SIZE");
 
-_Static_assert(TBFT_MAX_MESSAGE_SIZE % 8 == 0,
-               "TBFT_MAX_MESSAGE_SIZE must be a multiple of 8");
+static_assert(TBFT_MAX_MESSAGE_SIZE % 8 == 0,
+              "TBFT_MAX_MESSAGE_SIZE must be a multiple of 8");
 
-_Static_assert(TBFT_P_CHILDREN > 0,
-               "TBFT_MAX_MESSAGE_SIZE too small for partition tree");
+static_assert(TBFT_P_CHILDREN > 0,
+              "TBFT_MAX_MESSAGE_SIZE too small for partition tree");
 
-_Static_assert(TBFT_P_LEVELS >= 2,
-               "TBFT_P_LEVELS must be at least 2");
+static_assert(TBFT_P_LEVELS >= 2,
+              "TBFT_P_LEVELS must be at least 2");

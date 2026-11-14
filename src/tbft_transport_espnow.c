@@ -20,7 +20,7 @@
 #include <limits.h>
 #include <string.h>
 
-static const char *TAG = "tbft_espnow";
+static constexpr char TAG[] = "tbft_espnow";
 
 #ifndef MACSTR
 #define MACSTR "%02x:%02x:%02x:%02x:%02x:%02x"
@@ -37,32 +37,32 @@ static const char *TAG = "tbft_espnow";
 #define ESPNOW_MAX_DATA_LEN  ESP_NOW_MAX_DATA_LEN_V2  /* 1470 */
 #endif
 
-#define FRAG_HDR_SIZE       4
-#define FRAG_MAX_PAYLOAD    (ESPNOW_MAX_DATA_LEN - FRAG_HDR_SIZE)
-#define FRAG_MAX_PARTS      ((TBFT_MAX_MESSAGE_SIZE + FRAG_MAX_PAYLOAD - 1) / FRAG_MAX_PAYLOAD)
-#define REASM_MAX_SLOTS     8
-#define REASM_TIMEOUT_MS    5000
-#define ESPNOW_TX_MAX_ATTEMPTS   CONFIG_TBFT_ESPNOW_TX_RETRIES
-#define ESPNOW_TX_CB_TIMEOUT_MS  100   /* wait for the MAC-layer result */
+static constexpr int FRAG_HDR_SIZE    = 4;
+static constexpr int FRAG_MAX_PAYLOAD = ESPNOW_MAX_DATA_LEN - FRAG_HDR_SIZE;
+static constexpr int FRAG_MAX_PARTS   = (TBFT_MAX_MESSAGE_SIZE + FRAG_MAX_PAYLOAD - 1) / FRAG_MAX_PAYLOAD;
+static constexpr int REASM_MAX_SLOTS  = 8;
+static constexpr int REASM_TIMEOUT_MS = 5'000;
+static constexpr int ESPNOW_TX_MAX_ATTEMPTS  = CONFIG_TBFT_ESPNOW_TX_RETRIES;
+static constexpr int ESPNOW_TX_CB_TIMEOUT_MS = 100;   /* wait for the MAC-layer result */
 
-#define MSG_QUEUE_DEPTH     16
-#define SEND_QUEUE_DEPTH    8
-#define SEND_TASK_PRIORITY  7
-#define SEND_TASK_STACK_SIZE 8192
-#define SEND_TASK_RECV_TIMEOUT_MS  1000  /* only to notice shutdown; keeps the CPU asleep */
-#define RECV_TASK_TIMEOUT_MS  100
-#define SEND_QUEUE_TIMEOUT_MS 100
-#define SHUTDOWN_DRAIN_MS     200
+static constexpr int MSG_QUEUE_DEPTH      = 16;
+static constexpr int SEND_QUEUE_DEPTH     = 8;
+static constexpr int SEND_TASK_PRIORITY   = 7;
+static constexpr int SEND_TASK_STACK_SIZE = 8'192;
+static constexpr int SEND_TASK_RECV_TIMEOUT_MS = 1'000;  /* only to notice shutdown; keeps the CPU asleep */
+static constexpr int SEND_QUEUE_TIMEOUT_MS     = 100;
+static constexpr int SHUTDOWN_DRAIN_MS         = 200;
 
-#define SEND_TASK_SHUTDOWN  -999
-_Static_assert(SEND_TASK_SHUTDOWN < 0, "SEND_TASK_SHUTDOWN must be negative");
+static constexpr int SEND_TASK_SHUTDOWN = -999;
+static_assert(SEND_TASK_SHUTDOWN < 0, "SEND_TASK_SHUTDOWN must be negative");
 
-#define ESPNOW_MAC_LEN  6
+static constexpr int ESPNOW_MAC_LEN = 6;
 
+/* true when ESP-NOW runs on the softAP interface (TBFT_ESPNOW_IF_AP) */
 #if CONFIG_TBFT_ESPNOW_IF_AP
-#define CONFIG_TBFT_ESPNOW_IF_AP_FLAG 1
+static constexpr bool ESPNOW_IF_IS_AP = true;
 #else
-#define CONFIG_TBFT_ESPNOW_IF_AP_FLAG 0
+static constexpr bool ESPNOW_IF_IS_AP = false;
 #endif
 
 /* --------------------------------------------------------------------------
@@ -75,16 +75,14 @@ typedef struct {
     uint8_t  payload[TBFT_MAX_MESSAGE_SIZE];
 } recv_entry_t;
 
-#pragma pack(push, 1)
-typedef struct {
+typedef struct [[gnu::packed]] {
     uint16_t msg_id;
     uint8_t  frag_idx;
     uint8_t  frag_total;
 } frag_hdr_t;
-#pragma pack(pop)
 
-_Static_assert(sizeof(frag_hdr_t) == FRAG_HDR_SIZE, "frag_hdr_t size mismatch");
-_Static_assert(FRAG_MAX_PARTS <= 32, "TBFT_MAX_MESSAGE_SIZE too large");
+static_assert(sizeof(frag_hdr_t) == FRAG_HDR_SIZE, "frag_hdr_t size mismatch");
+static_assert(FRAG_MAX_PARTS <= 32, "TBFT_MAX_MESSAGE_SIZE too large");
 /* NOTE: When TBFT_MAX_MESSAGE_SIZE <= ESPNOW_MAX_DATA_LEN (1470), all messages
  * fit in a single fragment and the multi-fragment code path is dead code.
  * When TBFT_MAX_MESSAGE_SIZE > 1470, fragmentation is active and tested. */
@@ -137,16 +135,16 @@ typedef struct tbft_espnow {
     tbft_transport_stats_t stats;
 } tbft_espnow_t;
 
-static tbft_espnow_t *g_espnow_ctx = NULL;
+static tbft_espnow_t *g_espnow_ctx = nullptr;
 
 /* --------------------------------------------------------------------------
  * ฟังก์ชันคำนวณ MAC Address อย่างปลอดภัย (รองรับ Overflow/Underflow)
  * -------------------------------------------------------------------------- */
 
 #if CONFIG_TBFT_ESPNOW_IF_AP
-#define TBFT_ESPNOW_IFIDX WIFI_IF_AP
+static constexpr wifi_interface_t TBFT_ESPNOW_IFIDX = WIFI_IF_AP;
 #else
-#define TBFT_ESPNOW_IFIDX WIFI_IF_STA
+static constexpr wifi_interface_t TBFT_ESPNOW_IFIDX = WIFI_IF_STA;
 #endif
 
 /* "AP MAC" = the on-air address of the interface ESP-NOW uses.  For the
@@ -431,7 +429,7 @@ static int espnow_do_send_mac(tbft_espnow_t *enow, const uint8_t *ap_mac, uint16
     if (!buf || len == 0) return -1;
 
     /* Stack packet buffer; send_task is the sole caller. */
-    uint8_t pkt[sizeof(frag_hdr_t) + FRAG_MAX_PAYLOAD] __attribute__((aligned(4)));
+    alignas(4) uint8_t pkt[sizeof(frag_hdr_t) + FRAG_MAX_PAYLOAD];
 
     size_t remaining = len;
     const uint8_t *src = buf;
@@ -456,12 +454,12 @@ static int espnow_do_send_mac(tbft_espnow_t *enow, const uint8_t *ap_mac, uint16
 }
 
 #if CONFIG_TBFT_ESPNOW_BROADCAST
-static const uint8_t k_bcast_mac[6] = {0xff,0xff,0xff,0xff,0xff,0xff};
+static constexpr uint8_t k_bcast_mac[6] = {0xff,0xff,0xff,0xff,0xff,0xff};
 #endif
 
 /* Apply TBFT_ESPNOW_PHY_RATE to a peer.  Must run after esp_wifi_start() and
  * esp_now_add_peer() (ESP-NOW docs).  0 keeps the IDF default (1 Mbps). */
-static void espnow_apply_rate(const uint8_t *mac) {
+static void espnow_apply_rate([[maybe_unused]] const uint8_t *mac) {
 #if CONFIG_TBFT_ESPNOW_PHY_RATE != 0
     /* wifi_phy_rate_t value: 0x00-0x07 11b, 0x08-0x0F 11g, 0x10-0x17 HT20 */
     esp_now_rate_config_t rc = {
@@ -475,8 +473,6 @@ static void espnow_apply_rate(const uint8_t *mac) {
         ESP_LOGE(TAG, "esp_now_set_peer_rate_config " MACSTR " failed: 0x%x",
                  MAC2STR(mac), rr);
     }
-#else
-    (void)mac;
 #endif
 }
 
@@ -493,7 +489,7 @@ static void espnow_send_task(void *pvParameters) {
         if (xQueueReceive(enow->send_queue, &entry, pdMS_TO_TICKS(SEND_TASK_RECV_TIMEOUT_MS)) != pdTRUE) {
             if (enow->shutting_down) {
                 xSemaphoreGive(enow->task_exit_sem);
-                vTaskDelete(NULL);
+                vTaskDelete(nullptr);
             }
             continue;
         }
@@ -501,11 +497,11 @@ static void espnow_send_task(void *pvParameters) {
         if (entry.dest == SEND_TASK_SHUTDOWN) {
             ESP_LOGI(TAG, "send_task exiting cleanly");
             xSemaphoreGive(enow->task_exit_sem);
-            vTaskDelete(NULL);
+            vTaskDelete(nullptr);
         }
 
         if (entry.dest == TBFT_ALL_REPLICAS) {
-            int limit = enow->num_replicas > 0 ? enow->num_replicas : enow->num_nodes;
+            [[maybe_unused]] int limit = enow->num_replicas > 0 ? enow->num_replicas : enow->num_nodes;
 
             /* One msg_id per logical message, not per peer */
             uint16_t this_msg_id;
@@ -514,7 +510,6 @@ static void espnow_send_task(void *pvParameters) {
             xSemaphoreGive(enow->lock);
 
 #if CONFIG_TBFT_ESPNOW_BROADCAST
-            (void)limit;
             if (espnow_do_send_mac(enow, k_bcast_mac, this_msg_id, entry.buf, (size_t)entry.len) <= 0) {
                 enow->stats.tx_fail++;
             }
@@ -571,7 +566,7 @@ static tbft_node_id_t find_node_by_mac(tbft_espnow_t *enow, const uint8_t *mac) 
  * -------------------------------------------------------------------------- */
 
 int tbft_transport_create(tbft_transport_t **out, tbft_transport_type_t type, int num_nodes, int num_replicas, const char *mcast_ip, uint16_t port) {
-    if (g_espnow_ctx != NULL) {
+    if (g_espnow_ctx != nullptr) {
         ESP_LOGE(TAG, "ESP-NOW transport is already initialized (Singleton Guard)");
         return -1;
     }
@@ -677,7 +672,7 @@ int tbft_transport_create(tbft_transport_t **out, tbft_transport_type_t type, in
     return 0;
 
 init_error:
-    g_espnow_ctx = NULL;
+    g_espnow_ctx = nullptr;
     esp_now_unregister_recv_cb();
     esp_now_unregister_send_cb();
     if (enow->send_queue) vQueueDelete(enow->send_queue);
@@ -697,7 +692,7 @@ void tbft_transport_free(tbft_transport_t *t) {
     enow->shutting_down = true;
     esp_now_unregister_recv_cb();
     esp_now_unregister_send_cb();
-    g_espnow_ctx = NULL;
+    g_espnow_ctx = nullptr;
 
     vTaskDelay(pdMS_TO_TICKS(50));
 
@@ -750,7 +745,7 @@ void tbft_transport_set_peer(tbft_transport_t *t, tbft_node_id_t node_id, const 
     uint8_t self_ap[6];
     if (esp_efuse_mac_get_default(self_base) == ESP_OK) {
         get_ap_mac(self_base, self_ap);
-        if (CONFIG_TBFT_ESPNOW_IF_AP_FLAG && memcmp(ap_mac, self_ap, 6) == 0) {
+        if (ESPNOW_IF_IS_AP && memcmp(ap_mac, self_ap, 6) == 0) {
             ESP_LOGW(TAG, "set_peer: node %d AP MAC matches local AP MAC — "
                      "config may contain AP MAC instead of base (eFuse) MAC",
                      node_id);

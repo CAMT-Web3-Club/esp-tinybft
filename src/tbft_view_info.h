@@ -3,7 +3,6 @@
 #include "tbft_types.h"
 #include "tbft_message.h"
 #include "tbft_special_region.h"
-#include <stdbool.h>
 
 /* --------------------------------------------------------------------------
  * View_info — manages the view-change protocol state (section 9).

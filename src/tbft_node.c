@@ -17,7 +17,7 @@
 #include "freertos/task.h"
 #include <string.h>
 
-static const char *TAG = "tbft_node";
+static constexpr char TAG[] = "tbft_node";
 
 /* --------------------------------------------------------------------------
  * Lifecycle
@@ -71,10 +71,10 @@ int tbft_node_init(tbft_node_t *node, tbft_node_id_t node_id,
     }
 
     /* Initialise authentication freshness timer */
-    esp_err_t err = tbft_itimer_init(&node->atimer, NULL, node, "tbft_auth");
+    esp_err_t err = tbft_itimer_init(&node->atimer, nullptr, node, "tbft_auth");
     if (err != ESP_OK) {
         tbft_transport_free(node->transport);
-        node->transport = NULL;
+        node->transport = nullptr;
         return -1;
     }
 
@@ -87,11 +87,11 @@ void tbft_node_free(tbft_node_t *node)
 {
     tbft_itimer_free(&node->atimer);
     tbft_transport_free(node->transport);
-    node->transport = NULL;
+    node->transport = nullptr;
     for (int i = 0; i < node->num_principals; i++) {
         if (node->principals[i]) {
             tbft_principal_free(node->principals[i]);
-            node->principals[i] = NULL;
+            node->principals[i] = nullptr;
         }
     }
 }

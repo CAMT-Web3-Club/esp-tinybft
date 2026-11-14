@@ -2,7 +2,7 @@
 #include "esp_log.h"
 #include <string.h>
 
-static const char *TAG = "tbft_vi";
+static constexpr char TAG[] = "tbft_vi";
 
 void tbft_vi_init(tbft_view_info_t *vi, int num_replicas, int threshold,
                   tbft_special_region_t *sr)

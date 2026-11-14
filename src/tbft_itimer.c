@@ -1,7 +1,7 @@
 #include "tbft_itimer.h"
 #include "esp_log.h"
 
-static const char *TAG = "tbft_itimer";
+static constexpr char TAG[] = "tbft_itimer";
 
 static void timer_dispatch(void *arg)
 {
@@ -18,7 +18,7 @@ esp_err_t tbft_itimer_init(tbft_itimer_t *t, tbft_timer_cb_t cb,
     t->cb      = cb;
     t->arg     = arg;
     t->running = false;
-    t->handle  = NULL;
+    t->handle  = nullptr;
 
     const esp_timer_create_args_t args = {
         .callback        = timer_dispatch,
@@ -37,7 +37,7 @@ esp_err_t tbft_itimer_init(tbft_itimer_t *t, tbft_timer_cb_t cb,
 
 void tbft_itimer_start(tbft_itimer_t *t, int64_t timeout_us)
 {
-    if (t->handle == NULL) return;
+    if (t->handle == nullptr) return;
     if (timeout_us <= 0) {
         ESP_LOGE(TAG, "refusing to start timer with non-positive timeout %lld", (long long)timeout_us);
         return;
@@ -78,6 +78,6 @@ void tbft_itimer_free(tbft_itimer_t *t)
     if (t->handle) {
         tbft_itimer_stop(t);
         esp_timer_delete(t->handle);
-        t->handle = NULL;
+        t->handle = nullptr;
     }
 }

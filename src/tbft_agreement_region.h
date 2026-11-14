@@ -4,7 +4,6 @@
 #include "tbft_message.h"
 #include "tbft_certificate.h"
 #include "tbft_prepared_cert.h"
-#include <stdbool.h>
 
 /* --------------------------------------------------------------------------
  * agreement_region — TinyBFT static circular buffer for the hot-path
@@ -87,7 +86,7 @@ bool tbft_ar_store_pp(tbft_agreement_region_t *ar,
 
 /**
  * Load the stored Pre_prepare for @p seqno.
- * @return pointer to the pre-prepare bytes, or NULL
+ * @return pointer to the pre-prepare bytes, or nullptr
  */
 const uint8_t *tbft_ar_load_pp(const tbft_agreement_region_t *ar,
                                tbft_seqno_t seqno, int *len_out);

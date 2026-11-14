@@ -3,7 +3,6 @@
 #include "tbft_types.h"
 #include "tbft_message.h"
 #include <string.h>
-#include <stdbool.h>
 
 /* --------------------------------------------------------------------------
  * Certificate<T> — quorum certificate (section 6).
@@ -25,14 +24,14 @@
  *   Prepare:    sizeof(tbft_prepare_rep_t)    + TBFT_AUTH_SIZE
  * Use the largest across all three.
  */
-#define TBFT_CERT_COMMIT_MSG_SIZE     \
-    (sizeof(tbft_commit_rep_t) + TBFT_AUTH_SIZE)
+static constexpr size_t TBFT_CERT_COMMIT_MSG_SIZE =
+    sizeof(tbft_commit_rep_t) + TBFT_AUTH_SIZE;
 
-#define TBFT_CERT_CHECKPOINT_MSG_SIZE \
-    (sizeof(tbft_checkpoint_rep_t) + TBFT_AUTH_SIZE)
+static constexpr size_t TBFT_CERT_CHECKPOINT_MSG_SIZE =
+    sizeof(tbft_checkpoint_rep_t) + TBFT_AUTH_SIZE;
 
-#define TBFT_CERT_PREPARE_MSG_SIZE    \
-    (sizeof(tbft_prepare_rep_t) + TBFT_AUTH_SIZE)
+static constexpr size_t TBFT_CERT_PREPARE_MSG_SIZE =
+    sizeof(tbft_prepare_rep_t) + TBFT_AUTH_SIZE;
 
 /* --------------------------------------------------------------------------
  * Generic certificate structure
@@ -79,7 +78,7 @@ bool tbft_commit_cert_add_mine(tbft_commit_cert_t *cert,
                                const void *msg, int msg_len,
                                tbft_node_id_t my_id);
 
-/** Return pointer to the winning value (correct >= threshold), or NULL. */
+/** Return pointer to the winning value (correct >= threshold), or nullptr. */
 const uint8_t *tbft_commit_cert_cvalue(const tbft_commit_cert_t *cert);
 
 /** True when the certificate has reached its completion threshold. */

@@ -2,38 +2,43 @@
 #include "tbft_message.h"
 #include "esp_log.h"
 #include "psa/crypto.h"
+#include <stdckdint.h>
 #include <stdlib.h>
 #include <string.h>
 
-static const char *TAG = "tbft_ptree";
+static constexpr char TAG[] = "tbft_ptree";
 
 int tbft_ptree_compute_levels(int num_blocks, int p_children)
 {
     /* O3 FIX: Validate p_children to prevent infinite loop or overflow. */
     if (p_children < 2) return TBFT_P_LEVELS + 1; /* invalid: will be caught */
 
-    long nodes_at_level = 1;
+    int nodes_at_level = 1;
     int level = 0;
     while (nodes_at_level < num_blocks) {
-        nodes_at_level *= p_children;
         level++;
         if (level > TBFT_P_LEVELS) break; /* will be rejected by caller */
+        /* ckd_mul (C23 <stdckdint.h>): on overflow the level already holds
+         * more nodes than any int num_blocks, so stop counting there. */
+        if (ckd_mul(&nodes_at_level, nodes_at_level, p_children)) break;
     }
     return level + 1; /* +1 to include root */
 }
 
-/* M3 FIX: Use long to prevent integer overflow when computing node counts.
- * With TBFT_P_CHILDREN ≈ 56 and level=3, 56³ = 175,616 fits in int, but
- * larger configs could overflow. Return a sentinel value above any valid
- * bound so callers can detect the overflow. */
+/* M3 FIX: node counts can overflow int for large configs (with
+ * TBFT_P_CHILDREN ≈ 56 and level=3, 56³ = 175,616 still fits).  `long` is
+ * 32 bits on ESP32 targets, so overflow is checked with ckd_mul (C23
+ * <stdckdint.h>) instead.  Returns a sentinel above any valid bound so
+ * callers can detect it. */
 int tbft_ptree_nodes_at_level(int level, int p_children)
 {
-    long n = 1;
+    int n = 1;
     for (int i = 0; i < level; i++) {
-        n *= p_children;
-        if (n > 1000000) return 1000001; /* sentinel: overflow guard */
+        if (ckd_mul(&n, n, p_children) || n > 1'000'000) {
+            return 1'000'001; /* sentinel: overflow guard */
+        }
     }
-    return (int)n;
+    return n;
 }
 
 int tbft_ptree_init(tbft_ptree_t *tree, int num_blocks, int p_children)
@@ -52,12 +57,12 @@ int tbft_ptree_init(tbft_ptree_t *tree, int num_blocks, int p_children)
     tree->dims.num_blocks = num_blocks;
 
     /* Count total nodes across all levels.
-     * Check the sentinel return (1000001) before accumulating to avoid
+     * Check the sentinel return (1'000'001) before accumulating to avoid
      * passing a wildly large count to calloc. */
     int total = 0;
     for (int l = 0; l < levels; l++) {
         int n_at_l = tbft_ptree_nodes_at_level(l, p_children);
-        if (n_at_l > 1000000) {
+        if (n_at_l > 1'000'000) {
             ESP_LOGE(TAG, "ptree: level %d node count overflow", l);
             return -1;
         }

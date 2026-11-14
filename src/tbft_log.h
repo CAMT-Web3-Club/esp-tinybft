@@ -2,7 +2,6 @@
 
 #include "tbft_types.h"
 #include "tbft_checkpoint_region.h"
-#include <stdbool.h>
 #include <string.h>
 
 /* --------------------------------------------------------------------------

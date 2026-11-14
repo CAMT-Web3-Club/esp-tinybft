@@ -124,6 +124,18 @@ src/tbft_config.h           ← all compile-time constants (sourced from Kconfig
 src/tbft_types.h            ← typedefs: scalars, crypto structs, bitmap, network, state block
 ```
 
+### Language standard: C23
+
+The component and both examples are written in C23 (GNU dialect, `-std=gnu23`), the default C version of ESP-IDF ≥ 6.0 (`docs/en/api-guides/c.rst`; v5.5 was still `gnu17`), which `idf_component.yml` already requires. The `CMakeLists.txt` files pin it with `target_compile_options(${COMPONENT_LIB} PRIVATE -std=gnu23)`, the method that page documents, and `include/esp-tinybft.h` stops with `#error` on a pre-C23 C compiler (C++ callers are fine). The ESP toolchain (GCC 15.2) reports `__STDC_VERSION__ 202311L`.
+
+Conventions:
+- `nullptr` instead of `NULL`; `bool`/`true`/`false` are keywords (no `<stdbool.h>`); `static_assert` instead of `_Static_assert`.
+- Typed `static constexpr` constants instead of object-like `#define`s, keeping the type the literal had (`int` for counts and timeouts, `size_t` for `sizeof` sums). Macros stay where the preprocessor needs them: `#if` tests, `#ifndef` override defaults, string literals spliced into format strings (`MACSTR`), the Kconfig bridge in `tbft_config.h`, and public-API macros (`BYZ_REQ_HEADER_SIZE`). File-scope `constexpr` objects need `static` (C gives `const` objects external linkage), and an unused one in a `.c` file is a `-Werror` failure (`-Wunused-const-variable`); mark per-configuration ones `[[maybe_unused]]`.
+- C23 attribute syntax: `[[gnu::packed]]` on wire structs (same layout as `__attribute__((packed))`), `alignas(N)`, `[[maybe_unused]]` instead of `(void)x;`, `[[noreturn]]`, and `[[nodiscard]]` on the crypto/verify functions in `tbft_principal.h` and `tbft_node.h` (IDF builds with `-Werror`, so an ignored result fails the build).
+- Log tags as `static constexpr char TAG[] = "...";` (an array in flash, not a pointer variable).
+- `= {}` to zero-initialise new objects; keep `memset` for resetting existing ones (a compound-literal assignment of a large struct can put a big temporary on a FreeRTOS stack).
+- `ckd_add` / `ckd_mul` from `<stdckdint.h>` for size arithmetic on untrusted or caller-supplied values. `<stdbit.h>` is not available in the toolchain's C library.
+
 ### Crypto migration (ESP-IDF v6.0 / MbedTLS 4.x)
 
 MbedTLS 4.x removed several classic APIs. The component uses the **PSA Crypto API** for symmetric primitives while keeping `mbedtls/pk.h` for asymmetric operations:

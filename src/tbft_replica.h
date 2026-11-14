@@ -130,8 +130,8 @@ typedef struct {
     EventGroupHandle_t evt_group;
 } tbft_replica_t;
 
-#define TBFT_EVT_VTIMER (1 << 0)
-#define TBFT_EVT_STIMER (1 << 1)
+static constexpr EventBits_t TBFT_EVT_VTIMER = 1 << 0;
+static constexpr EventBits_t TBFT_EVT_STIMER = 1 << 1;
 
 /* --------------------------------------------------------------------------
  * Lifecycle

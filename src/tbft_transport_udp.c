@@ -17,7 +17,7 @@
 #include <errno.h>
 #include <fcntl.h>
 
-static const char *TAG = "tbft_udp";
+static constexpr char TAG[] = "tbft_udp";
 
 /* --------------------------------------------------------------------------
  * Internal struct
@@ -188,14 +188,12 @@ static int socket_open(uint16_t port, bool use_multicast,
  * -------------------------------------------------------------------------- */
 
 int tbft_transport_create(tbft_transport_t **out,
-                           tbft_transport_type_t type,
+                           [[maybe_unused]] tbft_transport_type_t type, /* always UDP here */
                            int num_nodes,
                            int num_replicas,
                            const char *mcast_ip,
                            uint16_t port)
 {
-    (void)type;  /* only called with TBFT_TRANSPORT_UDP */
-
     if (num_nodes > TBFT_MAX_NUM_REPLICAS + TBFT_MAX_NUM_CLIENTS) {
         ESP_LOGE(TAG, "num_nodes %d exceeds max %d", num_nodes,
                  TBFT_MAX_NUM_REPLICAS + TBFT_MAX_NUM_CLIENTS);
@@ -212,7 +210,7 @@ int tbft_transport_create(tbft_transport_t **out,
 #ifdef CONFIG_TBFT_DISABLE_MULTICAST
     udp->use_multicast = false;
 #else
-    udp->use_multicast = (mcast_ip != NULL &&
+    udp->use_multicast = (mcast_ip != nullptr &&
                           strcmp(mcast_ip, "none") != 0 &&
                           strcmp(mcast_ip, "off") != 0 &&
                           strcmp(mcast_ip, "0.0.0.0") != 0);
@@ -411,5 +409,5 @@ void tbft_transport_wait(tbft_transport_t *t, int timeout_ms)
     FD_SET(udp->sock, &rfds);
     struct timeval tv = { .tv_sec = timeout_ms / 1000,
                           .tv_usec = (timeout_ms % 1000) * 1000 };
-    select(udp->sock + 1, &rfds, NULL, NULL, &tv);
+    select(udp->sock + 1, &rfds, nullptr, nullptr, &tv);
 }

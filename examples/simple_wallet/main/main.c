@@ -12,15 +12,15 @@
 #include "esp-tinybft.h"
 #include "esp_task_wdt.h"
 
-#define TAG "simple_wallet"
+static constexpr char TAG[] = "simple_wallet";
 
 #if CONFIG_TBFT_TRANSPORT_UDP
 #include "esp_event.h"
 #include "freertos/event_groups.h"
 
 static EventGroupHandle_t s_wifi_event_group;
-#define WIFI_CONNECTED_BIT BIT0
-#define WIFI_FAIL_BIT      BIT1
+static constexpr EventBits_t WIFI_CONNECTED_BIT = BIT0;
+static constexpr EventBits_t WIFI_FAIL_BIT      = BIT1;
 
 static void wifi_event_handler(void *arg, esp_event_base_t base,
                                int32_t id, void *data)
@@ -38,21 +38,21 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
 }
 #endif
 
-#define NUM_ACCOUNTS 4
+static constexpr int NUM_ACCOUNTS = 4;
 static int32_t app_state[4096 / sizeof(int32_t)];
 
-typedef struct {
+typedef struct [[gnu::packed]] {
     uint8_t op; // 0 = read, 1 = transfer
     uint8_t from;
     uint8_t to;
     int32_t amount;
-} __attribute__((packed)) wallet_req_t;
+} wallet_req_t;
 
-typedef struct {
+typedef struct [[gnu::packed]] {
     int32_t balance_from;
     int32_t balance_to;
     int8_t status; // 0 = ok, -1 = error
-} __attribute__((packed)) wallet_rep_t;
+} wallet_rep_t;
 
 int exec_cb(Byz_req *in, Byz_rep *out, Byz_buffer *ndet, int cid, bool ro) {
     /* The exec callback receives the full embedded request from the
@@ -107,8 +107,8 @@ static void wifi_init(void) {
     wifi_init_config_t wcfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&wcfg));
     esp_event_handler_instance_t h1, h2;
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL, &h1));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL, &h2));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, nullptr, &h1));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, nullptr, &h2));
     wifi_config_t wifi_cfg = {
         .sta = { .ssid = CONFIG_EXAMPLE_WIFI_SSID, .password = CONFIG_EXAMPLE_WIFI_PASSWORD },
     };
@@ -175,7 +175,7 @@ static void replica_task(void *arg) {
     if (local_id < 0) {
         ESP_LOGE(TAG, "Failed to auto-detect local ID — "
                  "check that this board's MAC/IP is in the config file");
-        vTaskDelete(NULL);
+        vTaskDelete(nullptr);
         return;
     }
     ESP_LOGI(TAG, "Using local_id=%d", local_id);
@@ -192,10 +192,10 @@ static void replica_task(void *arg) {
     int ret = Byz_init_replica(config_file, priv_config,
                                local_id,
                                app_state, sizeof(app_state),
-                               exec_cb, NULL, 0, NULL, 0);
+                               exec_cb, nullptr, 0, nullptr, 0);
     if (ret != 0) {
         ESP_LOGE(TAG, "Failed to init replica");
-        vTaskDelete(NULL);
+        vTaskDelete(nullptr);
         return;
     }
 
@@ -215,7 +215,7 @@ static void client_task(void *arg) {
     if (local_id < 0) {
         ESP_LOGE(TAG, "Failed to auto-detect local ID — "
                  "check that this board's MAC is in the config file");
-        vTaskDelete(NULL);
+        vTaskDelete(nullptr);
         return;
     }
     ESP_LOGI(TAG, "Client detected local_id=%d", local_id);
@@ -226,14 +226,14 @@ static void client_task(void *arg) {
     int ret = Byz_init_client(config_file, priv_config, local_id, 0);
     if (ret != 0) {
         ESP_LOGE(TAG, "Failed to init client");
-        vTaskDelete(NULL);
+        vTaskDelete(nullptr);
         return;
     }
 
     ESP_LOGI(TAG, "Client running...");
 
 #if CONFIG_ESP_TASK_WDT_EN
-    esp_task_wdt_add(NULL);
+    esp_task_wdt_add(nullptr);
 #endif
 
     while(1) {
@@ -289,7 +289,7 @@ void app_main(void) {
 
     esp_vfs_spiffs_conf_t conf = {
       .base_path = "/spiffs",
-      .partition_label = NULL,
+      .partition_label = nullptr,
       .max_files = 5,
       .format_if_mount_failed = true
     };
@@ -299,8 +299,8 @@ void app_main(void) {
     wifi_init();
 
 #if CONFIG_EXAMPLE_ROLE_REPLICA
-    xTaskCreate(replica_task, "replica_task", 8192, NULL, 5, NULL);
+    xTaskCreate(replica_task, "replica_task", 8192, nullptr, 5, nullptr);
 #else
-    xTaskCreate(client_task, "client_task", 8192, NULL, 5, NULL);
+    xTaskCreate(client_task, "client_task", 8192, nullptr, 5, nullptr);
 #endif
 }

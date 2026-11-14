@@ -15,20 +15,20 @@
  * -------------------------------------------------------------------------- */
 
 /* Extract digest pointer from a message based on its type.
- * Returns NULL if the message is too small. */
+ * Returns nullptr if the message is too small. */
 static const tbft_digest_t *extract_msg_digest(const void *msg, int msg_len,
                                                 tbft_msg_tag_t expected_tag,
                                                 size_t digest_offset)
 {
     if (!msg || msg_len <= 0) {
-        return NULL;
+        return nullptr;
     }
     const tbft_msg_hdr_t *hdr = (const tbft_msg_hdr_t *)msg;
     if ((size_t)msg_len < digest_offset + sizeof(tbft_digest_t)) {
-        return NULL;
+        return nullptr;
     }
     if (hdr->tag != expected_tag) {
-        return NULL;
+        return nullptr;
     }
     return (const tbft_digest_t *)((const uint8_t *)msg + digest_offset);
 }
@@ -143,12 +143,12 @@ const uint8_t *prefix##_cvalue(const cert_t *cert)                            \
             return cert->vals[i];                                              \
         }                                                                      \
     }                                                                          \
-    return NULL;                                                               \
+    return nullptr;                                                               \
 }                                                                              \
                                                                                \
 bool prefix##_is_complete(const cert_t *cert)                                  \
 {                                                                              \
-    return prefix##_cvalue(cert) != NULL;                                      \
+    return prefix##_cvalue(cert) != nullptr;                                      \
 }
 
 /* Expand for each type with correct digest offsets:
@@ -156,9 +156,9 @@ bool prefix##_is_complete(const cert_t *cert)                                  \
  * - Commit: digest is at offset sizeof(tbft_msg_hdr_t) + sizeof(tbft_view_t) + sizeof(tbft_seqno_t)
  * - Checkpoint: digest is at offset sizeof(tbft_msg_hdr_t) + sizeof(tbft_seqno_t)
  */
-#define PREPARE_DIGEST_OFFSET (sizeof(tbft_msg_hdr_t) + sizeof(tbft_view_t) + sizeof(tbft_seqno_t))
-#define COMMIT_DIGEST_OFFSET  (sizeof(tbft_msg_hdr_t) + sizeof(tbft_view_t) + sizeof(tbft_seqno_t))
-#define CHECKPOINT_DIGEST_OFFSET (sizeof(tbft_msg_hdr_t) + sizeof(tbft_seqno_t))
+static constexpr size_t PREPARE_DIGEST_OFFSET    = sizeof(tbft_msg_hdr_t) + sizeof(tbft_view_t) + sizeof(tbft_seqno_t);
+static constexpr size_t COMMIT_DIGEST_OFFSET     = sizeof(tbft_msg_hdr_t) + sizeof(tbft_view_t) + sizeof(tbft_seqno_t);
+static constexpr size_t CHECKPOINT_DIGEST_OFFSET = sizeof(tbft_msg_hdr_t) + sizeof(tbft_seqno_t);
 
 CERT_IMPL(tbft_commit_cert,     tbft_commit_cert_t,     TBFT_CERT_COMMIT_MSG_SIZE,     COMMIT_DIGEST_OFFSET,     TBFT_MSG_COMMIT)
 CERT_IMPL(tbft_checkpoint_cert, tbft_checkpoint_cert_t, TBFT_CERT_CHECKPOINT_MSG_SIZE, CHECKPOINT_DIGEST_OFFSET, TBFT_MSG_CHECKPOINT)

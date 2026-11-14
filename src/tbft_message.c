@@ -16,7 +16,7 @@
 #include "psa/crypto.h"
 #include <string.h>
 
-static const char *TAG = "tbft_msg";
+static constexpr char TAG[] = "tbft_msg";
 
 void tbft_msg_digest(const void *data, size_t len, tbft_digest_t *out)
 {

@@ -3,7 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-static const char *TAG = "tbft_state";
+static constexpr char TAG[] = "tbft_state";
 
 /* --------------------------------------------------------------------------
  * CoW bitmap helpers (multi-word for >64 blocks)
@@ -98,7 +98,7 @@ int tbft_state_init(tbft_state_t *state, void *mem, size_t size)
                      state->num_blocks, sizeof(tbft_cow_entry_t));
             for (int j = 0; j < i; j++) {
                 free(state->ckpt_records[j].old_blocks);
-                state->ckpt_records[j].old_blocks = NULL;
+                state->ckpt_records[j].old_blocks = nullptr;
             }
             tbft_ptree_free(&state->ptree);
             return -1;
@@ -122,7 +122,7 @@ void tbft_state_free(tbft_state_t *state)
     for (int i = 0; i < TBFT_NUM_CKPT_SLOTS; i++) {
         if (state->ckpt_records[i].old_blocks) {
             free(state->ckpt_records[i].old_blocks);
-            state->ckpt_records[i].old_blocks = NULL;
+            state->ckpt_records[i].old_blocks = nullptr;
         }
     }
     memset(state, 0, sizeof(*state));

@@ -4,7 +4,7 @@
 static inline int slot_index(tbft_seqno_t seqno)
 {
     /* tbft_seqno_t is int64_t; negative seqno would indicate a logic bug
-     * in the caller. The division-by-zero guard in Kconfig (_Static_assert
+     * in the caller. The division-by-zero guard in Kconfig (static_assert
      * TBFT_CHECKPOINT_INTERVAL >= 1) ensures the modulo is safe. */
     return (int)((seqno / TBFT_CHECKPOINT_INTERVAL) % TBFT_NUM_CKPT_SLOTS);
 }
@@ -89,13 +89,13 @@ const uint8_t *tbft_cr_load(const tbft_checkpoint_region_t *cr,
 {
     if (replica_id < 0 || replica_id >= TBFT_MAX_NUM_REPLICAS) {
         if (len_out) *len_out = 0;
-        return NULL;
+        return nullptr;
     }
     int sidx = slot_index(seqno);
     const tbft_ckpt_slot_t *slot = &cr->slots[sidx];
     if (slot->seqno != seqno || !slot->present[replica_id]) {
         if (len_out) *len_out = 0;
-        return NULL;
+        return nullptr;
     }
     if (len_out) *len_out = slot->msg_lens[replica_id];
     return slot->msgs[replica_id];
@@ -113,7 +113,7 @@ const tbft_digest_t *tbft_cr_winning_digest(const tbft_checkpoint_region_t *cr,
                                              tbft_seqno_t seqno)
 {
     const tbft_ckpt_slot_t *slot = &cr->slots[slot_index(seqno)];
-    if (slot->match_count < cr->threshold) return NULL;
+    if (slot->match_count < cr->threshold) return nullptr;
     return &slot->winning_digest;
 }
 
@@ -154,12 +154,12 @@ const uint8_t *tbft_cr_load_above_window(const tbft_checkpoint_region_t *cr,
 {
     if (replica_id < 0 || replica_id >= TBFT_MAX_NUM_REPLICAS) {
         if (len_out) *len_out = 0;
-        return NULL;
+        return nullptr;
     }
     const tbft_ckpt_slot_t *slot = &cr->above_window[replica_id];
     if (!slot->present[0]) {
         if (len_out) *len_out = 0;
-        return NULL;
+        return nullptr;
     }
     if (len_out) *len_out = slot->msg_lens[0];
     return slot->msgs[0];

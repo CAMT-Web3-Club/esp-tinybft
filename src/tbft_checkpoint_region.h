@@ -3,7 +3,6 @@
 #include "tbft_config.h"
 #include "tbft_types.h"
 #include "tbft_message.h"
-#include <stdbool.h>
 #include <string.h>
 
 /* --------------------------------------------------------------------------
@@ -17,7 +16,7 @@
  * -------------------------------------------------------------------------- */
 
 /* Raw bytes for one Checkpoint message on the wire */
-#define TBFT_CKPT_MSG_SIZE  (sizeof(tbft_checkpoint_rep_t) + TBFT_AUTH_SIZE)
+static constexpr size_t TBFT_CKPT_MSG_SIZE = sizeof(tbft_checkpoint_rep_t) + TBFT_AUTH_SIZE;
 
 /** One slot: Checkpoint messages from each replica at one seqno */
 typedef struct {
@@ -70,7 +69,7 @@ bool tbft_cr_store(tbft_checkpoint_region_t *cr,
 
 /**
  * Load the Checkpoint message from @p replica_id for @p seqno.
- * @return message bytes or NULL
+ * @return message bytes or nullptr
  */
 const uint8_t *tbft_cr_load(const tbft_checkpoint_region_t *cr,
                              tbft_seqno_t seqno,
@@ -83,7 +82,7 @@ int tbft_cr_count(const tbft_checkpoint_region_t *cr, tbft_seqno_t seqno);
 
 /**
  * Return the winning digest for @p seqno (the one with threshold matches),
- * or NULL if not yet stable.
+ * or nullptr if not yet stable.
  */
 const tbft_digest_t *tbft_cr_winning_digest(const tbft_checkpoint_region_t *cr,
                                              tbft_seqno_t seqno);

@@ -1,7 +1,6 @@
 #pragma once
 
 #include <stdint.h>
-#include <stdbool.h>
 #include <stddef.h>
 #include "tbft_config.h"
 
@@ -22,10 +21,10 @@ typedef uint64_t tbft_req_id_t;
 typedef int32_t  tbft_node_id_t;
 
 /* Sentinel: send to all replicas */
-#define TBFT_ALL_REPLICAS  (-1)
+static constexpr int TBFT_ALL_REPLICAS = -1;
 
 /* Sentinel: no valid sequence number */
-#define TBFT_SEQNO_NONE    ((tbft_seqno_t)(-1LL))
+static constexpr tbft_seqno_t TBFT_SEQNO_NONE = -1;
 
 /* --------------------------------------------------------------------------
  * Cryptographic types

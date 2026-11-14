@@ -5,7 +5,6 @@
 #include "tbft_message.h"
 #include "mbedtls/pk.h"
 #include "psa/crypto.h"
-#include <stdbool.h>
 
 /* --------------------------------------------------------------------------
  * Principal — represents a remote (or local) participant.
@@ -69,14 +68,14 @@ void tbft_principal_init(tbft_principal_t *p, tbft_node_id_t id,
  * Load the principal's RSA public key from DER-encoded bytes.
  * @return 0 on success, negative MbedTLS error code otherwise
  */
-int  tbft_principal_load_pub_key(tbft_principal_t *p,
+[[nodiscard]] int  tbft_principal_load_pub_key(tbft_principal_t *p,
                                  const uint8_t *der, size_t der_len);
 
 /**
  * Load the local node's RSA private key from DER-encoded bytes.
  * @return 0 on success, negative MbedTLS error code otherwise
  */
-int  tbft_principal_load_priv_key(tbft_principal_t *p,
+[[nodiscard]] int  tbft_principal_load_priv_key(tbft_principal_t *p,
                                   const uint8_t *der, size_t der_len);
 
 /**
@@ -99,7 +98,7 @@ void tbft_principal_ensure_psa(void);
  * Generate a MAC for an outgoing message using this principal's out-key.
  * The result is placed in @p mac.
  */
-int tbft_principal_gen_mac_out(const tbft_principal_t *p,
+[[nodiscard]] int tbft_principal_gen_mac_out(const tbft_principal_t *p,
                                const void *msg, size_t msg_len,
                                tbft_mac_t *mac);
 
@@ -107,7 +106,7 @@ int tbft_principal_gen_mac_out(const tbft_principal_t *p,
  * Verify a MAC on an incoming message using this principal's in-key.
  * @return true if the MAC is valid, false otherwise
  */
-bool tbft_principal_verify_mac_in(const tbft_principal_t *p,
+[[nodiscard]] bool tbft_principal_verify_mac_in(const tbft_principal_t *p,
                                   const void *msg, size_t msg_len,
                                   const tbft_mac_t *mac);
 
@@ -116,7 +115,7 @@ bool tbft_principal_verify_mac_in(const tbft_principal_t *p,
  * Returns true if MAC is valid AND message is not a replay.
  * On success, updates p->last_auth_time_us to msg_time_us.
  */
-bool tbft_principal_verify_mac_in_with_replay_check(tbft_principal_t *p,
+[[nodiscard]] bool tbft_principal_verify_mac_in_with_replay_check(tbft_principal_t *p,
                                                     const void *msg, size_t msg_len,
                                                     const tbft_mac_t *mac,
                                                     int64_t msg_time_us);
@@ -152,7 +151,7 @@ void tbft_principal_set_out_key(tbft_principal_t *p, const tbft_hmac_key_t *key)
  * @param sig       Output signature buffer (must be TBFT_SIG_SIZE bytes)
  * @return 0 on success, negative error code otherwise
  */
-int tbft_principal_sign(tbft_principal_t *p,
+[[nodiscard]] int tbft_principal_sign(tbft_principal_t *p,
                         const void *msg, size_t msg_len,
                         tbft_sig_t *sig);
 
@@ -160,7 +159,7 @@ int tbft_principal_sign(tbft_principal_t *p,
  * Verify an RSA signature against this principal's public key.
  * @return true if valid, false otherwise
  */
-bool tbft_principal_verify_sig(const tbft_principal_t *p,
+[[nodiscard]] bool tbft_principal_verify_sig(const tbft_principal_t *p,
                                const void *msg, size_t msg_len,
                                const tbft_sig_t *sig);
 
@@ -179,7 +178,7 @@ bool tbft_principal_verify_sig(const tbft_principal_t *p,
  * @param out_enc_len  Receives actual ciphertext length
  * @return 0 on success
  */
-int tbft_principal_encrypt_new_key(tbft_principal_t *p,
+[[nodiscard]] int tbft_principal_encrypt_new_key(tbft_principal_t *p,
                                    const tbft_hmac_key_t *new_out_key,
                                    uint8_t *enc_buf, size_t enc_buf_len,
                                    size_t *out_enc_len);
@@ -193,6 +192,6 @@ int tbft_principal_encrypt_new_key(tbft_principal_t *p,
  * @param new_in_key   Receives the decrypted key
  * @return 0 on success
  */
-int tbft_principal_decrypt_new_key(tbft_principal_t *p,
+[[nodiscard]] int tbft_principal_decrypt_new_key(tbft_principal_t *p,
                                    const uint8_t *enc_buf, size_t enc_len,
                                    tbft_hmac_key_t *new_in_key);

@@ -27,10 +27,10 @@
  * INT64_MAX, latching last_auth_time_us and silently rejecting every
  * subsequent legitimate message as "stale". */
 #ifndef TBFT_ANTI_REPLAY_FUTURE_SLACK_US
-#define TBFT_ANTI_REPLAY_FUTURE_SLACK_US  ((int64_t)300 * 1000 * 1000) /* 5 min: allow for staggered boot */
+#define TBFT_ANTI_REPLAY_FUTURE_SLACK_US  ((int64_t)300'000'000) /* 5 min: allow for staggered boot */
 #endif
 
-static const char *TAG = "tbft_principal";
+static constexpr char TAG[] = "tbft_principal";
 
 /* --------------------------------------------------------------------------
  * Module-level PSA init (idempotent; called once before first crypto op)
@@ -100,7 +100,7 @@ int tbft_principal_load_priv_key(tbft_principal_t *p,
                                  const uint8_t *der, size_t der_len)
 {
     /* MbedTLS 4.x: no f_rng/p_rng in pk_parse_key */
-    int ret = mbedtls_pk_parse_key(&p->priv_pk, der, der_len, NULL, 0);
+    int ret = mbedtls_pk_parse_key(&p->priv_pk, der, der_len, nullptr, 0);
     if (ret != 0) {
         ESP_LOGE(TAG, "parse_key failed: -0x%04x", (unsigned)(-ret));
         return ret;
@@ -214,7 +214,7 @@ bool tbft_principal_verify_mac_in(const tbft_principal_t *p,
 bool tbft_principal_verify_mac_in_with_replay_check(tbft_principal_t *p,
                                                      const void *msg, size_t msg_len,
                                                      const tbft_mac_t *mac,
-                                                     int64_t msg_time_us)
+                                                     [[maybe_unused]] int64_t msg_time_us)
 {
     bool mac_ok = tbft_principal_verify_mac_in(p, msg, msg_len, mac);
     if (!mac_ok) {
@@ -229,7 +229,6 @@ bool tbft_principal_verify_mac_in_with_replay_check(tbft_principal_t *p,
      * rotated on every New_key exchange (verified by the self-test), which
      * provides replay protection — an old message under a rotated key fails
      * HMAC verification. */
-    (void)msg_time_us;
     return true;
 }
 
@@ -377,7 +376,7 @@ bool tbft_principal_verify_sig(const tbft_principal_t *p,
  * OAEP with SHA-256 is used (PKCS#1 v1.5 encryption is not CCA-secure).
  * -------------------------------------------------------------------------- */
 
-#define TBFT_KEY_WRAP_ALG  PSA_ALG_RSA_OAEP(PSA_ALG_SHA_256)
+static constexpr psa_algorithm_t TBFT_KEY_WRAP_ALG = PSA_ALG_RSA_OAEP(PSA_ALG_SHA_256);
 
 int tbft_principal_encrypt_new_key(tbft_principal_t *p,
                                    const tbft_hmac_key_t *new_out_key,
@@ -406,7 +405,7 @@ int tbft_principal_encrypt_new_key(tbft_principal_t *p,
 
     psa_status_t st = psa_asymmetric_encrypt(key_id, TBFT_KEY_WRAP_ALG,
                                              new_out_key->bytes, sizeof(new_out_key->bytes),
-                                             NULL, 0,
+                                             nullptr, 0,
                                              enc_buf, enc_buf_len, out_enc_len);
     psa_destroy_key(key_id);
     if (st != PSA_SUCCESS) {
@@ -443,7 +442,7 @@ int tbft_principal_decrypt_new_key(tbft_principal_t *p,
     size_t out_len = 0;
     psa_status_t st = psa_asymmetric_decrypt(key_id, TBFT_KEY_WRAP_ALG,
                                              enc_buf, enc_len,
-                                             NULL, 0,
+                                             nullptr, 0,
                                              new_in_key->bytes, sizeof(new_in_key->bytes),
                                              &out_len);
     psa_destroy_key(key_id);

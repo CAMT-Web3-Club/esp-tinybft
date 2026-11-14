@@ -36,7 +36,7 @@ const uint8_t *tbft_ar_load_pp(const tbft_agreement_region_t *ar,
 {
     if (!tbft_ar_in_range(ar, seqno)) {
         if (len_out) *len_out = 0;
-        return NULL;
+        return nullptr;
     }
     const tbft_agreement_slice_t *sl =
         (const tbft_agreement_slice_t *)tbft_ar_slice(

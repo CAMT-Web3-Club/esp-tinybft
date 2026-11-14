@@ -33,7 +33,7 @@ typedef enum {
  * All messages on the wire begin with this header (16 bytes).
  * -------------------------------------------------------------------------- */
 
-typedef struct __attribute__((packed)) {
+typedef struct [[gnu::packed]] {
     int16_t  tag;   /* tbft_msg_tag_t */
     int16_t  extra; /* tag-specific flags */
     int32_t  size;  /* total message byte length (8-byte aligned) */
@@ -45,7 +45,7 @@ typedef struct __attribute__((packed)) {
  * Wire: [hdr][Request_rep][command bytes][RSA signature]
  * -------------------------------------------------------------------------- */
 
-typedef struct __attribute__((packed)) {
+typedef struct [[gnu::packed]] {
     tbft_msg_hdr_t  hdr;
     tbft_digest_t   od;           /* SHA-256 of command */
     int32_t         cid;          /* client id */
@@ -59,7 +59,7 @@ typedef struct __attribute__((packed)) {
  * Wire: [hdr][Reply_rep][reply payload][RSA signature]
  * -------------------------------------------------------------------------- */
 
-typedef struct __attribute__((packed)) {
+typedef struct [[gnu::packed]] {
     tbft_msg_hdr_t  hdr;
     tbft_view_t     view;
     tbft_seqno_t    seqno;
@@ -71,8 +71,8 @@ typedef struct __attribute__((packed)) {
 /* Compile-time assertion: a fully-sized reply (header + max payload + RSA
  * signature) must fit within TBFT_MAX_MESSAGE_SIZE.  If a project raises
  * TBFT_MAX_REPLY_SIZE, this will fire at build time. */
-_Static_assert(sizeof(tbft_reply_rep_t) + TBFT_MAX_REPLY_SIZE + TBFT_SIG_SIZE
-                   <= TBFT_MAX_MESSAGE_SIZE,
+static_assert(sizeof(tbft_reply_rep_t) + TBFT_MAX_REPLY_SIZE + TBFT_SIG_SIZE
+                  <= TBFT_MAX_MESSAGE_SIZE,
     "Reply message (header + payload + signature) exceeds TBFT_MAX_MESSAGE_SIZE");
 
 /* --------------------------------------------------------------------------
@@ -80,7 +80,7 @@ _Static_assert(sizeof(tbft_reply_rep_t) + TBFT_MAX_REPLY_SIZE + TBFT_SIG_SIZE
  * Wire: [hdr][Pre_prepare_rep][request_set bytes][non-det bytes][authenticator]
  * -------------------------------------------------------------------------- */
 
-typedef struct __attribute__((packed)) {
+typedef struct [[gnu::packed]] {
     tbft_msg_hdr_t  hdr;
     tbft_view_t     view;
     tbft_seqno_t    seqno;
@@ -95,7 +95,7 @@ typedef struct __attribute__((packed)) {
  * Wire: [hdr][Prepare_rep][authenticator]
  * -------------------------------------------------------------------------- */
 
-typedef struct __attribute__((packed)) {
+typedef struct [[gnu::packed]] {
     tbft_msg_hdr_t  hdr;
     tbft_view_t     view;
     tbft_seqno_t    seqno;
@@ -109,7 +109,7 @@ typedef struct __attribute__((packed)) {
  * Wire: [hdr][Commit_rep][authenticator]
  * -------------------------------------------------------------------------- */
 
-typedef struct __attribute__((packed)) {
+typedef struct [[gnu::packed]] {
     tbft_msg_hdr_t  hdr;
     tbft_view_t     view;
     tbft_seqno_t    seqno;
@@ -123,7 +123,7 @@ typedef struct __attribute__((packed)) {
  * Wire: [hdr][Checkpoint_rep][authenticator]
  * -------------------------------------------------------------------------- */
 
-typedef struct __attribute__((packed)) {
+typedef struct [[gnu::packed]] {
     tbft_msg_hdr_t  hdr;
     tbft_seqno_t    seqno;
     tbft_digest_t   digest; /* state digest at this seqno */
@@ -136,7 +136,7 @@ typedef struct __attribute__((packed)) {
  * Wire: [hdr][Status_rep][optional bitmaps]
  * -------------------------------------------------------------------------- */
 
-typedef struct __attribute__((packed)) {
+typedef struct [[gnu::packed]] {
     tbft_msg_hdr_t  hdr;
     tbft_view_t     view;
     tbft_seqno_t    last_stable;
@@ -153,19 +153,19 @@ typedef struct __attribute__((packed)) {
  * -------------------------------------------------------------------------- */
 
 /* One checkpoint entry embedded in a View_change */
-typedef struct __attribute__((packed)) {
+typedef struct [[gnu::packed]] {
     tbft_seqno_t  seqno;
     tbft_digest_t digest;
 } tbft_vc_ckpt_t;
 
 /* One prepared request entry embedded in a View_change */
-typedef struct __attribute__((packed)) {
+typedef struct [[gnu::packed]] {
     tbft_seqno_t  seqno;
     tbft_view_t   last_view;   /* view in which it was prepared */
     tbft_digest_t digest;
 } tbft_vc_req_info_t;
 
-typedef struct __attribute__((packed)) {
+typedef struct [[gnu::packed]] {
     tbft_msg_hdr_t  hdr;
     tbft_view_t     v;        /* new view proposed */
     tbft_seqno_t    ls;       /* sender's last stable seqno */
@@ -181,7 +181,7 @@ typedef struct __attribute__((packed)) {
  *       [RSA signature of New_view_rep]
  * -------------------------------------------------------------------------- */
 
-typedef struct __attribute__((packed)) {
+typedef struct [[gnu::packed]] {
     tbft_msg_hdr_t  hdr;
     tbft_view_t     v;        /* new view number */
     tbft_seqno_t    min;      /* max of all last_stable values in view-changes */
@@ -194,7 +194,7 @@ typedef struct __attribute__((packed)) {
  * View_change_ack  (tag = 10)  Replica → New Primary
  * -------------------------------------------------------------------------- */
 
-typedef struct __attribute__((packed)) {
+typedef struct [[gnu::packed]] {
     tbft_msg_hdr_t  hdr;
     tbft_view_t     v;
     int32_t         id;      /* sender id */
@@ -211,14 +211,14 @@ typedef struct __attribute__((packed)) {
  * in-key for the sender.
  * -------------------------------------------------------------------------- */
 
-typedef struct __attribute__((packed)) {
+typedef struct [[gnu::packed]] {
     tbft_msg_hdr_t  hdr;
     int32_t         id;       /* sender's replica id */
     int32_t         n_keys;   /* number of tbft_new_key_slot_t entries */
 } tbft_new_key_rep_t;
 
 /** One encrypted-key slot inside a New_key message */
-typedef struct __attribute__((packed)) {
+typedef struct [[gnu::packed]] {
     int32_t  recipient_id;
     uint8_t  ciphertext[TBFT_SIG_SIZE]; /* RSA-OAEP encrypted tbft_hmac_key_t */
 } tbft_new_key_slot_t;
@@ -228,12 +228,12 @@ typedef struct __attribute__((packed)) {
  * Wire: [hdr][Meta_data_rep][Part_info array]
  * -------------------------------------------------------------------------- */
 
-typedef struct __attribute__((packed)) {
+typedef struct [[gnu::packed]] {
     tbft_digest_t digest;
     int32_t       version; /* checkpoint seqno version */
 } tbft_part_info_t;
 
-typedef struct __attribute__((packed)) {
+typedef struct [[gnu::packed]] {
     tbft_msg_hdr_t  hdr;
     tbft_seqno_t    seqno;   /* checkpoint seqno being transferred */
     int32_t         level;   /* level in partition tree (0 = root) */
@@ -247,7 +247,7 @@ typedef struct __attribute__((packed)) {
  * Wire: [hdr][Meta_data_d_rep][digest array]
  * -------------------------------------------------------------------------- */
 
-typedef struct __attribute__((packed)) {
+typedef struct [[gnu::packed]] {
     tbft_msg_hdr_t  hdr;
     tbft_seqno_t    seqno;
     int32_t         level;
@@ -261,7 +261,7 @@ typedef struct __attribute__((packed)) {
  * Wire: [hdr][Data_rep][block_data bytes]
  * -------------------------------------------------------------------------- */
 
-typedef struct __attribute__((packed)) {
+typedef struct [[gnu::packed]] {
     tbft_msg_hdr_t  hdr;
     tbft_seqno_t    seqno;
     int32_t         block_index; /* index into state block array */
@@ -273,7 +273,7 @@ typedef struct __attribute__((packed)) {
  * Fetch  (tag = 15)  Fetching → Replier
  * -------------------------------------------------------------------------- */
 
-typedef struct __attribute__((packed)) {
+typedef struct [[gnu::packed]] {
     tbft_msg_hdr_t  hdr;
     tbft_seqno_t    last_stable;
     tbft_seqno_t    c;      /* checkpoint seqno being fetched */
@@ -287,7 +287,7 @@ typedef struct __attribute__((packed)) {
  * Query_stable  (tag = 16)  Replica → All
  * -------------------------------------------------------------------------- */
 
-typedef struct __attribute__((packed)) {
+typedef struct [[gnu::packed]] {
     tbft_msg_hdr_t  hdr;
     tbft_req_id_t   rid; /* request id for matching replies */
     int32_t         id;
@@ -298,7 +298,7 @@ typedef struct __attribute__((packed)) {
  * Reply_stable  (tag = 17)  Replica → Querier
  * -------------------------------------------------------------------------- */
 
-typedef struct __attribute__((packed)) {
+typedef struct [[gnu::packed]] {
     tbft_msg_hdr_t  hdr;
     tbft_seqno_t    seqno;   /* max stable checkpoint known */
     tbft_req_id_t   rid;     /* matching query rid */

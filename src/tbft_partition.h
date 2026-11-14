@@ -2,7 +2,6 @@
 
 #include "tbft_types.h"
 #include <stdint.h>
-#include <stdbool.h>
 
 /* --------------------------------------------------------------------------
  * Partition tree — Merkle-like digest tree over state blocks (section 8).

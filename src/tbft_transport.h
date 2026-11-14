@@ -1,7 +1,6 @@
 #pragma once
 
 #include "tbft_types.h"
-#include <stdbool.h>
 #include <stdint.h>
 #include <stddef.h>
 
@@ -36,7 +35,7 @@ typedef struct tbft_transport tbft_transport_t;
  * @param num_nodes   Total node count (for peer table sizing)
  * @param num_replicas  Replica count (3f+1); TBFT_ALL_REPLICAS broadcast
  *                      targets only nodes 0..num_replicas-1
- * @param mcast_ip    Multicast IP string (UDP only; NULL for ESP-NOW)
+ * @param mcast_ip    Multicast IP string (UDP only; nullptr for ESP-NOW)
  * @param port        UDP bind port (UDP only; ignored for ESP-NOW)
  * @return 0 on success, -1 on error
  */
@@ -84,7 +83,7 @@ int tbft_transport_send(tbft_transport_t *t, const void *buf, size_t len,
  *
  * @param buf      Output buffer (must be TBFT_MAX_MESSAGE_SIZE bytes)
  * @param buf_len  Size of @p buf
- * @param src_id   If non-NULL, receives the apparent sender id
+ * @param src_id   If non-nullptr, receives the apparent sender id
  * @return bytes received, 0 if nothing available, -1 on error
  *
  * ESP-NOW backend automatically reassembles fragmented packets.
@@ -95,7 +94,7 @@ int tbft_transport_recv(tbft_transport_t *t, void *buf, size_t buf_len,
 /* --------------------------------------------------------------------------
  * Statistics (A8) - plain counters, cheap enough to keep always on
  * -------------------------------------------------------------------------- */
-#define TBFT_STATS_NUM_TAGS 18   /* tbft_msg_tag_t values are 1..17 */
+static constexpr int TBFT_STATS_NUM_TAGS = 18;   /* tbft_msg_tag_t values are 1..17 */
 
 typedef struct {
     uint32_t tx_msgs;        /* logical messages accepted for sending */
