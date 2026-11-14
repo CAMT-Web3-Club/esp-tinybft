@@ -25,7 +25,7 @@ Clients can submit `transfer` requests which subtract from one balance and add t
    - If using UDP, navigate to `Example Connection Configuration` and set your Wi-Fi SSID and Password.
 
 3. **Build and Flash**
-   You need 5 ESP32 boards (4 replicas to tolerate 1 fault, and 1 client).
+   You need 5 ESP32-C3 boards (4 replicas to tolerate 1 fault, and 1 client); `sdkconfig.defaults` sets the target to `esp32c3`.
 
    For each board, you must edit `main.c` before flashing to select its identity:
    - For **Node 0** (Replica): Keep `xTaskCreate(replica_task, ...)` uncommented, and ensure `priv_config` is set to `/spiffs/priv0.der`.
@@ -41,4 +41,4 @@ Clients can submit `transfer` requests which subtract from one balance and add t
 ## Note on MACs and IP Addresses
 
 The generated `config_espnow.txt` and `config_udp.txt` contain dummy MAC addresses (`02:00:00:00:00:00`) and loopback IP addresses (`127.0.0.1`).
-**For a real test across multiple boards, you MUST edit `config_udp.txt` and `config_espnow.txt` in the `spiffs_image/` folder** to contain the real MAC addresses or IP addresses of your ESP32 boards before running `idf.py build`.
+**For a real test across multiple boards, you MUST edit `config_udp.txt` and `config_espnow.txt` in the `spiffs_image/` folder** to contain the real MAC addresses or IP addresses of your ESP32-C3 boards before running `idf.py build`.

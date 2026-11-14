@@ -1,3 +1,9 @@
+# Default target for every build directory (ESP-IDF idf-py guide: "add the
+# CONFIG_IDF_TARGET option to the project's sdkconfig.defaults file").
+# Without it a fresh build directory falls back to esp32, whose static DRAM
+# (at most 160 KB) cannot hold this configuration.
+CONFIG_IDF_TARGET="esp32c3"
+
 CONFIG_EXAMPLE_ROLE_REPLICA=y
 
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
@@ -30,9 +36,7 @@ CONFIG_TBFT_RQUEUE_MAX=4
 CONFIG_TBFT_NDET_BUF_SIZE=256
 CONFIG_TBFT_MAX_STATE_BLOCKS=8
 CONFIG_TBFT_P_LEVELS=2
-# 8, not 16: all replica memory is static, and the original ESP32 holds at
-# most 160 KB of static DRAM (ESP-IDF api-guides/memory-types)
-CONFIG_TBFT_WINDOW_SIZE=8
+CONFIG_TBFT_WINDOW_SIZE=16
 CONFIG_TBFT_CHECKPOINT_INTERVAL=4
 CONFIG_TBFT_ANTI_REPLAY_WINDOW_MS=30000
 

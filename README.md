@@ -20,9 +20,10 @@ A pure-C implementation of [PBFT](https://pmg.csail.mit.edu/papers/osdi99.pdf) (
 - Supported targets: ESP32, ESP32-S2, ESP32-S3, ESP32-C3, ESP32-C6, ESP32-H2
 - Enough static RAM: the replica's memory is reserved at link time
   (`examples/counter/memcalc.sh` estimates it, `idf.py size` reports it).
-  On the original ESP32 at most 160 KB of DRAM can be static (ESP-IDF
-  *Memory Types* guide), so keep window, message size and replica count
-  small there; the ESP32-C3 has no such split.
+  The component and both examples are tuned for the ESP32-C3, whose whole
+  DRAM can hold static data. The original ESP32 allows at most 160 KB of
+  static DRAM (ESP-IDF *Memory Types* guide), less than the examples'
+  settings need.
 - An `nvs` partition, initialised with `nvs_flash_init()` before
   `Byz_init_client()`: the client keeps a boot counter there so that its
   request ids keep growing across resets (replicas never run a request id
