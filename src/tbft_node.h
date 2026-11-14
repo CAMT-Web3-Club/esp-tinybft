@@ -29,6 +29,9 @@ struct tbft_node {
 
     /* Principal registry */
     tbft_principal_t  *principals[TBFT_MAX_NUM_REPLICAS + TBFT_MAX_NUM_CLIENTS];
+    /* Their storage (static along with the node): principals[i] points to
+     * principal_store[i] */
+    tbft_principal_t   principal_store[TBFT_MAX_NUM_REPLICAS + TBFT_MAX_NUM_CLIENTS];
     int                num_principals;
 
     /* Local principal (shortcut into principals[node_id]) */

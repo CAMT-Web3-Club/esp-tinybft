@@ -174,7 +174,7 @@ The transport interface (`tbft_transport.h`) abstracts send/recv/peer-registrati
 
 #### ESP-NOW fragmentation
 
-ESP-NOW v2.0 limits each packet to 1470 bytes. Messages exceeding this are automatically fragmented with a 4-byte header (`msg_id`, `frag_idx`, `frag_total`) and reassembled on the receiving side. Fragmentation works for both unicast and broadcast sends. The reassembly system uses 4 concurrent slots with 5-second timeout per message.
+ESP-NOW v2.0 limits each packet to 1470 bytes. Messages exceeding this are automatically fragmented with a 4-byte header (`msg_id`, `frag_idx`, `frag_total`) and reassembled on the receiving side. Fragmentation works for both unicast and broadcast sends. The reassembly system uses 8 concurrent slots with 5-second timeout per message.
 
 `espnow_recv_cb` runs in the **WiFi task context** (not an ISR); standard task-context FreeRTOS APIs (`xSemaphoreTake`, `xQueueSend`) are used throughout.
 
@@ -204,7 +204,9 @@ When using ESP-NOW, the host application must:
 
 ### TinyBFT static memory model
 
-The key design decision: instead of `malloc`/`free` for every protocol message, three **statically-allocated region structs** hold all in-flight messages:
+All memory of the component is static: it never calls `malloc`. The replica (or the client; a process runs one, so they share the storage), the transports with their queues and send task, the FreeRTOS objects (created with the `...Static` APIs) and the file buffer used at start-up are global objects, so the heap cannot fragment because of the component and the linker checks at build time that everything fits. ESP-IDF's own components (Wi-Fi, lwIP, mbedtls/PSA, esp_timer, NVS) still use the heap.
+
+Three region structs inside `tbft_replica_t` hold all in-flight messages:
 
 | Region | File | Contents |
 |--------|------|----------|
@@ -222,7 +224,7 @@ All three regions live directly inside `tbft_replica_t`. Indexing into `agreemen
 
 ### Replica struct layout
 
-`tbft_replica_t` (in `tbft_replica.h`) begins with `tbft_node_t node` as its first member, enabling safe pointer-aliasing between `tbft_replica_t *` and `tbft_node_t *`. The three static regions (`ar`, `cr`, `sr`) are embedded by value — there is no heap allocation in the steady-state protocol path.
+`tbft_replica_t` (in `tbft_replica.h`) begins with `tbft_node_t node` as its first member, enabling safe pointer-aliasing between `tbft_replica_t *` and `tbft_node_t *`. Everything it needs is embedded by value: the three regions (`ar`, `cr`, `sr`), the state with its checkpoint copy and partition tree, the principals (`node.principal_store`) and the event group's storage. `tbft_libbyz.c` keeps it in a static union with the client's node and buffers (`s_mem`); the transports keep their state in static singletons (one per process).
 
 Additional important fields:
 - `tbft_view_info_t vi` — view-change protocol state
@@ -337,11 +339,11 @@ examples/<name>/
 2. Define the app state array, request/response structs, and `exec_cb`.
 3. Run `./gen_configs.sh` to generate RSA keys and config files.
 4. Edit `sdkconfig.defaults` with appropriate `TBFT_MAX_NUM_REPLICAS`, `TBFT_WINDOW_SIZE`, etc.
-5. The `memcalc.sh` script can estimate `tbft_replica_t` size before building — useful for checking DRAM fit on ESP32-C3 (~80 KB heap).
+5. The `memcalc.sh` script computes the component's static memory before building; `idf.py size` reports what the build really uses. Allocate nothing from the heap in the example either: use the `...Static` FreeRTOS APIs as the examples do.
 
 ### Memory sizing for ESP32-C3
 
-`tbft_replica_t` is statically allocated. Its size is driven primarily by:
+Nothing is allocated at run time: the component's memory is static and the linker fails the build if it does not fit. `tbft_replica_t` is driven primarily by:
 
 | Region | Key scaling factors |
 |--------|---------------------|
@@ -351,7 +353,7 @@ examples/<name>/
 | `rqueues` (×2) | `2 × RQUEUE_MAX × MAX_MESSAGE_SIZE` |
 | client table | `MAX_NUM_CLIENTS × (24 + MAX_REPLY_SIZE)`, rounded up to whole blocks |
 
-On the heap, `tbft_state_init` allocates one copy of the whole state (application blocks + client table) for the latest checkpoint image.
+Also inside it: the checkpoint copy (`TBFT_MAX_STATE_BLOCKS × TBFT_BLOCK_SIZE`), the partition tree (every level full for `TBFT_MAX_STATE_BLOCKS` leaves) and the principals (`(MAX_NUM_REPLICAS + MAX_NUM_CLIENTS) × sizeof(tbft_principal_t)`, 1,712 bytes each with ESP-IDF 6.1). Outside it: the ESP-NOW transport (8 reassembly slots, 16 + 8 queue entries of `MAX_MESSAGE_SIZE`, an 8 KB send task stack) or the 280-byte UDP transport, and a ~2 KB file buffer. On the original ESP32 static DRAM is limited to 160 KB (ESP-IDF *Memory Types* guide); the ESP32-C3 has no such limit.
 
 **New_key constrains `MAX_MESSAGE_SIZE`**: the message carries `(n-1)` RSA-encrypted HMAC keys plus an RSA signature:
 
@@ -363,7 +365,7 @@ New_key_bytes = sizeof(tbft_new_key_rep_t)               // 32
 
 With n=7: `32 + 6×260 + 256 = 1848` — `out_buf` (sized to `TBFT_MAX_MESSAGE_SIZE`) must be ≥ this.
 
-**Typical ESP32-C3 allocation** (~80 KB free heap): with 7 replicas, keep `WINDOW_SIZE=4` and `MAX_MESSAGE_SIZE=2048` to stay under the limit. With the counter example's settings `tbft_replica_t` is 53,112 bytes plus a 5 KiB checkpoint image. Run `memcalc.sh` to verify (its total matches `sizeof(tbft_replica_t)` for that configuration).
+**Typical ESP32-C3 budget** (321,296 bytes of DRAM for static data; the rest is heap for ESP-IDF): with 7 replicas keep `WINDOW_SIZE=4` and `MAX_MESSAGE_SIZE=2048`. With the counter example's settings `tbft_replica_t` is 79,072 bytes and the whole ESP-NOW build uses 272,092 bytes of static DRAM (49 KB left as heap for Wi-Fi, lwIP and mbedtls), the UDP build 191,140. Run `memcalc.sh` to estimate (its `tbft_replica_t` total matches `sizeof` for that configuration) and `idf.py size` to check.
 
 `tbft_config.h` defines all constants from `CONFIG_TBFT_*` Kconfig values and enforces these `_Static_assert` checks:
 
@@ -375,11 +377,12 @@ With n=7: `32 + 6×260 + 256 = 1848` — `out_buf` (sized to `TBFT_MAX_MESSAGE_S
 - `TBFT_MAX_MESSAGE_SIZE % 8 == 0`.
 - `TBFT_P_LEVELS >= 2`.
 - A View_change and a New_view covering `TBFT_WINDOW_SIZE` sequence numbers must fit in `TBFT_MAX_MESSAGE_SIZE` (`tbft_special_region.h`).
+- `2 <= TBFT_MAX_STATE_BLOCKS <= TBFT_P_CHILDREN³` (static partition tree).
 
 Derived constants: `TBFT_DIGEST_SIZE` (32), `TBFT_HMAC_SIZE` (32), `TBFT_SIG_SIZE` (256), `TBFT_AUTH_SIZE`, `TBFT_NUM_CKPT_SLOTS`, `TBFT_MAX_FAULTY`, `TBFT_CERT_MAX_VALS` (f+1), `TBFT_P_CHILDREN`.
 
 Additional Kconfig-sourced constants (with `#ifndef` guards for override):
-- `TBFT_MAX_STATE_BLOCKS` (default 256) — max state blocks
+- `TBFT_MAX_STATE_BLOCKS` (default 16) — max state blocks (application + client table); sizes the static checkpoint copy, digests, fetch queue and partition tree
 - `TBFT_RQUEUE_MAX` (default 8) — request queue depth
 - `TBFT_NDET_BUF_SIZE` (default 256) — non-det choices buffer
 - `TBFT_P_LEVELS` (default 4) — Merkle partition tree depth

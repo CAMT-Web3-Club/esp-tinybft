@@ -3,7 +3,6 @@
 #include "esp_log.h"
 #include "psa/crypto.h"
 #include <stdckdint.h>
-#include <stdlib.h>
 #include <string.h>
 
 static constexpr char TAG[] = "tbft_ptree";
@@ -68,16 +67,12 @@ int tbft_ptree_init(tbft_ptree_t *tree, int num_blocks, int p_children)
         }
         total += n_at_l;
     }
-    tree->total_nodes = total;
-
-    tree->ptree_mem = (tbft_part_t *)calloc(total, sizeof(tbft_part_t));
-    tree->stree_mem = (tbft_dsum_t *)calloc(total, sizeof(tbft_dsum_t));
-    if (!tree->ptree_mem || !tree->stree_mem) {
-        ESP_LOGE(TAG, "out of memory for partition tree (%d nodes)", total);
-        free(tree->ptree_mem);
-        free(tree->stree_mem);
+    if (total > TBFT_PTREE_MAX_NODES) {
+        ESP_LOGE(TAG, "partition tree needs %d nodes, room for %lld: raise "
+                 "TBFT_MAX_STATE_BLOCKS", total, (long long)TBFT_PTREE_MAX_NODES);
         return -1;
     }
+    tree->total_nodes = total;
 
     /* Slice backing arrays into per-level pointers */
     int offset = 0;
@@ -94,8 +89,6 @@ int tbft_ptree_init(tbft_ptree_t *tree, int num_blocks, int p_children)
 
 void tbft_ptree_free(tbft_ptree_t *tree)
 {
-    free(tree->ptree_mem);
-    free(tree->stree_mem);
     memset(tree, 0, sizeof(*tree));
 }
 

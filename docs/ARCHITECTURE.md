@@ -1,6 +1,6 @@
 # esp-tinybft Architecture
 
-TinyBFT is a pure-C implementation of PBFT (Practical Byzantine Fault Tolerance) optimised for embedded systems running ESP-IDF. It uses static memory allocation throughout -- no `malloc` in the hot path -- and supports two transport backends: UDP over lwIP sockets and ESP-NOW with automatic fragmentation/reassembly. Cryptography uses PSA Crypto for SHA-256/HMAC (fast path) and MbedTLS 4.x for RSA-2048 signatures (slow path).
+TinyBFT is a pure-C implementation of PBFT (Practical Byzantine Fault Tolerance) optimised for embedded systems running ESP-IDF. All of its memory is static -- it never calls `malloc` -- and it supports two transport backends: UDP over lwIP sockets and ESP-NOW with automatic fragmentation/reassembly. Cryptography uses PSA Crypto for SHA-256/HMAC (fast path) and MbedTLS 4.x for RSA-2048 signatures (slow path).
 
 ## 1. Overview
 
@@ -289,6 +289,7 @@ struct tbft_node {
     int             cur_primary;    /* view % num_replicas */
 
     tbft_principal_t  *principals[TBFT_MAX_NUM_REPLICAS + TBFT_MAX_NUM_CLIENTS];
+    tbft_principal_t   principal_store[TBFT_MAX_NUM_REPLICAS + TBFT_MAX_NUM_CLIENTS]; /* their storage */
     int                num_principals;
     tbft_principal_t  *local_principal;   /* shortcut */
 
@@ -470,8 +471,9 @@ typedef struct {
     /* View-change */
     tbft_view_info_t vi;
 
-    /* Event Group for decoupled timer callbacks */
+    /* Event Group for decoupled timer callbacks (static storage) */
     EventGroupHandle_t evt_group;
+    StaticEventGroup_t evt_group_buf;
 
     /* Timers */
     tbft_itimer_t vtimer;   /* view-change timeout */
@@ -495,7 +497,23 @@ typedef struct {
 } tbft_replica_t;
 ```
 
-With the counter example's configuration (7 replicas, window 4, 2048-byte messages) `sizeof(tbft_replica_t)` is 53,112 bytes on the ESP32-C3; `examples/counter/memcalc.sh` prints the breakdown.
+With the counter example's configuration (7 replicas, window 4, 2048-byte messages, 8 state blocks) `sizeof(tbft_replica_t)` is 79,072 bytes on the ESP32-C3; `examples/counter/memcalc.sh` prints the breakdown.
+
+### Where the memory lives
+
+All memory of the component is static: it never calls `malloc`. The replica (or the client; a process runs one, so they share the storage), the transports with their queues and send task, the FreeRTOS objects (created with the `...Static` APIs) and the file buffer used at start-up are global objects, so the heap cannot fragment because of the component and the linker checks at build time that everything fits. ESP-IDF's own components (Wi-Fi, lwIP, mbedtls/PSA, esp_timer, NVS) still use the heap.
+
+| Object | Where |
+|---|---|
+| `tbft_replica_t` or the client's node, reply slots and request/reply buffers | `s_mem` union in `tbft_libbyz.c` (one node per process) |
+| Principals | `node.principal_store[]` |
+| Checkpoint copy, partition tree | inside `tbft_state_t` (sized by `TBFT_MAX_STATE_BLOCKS`) |
+| Replica event group | `evt_group_buf` (`xEventGroupCreateStatic`) |
+| UDP transport | `s_udp` in `tbft_transport_udp.c` |
+| ESP-NOW transport, its queues, semaphores and send task | static objects in `tbft_transport_espnow.c` (`xQueueCreateStatic`, `xSemaphoreCreate*Static`, `xTaskCreateStatic`) |
+| Config and key files | read with POSIX `read()` into `s_file_buf` |
+
+On the original ESP32 at most 160 KB of DRAM can hold static data (ESP-IDF *Memory Types* guide); configurations must fit that there.
 
 ### Dispatch Table (in tbft_replica_run)
 
@@ -1025,7 +1043,7 @@ The client re-sends its request to all replicas after `TBFT_CLIENT_RETRANSMIT_MS
 ### tbft_state_t Layout
 
 ```c
-/* TBFT_MAX_STATE_BLOCKS — sourced from Kconfig (default 256) */
+/* TBFT_MAX_STATE_BLOCKS — sourced from Kconfig (default 16) */
 /* TBFT_NUM_CKPT_SLOTS = (TBFT_WINDOW_SIZE / TBFT_CHECKPOINT_INTERVAL + 2) — defined in tbft_config.h */
 
 typedef struct {
@@ -1058,9 +1076,9 @@ typedef struct {
     int               fetch_replier;
     bool              fetch_has_digest;  /* the root digest the fetched state must have */
     tbft_digest_t     fetch_digest;
-    uint8_t          *image;             /* every block at the latest checkpoint (heap) */
     tbft_seqno_t      image_seqno;
     tbft_seqno_t      last_stable;
+    uint8_t           image[TBFT_MAX_STATE_BLOCKS * TBFT_BLOCK_SIZE];  /* every block at the latest checkpoint */
 } tbft_state_t;
 ```
 
@@ -1213,7 +1231,7 @@ View_change entries carry no proof (no prepared certificate) and a New_view is n
 | `TBFT_WINDOW_SIZE` | int | 16 | power of 2 | Sequence number window |
 | `TBFT_CHECKPOINT_INTERVAL` | int | 8 | -- | Checkpoints per N seqnos (< WINDOW_SIZE) |
 | `TBFT_MAX_NUM_CLIENTS` | int | 1 | 1-16 | Simultaneous clients |
-| `TBFT_MAX_STATE_BLOCKS` | int | 256 | -- | State blocks (state_size / BLOCK_SIZE) |
+| `TBFT_MAX_STATE_BLOCKS` | int | 16 | 2-1024 | State blocks (application + client table); sizes the static checkpoint copy and partition tree |
 | `TBFT_RQUEUE_MAX` | int | 8 | 4-256 | Pending requests per queue |
 | `TBFT_NDET_BUF_SIZE` | int | 256 | 32-4096 | Non-det choices buffer |
 | `TBFT_P_LEVELS` | int | 4 | 2-8 | Merkle partition tree depth |
@@ -1316,12 +1334,12 @@ typedef void (*Byz_recv_reply_cb)(Byz_rep *reply, int cid);
 | Function | Description |
 |---|---|
 | `Byz_init_client(config_file, priv_config, port)` | Parse config, create client node (id = first client index after replicas), load keys, read and increment the boot epoch in NVS (call `nvs_flash_init()` first) |
-| `Byz_alloc_request(req, size)` | `malloc` request buffer |
+| `Byz_alloc_request(req, size)` | Hand out the static request buffer (one at a time; -1 if in use or too large) |
 | `Byz_send_request(req, read_only)` | Build Request with RSA signature, send to primary |
-| `Byz_recv_reply(rep)` | Block until f+1 matching replies or 10 s timeout; `malloc`s reply contents |
+| `Byz_recv_reply(rep)` | Block until f+1 matching replies or the timeout, re-sending the request; `rep->contents` points to a static buffer valid until the next call |
 | `Byz_invoke(req, rep, read_only)` | Convenience: send + recv |
-| `Byz_free_request(req)` | `free(req->contents)` |
-| `Byz_free_reply(rep)` | `free(rep->contents)` |
+| `Byz_free_request(req)` | Release the request buffer |
+| `Byz_free_reply(rep)` | Clear `rep` (nothing to free) |
 | `Byz_reset_client()` | Clear reply cache |
 
 ### Replica API

@@ -106,35 +106,58 @@ RQUEUE_BOTH=$(( RQUEUE_SIZE_ONE * 2 ))
 
 COWB_SIZE=$(( (MAX_STATE_BLOCKS / 64 + 1) * 8 ))
 PTREE_EST=40
+# Partition tree storage (static): every level full, as many levels as
+# MAX_STATE_BLOCKS leaves need (capped at P_LEVELS); 40 + 32 bytes per node
+P_CHILDREN=$(( (MAX_MESSAGE_SIZE - 40) / 36 ))
+if   [ $MAX_STATE_BLOCKS -le 1 ]; then PT_LEVELS=1
+elif [ $MAX_STATE_BLOCKS -le $P_CHILDREN ]; then PT_LEVELS=2
+elif [ $MAX_STATE_BLOCKS -le $(( P_CHILDREN * P_CHILDREN )) ]; then PT_LEVELS=3
+else PT_LEVELS=4; fi
+[ $PT_LEVELS -gt $P_LEVELS ] && PT_LEVELS=$P_LEVELS
+PT_NODES=1; PT_N=1
+for ((l = 1; l < PT_LEVELS; l++)); do PT_N=$(( PT_N * P_CHILDREN )); PT_NODES=$(( PT_NODES + PT_N )); done
+PTREE_STORE=$(( PT_NODES * (40 + 32) ))
+# Copy of every block at the latest checkpoint (served to fetching replicas)
+IMAGE_SIZE=$(( MAX_STATE_BLOCKS * BLOCK_SIZE ))
 CKPT_RECORD_SIZE=48
 FETCH_QUEUE=$(( MAX_STATE_BLOCKS * 12 ))
 FETCH_RECV=$(( ((MAX_STATE_BLOCKS + 63) / 64) * 8 ))
 
 # 136 = pointers, counters, fetch bookkeeping and the fetch target digest
-STATE_SIZE=$(( 136 + COWB_SIZE + PTREE_EST
+STATE_SIZE=$(( 136 + COWB_SIZE + PTREE_EST + PTREE_STORE + IMAGE_SIZE
     + MAX_STATE_BLOCKS * DIGEST_SIZE
     + NUM_CKPT_SLOTS * CKPT_RECORD_SIZE
     + FETCH_QUEUE + FETCH_RECV ))
 
 PRINCPTRS=$(( (MAX_NUM_REPLICAS + MAX_NUM_CLIENTS) * 4 ))
+# sizeof(tbft_principal_t) with ESP-IDF 6.1 (two mbedtls pk contexts, keys)
+PRINCIPAL_SIZE=1712
+PRINC_STORE=$(( (MAX_NUM_REPLICAS + MAX_NUM_CLIENTS) * PRINCIPAL_SIZE ))
 TIMER_EST=16
-NODE_SIZE=$(( 28 + PRINCPTRS + 4 + 4 + 4 + MAX_MESSAGE_SIZE + TIMER_EST + 8 + 8 ))
+NODE_SIZE=$(( 28 + PRINCPTRS + PRINC_STORE + 4 + 4 + 4 + MAX_MESSAGE_SIZE + TIMER_EST + 8 + 8 ))
 
 VI_EST=$(align8 $(( 32 + MAX_NUM_REPLICAS + 8 * MAX_NUM_REPLICAS )))
 # per-principal request-id counters (received, executed, forwarded, assigned)
 RID_ARRAYS=$(( 4 * (MAX_NUM_REPLICAS + MAX_NUM_CLIENTS) * 8 ))
 # per-replica view-change and Status tracking, per-client reply times
 PEER_ARRAYS=$(align8 $(( 6 * 8 * MAX_NUM_REPLICAS + MAX_NUM_REPLICAS + 8 * MAX_NUM_CLIENTS )))
-FIXED=184    # sequence numbers, timers, callbacks, statistics
+FIXED=224    # sequence numbers, timers, event group, callbacks, statistics
 
 REPLICA_SIZE=$(( NODE_SIZE + RQUEUE_BOTH + AR_SIZE + CR_SIZE + SR_SIZE
     + STATE_SIZE + VI_EST + NDET_BUF_SIZE + MAX_MESSAGE_SIZE + SYS_STATE_SIZE
     + RID_ARRAYS + PEER_ARRAYS + FIXED ))
 
-# Heap used besides the replica struct: a copy of every state block at the
-# latest checkpoint (served to replicas that fetch the state)
 STATE_BLOCKS=$(( APP_STATE_SIZE / BLOCK_SIZE + SYS_STATE_SIZE / BLOCK_SIZE ))
-IMAGE_SIZE=$(( STATE_BLOCKS * BLOCK_SIZE ))
+
+# Static memory outside tbft_replica_t
+# ESP-NOW transport: state with 8 reassembly slots, receive queue (16
+# entries), send queue (8), send task stack (8192) and FreeRTOS objects
+ESPNOW_SIZE=$(( 352 + 8 * (MAX_MESSAGE_SIZE + 28) + 16 * (MAX_MESSAGE_SIZE + 12)
+    + 8 * (MAX_MESSAGE_SIZE + 8) + 8192 + 600 ))
+UDP_SIZE=280
+FILE_BUF=$(( 256 + (MAX_NUM_REPLICAS + MAX_NUM_CLIENTS) * 240 ))
+[ $FILE_BUF -lt $(( 8 * SIG_SIZE )) ] && FILE_BUF=$(( 8 * SIG_SIZE ))
+FILE_BUF=$(( FILE_BUF + 1 ))
 
 format_size() {
     awk "BEGIN {printf \"%7d  (%5.1f KB)\", $1, $1/1024}"
@@ -183,6 +206,9 @@ row "state_t" $STATE_SIZE
 row "node_t" $NODE_SIZE
 row "view_info_t" $VI_EST
 row "" 0
+row "  in state_t: checkpoint image [${MAX_STATE_BLOCKS}x${BLOCK_SIZE}]" $IMAGE_SIZE
+row "  in state_t: partition tree [${PT_NODES} nodes]" $PTREE_STORE
+row "  in node_t: principals [$((MAX_NUM_REPLICAS + MAX_NUM_CLIENTS))x${PRINCIPAL_SIZE}]" $PRINC_STORE
 row "ndet_buf" $NDET_BUF_SIZE
 row "out_buf" $MAX_MESSAGE_SIZE
 row "client table [${MAX_NUM_CLIENTS}x${CLIENT_ENTRY_SIZE}, in blocks]" $SYS_STATE_SIZE
@@ -209,17 +235,21 @@ else
     echo "FAIL (short by $((NK_TOTAL - MAX_MESSAGE_SIZE)))"
 fi
 
-# Heap estimate
-STACK=8192
-HEAP_EST=$(( REPLICA_SIZE + IMAGE_SIZE + STACK + 8192 ))  # +8K for system overhead
-HEAP_KB=$(awk "BEGIN {printf \"%.1f\", $HEAP_EST/1024}")
+# Static memory of the component (no heap: the linker checks that it fits)
+TASK_STACK=8192   # the example's replica/client task, static too
+STATIC_ESPNOW=$(( REPLICA_SIZE + ESPNOW_SIZE + FILE_BUF + TASK_STACK ))
+STATIC_UDP=$(( REPLICA_SIZE + UDP_SIZE + FILE_BUF + TASK_STACK ))
 echo ""
-echo "── Heap estimate ──"
-printf "  checkpoint image = %d blocks x %d = %d bytes\n" $STATE_BLOCKS $BLOCK_SIZE $IMAGE_SIZE
-printf "  replica + image + stack + overhead = %d bytes (%.1f KB)\n" $HEAP_EST $HEAP_KB
-echo "  ESP32-C3 typical free: ~80–100 KB"
-if [ $HEAP_EST -le 100000 ]; then
-    echo "  => should fit"
-else
-    echo "  => WARNING: may not fit, try reducing WINDOW or RQUEUE"
-fi
+echo "── Static memory (component + example task) ──"
+printf "  state blocks used by the counter: %d of %d\n" $STATE_BLOCKS $MAX_STATE_BLOCKS
+row "tbft_replica_t (client data shares it)" $REPLICA_SIZE
+row "ESP-NOW transport" $ESPNOW_SIZE
+row "UDP transport" $UDP_SIZE
+row "config/key file buffer" $FILE_BUF
+row "role task stack" $TASK_STACK
+row "total with ESP-NOW" $STATIC_ESPNOW
+row "total with UDP" $STATIC_UDP
+echo "  ESP32-C3: about 320 KB of DRAM for all static data; what is left is"
+echo "  heap for ESP-IDF itself (Wi-Fi, lwIP, mbedtls). Check with idf.py size."
+echo "  ESP32: at most 160 KB of static DRAM (ESP-IDF api-guides/memory-types)."
+

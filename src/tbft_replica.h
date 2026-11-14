@@ -169,6 +169,7 @@ typedef struct {
 
     /* Event group for decoupling timer callbacks from heavy processing */
     EventGroupHandle_t evt_group;
+    StaticEventGroup_t evt_group_buf;   /* its storage (no heap) */
 } tbft_replica_t;
 
 static constexpr EventBits_t TBFT_EVT_VTIMER = 1 << 0;

@@ -183,3 +183,26 @@ static_assert(TBFT_P_CHILDREN > 0,
 
 static_assert(TBFT_P_LEVELS >= 2,
               "TBFT_P_LEVELS must be at least 2");
+
+/* Partition tree, sized at compile time (static memory): the levels needed
+ * for TBFT_MAX_STATE_BLOCKS leaves, capped at TBFT_P_LEVELS, and the node
+ * count with every level full, as tbft_ptree_nodes_at_level() assumes. */
+#define TBFT_PTREE_LEVELS_FOR_MAX_BLOCKS                                       \
+    (TBFT_MAX_STATE_BLOCKS <= 1 ? 1 :                                          \
+     TBFT_MAX_STATE_BLOCKS <= (long long)TBFT_P_CHILDREN ? 2 :                 \
+     TBFT_MAX_STATE_BLOCKS <= (long long)TBFT_P_CHILDREN * TBFT_P_CHILDREN ? 3 \
+                                                                           : 4)
+#define TBFT_PTREE_MAX_LEVELS                                                  \
+    (TBFT_PTREE_LEVELS_FOR_MAX_BLOCKS < TBFT_P_LEVELS                          \
+         ? TBFT_PTREE_LEVELS_FOR_MAX_BLOCKS : TBFT_P_LEVELS)
+#define TBFT_PTREE_MAX_NODES                                                   \
+    (1 + (TBFT_PTREE_MAX_LEVELS > 1 ? (long long)TBFT_P_CHILDREN : 0)          \
+       + (TBFT_PTREE_MAX_LEVELS > 2 ? (long long)TBFT_P_CHILDREN * TBFT_P_CHILDREN : 0) \
+       + (TBFT_PTREE_MAX_LEVELS > 3                                            \
+              ? (long long)TBFT_P_CHILDREN * TBFT_P_CHILDREN * TBFT_P_CHILDREN : 0))
+
+static_assert(TBFT_MAX_STATE_BLOCKS >= 2,
+              "TBFT_MAX_STATE_BLOCKS must be at least 2 (application state + client table)");
+static_assert(TBFT_MAX_STATE_BLOCKS <=
+                  (long long)TBFT_P_CHILDREN * TBFT_P_CHILDREN * TBFT_P_CHILDREN,
+              "TBFT_MAX_STATE_BLOCKS too large for the static partition tree");

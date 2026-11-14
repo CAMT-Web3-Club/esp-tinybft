@@ -1,6 +1,7 @@
 #pragma once
 
 #include "tbft_types.h"
+#include "tbft_config.h"
 #include <stdint.h>
 
 /* --------------------------------------------------------------------------
@@ -78,16 +79,20 @@ typedef struct {
     /* stree[level] points to an array of (p_children^level) tbft_dsum_t */
     tbft_dsum_t  *stree[TBFT_P_LEVELS];
 
-    /* Backing storage (allocated once, sliced into levels) */
-    tbft_part_t  *ptree_mem;
-    tbft_dsum_t  *stree_mem;
     int           total_nodes; /* sum of nodes across all levels */
+
+    /* Backing storage, sliced into levels; static, sized at compile time for
+     * TBFT_MAX_STATE_BLOCKS (the tree must not be copied: ptree[] and
+     * stree[] point into it) */
+    tbft_part_t   ptree_mem[TBFT_PTREE_MAX_NODES];
+    tbft_dsum_t   stree_mem[TBFT_PTREE_MAX_NODES];
 } tbft_ptree_t;
 
 /**
- * Initialise the partition tree for @p num_blocks state blocks.
- * Allocates ptree and stree from the heap.
- * @return 0 on success, -1 on allocation failure
+ * Initialise the partition tree for @p num_blocks state blocks in the
+ * tree's own storage.
+ * @return 0 on success, -1 if the tree needs more levels or nodes than
+ *         TBFT_P_LEVELS / TBFT_MAX_STATE_BLOCKS allow
  */
 int tbft_ptree_init(tbft_ptree_t *tree, int num_blocks, int p_children);
 

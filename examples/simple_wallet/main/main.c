@@ -19,6 +19,7 @@ static constexpr char TAG[] = "simple_wallet";
 #include "freertos/event_groups.h"
 
 static EventGroupHandle_t s_wifi_event_group;
+static StaticEventGroup_t s_wifi_event_group_buf;   /* its storage (no heap) */
 static constexpr EventBits_t WIFI_CONNECTED_BIT = BIT0;
 static constexpr EventBits_t WIFI_FAIL_BIT      = BIT1;
 
@@ -102,7 +103,7 @@ static void wifi_init(void) {
 
 #if CONFIG_TBFT_TRANSPORT_UDP
     ESP_LOGI(TAG, "Connecting to WiFi (SSID: %s)...", CONFIG_EXAMPLE_WIFI_SSID);
-    s_wifi_event_group = xEventGroupCreate();
+    s_wifi_event_group = xEventGroupCreateStatic(&s_wifi_event_group_buf);
     esp_netif_create_default_wifi_sta();
     wifi_init_config_t wcfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&wcfg));
@@ -276,6 +277,11 @@ static void client_task(void *arg) {
 }
 #endif /* CONFIG_EXAMPLE_ROLE_REPLICA / else */
 
+/* The role's task uses static memory (no heap): one task runs, replica or
+ * client, so they share one stack. */
+static StaticTask_t s_role_task_tcb;
+static StackType_t  s_role_task_stack[8192];   /* bytes in ESP-IDF */
+
 void app_main(void) {
     ESP_LOGI(TAG, "=== Simple Wallet starting ===");
     ESP_LOGI(TAG, "ESP-IDF: %s, Target: ESP32-C3", IDF_VER);
@@ -299,8 +305,10 @@ void app_main(void) {
     wifi_init();
 
 #if CONFIG_EXAMPLE_ROLE_REPLICA
-    xTaskCreate(replica_task, "replica_task", 8192, nullptr, 5, nullptr);
+    xTaskCreateStatic(replica_task, "replica_task", sizeof(s_role_task_stack), nullptr, 5,
+                      s_role_task_stack, &s_role_task_tcb);
 #else
-    xTaskCreate(client_task, "client_task", 8192, nullptr, 5, nullptr);
+    xTaskCreateStatic(client_task, "client_task", sizeof(s_role_task_stack), nullptr, 5,
+                      s_role_task_stack, &s_role_task_tcb);
 #endif
 }

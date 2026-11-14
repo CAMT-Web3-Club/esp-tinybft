@@ -137,6 +137,20 @@ typedef struct tbft_espnow {
 
 static tbft_espnow_t *g_espnow_ctx = nullptr;
 
+/* All of the transport's memory is static (one transport per process): its
+ * state, the queues' storage, the semaphores and the send task. */
+static tbft_espnow_t     s_enow;
+static StaticSemaphore_t s_lock_buf;
+static StaticSemaphore_t s_task_exit_buf;
+static StaticSemaphore_t s_tx_done_buf;
+static StaticSemaphore_t s_rx_sem_buf;
+static StaticQueue_t     s_msg_queue_buf;
+static StaticQueue_t     s_send_queue_buf;
+static uint8_t           s_msg_queue_storage[MSG_QUEUE_DEPTH * sizeof(recv_entry_t)];
+static uint8_t           s_send_queue_storage[SEND_QUEUE_DEPTH * sizeof(send_entry_t)];
+static StaticTask_t      s_send_task_tcb;
+static StackType_t       s_send_task_stack[SEND_TASK_STACK_SIZE];   /* bytes in ESP-IDF */
+
 /* --------------------------------------------------------------------------
  * ฟังก์ชันคำนวณ MAC Address อย่างปลอดภัย (รองรับ Overflow/Underflow)
  * -------------------------------------------------------------------------- */
@@ -576,38 +590,30 @@ int tbft_transport_create(tbft_transport_t **out, tbft_transport_type_t type, in
         return -1;
     }
 
-    ESP_LOGI(TAG, "transport_create: free_heap=%u struct_size=%zu",
-             (unsigned)esp_get_free_heap_size(), sizeof(tbft_espnow_t));
-
-    tbft_espnow_t *enow = (tbft_espnow_t *)calloc(1, sizeof(*enow));
-    if (!enow) {
-        ESP_LOGE(TAG, "calloc(%zu) failed, free_heap=%u",
-                 sizeof(tbft_espnow_t), (unsigned)esp_get_free_heap_size());
-        return -1;
-    }
+    tbft_espnow_t *enow = &s_enow;
+    memset(enow, 0, sizeof(*enow));
 
     enow->num_nodes    = num_nodes;
     enow->num_replicas = num_replicas;
     enow->next_msg_id  = 1;
 
-    enow->lock = xSemaphoreCreateMutex();
-    enow->task_exit_sem = xSemaphoreCreateBinary();
-    enow->tx_done = xSemaphoreCreateBinary();
-    enow->rx_sem = xSemaphoreCreateBinary();
-    enow->msg_queue = xQueueCreate(MSG_QUEUE_DEPTH, sizeof(recv_entry_t));
-    enow->send_queue = xQueueCreate(SEND_QUEUE_DEPTH, sizeof(send_entry_t));
+    enow->lock          = xSemaphoreCreateMutexStatic(&s_lock_buf);
+    enow->task_exit_sem = xSemaphoreCreateBinaryStatic(&s_task_exit_buf);
+    enow->tx_done       = xSemaphoreCreateBinaryStatic(&s_tx_done_buf);
+    enow->rx_sem        = xSemaphoreCreateBinaryStatic(&s_rx_sem_buf);
+    enow->msg_queue     = xQueueCreateStatic(MSG_QUEUE_DEPTH, sizeof(recv_entry_t),
+                                             s_msg_queue_storage, &s_msg_queue_buf);
+    enow->send_queue    = xQueueCreateStatic(SEND_QUEUE_DEPTH, sizeof(send_entry_t),
+                                             s_send_queue_storage, &s_send_queue_buf);
 
     if (!enow->lock || !enow->task_exit_sem || !enow->tx_done || !enow->rx_sem || !enow->msg_queue || !enow->send_queue) {
-        ESP_LOGE(TAG, "queue/sem alloc failed: lock=%p sem=%p msg_q=%p send_q=%p free_heap=%u",
-                 enow->lock, enow->task_exit_sem, enow->msg_queue, enow->send_queue,
-                 (unsigned)esp_get_free_heap_size());
+        ESP_LOGE(TAG, "queue/semaphore creation failed");
         if (enow->send_queue) vQueueDelete(enow->send_queue);
         if (enow->msg_queue) vQueueDelete(enow->msg_queue);
         if (enow->task_exit_sem) vSemaphoreDelete(enow->task_exit_sem);
         if (enow->tx_done) vSemaphoreDelete(enow->tx_done);
         if (enow->rx_sem) vSemaphoreDelete(enow->rx_sem);
         if (enow->lock) vSemaphoreDelete(enow->lock);
-        free(enow);
         return -1;
     }
 
@@ -663,8 +669,11 @@ int tbft_transport_create(tbft_transport_t **out, tbft_transport_type_t type, in
         espnow_apply_rate(k_bcast_mac);
     }
 #endif
-    if (xTaskCreate(espnow_send_task, "tbft_send", SEND_TASK_STACK_SIZE, enow, SEND_TASK_PRIORITY, &enow->send_task_handle) != pdPASS) {
-        ESP_LOGE(TAG, "xTaskCreate for send_task failed");
+    enow->send_task_handle = xTaskCreateStatic(espnow_send_task, "tbft_send",
+                                               SEND_TASK_STACK_SIZE, enow, SEND_TASK_PRIORITY,
+                                               s_send_task_stack, &s_send_task_tcb);
+    if (!enow->send_task_handle) {
+        ESP_LOGE(TAG, "xTaskCreateStatic for send_task failed");
         goto init_error;
     }
 
@@ -681,7 +690,7 @@ init_error:
     if (enow->tx_done) vSemaphoreDelete(enow->tx_done);
     if (enow->rx_sem) vSemaphoreDelete(enow->rx_sem);
     if (enow->lock) vSemaphoreDelete(enow->lock);
-    free(enow);
+    memset(enow, 0, sizeof(*enow));
     return -1;
 }
 
@@ -707,6 +716,9 @@ void tbft_transport_free(tbft_transport_t *t) {
             ESP_LOGW(TAG, "shutdown sentinel enqueue failed, forcing delete");
             vTaskDelete(enow->send_task_handle);
         }
+        /* The task's TCB and stack are static: let the idle task finish
+         * deleting it before they can be used for a new transport. */
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
 
     if (enow->send_queue) vQueueDelete(enow->send_queue);
@@ -715,7 +727,7 @@ void tbft_transport_free(tbft_transport_t *t) {
     if (enow->tx_done) vSemaphoreDelete(enow->tx_done);
     if (enow->rx_sem) vSemaphoreDelete(enow->rx_sem);
     if (enow->lock) vSemaphoreDelete(enow->lock);
-    free(enow);
+    memset(enow, 0, sizeof(*enow));
 }
 
 void tbft_transport_set_peer(tbft_transport_t *t, tbft_node_id_t node_id, const tbft_addr_t *addr) {

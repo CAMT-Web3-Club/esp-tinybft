@@ -218,7 +218,7 @@ int tbft_replica_init(tbft_replica_t *r,
         return -1;
     }
 
-    r->evt_group = xEventGroupCreate();
+    r->evt_group = xEventGroupCreateStatic(&r->evt_group_buf);
     if (!r->evt_group) {
         ESP_LOGE(TAG, "replica: failed to create event group");
         tbft_itimer_free(&r->vtimer);

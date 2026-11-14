@@ -29,6 +29,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <unistd.h>
 #include "esp_mac.h"
 #include "mbedtls/platform_util.h"
 #if CONFIG_TBFT_TRANSPORT_ESPNOW
@@ -44,20 +48,111 @@ static_assert(sizeof(tbft_request_rep_t) == BYZ_REQ_HEADER_SIZE,
  * Module-level singletons
  * -------------------------------------------------------------------------- */
 
-static tbft_replica_t *s_replica  = nullptr;  /* allocated on Byz_init_replica */
-static tbft_node_t    *s_client   = nullptr;  /* allocated on Byz_init_client  */
-static bool            s_is_replica = false;
+/* Everything the library uses is static memory: no heap allocation, so no
+ * fragmentation, and the linker checks at build time that it fits.  A
+ * process runs one node, a replica or a client, so the two share storage. */
+typedef struct {
+    tbft_node_t node;
+    /* Reply collection, indexed by replica id — exactly one slot per
+     * replica.  This makes any "match" count necessarily a count of DISTINCT
+     * senders, which is required for BFT reply agreement (f+1 matching
+     * replies from different replicas). */
+    struct {
+        uint8_t  buf[TBFT_MAX_MESSAGE_SIZE];
+        int      len;
+        bool     valid;
+    } replies[TBFT_MAX_NUM_REPLICAS];
+    uint8_t rx_buf[TBFT_MAX_MESSAGE_SIZE];    /* receiving and draining */
+    uint8_t req_buf[TBFT_MAX_MESSAGE_SIZE];   /* the signed request, kept for re-sending */
+    /* Byz_alloc_request's buffer: the largest command a Request can carry */
+    uint8_t app_req[TBFT_MAX_MESSAGE_SIZE - sizeof(tbft_request_rep_t) - TBFT_SIG_SIZE];
+    uint8_t app_rep[TBFT_MAX_REPLY_SIZE];     /* contents returned by Byz_recv_reply */
+} client_mem_t;
 
-/* Reply collection state for clients.
- * Indexed by replica id — exactly one slot per replica.  This makes any
- * "match" count necessarily a count of DISTINCT senders, which is required
- * for BFT reply agreement (f+1 matching replies from different replicas). */
-static struct {
-    uint8_t          buf[TBFT_MAX_MESSAGE_SIZE];
-    int              len;
-    bool             valid;
-} s_replies[TBFT_MAX_NUM_REPLICAS];
-static int s_reply_count = 0;
+static_assert(TBFT_MAX_MESSAGE_SIZE > sizeof(tbft_request_rep_t) + TBFT_SIG_SIZE,
+              "TBFT_MAX_MESSAGE_SIZE too small for a signed Request");
+
+static union {
+    tbft_replica_t replica;
+    client_mem_t   client;
+} s_mem;
+static client_mem_t *const s_cm = &s_mem.client;
+
+static tbft_replica_t *s_replica  = nullptr;  /* &s_mem.replica once initialised */
+static tbft_node_t    *s_client   = nullptr;  /* &s_mem.client.node once initialised */
+static bool            s_is_replica = false;
+static int             s_reply_count = 0;
+static bool            s_app_req_in_use = false;
+
+/* --------------------------------------------------------------------------
+ * Files (config, keys) are read whole into one static buffer with POSIX
+ * read(): no FILE objects, no heap.  Sized for the config file of the
+ * largest cluster or an RSA key file, whichever is larger.
+ * -------------------------------------------------------------------------- */
+static constexpr size_t TBFT_FILE_BUF_SIZE =
+    256 + (TBFT_MAX_NUM_REPLICAS + TBFT_MAX_NUM_CLIENTS) * 240 > 8 * TBFT_SIG_SIZE
+        ? 256 + (TBFT_MAX_NUM_REPLICAS + TBFT_MAX_NUM_CLIENTS) * 240
+        : 8 * TBFT_SIG_SIZE;
+static uint8_t s_file_buf[TBFT_FILE_BUF_SIZE + 1];   /* + NUL for text */
+
+/* Read @p path into s_file_buf (NUL-terminated).
+ * @return its length, or -1 if it is missing, empty, unreadable or larger
+ *         than the buffer */
+static int read_file(const char *path)
+{
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    size_t  len = 0;
+    ssize_t r   = 0;
+    while (len < TBFT_FILE_BUF_SIZE &&
+           (r = read(fd, s_file_buf + len, TBFT_FILE_BUF_SIZE - len)) > 0) {
+        len += (size_t)r;
+    }
+    if (r >= 0 && len == TBFT_FILE_BUF_SIZE) {
+        uint8_t extra;
+        if (read(fd, &extra, 1) > 0) {
+            ESP_LOGE(TAG, "%s is larger than %u bytes", path, (unsigned)TBFT_FILE_BUF_SIZE);
+            r = -1;
+        }
+    }
+    close(fd);
+    if (r < 0 || len == 0) return -1;
+    s_file_buf[len] = '\0';
+    return (int)len;
+}
+
+/* Whitespace-separated tokens of the config text, read like fscanf("%s"). */
+typedef struct {
+    const char *p;
+} cfg_reader_t;
+
+/* Next token into @p out; false at the end or if longer than size - 1. */
+static bool next_token(cfg_reader_t *rd, char *out, size_t size)
+{
+    const char *p = rd->p;
+    while (*p && isspace((unsigned char)*p)) p++;
+    const char *start = p;
+    while (*p && !isspace((unsigned char)*p)) p++;
+    rd->p = p;
+    size_t n = (size_t)(p - start);
+    if (n == 0 || n >= size) return false;
+    memcpy(out, start, n);
+    out[n] = '\0';
+    return true;
+}
+
+/* Next token as a decimal int; false unless the whole token is one. */
+static bool next_int(cfg_reader_t *rd, int *out)
+{
+    char tok[16];
+    if (!next_token(rd, tok, sizeof(tok))) return false;
+    char *end = nullptr;
+    errno = 0;
+    long v = strtol(tok, &end, 10);
+    if (errno != 0 || end == tok || *end != '\0' || v < INT_MIN || v > INT_MAX) return false;
+    *out = (int)v;
+    return true;
+}
 
 /* --------------------------------------------------------------------------
  * Config file parser (section 12)
@@ -101,20 +196,20 @@ typedef struct {
 
 static int parse_config(const char *path, tbft_config_t *cfg)
 {
-    FILE *f = fopen(path, "r");
-    if (!f) {
-        ESP_LOGE(TAG, "cannot open config file: %s", path);
+    if (read_file(path) < 0) {
+        ESP_LOGE(TAG, "cannot read config file: %s", path);
         return -1;
     }
+    cfg_reader_t rd = { .p = (const char *)s_file_buf };
 
     memset(cfg, 0, sizeof(*cfg));
     cfg->local_node_id = -1;
 
-    if (fscanf(f, "%63s", cfg->service_name) != 1) goto fail;
-    if (fscanf(f, "%d", &cfg->f) != 1) goto fail;
-    if (fscanf(f, "%d", &cfg->auth_timeout_ms) != 1) goto fail;
-    if (fscanf(f, "%d", &cfg->num_nodes) != 1) goto fail;
-    if (fscanf(f, "%31s", cfg->mcast_ip) != 1) goto fail;
+    if (!next_token(&rd, cfg->service_name, sizeof(cfg->service_name))) goto fail;
+    if (!next_int(&rd, &cfg->f)) goto fail;
+    if (!next_int(&rd, &cfg->auth_timeout_ms)) goto fail;
+    if (!next_int(&rd, &cfg->num_nodes)) goto fail;
+    if (!next_token(&rd, cfg->mcast_ip, sizeof(cfg->mcast_ip))) goto fail;
 
     /* Validate: f must fit the static cert buffers sized at compile time */
     if (cfg->f < 1 || cfg->f > TBFT_MAX_FAULTY) {
@@ -141,7 +236,8 @@ static int parse_config(const char *path, tbft_config_t *cfg)
         /* field2 holds a MAC (17 chars) or IP (15 chars) — 32 bytes matches the struct fields */
         char field2[32];
 
-        if (fscanf(f, "%63s %31s", cfg->nodes[i].hostname, field2) != 2) {
+        if (!next_token(&rd, cfg->nodes[i].hostname, sizeof(cfg->nodes[i].hostname)) ||
+            !next_token(&rd, field2, sizeof(field2))) {
             ESP_LOGE(TAG, "failed to parse node %d", i);
             goto fail;
         }
@@ -168,7 +264,7 @@ static int parse_config(const char *path, tbft_config_t *cfg)
             /* M7 FIX: Use snprintf instead of memcpy to avoid copying
              * garbage bytes beyond the null terminator of field2. */
             snprintf(cfg->nodes[i].mac_str, sizeof(cfg->nodes[i].mac_str), "%s", field2);
-            if (fscanf(f, "%127s", cfg->nodes[i].pubkey_path) != 1) {
+            if (!next_token(&rd, cfg->nodes[i].pubkey_path, sizeof(cfg->nodes[i].pubkey_path))) {
                 ESP_LOGE(TAG, "failed to parse node %d pubkey_path", i);
                 goto fail;
             }
@@ -179,7 +275,8 @@ static int parse_config(const char *path, tbft_config_t *cfg)
             /* M7 FIX: Use snprintf instead of memcpy. */
             snprintf(cfg->nodes[i].ip, sizeof(cfg->nodes[i].ip), "%s", field2);
             int port_int = 0;
-            if (fscanf(f, "%d %127s", &port_int, cfg->nodes[i].pubkey_path) != 2) {
+            if (!next_int(&rd, &port_int) ||
+                !next_token(&rd, cfg->nodes[i].pubkey_path, sizeof(cfg->nodes[i].pubkey_path))) {
                 ESP_LOGE(TAG, "failed to parse node %d port/pubkey", i);
                 goto fail;
             }
@@ -215,9 +312,9 @@ static int parse_config(const char *path, tbft_config_t *cfg)
         goto fail;
     }
 
-    if (fscanf(f, "%d", &cfg->vc_timeout_ms)       != 1) goto fail;
-    if (fscanf(f, "%d", &cfg->status_timeout_ms)    != 1) goto fail;
-    if (fscanf(f, "%d", &cfg->recovery_timeout_ms)  != 1) goto fail;
+    if (!next_int(&rd, &cfg->vc_timeout_ms))       goto fail;
+    if (!next_int(&rd, &cfg->status_timeout_ms))   goto fail;
+    if (!next_int(&rd, &cfg->recovery_timeout_ms)) goto fail;
 
     if (cfg->auth_timeout_ms <= 0 || cfg->vc_timeout_ms <= 0 ||
         cfg->status_timeout_ms <= 0 || cfg->recovery_timeout_ms <= 0) {
@@ -225,7 +322,6 @@ static int parse_config(const char *path, tbft_config_t *cfg)
         goto fail;
     }
 
-    fclose(f);
     ESP_LOGI(TAG, "parsed config: service=%s f=%d nodes=%d mcast=%s",
              cfg->service_name, cfg->f, cfg->num_nodes, cfg->mcast_ip);
 
@@ -297,31 +393,21 @@ static int parse_config(const char *path, tbft_config_t *cfg)
     return 0;
 
 fail:
-    fclose(f);
+    ESP_LOGE(TAG, "config file %s: unexpected or missing value", path);
     return -1;
 }
 
 /**
- * Load a DER-encoded key file and return heap-allocated buffer.
+ * Load a DER-encoded key file into the static file buffer (valid until the
+ * next file is read).
  */
 static uint8_t *load_key_file(const char *path, size_t *len_out)
 {
     if (!path) return nullptr;
-    FILE *f = fopen(path, "rb");
-    if (!f) return nullptr;
-    fseek(f, 0, SEEK_END);
-    long sz = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    if (sz <= 0) { fclose(f); return nullptr; }
-
-    uint8_t *buf = (uint8_t *)malloc((size_t)sz);
-    if (!buf) { fclose(f); return nullptr; }
-    if (fread(buf, 1, (size_t)sz, f) != (size_t)sz) {
-        free(buf); fclose(f); return nullptr;
-    }
-    fclose(f);
-    *len_out = (size_t)sz;
-    return buf;
+    int len = read_file(path);
+    if (len < 0) return nullptr;
+    *len_out = (size_t)len;
+    return s_file_buf;
 }
 
 /**
@@ -364,19 +450,8 @@ static int setup_principals(tbft_node_t *node, const tbft_config_t *cfg,
                              tbft_node_id_t local_id)
 {
     for (int i = 0; i < cfg->num_nodes; i++) {
-        tbft_principal_t *p =
-            (tbft_principal_t *)calloc(1, sizeof(tbft_principal_t));
-        if (!p) {
-            /* Free already-allocated principals to avoid a leak */
-            for (int j = 0; j < i; j++) {
-                if (node->principals[j]) {
-                    tbft_principal_free(node->principals[j]);
-                    free(node->principals[j]);
-                    node->principals[j] = nullptr;
-                }
-            }
-            return -1;
-        }
+        tbft_principal_t *p = &node->principal_store[i];
+        memset(p, 0, sizeof(*p));
 
         tbft_addr_t addr;
         memset(&addr, 0, sizeof(addr));
@@ -401,7 +476,6 @@ static int setup_principals(tbft_node_t *node, const tbft_config_t *cfg,
         if (inet_pton(AF_INET, cfg->nodes[i].ip, &parsed_ip) != 1) {
             ESP_LOGE(TAG, "invalid IP for node %d: %s", i, cfg->nodes[i].ip);
             tbft_principal_free(p);
-            free(p);
             return -1;
         }
         tbft_addr_udp_ip(addr) = parsed_ip.s_addr;
@@ -416,27 +490,22 @@ static int setup_principals(tbft_node_t *node, const tbft_config_t *cfg,
         if (!pub) {
             ESP_LOGE(TAG, "no public key file for node %d: %s", i, cfg->nodes[i].pubkey_path);
             tbft_principal_free(p);
-            free(p);
             for (int j = 0; j < i; j++) {
                 if (node->principals[j]) {
                     tbft_principal_free(node->principals[j]);
-                    free(node->principals[j]);
                     node->principals[j] = nullptr;
                 }
             }
             return -1;
         }
         int pub_ret = tbft_principal_load_pub_key(p, pub, pub_len);
-        free(pub);
         if (pub_ret != 0) {
             ESP_LOGE(TAG, "failed to parse public key for node %d from %s",
                      i, cfg->nodes[i].pubkey_path);
             tbft_principal_free(p);
-            free(p);
             for (int j = 0; j < i; j++) {
                 if (node->principals[j]) {
                     tbft_principal_free(node->principals[j]);
-                    free(node->principals[j]);
                     node->principals[j] = nullptr;
                 }
             }
@@ -455,14 +524,12 @@ static int setup_principals(tbft_node_t *node, const tbft_config_t *cfg,
             if (priv) {
                 int pk_ret = tbft_principal_load_priv_key(p, priv, priv_len);
                 mbedtls_platform_zeroize(priv, priv_len);
-                free(priv);
                 if (pk_ret != 0) {
                     ESP_LOGE(TAG, "failed to load private key for node %d: -0x%04x",
                              i, (unsigned)(-pk_ret));
                     for (int j = 0; j <= i; j++) {
                         if (node->principals[j]) {
                             tbft_principal_free(node->principals[j]);
-                            free(node->principals[j]);
                             node->principals[j] = nullptr;
                         }
                     }
@@ -491,7 +558,6 @@ static int setup_principals(tbft_node_t *node, const tbft_config_t *cfg,
                     for (int j = 0; j <= i; j++) {
                         if (node->principals[j]) {
                             tbft_principal_free(node->principals[j]);
-                            free(node->principals[j]);
                             node->principals[j] = nullptr;
                         }
                     }
@@ -507,8 +573,7 @@ static int setup_principals(tbft_node_t *node, const tbft_config_t *cfg,
  * Client API
  * -------------------------------------------------------------------------- */
 
-/* The request being worked on: kept so that it can be re-sent. */
-static uint8_t       s_req_buf[TBFT_MAX_MESSAGE_SIZE];
+/* The request being worked on (in s_cm->req_buf): kept for re-sending. */
 static int           s_req_len = 0;
 static tbft_req_id_t s_req_rid = 0;
 static uint32_t      s_req_resent = 0;   /* retransmissions, for TBFT_STATS */
@@ -569,35 +634,37 @@ int Byz_init_client(const char *config_file, const char *priv_config,
         return -1;
     }
 
+    if (s_replica) {
+        ESP_LOGE(TAG, "this process runs a replica: a client needs a process of its own");
+        return -1;
+    }
     if (s_client) {
         tbft_node_free(s_client);
-        free(s_client);
     }
-    s_client = (tbft_node_t *)calloc(1, sizeof(tbft_node_t));
-    if (!s_client) return -1;
+    s_client = &s_cm->node;
+    memset(s_client, 0, sizeof(*s_client));
 
     uint16_t bind_port = (port != 0) ? port : cfg.nodes[local_id].port;
     if (tbft_node_init(s_client, local_id, cfg.f, num_replicas, cfg.num_nodes,
                        cfg.mcast_ip,
                        (int64_t)cfg.auth_timeout_ms * 1000LL,
                        bind_port) != 0) {
-        free(s_client);
         s_client = nullptr;
         return -1;
     }
 
     if (setup_principals(s_client, &cfg, priv_config, local_id) != 0) {
         tbft_node_free(s_client);
-        free(s_client);
         s_client = nullptr;
         return -1;
     }
 
     s_is_replica = false;
     s_reply_count = 0;
-    memset(s_replies, 0, sizeof(s_replies));
+    memset(s_cm->replies, 0, sizeof(s_cm->replies));
     s_req_len = 0;
     s_req_rid = 0;
+    s_app_req_in_use = false;
 
     uint32_t epoch = client_boot_epoch(local_id);
     s_client->rid_counter = (uint64_t)epoch << TBFT_RID_COUNTER_BITS;
@@ -608,9 +675,18 @@ int Byz_init_client(const char *config_file, const char *priv_config,
 
 int Byz_alloc_request(Byz_req *req, int size)
 {
-    req->contents = (char *)malloc((size_t)size);
-    if (!req->contents) return -1;
-    req->size = size;
+    /* One request buffer in static memory: a client has one request
+     * outstanding at a time (Byz_invoke). */
+    if (!req) return -1;
+    req->contents = nullptr;
+    req->size     = 0;
+    if (!s_client || s_app_req_in_use || size < 0 || (size_t)size > sizeof(s_cm->app_req)) {
+        return -1;
+    }
+    s_app_req_in_use = true;
+    memset(s_cm->app_req, 0, (size_t)size);
+    req->contents = (char *)s_cm->app_req;
+    req->size     = size;
     return 0;
 }
 
@@ -620,15 +696,14 @@ int Byz_send_request(Byz_req *req, bool read_only)
 
     /* Drain any stale replies or other messages in the transport queue */
     if (!s_is_replica) {
-        static uint8_t dummy[TBFT_MAX_MESSAGE_SIZE];
-        while (tbft_node_recv(s_client, dummy, sizeof(dummy), nullptr) > 0) {
+        while (tbft_node_recv(s_client, s_cm->rx_buf, sizeof(s_cm->rx_buf), nullptr) > 0) {
             /* discard */
         }
     }
 
     /* Build Request message in a static buffer (TBFT_MAX_MESSAGE_SIZE is too
      * large for a task stack); it is kept for retransmission. */
-    uint8_t *out = s_req_buf;
+    uint8_t *out = s_cm->req_buf;
     s_req_len = 0;
     if ((s_client->rid_counter & TBFT_RID_COUNTER_MASK) == TBFT_RID_COUNTER_MASK) {
         /* request counter used up: continue in a new epoch */
@@ -718,14 +793,14 @@ int Byz_recv_reply(Byz_rep *rep)
         if (retx_us > 0 && s_req_len > 0 && esp_timer_get_time() >= next_retx_us) {
             ESP_LOGW(TAG, "rid=%llu: %d of %d matching replies so far - re-sending the request",
                      (unsigned long long)expected_rid, s_reply_count, needed);
-            tbft_node_send(s_client, s_req_buf, (size_t)s_req_len, TBFT_ALL_REPLICAS);
+            tbft_node_send(s_client, s_cm->req_buf, (size_t)s_req_len, TBFT_ALL_REPLICAS);
             s_req_resent++;
             retx_us *= 2;
             next_retx_us = esp_timer_get_time() + retx_us;
         }
-        uint8_t buf[TBFT_MAX_MESSAGE_SIZE];
+        uint8_t *buf = s_cm->rx_buf;
         tbft_node_id_t src_hint = -1;
-        int n = tbft_node_recv(s_client, buf, sizeof(buf), &src_hint);
+        int n = tbft_node_recv(s_client, buf, sizeof(s_cm->rx_buf), &src_hint);
         if (n < (int)sizeof(tbft_reply_rep_t)) {
             tbft_node_wait(s_client, 100);   /* woken at once by an arriving reply */
 #if CONFIG_ESP_TASK_WDT_EN
@@ -778,12 +853,12 @@ int Byz_recv_reply(Byz_rep *rep)
         }
 
         /* Drop replies for old rids that were not cleared. */
-        if (s_replies[rep_id].valid) {
+        if (s_cm->replies[rep_id].valid) {
             const tbft_reply_rep_t *old =
-                (const tbft_reply_rep_t *)s_replies[rep_id].buf;
+                (const tbft_reply_rep_t *)s_cm->replies[rep_id].buf;
             if (old->rid != r0->rid) {
                 /* Stale cached reply from a previous request — replace. */
-                s_replies[rep_id].valid = false;
+                s_cm->replies[rep_id].valid = false;
                 s_reply_count--;
             } else {
                 /* Duplicate reply for same rid from this replica — ignore. */
@@ -792,10 +867,10 @@ int Byz_recv_reply(Byz_rep *rep)
         }
 
         /* Store — one slot per replica id guarantees distinct senders. */
-        if ((size_t)n > sizeof(s_replies[rep_id].buf)) continue;
-        memcpy(s_replies[rep_id].buf, buf, (size_t)n);
-        s_replies[rep_id].len   = n;
-        s_replies[rep_id].valid = true;
+        if ((size_t)n > sizeof(s_cm->replies[rep_id].buf)) continue;
+        memcpy(s_cm->replies[rep_id].buf, buf, (size_t)n);
+        s_cm->replies[rep_id].len   = n;
+        s_cm->replies[rep_id].valid = true;
         s_reply_count++;
 
         /* Count matching replies: find the digest with the most votes.
@@ -808,33 +883,33 @@ int Byz_recv_reply(Byz_rep *rep)
         int winning_payload_len = 0;
 
         for (int i = 0; i < num_replicas; i++) {
-            if (!s_replies[i].valid) continue;
+            if (!s_cm->replies[i].valid) continue;
             const tbft_reply_rep_t *ri =
-                (const tbft_reply_rep_t *)s_replies[i].buf;
+                (const tbft_reply_rep_t *)s_cm->replies[i].buf;
             if (ri->rid != r0->rid) continue;
             if (ri->reply_size != r0->reply_size) continue;
             /* Validate reply_size is non-negative and fits within stored message.
              * Check len >= sizeof(*ri) first to prevent unsigned underflow. */
             if (ri->reply_size < 0 ||
-                (size_t)s_replies[i].len < sizeof(*ri) ||
-                (size_t)ri->reply_size > (size_t)s_replies[i].len - sizeof(*ri)) continue;
+                (size_t)s_cm->replies[i].len < sizeof(*ri) ||
+                (size_t)ri->reply_size > (size_t)s_cm->replies[i].len - sizeof(*ri)) continue;
 
-            const uint8_t *payload_i = s_replies[i].buf + sizeof(*ri);
+            const uint8_t *payload_i = s_cm->replies[i].buf + sizeof(*ri);
             tbft_digest_t digest_i;
             tbft_msg_digest(payload_i, (size_t)ri->reply_size, &digest_i);
 
             int cnt = 0;
             for (int j = 0; j < num_replicas; j++) {
-                if (!s_replies[j].valid) continue;
+                if (!s_cm->replies[j].valid) continue;
                 const tbft_reply_rep_t *rj =
-                    (const tbft_reply_rep_t *)s_replies[j].buf;
+                    (const tbft_reply_rep_t *)s_cm->replies[j].buf;
                 if (rj->rid != r0->rid) continue;
                 if (rj->reply_size != ri->reply_size) continue;
                 /* Validate rj->reply_size before use */
                 if (rj->reply_size < 0 ||
-                    (size_t)s_replies[j].len < sizeof(*rj) ||
-                    (size_t)rj->reply_size > (size_t)s_replies[j].len - sizeof(*rj)) continue;
-                const uint8_t *payload_j = s_replies[j].buf + sizeof(*rj);
+                    (size_t)s_cm->replies[j].len < sizeof(*rj) ||
+                    (size_t)rj->reply_size > (size_t)s_cm->replies[j].len - sizeof(*rj)) continue;
+                const uint8_t *payload_j = s_cm->replies[j].buf + sizeof(*rj);
                 tbft_digest_t digest_j;
                 tbft_msg_digest(payload_j, (size_t)rj->reply_size, &digest_j);
                 if (memcmp(&digest_i, &digest_j, sizeof(digest_i)) == 0) cnt++;
@@ -848,16 +923,20 @@ int Byz_recv_reply(Byz_rep *rep)
         }
 
         if (match >= needed) {
-            rep->contents = (char *)malloc((size_t)winning_payload_len);
-            if (!rep->contents) return -1;
-            memcpy(rep->contents, winning_payload, (size_t)winning_payload_len);
-            rep->size = winning_payload_len;
+            if (winning_payload_len < 0 ||
+                (size_t)winning_payload_len > sizeof(s_cm->app_rep)) {
+                return -1;
+            }
+            /* static buffer: valid until the next Byz_recv_reply */
+            memcpy(s_cm->app_rep, winning_payload, (size_t)winning_payload_len);
+            rep->contents = (char *)s_cm->app_rep;
+            rep->size     = winning_payload_len;
 
             ESP_LOGI(TAG, "reply accepted: %d matching replies (needed=%d)",
                      match, needed);
 
             /* Clear reply cache */
-            memset(s_replies, 0, sizeof(s_replies));
+            memset(s_cm->replies, 0, sizeof(s_cm->replies));
             s_reply_count = 0;
             return 0;
         }
@@ -865,7 +944,7 @@ int Byz_recv_reply(Byz_rep *rep)
 
     ESP_LOGW(TAG, "recv_reply timeout: got %d replies (needed=%d)",
              s_reply_count, needed);
-    memset(s_replies, 0, sizeof(s_replies));
+    memset(s_cm->replies, 0, sizeof(s_cm->replies));
     s_reply_count = 0;
     return -1; /* timeout */
 }
@@ -879,25 +958,22 @@ int Byz_invoke(Byz_req *req, Byz_rep *rep, bool read_only)
 
 void Byz_free_request(Byz_req *req)
 {
-    if (req && req->contents) {
-        free(req->contents);
-        req->contents = nullptr;
-        req->size = 0;
-    }
+    if (!req) return;
+    if (req->contents == (char *)s_cm->app_req) s_app_req_in_use = false;
+    req->contents = nullptr;
+    req->size = 0;
 }
 
 void Byz_free_reply(Byz_rep *rep)
 {
-    if (rep && rep->contents) {
-        free(rep->contents);
-        rep->contents = nullptr;
-        rep->size = 0;
-    }
+    if (!rep) return;
+    rep->contents = nullptr;
+    rep->size = 0;
 }
 
 void Byz_reset_client(void)
 {
-    memset(s_replies, 0, sizeof(s_replies));
+    memset(s_cm->replies, 0, sizeof(s_cm->replies));
     s_reply_count = 0;
 }
 
@@ -975,15 +1051,14 @@ int Byz_init_replica(const char *config_file, const char *priv_config,
     s_comp_ndet_cb  = comp_ndet_cb;
     s_recv_reply_cb = recv_reply_cb;
 
-    if (s_replica) {
-        tbft_replica_free(s_replica);
-        free(s_replica);
-    }
-    s_replica = (tbft_replica_t *)calloc(1, sizeof(tbft_replica_t));
-    if (!s_replica) {
-        ESP_LOGE(TAG, "failed to allocate tbft_replica_t (size=%zu). device out of memory. reduce TBFT_WINDOW_SIZE or max nodes.", sizeof(tbft_replica_t));
+    if (s_client) {
+        ESP_LOGE(TAG, "this process runs a client: a replica needs a process of its own");
         return -1;
     }
+    if (s_replica) {
+        tbft_replica_free(s_replica);
+    }
+    s_replica = &s_mem.replica;   /* static; tbft_replica_init clears it */
 
     uint16_t bind_port = (port != 0) ? port : cfg.nodes[local_id].port;
 
@@ -999,7 +1074,6 @@ int Byz_init_replica(const char *config_file, const char *priv_config,
         recv_reply_cb ? recv_reply_adapter : nullptr);
 
     if (ret != 0) {
-        free(s_replica);
         s_replica = nullptr;
         return -1;
     }
@@ -1023,7 +1097,6 @@ int Byz_init_replica(const char *config_file, const char *priv_config,
     /* Setup principals */
     if (setup_principals(&s_replica->node, &cfg, priv_config, local_id) != 0) {
         tbft_replica_free(s_replica);
-        free(s_replica);
         s_replica = nullptr;
         return -1;
     }

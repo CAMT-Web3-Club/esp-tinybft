@@ -70,14 +70,15 @@ typedef struct {
     bool              fetch_has_digest;
     tbft_digest_t     fetch_digest;
 
-    /* Copy of every block at the latest checkpoint (image_seqno); served to
-     * replicas that fetch that checkpoint, so they get exactly the state the
-     * checkpoint digest covers even while this replica executes further. */
-    uint8_t          *image;
-    tbft_seqno_t      image_seqno;
+    tbft_seqno_t      image_seqno;   /* checkpoint held in image[] */
 
     /* Stable seqno (updated when checkpoints become stable) */
     tbft_seqno_t      last_stable;
+
+    /* Copy of every block at the latest checkpoint (image_seqno); served to
+     * replicas that fetch that checkpoint, so they get exactly the state the
+     * checkpoint digest covers even while this replica executes further. */
+    uint8_t           image[TBFT_MAX_STATE_BLOCKS * TBFT_BLOCK_SIZE];
 } tbft_state_t;
 
 /* --------------------------------------------------------------------------
@@ -169,7 +170,7 @@ void tbft_state_install_fetched(tbft_state_t *state, tbft_seqno_t seqno);
 static inline bool tbft_state_can_serve(const tbft_state_t *state,
                                         tbft_seqno_t seqno)
 {
-    return !state->in_fetch && state->image && state->image_seqno == seqno;
+    return !state->in_fetch && state->num_blocks > 0 && state->image_seqno == seqno;
 }
 
 /** Block @p i of the image served for checkpoint image_seqno. */

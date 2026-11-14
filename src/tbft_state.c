@@ -1,6 +1,5 @@
 #include "tbft_state.h"
 #include "esp_log.h"
-#include <stdlib.h>
 #include <string.h>
 
 static constexpr char TAG[] = "tbft_state";
@@ -92,14 +91,6 @@ int tbft_state_init(tbft_state_t *state, void *mem, size_t size,
         return -1;
     }
 
-    state->image = (uint8_t *)malloc((size_t)state->num_blocks * TBFT_BLOCK_SIZE);
-    if (!state->image) {
-        ESP_LOGE(TAG, "state init: OOM allocating the %d-block checkpoint image",
-                 state->num_blocks);
-        tbft_ptree_free(&state->ptree);
-        return -1;
-    }
-
     /* Checkpoint 0: the initial state every replica starts from. */
     for (int i = 0; i < state->num_blocks; i++) {
         tbft_state_cow_single(state, i);
@@ -115,9 +106,6 @@ int tbft_state_init(tbft_state_t *state, void *mem, size_t size,
 void tbft_state_free(tbft_state_t *state)
 {
     tbft_ptree_free(&state->ptree);
-
-    free(state->image);
-    state->image = nullptr;
     memset(state, 0, sizeof(*state));
 }
 

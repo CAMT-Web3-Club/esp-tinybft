@@ -3,6 +3,8 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <strings.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_system.h"
@@ -24,6 +26,37 @@
 static constexpr char TAG[] = "counter";
 
 #if CONFIG_TBFT_TRANSPORT_UDP && CONFIG_EXAMPLE_STATIC_IP
+/* Config files are read with POSIX read() into a static buffer: no FILE
+ * object, no heap.  False if missing or too large for the buffer. */
+static char s_cfg_text[2048];
+
+static bool read_text_file(const char *path) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return false;
+    size_t len = 0;
+    ssize_t r = 0;
+    while (len < sizeof(s_cfg_text) - 1 &&
+           (r = read(fd, s_cfg_text + len, sizeof(s_cfg_text) - 1 - len)) > 0) {
+        len += (size_t)r;
+    }
+    close(fd);
+    s_cfg_text[len] = '\0';
+    return r >= 0 && len < sizeof(s_cfg_text) - 1;
+}
+
+/* Copy the next line of *cursor (without its newline) into line. */
+static bool next_line(const char **cursor, char *line, size_t size) {
+    const char *p = *cursor;
+    if (*p == '\0') return false;
+    const char *nl = strchr(p, '\n');
+    size_t n = nl ? (size_t)(nl - p) : strlen(p);
+    size_t c = n < size - 1 ? n : size - 1;
+    memcpy(line, p, c);
+    line[c] = '\0';
+    *cursor = nl ? nl + 1 : p + n;
+    return true;
+}
+
 /* Return the 0-based node index whose MAC matches this board in
  * config_espnow.txt (header: name, f, auth, num_nodes, mcast; then one
  * "<host> <mac> <key>" line per node). -1 if not found. */
@@ -33,11 +66,11 @@ static int node_index_by_mac(void) {
     char want[18];
     snprintf(want, sizeof(want), "%02x:%02x:%02x:%02x:%02x:%02x",
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-    FILE *f = fopen("/spiffs/config_espnow.txt", "r");
-    if (!f) return -1;
+    if (!read_text_file("/spiffs/config_espnow.txt")) return -1;
+    const char *cur = s_cfg_text;
     char line[160];
     int lineno = 0, nodes = 0, idx = -1;
-    while (fgets(line, sizeof(line), f)) {
+    while (next_line(&cur, line, sizeof(line))) {
         lineno++;
         if (lineno == 4) nodes = atoi(line);
         if (lineno <= 5) continue;
@@ -48,18 +81,17 @@ static int node_index_by_mac(void) {
             break;
         }
     }
-    fclose(f);
     return idx;
 }
 
 /* Return the IP string at node index idx in config_udp.txt (same layout). */
 static bool ip_for_index(int idx, char *out, size_t out_len) {
-    FILE *f = fopen("/spiffs/config_udp.txt", "r");
-    if (!f) return false;
+    if (!read_text_file("/spiffs/config_udp.txt")) return false;
+    const char *cur = s_cfg_text;
     char line[160];
     int lineno = 0;
     bool ok = false;
-    while (fgets(line, sizeof(line), f)) {
+    while (next_line(&cur, line, sizeof(line))) {
         lineno++;
         if (lineno - 6 == idx) {
             char host[64], ip[32];
@@ -70,7 +102,6 @@ static bool ip_for_index(int idx, char *out, size_t out_len) {
             break;
         }
     }
-    fclose(f);
     return ok;
 }
 
@@ -118,6 +149,7 @@ static void apply_static_ip(esp_netif_t *netif) {
 #include "freertos/event_groups.h"
 
 static EventGroupHandle_t s_wifi_event_group;
+static StaticEventGroup_t s_wifi_event_group_buf;   /* its storage (no heap) */
 static constexpr EventBits_t WIFI_CONNECTED_BIT = BIT0;
 
 static void wifi_event_handler(void *arg, esp_event_base_t base,
@@ -284,7 +316,7 @@ static void wifi_init(void) {
 
 #if CONFIG_TBFT_TRANSPORT_UDP
     ESP_LOGI(TAG, "Connecting to WiFi (SSID: %s)...", CONFIG_EXAMPLE_WIFI_SSID);
-    s_wifi_event_group = xEventGroupCreate();
+    s_wifi_event_group = xEventGroupCreateStatic(&s_wifi_event_group_buf);
     esp_netif_t *sta_netif = esp_netif_create_default_wifi_sta();
 #if CONFIG_EXAMPLE_STATIC_IP
     resolve_static_ip();
@@ -500,6 +532,11 @@ static void client_task(void *arg) {
 }
 #endif
 
+/* The role's task uses static memory (no heap): one task runs, replica or
+ * client, so they share one stack. */
+static StaticTask_t s_role_task_tcb;
+static StackType_t  s_role_task_stack[8192];   /* bytes in ESP-IDF */
+
 void app_main(void) {
     ESP_LOGI(TAG, "=== Counter starting ===");
     ESP_LOGI(TAG, "ESP-IDF: %s, Target: ESP32-C3", IDF_VER);
@@ -556,11 +593,13 @@ void app_main(void) {
 
 #if !CONFIG_EXAMPLE_ROLE_CLIENT
     if (listed_replica == 1) {
-        xTaskCreate(replica_task, "replica_task", 8192, (void *)(intptr_t)local_id, 5, nullptr);
+        xTaskCreateStatic(replica_task, "replica_task", sizeof(s_role_task_stack),
+                          (void *)(intptr_t)local_id, 5, s_role_task_stack, &s_role_task_tcb);
         return;
     }
 #endif
 #if !CONFIG_EXAMPLE_ROLE_REPLICA
-    xTaskCreate(client_task, "client_task", 8192, (void *)(intptr_t)local_id, 5, nullptr);
+    xTaskCreateStatic(client_task, "client_task", sizeof(s_role_task_stack),
+                      (void *)(intptr_t)local_id, 5, s_role_task_stack, &s_role_task_tcb);
 #endif
 }

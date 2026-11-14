@@ -187,6 +187,10 @@ static int socket_open(uint16_t port, bool use_multicast,
  * Public API
  * -------------------------------------------------------------------------- */
 
+/* The transport's state is static: one transport per process. */
+static tbft_udp_t s_udp;
+static bool       s_udp_in_use = false;
+
 int tbft_transport_create(tbft_transport_t **out,
                            [[maybe_unused]] tbft_transport_type_t type, /* always UDP here */
                            int num_nodes,
@@ -200,8 +204,12 @@ int tbft_transport_create(tbft_transport_t **out,
         return -1;
     }
 
-    tbft_udp_t *udp = (tbft_udp_t *)calloc(1, sizeof(*udp));
-    if (!udp) return -1;
+    if (s_udp_in_use) {
+        ESP_LOGE(TAG, "UDP transport already in use (one per process)");
+        return -1;
+    }
+    tbft_udp_t *udp = &s_udp;
+    memset(udp, 0, sizeof(*udp));
 
     udp->num_nodes    = num_nodes;
     udp->num_replicas = num_replicas;
@@ -219,10 +227,10 @@ int tbft_transport_create(tbft_transport_t **out,
     udp->sock = socket_open(port, udp->use_multicast, mcast_ip,
                             &udp->mcast_addr);
     if (udp->sock < 0) {
-        free(udp);
         return -1;
     }
 
+    s_udp_in_use = true;
     *out = (tbft_transport_t *)udp;
     ESP_LOGI(TAG, "UDP transport init: port=%d mcast=%s", port,
              udp->use_multicast ? (mcast_ip ? mcast_ip : "yes") : "no");
@@ -252,7 +260,8 @@ void tbft_transport_free(tbft_transport_t *t)
         }
         close(udp->sock);
     }
-    free(udp);
+    memset(udp, 0, sizeof(*udp));
+    s_udp_in_use = false;
 }
 
 void tbft_transport_set_peer(tbft_transport_t *t,

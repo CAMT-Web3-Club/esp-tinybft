@@ -609,6 +609,12 @@ EventGroupHandle_t xEventGroupCreate(void)
     return g;
 }
 
+EventGroupHandle_t xEventGroupCreateStatic(StaticEventGroup_t *buffer)
+{
+    (void)buffer;
+    return xEventGroupCreate();
+}
+
 void vEventGroupDelete(EventGroupHandle_t g)
 {
     if (!g) return;

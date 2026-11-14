@@ -268,10 +268,19 @@ menu "TinyBFT Configuration"
 
         config TBFT_MAX_STATE_BLOCKS
             int "Maximum number of state blocks"
-            default 256
+            default 16
+            range 2 1024
             help
-                Maximum number of state blocks (state_size / BLOCK_SIZE).
-                Affects CoW bitmap, block_digests, and fetch queue sizing.
+                Maximum number of state blocks: the application state
+                (Byz_init_replica's state size / BLOCK_SIZE) plus the blocks
+                of the library's client table (one block for one client with
+                the default reply size).
+
+                All replica memory is static, so this sets RAM use at build
+                time: a copy of the checkpointed state
+                (MAX_STATE_BLOCKS x BLOCK_SIZE bytes), a digest per block,
+                the fetch queue and the partition tree. Keep it at what the
+                application needs.
 
         config TBFT_RQUEUE_MAX
             int "Maximum pending requests in queue"

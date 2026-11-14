@@ -1,11 +1,11 @@
 # esp-tinybft
 
-A pure-C implementation of [PBFT](https://pmg.csail.mit.edu/papers/osdi99.pdf) (Practical Byzantine Fault Tolerance) for ESP-IDF, optimised for embedded systems. It uses static memory allocation throughout — no `malloc` in the hot path — and exposes a `libbyz`-compatible API.
+A pure-C implementation of [PBFT](https://pmg.csail.mit.edu/papers/osdi99.pdf) (Practical Byzantine Fault Tolerance) for ESP-IDF, optimised for embedded systems. All of its memory is static (it never calls `malloc`) and it exposes a `libbyz`-compatible API.
 
 ## Features
 
 - **PBFT consensus** — tolerates up to `f` Byzantine faults in a cluster of `n = 3f + 1` replicas
-- **Static memory model** — three pre-allocated region structs (agreement, checkpoint, special); no heap allocation in the steady-state protocol path
+- **Static memory only** — the component never calls `malloc`: replica, client, transports, FreeRTOS objects and buffers are static, so it cannot fragment the heap and the linker checks the RAM budget at build time (ESP-IDF's own components such as Wi-Fi, lwIP and mbedtls still use the heap)
 - **Dual transport** — UDP over lwIP sockets or ESP-NOW with automatic fragmentation/reassembly; switchable via `menuconfig`
 - **PSA Crypto / MbedTLS 4.x** — HMAC-SHA256 (hot path) via PSA; RSA-2048 sign/verify via `mbedtls/pk.h`
 - **libbyz-compatible API** — drop-in for projects that already use the original libbyz interface
@@ -18,6 +18,11 @@ A pure-C implementation of [PBFT](https://pmg.csail.mit.edu/papers/osdi99.pdf) (
   version of ESP-IDF v6.0 and later. C files that include `esp-tinybft.h` must
   be compiled as C23 (the IDF default) or as C++.
 - Supported targets: ESP32, ESP32-S2, ESP32-S3, ESP32-C3, ESP32-C6, ESP32-H2
+- Enough static RAM: the replica's memory is reserved at link time
+  (`examples/counter/memcalc.sh` estimates it, `idf.py size` reports it).
+  On the original ESP32 at most 160 KB of DRAM can be static (ESP-IDF
+  *Memory Types* guide), so keep window, message size and replica count
+  small there; the ESP32-C3 has no such split.
 - An `nvs` partition, initialised with `nvs_flash_init()` before
   `Byz_init_client()`: the client keeps a boot counter there so that its
   request ids keep growing across resets (replicas never run a request id
@@ -60,7 +65,7 @@ Key options:
 | `TBFT_CHECKPOINT_INTERVAL` | 8 | Checkpoint every N requests |
 | `TBFT_RQUEUE_MAX` | 8 | Max queued requests (memory: 2 × N × msg_size) |
 | `TBFT_NDET_BUF_SIZE` | 256 | Non-deterministic choices buffer |
-| `TBFT_MAX_STATE_BLOCKS` | 256 | Max state blocks for CoW / partition tree |
+| `TBFT_MAX_STATE_BLOCKS` | 16 | Max state blocks (application state + client table); sets the static checkpoint copy, digests and partition tree |
 | `TBFT_P_LEVELS` | 4 | Merkle partition tree depth |
 | `TBFT_ANTI_REPLAY_WINDOW_MS` | 30000 | Anti-replay window (ms, 0 = disabled) |
 | `TBFT_CLIENT_REPLY_TIMEOUT_MS` | 10000 | How long `Byz_invoke` waits for f+1 matching replies |
@@ -225,7 +230,7 @@ PBFT correctness and staggered boot:
 | Retransmission | Status-driven: a replica re-sends the New_view, its Checkpoint and its Commit/Pre-prepare/Prepare messages to a peer that lacks them; the 500 ms commit re-send is gone |
 | State transfer | Served from a copy of the checkpointed state and checked against the certified digest before it is used |
 | Key exchange | New_key says which keys the sender holds; a replica whose key is missing answers at once, so a late or restarted replica is ready in about a second |
-| Memory | Unused special-region and checkpoint-region slots removed: `tbft_replica_t` for the counter example is 53,112 bytes instead of 83,112 (plus a 5 KiB checkpoint image on the heap) |
+| Memory | No heap in the component: everything static, checked by the linker (counter example on ESP32-C3: `tbft_replica_t` 79,072 bytes including the checkpoint copy, partition tree and principals; ESP-NOW transport 75,160). Unused special-region and checkpoint-region slots removed (they took 30,000 bytes) |
 
 ### v0.2.0
 
