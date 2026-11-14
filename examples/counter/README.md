@@ -178,7 +178,22 @@ All three lines are at WARN level, so they appear with the default log level.
   messages sent (`tx`) and frames handed to the radio (`tx_frames`: every
   ESP-NOW attempt, fragments and retries included; one per UDP datagram),
   messages received, send failures, queue drops, executed requests, re-sent
-  commits, view changes, state fetches, free heap and its minimum.
+  commits (`commit_resent`, replicas) and re-sent requests (`req_resent`,
+  client), view changes, state fetches, free heap and its minimum.
+
+  Nothing is re-sent on a timer in a healthy run: replicas re-send only what a
+  peer reports missing in its Status, and the client re-sends a request only
+  when it has no f+1 matching replies after *Client request retransmission
+  interval* (TinyBFT Configuration > Timeouts, 5000 ms by default, doubling).
+  Non-zero `commit_resent` / `req_resent` therefore mean that messages were
+  lost and recovered; `tools/analyze.py` reports them per run.
+
+The client keeps a boot counter in NVS (namespace `tbft`) so that its request
+ids keep growing after a reset; the replicas ignore requests whose id is not
+above the last one they executed. Erasing the client's flash
+(`idf.py erase-flash`) resets that counter: restart all replicas as well in
+that case (they keep their state, the client table included, in RAM only),
+otherwise they keep ignoring the client.
 
 ## Best-vs-best: configurations to run
 
@@ -234,11 +249,11 @@ result; repeat at a second period if the ranking matters at other loads.
 
 `python3 tools/analyze.py runs/` reads `CLIENT_STATS`, `TBFT_STATS`, the
 `BANNER` (for the settings of each configuration) and `energy.csv`, and prints
-success rate, latency, requests per joule, the best configuration per
-transport and whether the difference exceeds one standard deviation. It drops
-runs with view changes or state fetches (`--include-faulty` keeps them) and
-requires `--min-success` (default 95%). It is not needed for configuring,
-building or flashing.
+success rate, latency, requests per joule, re-sent messages per run, the best
+configuration per transport and whether the difference exceeds one standard
+deviation. It drops runs with view changes or state fetches
+(`--include-faulty` keeps them) and requires `--min-success` (default 95%). It
+is not needed for configuring, building or flashing.
 
 ## CPU power management (not part of the comparison)
 

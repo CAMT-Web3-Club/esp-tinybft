@@ -26,6 +26,9 @@ requests per joule summed over the boards listed in energy.csv.
 
 A configuration qualifies only if its mean success rate >= --min-success.
 Runs with view-changes or state fetches are excluded unless --include-faulty.
+The "resent/run" column counts re-sent requests (client) and commits
+(replicas): messages that were lost and recovered, kept in the result but
+worth reporting.
 "Best" means best among the points you ran, not a proven optimum.
 
   analyze.py runs/ [--min-success 0.95]
@@ -74,7 +77,7 @@ def energy(path):
 def load_run(d):
     logs = {os.path.splitext(os.path.basename(p))[0]: parse_log(p)
             for p in glob.glob(os.path.join(d, "*.log"))}
-    r = {"dir": d, "ok": 0, "total": 0, "faulty": False, "avg_ms": None,
+    r = {"dir": d, "ok": 0, "total": 0, "faulty": False, "avg_ms": None, "resent": 0,
          "banner": next((v["banner"] for v in logs.values() if v["banner"]), None)}
     rows = next((v["client"] for v in logs.values() if v["client"]), [])
     first = next((i for i, x in enumerate(rows) if x["ok"] > 0), None)
@@ -89,6 +92,7 @@ def load_run(d):
         s = v["stats"] or {}
         if s.get("vc_sent", 0) or s.get("new_view", 0) or s.get("fetch", 0):
             r["faulty"] = True
+        r["resent"] += s.get("req_resent", 0) + s.get("commit_resent", 0)
     f = os.path.join(d, "energy.csv")
     if os.path.exists(f):
         r["energy"], r["nodes"], r["secs"] = energy(f)
@@ -139,9 +143,11 @@ def main():
         counted = [r for r in rs if r["total"] > 0]
         used = [r for r in counted if a.include_faulty or not r["faulty"]]
         m = {"n": len(used), "of": len(rs), "dropped": len(counted) - len(used),
-             "succ": None, "eff": None, "eff_sd": 0.0, "jpr": None, "inc": None, "lat": None}
+             "succ": None, "eff": None, "eff_sd": 0.0, "jpr": None, "inc": None, "lat": None,
+             "resent": None}
         if used:
             m["succ"] = st.mean(r["ok"] / r["total"] for r in used)
+            m["resent"] = st.mean(r["resent"] for r in used)
             lat = [r["avg_ms"] for r in used if r["avg_ms"]]
             m["lat"] = st.mean(lat) if lat else None
             with_e = [r for r in used if "energy" in r and r["ok"] > 0]
@@ -157,12 +163,13 @@ def main():
     def fmt(x, spec):
         return format(x, spec) if x is not None else "-"
 
-    print("| point | runs | success | avg latency ms | req/J (±sd) | J/req | incr J/req | excl. faulty |")
-    print("|---|---|---|---|---|---|---|---|")
+    print("| point | runs | success | avg latency ms | req/J (±sd) | J/req | incr J/req | resent/run | excl. faulty |")
+    print("|---|---|---|---|---|---|---|---|---|")
     for pid, m in sorted(rows.items(), key=lambda kv: -(kv[1]["eff"] or -1)):
         eff = f"{m['eff']:.4f} ±{m['eff_sd']:.4f}" if m["eff"] is not None else "-"
         print(f"| {pid} | {m['n']}/{m['of']} | {fmt(m['succ'], '.1%')} | {fmt(m['lat'], '.0f')} "
-              f"| {eff} | {fmt(m['jpr'], '.2f')} | {fmt(m['inc'], '.2f')} | {m['dropped']} |")
+              f"| {eff} | {fmt(m['jpr'], '.2f')} | {fmt(m['inc'], '.2f')} | {fmt(m['resent'], '.1f')} "
+              f"| {m['dropped']} |")
 
     # ESP-NOW rate screen: with an always-on radio the rate barely moves req/J,
     # so choose by success rate, then by speed (shorter airtime).

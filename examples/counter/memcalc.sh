@@ -13,6 +13,7 @@ NDET_BUF_SIZE=256
 MAX_STATE_BLOCKS=8
 P_LEVELS=2
 BLOCK_SIZE=1024
+APP_STATE_SIZE=4096   # sizeof(counter_state) in main.c
 
 # --- derived ---
 DIGEST_SIZE=32
@@ -25,24 +26,30 @@ CERT_MAX_VALS=$(( MAX_FAULTY + 1 ))
 
 # --- message sizes ---
 HDR_SIZE=16
-CKPT_REP_SIZE=68
+CKPT_REP_SIZE=64
 CKPT_MSG_SIZE=$(( CKPT_REP_SIZE + AUTH_SIZE ))
 PREPARE_REP_SIZE=72
 PREPARE_MSG_SIZE=$(( PREPARE_REP_SIZE + AUTH_SIZE ))
 COMMIT_REP_SIZE=72
 COMMIT_MSG_SIZE=$(( COMMIT_REP_SIZE + AUTH_SIZE ))
 PP_MAX_SIZE=$MAX_MESSAGE_SIZE
-NK_REP_SIZE=24
-NK_SLOT_SIZE=$(( 4 + SIG_SIZE ))
-VC_REP_SIZE=64
-VC_MSG_MAX=$MAX_MESSAGE_SIZE
-VC_ACK_REP_SIZE=56
-REQUEST_REP_SIZE=36
-REQ_MSG_MAX=$MAX_MESSAGE_SIZE
-REPLY_REP_SIZE=40
-REP_MSG_MAX=$(( REPLY_REP_SIZE + MAX_REPLY_SIZE + SIG_SIZE ))
-
 align8() { echo $(( ($1 + 7) & ~7 )); }
+
+NK_REP_SIZE=32
+NK_SLOT_SIZE=$(( 4 + SIG_SIZE ))
+# View_change: header + one checkpoint + one entry per window seqno, signed
+VC_REP_SIZE=48
+VC_CKPT_SIZE=40
+VC_REQ_INFO_SIZE=48
+VC_MSG_MAX=$(( $(align8 $(( VC_REP_SIZE + VC_CKPT_SIZE + WINDOW_SIZE * VC_REQ_INFO_SIZE ))) + SIG_SIZE ))
+# New_view: header + one entry per window seqno, signed
+NV_REP_SIZE=80
+NV_MSG_MAX=$(( $(align8 $(( NV_REP_SIZE + WINDOW_SIZE * VC_REQ_INFO_SIZE ))) + SIG_SIZE ))
+REPLY_REP_SIZE=48
+REP_MSG_MAX=$(( $(align8 $(( REPLY_REP_SIZE + MAX_REPLY_SIZE ))) + SIG_SIZE ))
+# Client table entry (replicated library state): last rid, seqno, reply
+CLIENT_ENTRY_SIZE=$(align8 $(( 8 + 8 + 4 + 4 + MAX_REPLY_SIZE )))
+SYS_STATE_SIZE=$(( (MAX_NUM_CLIENTS * CLIENT_ENTRY_SIZE + BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE ))
 
 # --- certificate size helper ---
 cert_size() {
@@ -69,7 +76,8 @@ sr_slot_size() {
 PREPARE_CERT_SIZE=$(cert_size $PREPARE_MSG_SIZE)
 COMMIT_CERT_SIZE=$(cert_size $COMMIT_MSG_SIZE)
 PREPARED_CERT_SIZE=$(( PP_MAX_SIZE + 4 + 4 + PREPARE_CERT_SIZE + 8 ))
-SLICE_SIZE=$(( PREPARED_CERT_SIZE + COMMIT_CERT_SIZE ))
+# + seqno tag, commit time, New_view digest, prepared view and digest
+SLICE_SIZE=$(( PREPARED_CERT_SIZE + COMMIT_CERT_SIZE + 96 ))
 
 AR_OVERHEAD=24  # head(8)+head_idx(4)+mask(4)+prepare_thr(4)+commit_thr(4)
 AR_SIZE=$(( SLICE_SIZE * WINDOW_SIZE + AR_OVERHEAD ))
@@ -81,54 +89,52 @@ CKPT_SLOT_SIZE=$(( 8
     + 4 + CERT_MAX_VALS * DIGEST_SIZE + CERT_MAX_VALS * 4 + 4 + DIGEST_SIZE ))
 CKPT_SLOT_SIZE=$(( (CKPT_SLOT_SIZE + 7) & ~7 ))
 
-CR_SIZE=$(( CKPT_SLOT_SIZE * NUM_CKPT_SLOTS + CKPT_SLOT_SIZE * MAX_NUM_REPLICAS + 8 ))
+CR_SIZE=$(( CKPT_SLOT_SIZE * NUM_CKPT_SLOTS + 8 ))
 
 SR_VC_SLOT=$(sr_slot_size $VC_MSG_MAX)
-SR_VC_ACK_SLOT=$(sr_slot_size $VC_ACK_REP_SIZE)
-SR_NV_SLOT=$(sr_slot_size $VC_MSG_MAX)
-SR_NK_SLOT=$(sr_slot_size $MAX_MESSAGE_SIZE)
-SR_REQ_SLOT=$(sr_slot_size $REQ_MSG_MAX)
+SR_NV_SLOT=$(sr_slot_size $NV_MSG_MAX)
 SR_REP_SLOT=$(sr_slot_size $REP_MSG_MAX)
 
 SR_VC_TOTAL=$(( MAX_NUM_REPLICAS * SR_VC_SLOT ))
-SR_VC_ACK_TOTAL=$(( MAX_NUM_REPLICAS * MAX_NUM_REPLICAS * SR_VC_ACK_SLOT ))
 SR_OVERHEAD=8  # num_replicas(4)+num_clients(4)
 
-SR_SIZE=$(( SR_VC_TOTAL + SR_VC_ACK_TOTAL + SR_NV_SLOT + SR_NK_SLOT
-          + MAX_NUM_CLIENTS * SR_REQ_SLOT + MAX_NUM_CLIENTS * SR_REP_SLOT
-          + SR_OVERHEAD ))
+SR_SIZE=$(( SR_VC_TOTAL + SR_NV_SLOT + MAX_NUM_CLIENTS * SR_REP_SLOT + SR_OVERHEAD ))
 
 RQUEUE_ENTRY_SIZE=$(( MAX_MESSAGE_SIZE + 8 ))  # buf(2048)+len(4)+ro(1)+used(1)+pad(2)
 RQUEUE_SIZE_ONE=$(( RQUEUE_MAX * RQUEUE_ENTRY_SIZE + 12 ))  # entries + head(4)+tail(4)+count(4)
 RQUEUE_BOTH=$(( RQUEUE_SIZE_ONE * 2 ))
 
-COWB_SIZE=$(( ((MAX_STATE_BLOCKS + 63) / 64) * 8 ))
-PTREE_EST=56
-CKPT_RECORD_SIZE=52
+COWB_SIZE=$(( (MAX_STATE_BLOCKS / 64 + 1) * 8 ))
+PTREE_EST=40
+CKPT_RECORD_SIZE=48
 FETCH_QUEUE=$(( MAX_STATE_BLOCKS * 12 ))
 FETCH_RECV=$(( ((MAX_STATE_BLOCKS + 63) / 64) * 8 ))
 
-STATE_SIZE=$(( 16 + COWB_SIZE + PTREE_EST
+# 136 = pointers, counters, fetch bookkeeping and the fetch target digest
+STATE_SIZE=$(( 136 + COWB_SIZE + PTREE_EST
     + MAX_STATE_BLOCKS * DIGEST_SIZE
     + NUM_CKPT_SLOTS * CKPT_RECORD_SIZE
-    + 8 + 8 + 8
-    + FETCH_QUEUE + 4 + 4 + 8 + 8 + 4 + 4
-    + FETCH_RECV + 8 ))
+    + FETCH_QUEUE + FETCH_RECV ))
 
 PRINCPTRS=$(( (MAX_NUM_REPLICAS + MAX_NUM_CLIENTS) * 4 ))
 TIMER_EST=16
-NODE_SIZE=$(( 36 + PRINCPTRS + 4 + 4 + 4 + MAX_MESSAGE_SIZE + TIMER_EST + 8 + 8 ))
+NODE_SIZE=$(( 28 + PRINCPTRS + 4 + 4 + 4 + MAX_MESSAGE_SIZE + TIMER_EST + 8 + 8 ))
 
-SCALARS=52   # seqno(8)+last_assigned_*(4+8+8+8+8+8)
-VI_EST=256
-TIMERS2=32
-PERIODS=16
-CALLBACKS=16
-MISC=9
+VI_EST=$(align8 $(( 32 + MAX_NUM_REPLICAS + 8 * MAX_NUM_REPLICAS )))
+# per-principal request-id counters (received, executed, forwarded, assigned)
+RID_ARRAYS=$(( 4 * (MAX_NUM_REPLICAS + MAX_NUM_CLIENTS) * 8 ))
+# per-replica view-change and Status tracking, per-client reply times
+PEER_ARRAYS=$(align8 $(( 6 * 8 * MAX_NUM_REPLICAS + MAX_NUM_REPLICAS + 8 * MAX_NUM_CLIENTS )))
+FIXED=184    # sequence numbers, timers, callbacks, statistics
 
-REPLICA_SIZE=$(( NODE_SIZE + SCALARS + RQUEUE_BOTH + AR_SIZE + CR_SIZE + SR_SIZE
-    + STATE_SIZE + VI_EST + TIMERS2 + PERIODS + CALLBACKS
-    + NDET_BUF_SIZE + MAX_MESSAGE_SIZE + MISC ))
+REPLICA_SIZE=$(( NODE_SIZE + RQUEUE_BOTH + AR_SIZE + CR_SIZE + SR_SIZE
+    + STATE_SIZE + VI_EST + NDET_BUF_SIZE + MAX_MESSAGE_SIZE + SYS_STATE_SIZE
+    + RID_ARRAYS + PEER_ARRAYS + FIXED ))
+
+# Heap used besides the replica struct: a copy of every state block at the
+# latest checkpoint (served to replicas that fetch the state)
+STATE_BLOCKS=$(( APP_STATE_SIZE / BLOCK_SIZE + SYS_STATE_SIZE / BLOCK_SIZE ))
+IMAGE_SIZE=$(( STATE_BLOCKS * BLOCK_SIZE ))
 
 format_size() {
     awk "BEGIN {printf \"%7d  (%5.1f KB)\", $1, $1/1024}"
@@ -163,13 +169,10 @@ row "prepared_cert_t" $PREPARED_CERT_SIZE
 row "agreement_slice_t" $SLICE_SIZE
 row "agreement_region (ar) [${WINDOW_SIZE}x]" $AR_SIZE
 row "ckpt_slot_t" $CKPT_SLOT_SIZE
-row "checkpoint_region (cr) [${NUM_CKPT_SLOTS}+${MAX_NUM_REPLICAS}]" $CR_SIZE
+row "checkpoint_region (cr) [${NUM_CKPT_SLOTS}x]" $CR_SIZE
 row "" 0
 row "sr: view_change [${MAX_NUM_REPLICAS}x]" $SR_VC_TOTAL
-row "sr: vc_ack [${MAX_NUM_REPLICAS}x${MAX_NUM_REPLICAS}]" $SR_VC_ACK_TOTAL
 row "sr: new_view" $SR_NV_SLOT
-row "sr: new_key" $SR_NK_SLOT
-row "sr: request [${MAX_NUM_CLIENTS}x]" $((MAX_NUM_CLIENTS * SR_REQ_SLOT))
 row "sr: reply [${MAX_NUM_CLIENTS}x]" $((MAX_NUM_CLIENTS * SR_REP_SLOT))
 row "special_region (sr) total" $SR_SIZE
 row "" 0
@@ -182,7 +185,9 @@ row "view_info_t" $VI_EST
 row "" 0
 row "ndet_buf" $NDET_BUF_SIZE
 row "out_buf" $MAX_MESSAGE_SIZE
-row "scalars + timers + callbacks" $((SCALARS + TIMERS2 + PERIODS + CALLBACKS + MISC))
+row "client table [${MAX_NUM_CLIENTS}x${CLIENT_ENTRY_SIZE}, in blocks]" $SYS_STATE_SIZE
+row "request-id + peer tracking arrays" $((RID_ARRAYS + PEER_ARRAYS))
+row "scalars + timers + callbacks" $FIXED
 
 echo ""
 echo "  ───────────────────────────────────────────────────────"
@@ -206,11 +211,12 @@ fi
 
 # Heap estimate
 STACK=8192
-HEAP_EST=$(( REPLICA_SIZE + STACK + 8192 ))  # +8K for system overhead
+HEAP_EST=$(( REPLICA_SIZE + IMAGE_SIZE + STACK + 8192 ))  # +8K for system overhead
 HEAP_KB=$(awk "BEGIN {printf \"%.1f\", $HEAP_EST/1024}")
 echo ""
 echo "── Heap estimate ──"
-printf "  replica + stack + overhead = %d bytes (%.1f KB)\n" $HEAP_EST $HEAP_KB
+printf "  checkpoint image = %d blocks x %d = %d bytes\n" $STATE_BLOCKS $BLOCK_SIZE $IMAGE_SIZE
+printf "  replica + image + stack + overhead = %d bytes (%.1f KB)\n" $HEAP_EST $HEAP_KB
 echo "  ESP32-C3 typical free: ~80–100 KB"
 if [ $HEAP_EST -le 100000 ]; then
     echo "  => should fit"
