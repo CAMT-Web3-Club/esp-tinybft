@@ -12,6 +12,9 @@ for i in 0 1 2 3; do
     rm spiffs_image/priv$i.pem spiffs_image/pub$i.pem
 done
 
+# The last three lines of each config file are the protocol timeouts.
+# TinyBFT does not use them (menuconfig: TinyBFT Configuration > Timeouts, set
+# in sdkconfig.defaults), so they are written as 0.
 echo "Generating UDP config..."
 cat <<EOF > spiffs_image/config_udp.txt
 wallet
@@ -23,9 +26,9 @@ node0 127.0.0.1 5000 /spiffs/pub0.der
 node1 127.0.0.1 5001 /spiffs/pub1.der
 node2 127.0.0.1 5002 /spiffs/pub2.der
 node3 127.0.0.1 5003 /spiffs/pub3.der
-2000
-5000
-10000
+0
+0
+0
 EOF
 
 echo "Generating ESP-NOW config (3 replicas + 1 client, f=1)..."
@@ -39,9 +42,9 @@ node0 88:56:a6:5b:76:ac /spiffs/pub0.der
 node1 e8:3d:c1:8c:18:58 /spiffs/pub1.der
 node2 88:56:a6:5b:7c:ac /spiffs/pub2.der
 client3 1c:db:d4:c6:41:14 /spiffs/pub3.der
-60000
-5000
-10000
+0
+0
+0
 EOF
 
 echo "Done."

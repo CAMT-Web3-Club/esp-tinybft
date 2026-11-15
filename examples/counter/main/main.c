@@ -267,6 +267,14 @@ int exec_cb(Byz_req *in, Byz_rep *out, Byz_buffer *ndet, int cid, bool ro) {
 [[maybe_unused]] static constexpr int EXAMPLE_LISTEN_INTERVAL = 0;  /* only used with WIFI_PS_MAX_MODEM */
 #endif
 
+/* The protocol timeouts of the build (TinyBFT Configuration > Timeouts), the
+ * same keys in both transports' BANNER. */
+#define BANNER_TIMEOUTS_FMT "vc_ms=%d status_ms=%d recovery_ms=%d retx_ms=%d reply_ms=%d "
+#define BANNER_TIMEOUTS_ARGS                                              \
+    CONFIG_TBFT_VIEW_CHANGE_TIMEOUT_US / 1000, CONFIG_TBFT_STATUS_TIMEOUT_US / 1000, \
+    CONFIG_TBFT_RECOVERY_TIMEOUT_US / 1000, CONFIG_TBFT_CLIENT_RETRANSMIT_MS,      \
+    CONFIG_TBFT_CLIENT_REPLY_TIMEOUT_MS
+
 /* Printed at WARN so it survives CONFIG_LOG_DEFAULT_LEVEL_WARN: proves which
  * configuration each board runs (every menuconfig setting of the experiment,
  * plus the role found in the node list and the node id). */
@@ -280,7 +288,7 @@ static void print_banner(bool replica, int local_id) {
     esp_wifi_get_ps(&ps);
     ESP_LOGW(TAG, "BANNER role=%s role_from=%s id=%d transport=udp ps=%s listen_interval=%d "
              "min_active_ms=%d mcast=%d static_ip=%d ch=%d pm=%d hz=%d "
-             "idle_wait_ms=%d req_interval_ms=%d build=%s "
+             "idle_wait_ms=%d req_interval_ms=%d " BANNER_TIMEOUTS_FMT "build=%s "
              "mac=%02x:%02x:%02x:%02x:%02x:%02x",
              replica ? "replica" : "client", EXAMPLE_ROLE_FROM, local_id,
              ps == WIFI_PS_NONE ? "none" : ps == WIFI_PS_MIN_MODEM ? "min" : "max",
@@ -288,12 +296,13 @@ static void print_banner(bool replica, int local_id) {
              CONFIG_ESP_WIFI_SLP_DEFAULT_MIN_ACTIVE_TIME,
              EXAMPLE_MCAST, EXAMPLE_STATIC_IP_ON, ch,
              EXAMPLE_PM, CONFIG_FREERTOS_HZ, CONFIG_TBFT_IDLE_WAIT_MS,
-             replica ? 0 : EXAMPLE_REQ_INTERVAL_MS, __DATE__ " " __TIME__,
+             replica ? 0 : EXAMPLE_REQ_INTERVAL_MS, BANNER_TIMEOUTS_ARGS,
+             __DATE__ " " __TIME__,
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 #else
     ESP_LOGW(TAG, "BANNER role=%s role_from=%s id=%d transport=espnow if=%s rate=%d retries=%d "
              "retry_delay_ms=%d retry_span_ms=%d window_ms=%d interval_ms=%d bcast=%d ch=%d "
-             "pm=%d hz=%d idle_wait_ms=%d req_interval_ms=%d build=%s "
+             "pm=%d hz=%d idle_wait_ms=%d req_interval_ms=%d " BANNER_TIMEOUTS_FMT "build=%s "
              "mac=%02x:%02x:%02x:%02x:%02x:%02x",
              replica ? "replica" : "client", EXAMPLE_ROLE_FROM, local_id,
 #if CONFIG_TBFT_ESPNOW_IF_STA
@@ -305,7 +314,8 @@ static void print_banner(bool replica, int local_id) {
              TBFT_ESPNOW_RETRY_DELAY_MS, TBFT_ESPNOW_RETRY_SPAN_MS,
              EXAMPLE_EN_WINDOW, EXAMPLE_EN_INTERVAL, EXAMPLE_BCAST, ch,
              EXAMPLE_PM, CONFIG_FREERTOS_HZ, CONFIG_TBFT_IDLE_WAIT_MS,
-             replica ? 0 : EXAMPLE_REQ_INTERVAL_MS, __DATE__ " " __TIME__,
+             replica ? 0 : EXAMPLE_REQ_INTERVAL_MS, BANNER_TIMEOUTS_ARGS,
+             __DATE__ " " __TIME__,
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 #endif
 }

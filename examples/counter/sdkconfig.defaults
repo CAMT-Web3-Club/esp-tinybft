@@ -18,7 +18,7 @@ CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
 CONFIG_TBFT_MAX_NUM_REPLICAS=7
 
 # TinyBFT: aggressive RAM reduction for ESP32-C3 (~80KB app heap)
-# New_key needs 1840 bytes (1584 body + 256 RSA sig). Round to 2048.
+# New_key needs 1848 bytes (1592 body + 256 RSA sig). Round to 2048.
 CONFIG_TBFT_MAX_MESSAGE_SIZE=2048
 CONFIG_TBFT_MAX_REPLY_SIZE=900
 
@@ -38,9 +38,18 @@ CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
 
-# Relax timeouts to accommodate slow RSA operations on ESP32-C3
+# Protocol timeouts: the same for every configuration of the comparison
+# (TinyBFT Configuration > Timeouts; the config file's timeout lines are not
+# used).  View change 30 s, Status every 5 s, state fetch 10 s.
+CONFIG_TBFT_VIEW_CHANGE_TIMEOUT_US=30000000
+CONFIG_TBFT_STATUS_TIMEOUT_US=5000000
+CONFIG_TBFT_RECOVERY_TIMEOUT_US=10000000
+# The client waits 20 s for f+1 matching replies and re-sends its request
+# after 5 s, then 10 s.  Keep the re-send interval above the max_ms that
+# CLIENT_STATS shows for the slowest configuration (tools/analyze.py warns),
+# otherwise a slow request is re-sent although nothing was lost.
 CONFIG_TBFT_CLIENT_REPLY_TIMEOUT_MS=20000
-CONFIG_TBFT_VIEW_CHANGE_TIMEOUT_US=15000000
+CONFIG_TBFT_CLIENT_RETRANSMIT_MS=5000
 
 # Enable IP fragmentation and reassembly for large UDP messages (e.g., New_key)
 CONFIG_LWIP_IP4_FRAG=y

@@ -51,3 +51,10 @@ CONFIG_LWIP_IP4_REASSEMBLY=y
 
 # Enable unicast UDP mode by default to prevent Wi-Fi router multicast packet drops
 CONFIG_TBFT_DISABLE_MULTICAST=y
+
+# Protocol timeouts (TinyBFT Configuration > Timeouts; the config file's
+# timeout lines are not used): view change 60 s, Status every 5 s, state
+# fetch 10 s, as the ESP-NOW config file gave them before.
+CONFIG_TBFT_VIEW_CHANGE_TIMEOUT_US=60000000
+CONFIG_TBFT_STATUS_TIMEOUT_US=5000000
+CONFIG_TBFT_RECOVERY_TIMEOUT_US=10000000

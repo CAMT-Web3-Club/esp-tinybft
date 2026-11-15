@@ -58,7 +58,7 @@ Two menus at the top level of `idf.py menuconfig` belong to this example.
 | ESP-NOW radio > Wake window / Wake interval | only shown for Custom | ms |
 | ESP-NOW radio > Attempts per frame | 3 | minimum number of attempts |
 | ESP-NOW radio > Delay between attempts | 10 ms | only with power saving Off |
-| Protocol sizes, Timeouts | | keep them fixed for the comparison (set in `sdkconfig.defaults`) |
+| Protocol sizes, Timeouts | | keep them fixed for the comparison (set in `sdkconfig.defaults`: view change 30 s, Status 5 s, state fetch 10 s, client re-send 5 s, client reply 20 s). The timeout lines at the end of the config files are not used (`gen_configs.sh` writes 0 there) |
 
 ### Counter Example Configuration (experiment)
 
@@ -170,23 +170,46 @@ All three lines are at WARN level, so they appear with the default log level.
   node id, and every setting that defines the configuration (power saving,
   listen interval, minimum active time, rate, attempts, retry delay and span,
   wake window and interval, broadcast/multicast, channel, power management,
-  tick rate).
+  tick rate), plus the protocol timeouts in ms: `vc_ms` (view change),
+  `status_ms`, `recovery_ms` (state fetch), `retx_ms` (client re-send) and
+  `reply_ms` (client reply).
 - `CLIENT_STATS ok=… fail=… missed=… last_ms=… min_ms=… avg_ms=… max_ms=…`
   after every request. The client sends on a fixed period; `missed` counts
   slots skipped because the previous request was still running.
-- `TBFT_STATS …` every 60 s on replicas and after each request on the client:
-  messages sent (`tx`) and frames handed to the radio (`tx_frames`: every
-  ESP-NOW attempt, fragments and retries included; one per UDP datagram),
-  messages received, send failures, queue drops, executed requests, re-sent
-  commits (`commit_resent`, replicas) and re-sent requests (`req_resent`,
-  client), view changes, state fetches, free heap and its minimum.
+- `TBFT_STATS …` every 60 s on replicas and after each request on the client.
+  - Both: messages sent (`tx`) and frames handed to the radio (`tx_frames`:
+    every ESP-NOW attempt, fragments and retries included; one per UDP
+    datagram), sends given up (`tx_fail`), send-queue drops (`tx_qfull`),
+    messages received (`rx`), receive drops (`rx_drop`, `rx_frag_drop`), free
+    heap and its minimum (`heap`, `heap_min`).
+  - ESP-NOW only (0 with UDP), what happened to each frame: no ACK
+    (`cb_fail`), no send callback within the 2 s safety timeout
+    (`cb_timeout`), refused by `esp_now_send()` (`send_err`), callbacks slower
+    than 100 ms (`cb_slow`) and the slowest one (`cb_max_ms`). `rx_dup` counts
+    frames dropped as an exact repeat of the previous frame from the same
+    sender (its ACK was lost); they are not drops.
+  - Replicas: `view`, `last_exec`, `last_stable`, executed requests, every
+    message sent again (`resent`: re-sent commits, pre-prepares, prepares,
+    checkpoints, new-views, cached replies, New_keys and View_changes;
+    `commit_resent` counts the commits among them), view changes (`vc_sent`,
+    `new_view`) and state fetches (`fetch`). `first_exec` is the sequence
+    number of the first client request the replica executed; the `run_*`
+    counters (`run_vc`, `run_nv`, `run_fetch`, `run_resent`, `run_tx_fail`,
+    `run_drop`) count from there, so the boot phase does not show in them.
+  - Client: the highest `view` of an accepted reply (a view change during the
+    run shows here), received replies (`rx_reply`) and re-sent requests
+    (`req_resent`).
 
   Nothing is re-sent on a timer in a healthy run: replicas re-send only what a
   peer reports missing in its Status, and the client re-sends a request only
   when it has no f+1 matching replies after *Client request retransmission
   interval* (TinyBFT Configuration > Timeouts, 5000 ms by default, doubling).
-  Non-zero `commit_resent` / `req_resent` therefore mean that messages were
-  lost and recovered; `tools/analyze.py` reports them per run.
+  Non-zero `resent` / `req_resent` mean that messages were lost and
+  recovered, or that a request took longer than the re-send interval: compare
+  `max_ms` in `CLIENT_STATS` with `retx_ms` in the BANNER (`tools/analyze.py`
+  warns when the slowest request comes within 80 % of it). Keep the interval
+  above the slowest configuration's `max_ms`, the same for every
+  configuration.
 
 The client keeps a boot counter in NVS (namespace `tbft`) so that its request
 ids keep growing after a reset; the replicas ignore requests whose id is not
@@ -229,10 +252,16 @@ Procedure:
 2. Screen steps 2-4 with one short run per configuration, then repeat the two
    best configurations of each transport at least three times.
 3. Save each run as `runs/<name>-r1/` (`-r2`, …) with one serial log per
-   board (`node0.log` … `node6.log`, `client7.log`; only the client log is
-   required, and it must include the boot `BANNER`) and `energy.csv`
+   board (`node0.log` … `node6.log`, `client7.log`) and `energy.csv`
    (`node,joules[,seconds]` or `node,avg_ma,volts,seconds`). Start the meter
    at the first successful request. Measure the same boards in every run.
+   - The client log is required and must include the boot `BANNER`. It gives
+     success, latency and, from the view of the replies it accepted, any view
+     change.
+   - Keep the logs of all seven replicas, from boot: only they show a state
+     fetch, a reboot (a second `BANNER`) or a replica that joined late.
+   - Keep logging at least 60 s after the last request: replicas print
+     `TBFT_STATS` every 60 s, and the last line must cover the whole run.
 4. Optional baseline: the same image with the client switched off, saved as
    `runs/<name>-base/`, gives the energy added per request.
 
@@ -249,11 +278,18 @@ result; repeat at a second period if the ranking matters at other loads.
 
 `python3 tools/analyze.py runs/` reads `CLIENT_STATS`, `TBFT_STATS`, the
 `BANNER` (for the settings of each configuration) and `energy.csv`, and prints
-success rate, latency, requests per joule, re-sent messages per run, the best
-configuration per transport and whether the difference exceeds one standard
-deviation. It drops runs with view changes or state fetches
-(`--include-faulty` keeps them) and requires `--min-success` (default 95%). It
-is not needed for configuring, building or flashing.
+success rate, average and maximum latency, requests per joule, re-sent
+messages and drops per run, the best configuration per transport and whether
+the difference exceeds one standard deviation. It requires `--min-success`
+(default 95%) and is not needed for configuring, building or flashing.
+
+It drops a run (`--include-faulty` keeps it) when the client saw a view
+change, a board rebooted, a replica joined late (`first_exec` > 1) or a
+replica's `run_*` counters show a view change or a state fetch. It notes runs
+without replica logs (a state fetch cannot be detected then), replica stats
+printed before the run ended and an `energy.csv` that covers another span
+than the requests, and warns when the slowest request comes close to the
+client re-send interval.
 
 ## CPU power management (not part of the comparison)
 

@@ -3,12 +3,14 @@ set -e
 
 mkdir -p spiffs_image
 
-# Protocol timeouts shared by BOTH transports: the energy comparison is only
-# fair if UDP and ESP-NOW recover from loss on the same schedule.
+# The protocol timeouts are set in menuconfig (TinyBFT Configuration >
+# Timeouts; examples/counter/sdkconfig.defaults gives 30 s / 5 s / 10 s).  The
+# config file keeps its timeout lines for the format; TinyBFT does not use
+# them, so they are written as 0.
 AUTH_TIMEOUT_MS=3000      # parsed but currently unused by the library
-VC_TIMEOUT_MS=30000       # view-change timeout
-STATUS_TIMEOUT_MS=5000
-RECOVERY_TIMEOUT_MS=10000
+VC_TIMEOUT_MS=0           # not used: menuconfig
+STATUS_TIMEOUT_MS=0       # not used: menuconfig
+RECOVERY_TIMEOUT_MS=0     # not used: menuconfig
 
 # Keys are only generated when missing (or with --keys): regenerating them
 # invalidates every flashed board.  Config files are always rewritten.
