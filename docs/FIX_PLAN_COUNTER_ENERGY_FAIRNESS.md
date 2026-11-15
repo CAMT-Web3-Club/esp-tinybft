@@ -479,7 +479,7 @@ static bool espnow_tx_frame(tbft_espnow_t *enow, const uint8_t *mac,
 | C3 | replica ข้าม seqno ที่ยังไม่ commit หรือไม่มี pre-prepare | execute ตามลำดับ seqno อย่างเคร่งครัด หยุดที่ seqno แรกที่ยังไม่ครบ quorum หรือยังไม่มี pre-prepare แล้วขอข้อความที่ขาดทันที (Status ที่มี flag `TBFT_STATUS_WANT`) ไม่ข้ามอีก; New_view เสนอ request ที่ prepared แล้วซ้ำใน view ใหม่และใส่ null request ในช่องว่าง; ถ้าตามข้อความไม่ทันจึง fetch state ของ checkpoint ที่ quorum รับรองแล้ว |
 | C4 | execute request ซ้ำได้ | ตาราง client (rid ล่าสุดที่ execute และ reply ของแต่ละ client) เป็นส่วนหนึ่งของ state ที่ replicate, checkpoint และ fetch; request ที่ rid ไม่มากกว่าค่าในตารางไม่ถูก execute อีก ถ้าเป็นตัวล่าสุดจะส่ง reply เดิมซ้ำจาก cache (ไม่เซ็น RSA ใหม่) |
 | C5 | commit ถูกส่งซ้ำตามเวลา 500 ms | เอาออก การส่งซ้ำเกิดเมื่อ Status บอกว่ามีคนขาดข้อความเท่านั้น run ที่ไม่มีข้อความหายจึงมีจำนวนข้อความต่อ request เท่ากันทุก variant |
-| C6 | client ส่ง request ครั้งเดียว | client ส่ง request ซ้ำไปทุก replica หลัง `TBFT_CLIENT_RETRANSMIT_MS` (ค่าเริ่มต้น 5000 ms แล้วเพิ่มเป็นสองเท่าทุกครั้ง) ปลอดภัยเพราะ C4; rid ไม่ย้อนเมื่อ client reboot เพราะเก็บ boot epoch ไว้ใน NVS |
+| C6 | client ส่ง request ครั้งเดียว | client ส่ง request ซ้ำไปทุก replica หลัง `TBFT_CLIENT_RETRANSMIT_MS` (ค่าเริ่มต้น 8000 ms แล้วเพิ่มเป็นสองเท่าทุกครั้ง) ปลอดภัยเพราะ C4; rid ไม่ย้อนเมื่อ client reboot เพราะเก็บ boot epoch ไว้ใน NVS |
 
 **ปัญหาที่พบเพิ่มระหว่างแก้ (แก้แล้วเช่นกัน)**
 
@@ -512,8 +512,23 @@ static bool espnow_tx_frame(tbft_espnow_t *enow, const uint8_t *mac,
 | L5 | ซ่อมข้อความหายช้า (1–2 Status period ต่อข้อความ) เพราะเทียบกับ snapshot ของ Status รอบก่อน | เมื่อ Status จาก peer บอกว่า peer นำหน้า (executed/prepared สูงกว่าเรา) replica จะส่ง Status แบบ `WANT` ทันที (จำกัด 1 ครั้ง/วินาที) เพื่อให้ peer เทียบกับสถานะปัจจุบันและส่งของที่ขาดให้เลย |
 | L8 | broadcast ช้าเมื่อมี peer ตาย: ส่ง unicast ทีละ peer ลอง 3 ครั้งต่อเฟรม และคิวส่งเต็มแล้วบล็อก replica task | จำนับการส่งที่ล้มเหลวติดกันต่อ peer ถ้าเกิน 3 ครั้งจะลองเพียง 1 ครั้งต่อเฟรมจนกว่าจะได้ยินจาก peer นั้นอีก และรีเซ็ตทุก peer ทุก 10 s (probe) เพื่อให้ peer ที่เพิ่ง boot ไม่ถูกจำกัด retry |
 | R1 | `handle_fetch` อ่านนอกขอบเขตเมื่อ `index` ใหญ่ | ปฏิเสธ `index >= tbft_ptree_nodes_at_level(level)` |
+| R3 | command 1461–1724 B ผ่าน `handle_request` แต่ใส่ Pre-prepare ไม่ได้ → primary ทิ้งเงียบๆ ขณะที่ backup เริ่ม vtimer → view change ฟรี | ตรวจ `command_size` กับขนาดที่ใส่ Pre-prepare ได้จริง (หัก `TBFT_NDET_BUF_SIZE`) และปฏิเสธพร้อม log ตั้งแต่รับ request |
+| R4 | `Byz_reset_client` ไม่เช็ค role → เรียกใน replica จะล้าง `s_mem` ~14 KB | ถ้าโปรเซสนี้ไม่ใช่ client จะ log warning แล้วไม่ทำอะไร |
+| R5 | `exec_cb` ได้ `out.size = 0` จึงไม่รู้ความจุของ reply | เพิ่มฟิลด์ `capacity` ใน `Byz_rep` (source-compatible) ตั้งเป็น `TBFT_MAX_REPLY_SIZE` ก่อนเรียก callback |
+| R6 | `fetch_queue` ขาด 1 ช่อง (root + leaf ทุก block) | ขยายเป็น `TBFT_MAX_STATE_BLOCKS + 1` และแก้ขอบเขตที่ใช้ |
+| R7 | ขนาด Data และ New_key ตรวจแค่ตอนรัน | `static_assert` ตอน build (Data = rep + block, New_key = rep + (n-1) slot + sig) |
+| R8 | รับ `num_replicas` มากกว่า 3f+1 ไปจนถึง 4f+2 ทำให้ quorum 2f+1 ไม่ตัดกัน | ปฏิเสธตอน parse config ถ้า `n >= 4f+2` |
+| R9 | reply cache จับคู่ด้วย rid เดียว ถ้า NVS ใช้ไม่ได้ epoch จะเป็น 0 ทุก boot จึงอาจได้ reply เก่า | `Byz_init_client` ล้มเหลวถ้าอ่าน/เขียน boot epoch ไม่ได้ |
+| R10 | คำนวณ MAC ของ softAP โดยทดเลขไปถึง byte 4 แต่ IDF บวกเฉพาะ byte สุดท้าย | บวก/ลบเฉพาะ byte 5 ตาม `mac_addr.c` ของ IDF |
+| R11 | `esp_task_wdt_reset()` จาก task ที่ไม่ได้ subscribe → log error ทุกรอบ | เก็บ flag หลัง subscribe สำเร็จ (replica) และเช็ค `esp_task_wdt_status()` (client) |
 
-ข้อที่ยังไม่แก้ (ให้เจ้าของงานวิจัยกำหนดเวลา): R3–R11 และ X1 ส่วนที่เหลือคือค่า *Client request retransmission interval* ซึ่งต้องวัด `max_ms` ของทุก config บนบอร์ดก่อน (ผลวัดอยู่ท้ายหัวข้อนี้)
+**X1 (ปิดแล้ว):** *Client request retransmission interval* ตั้งเป็น **6000 ms** (Kconfig default + `sdkconfig.defaults` ของ counter) จากผลวัด `max_ms` บนบอร์ด: config ที่แนะนำทั้ง 6 ตัวได้ 1.6–3.8 s → 6 s เหลือ margin 57 % และยังส่งซ้ำได้ 2 ครั้งภายใน reply timeout 20 s
+
+เหตุผลที่เลือกจาก margin ของ latency ไม่ใช่จาก loss run: รันที่ loss 15% สามครั้ง (interval 5 / 8 / 6 s) ได้ 23/25, 14/18 และ 14/17 request — **ความแปรปรวนระหว่างรอบสูงกว่าผลของ interval มาก** จึงสรุปจากรอบเดียวไม่ได้ (ต้องทำซ้ำอย่างน้อย 3 รอบต่อค่าถ้าจะเทียบ) ค่าที่เลือกจึงยึดหลักว่า interval ต้องสูงกว่า `max_ms` ของ config ที่วัดชัดเจน (3.81 s → 6 s = margin 57 %) และยังส่งซ้ำได้ 2 ครั้งใน reply timeout 20 s
+
+`analyze.py` เตือนถ้า `max_ms` ของ config ใดเข้าใกล้ interval (80 %) ซึ่งเป็นตาข่ายกันการตีความผิดถ้าเปลี่ยนไปใช้ config ที่ช้ากว่านี้ (เช่น 50/200 ที่ 6.2 s)
+
+**เหลือข้อเดียว: broadcast** (`en1_bcast`) ยังค้างที่ seqno 2 วินิจฉัยแล้วว่า Prepare ไปถึงไม่ครบ (ตัวอย่าง: node1 ได้ Prepare จาก 3 ตัวจาก 6 ตัวที่ต้องได้ 4 ตัว จึงไม่ prepared และไม่ส่ง Commit) และการซ่อมผ่าน Status ไม่ทันใน 120 s เพราะ Status เองก็ส่งแบบ broadcast ซึ่งไม่มี ACK — ต้องแก้เชิงลึก (เช่น ส่ง broadcast ซ้ำ หรือให้ Status/retransmission เป็น unicast ในโหมดนี้) ก่อนใช้งาน
 
 **ทดสอบ liveness ใต้ loss บนบอร์ดจริง (2026-11-15)**
 

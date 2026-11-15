@@ -497,7 +497,7 @@ typedef struct {
 } tbft_replica_t;
 ```
 
-With the counter example's configuration (7 replicas, window 4, 2048-byte messages, 8 state blocks) `sizeof(tbft_replica_t)` is 79,112 bytes on the ESP32-C3; `examples/counter/memcalc.sh` prints the breakdown.
+With the counter example's configuration (7 replicas, window 4, 2048-byte messages, 8 state blocks) `sizeof(tbft_replica_t)` is 79,128 bytes on the ESP32-C3; `examples/counter/memcalc.sh` prints the breakdown.
 
 ### Where the memory lives
 
@@ -1240,7 +1240,7 @@ View_change entries carry no proof (no prepared certificate) and a New_view is n
 | `TBFT_TRANSPORT_UDP` | bool | -- | -- | UDP over lwIP |
 | `TBFT_TRANSPORT_ESPNOW` | bool | -- | -- | ESP-NOW with fragmentation |
 | `TBFT_PRINT_STATS` | bool | n | -- | Compile in stats |
-| `TBFT_CLIENT_RETRANSMIT_MS` | int | 5000 | 0-120000 | Client re-sends a request without f+1 replies after this time (doubling); 0 = never |
+| `TBFT_CLIENT_RETRANSMIT_MS` | int | 8000 | 0-120000 | Client re-sends a request without f+1 replies after this time (doubling); 0 = never |
 
 ### Derived Constants (src/tbft_config.h)
 

@@ -357,6 +357,7 @@ examples/<name>/
 1. Copy an existing example structure.
 2. Define the app state array, request/response structs, and `exec_cb`.
 3. Run `./gen_configs.sh` to generate RSA keys and config files.
+   The exec callback gets the reply buffer capacity in `Byz_rep.capacity` (`TBFT_MAX_REPLY_SIZE`), so it can bound what it writes; it still sets `Byz_rep.size` to the bytes written, and a callback that leaves `size` at 0 produces an empty reply.
 4. Edit `sdkconfig.defaults` with appropriate `TBFT_MAX_NUM_REPLICAS`, `TBFT_WINDOW_SIZE`, etc.
 5. The `memcalc.sh` script computes the component's static memory before building; `idf.py size` reports what the build really uses. Allocate nothing from the heap in the example either: use the `...Static` FreeRTOS APIs as the examples do.
 
@@ -384,7 +385,7 @@ New_key_bytes = sizeof(tbft_new_key_rep_t)               // 32
 
 With n=7: `32 + 6×260 + 256 = 1848` — `out_buf` (sized to `TBFT_MAX_MESSAGE_SIZE`) must be ≥ this.
 
-**Typical ESP32-C3 budget** (321,296 bytes of DRAM for static data; the rest is heap for ESP-IDF): with 7 replicas keep `WINDOW_SIZE=4` and `MAX_MESSAGE_SIZE=2048`. With the counter example's settings `tbft_replica_t` is 79,112 bytes and the whole ESP-NOW build uses 272,140 bytes of static DRAM, the UDP build 191,188. Run `memcalc.sh` to estimate (its `tbft_replica_t` total matches `sizeof` for that configuration) and `idf.py size` to check.
+**Typical ESP32-C3 budget** (321,296 bytes of DRAM for static data; the rest is heap for ESP-IDF): with 7 replicas keep `WINDOW_SIZE=4` and `MAX_MESSAGE_SIZE=2048`. With the counter example's settings `tbft_replica_t` is 79,128 bytes and the whole ESP-NOW build uses 272,156 bytes of static DRAM, the UDP build 191,204. Run `memcalc.sh` to estimate (its `tbft_replica_t` total matches `sizeof` for that configuration) and `idf.py size` to check.
 
 That leaves 49,156 bytes by the linker, but the heap the firmware really has is larger: the region `0x3FCCE710-0x3FCDC710` is reserved for the bootloader only while it runs (`components/esp_system/ld/esp32c3/memory.ld.in`, `components/heap/port/esp32c3/memory_layout.c`). On the boards the counter reports about 104 KiB free at boot, plus about 14 KiB once the scheduler starts; with the client's node running, `heap_min` stayed at 44-46 KiB through a 7-minute run (8 boards, ESP-NOW defaults). Take the figure from `heap`/`heap_min` in `TBFT_STATS`, not from the link-time number.
 
@@ -416,7 +417,7 @@ Additional Kconfig-sourced constants (with `#ifndef` guards for override):
 
 Every message handler performs bounds and identity checks before touching protocol state:
 
-- `handle_request`: `command_size` validated non-negative and no integer overflow (`command_size <= TBFT_MAX_MESSAGE_SIZE - sizeof(rep) - sizeof(sig)`); `cid` must be a client id (`num_replicas <= cid < num_principals`)
+- `handle_request`: `command_size` must also fit in the Pre-prepare the primary builds around it (`TBFT_MAX_MESSAGE_SIZE - sizeof(pre_prepare_rep) - sizeof(request_rep) - sizeof(sig) - TBFT_NDET_BUF_SIZE`); a larger command would be dropped silently by the primary while the backups armed their view-change timer. `cid` must be a client id (`num_replicas <= cid < num_principals`)
 - `handle_prepare`, `handle_commit`, `handle_checkpoint`, `handle_view_change`, `handle_fetch`: sender id validated `>= 0 && < num_replicas`
 - `handle_meta_data`: `n_parts` validated non-negative and `<= TBFT_P_CHILDREN` before the size arithmetic `sizeof(rep) + n_parts * sizeof(tbft_part_info_t) <= len`
 - `handle_view_change`: `body_size >= sizeof(tbft_view_change_rep_t)` and `body_size <= len` before reading the RSA signature; at most one checkpoint entry and `TBFT_WINDOW_SIZE` request entries, all inside the body
