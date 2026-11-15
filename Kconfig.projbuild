@@ -360,7 +360,7 @@ menu "TinyBFT Configuration"
 
         config TBFT_CLIENT_RETRANSMIT_MS
             int "Client request retransmission interval (milliseconds)"
-            default 5000
+            default 6000
             range 0 120000
             help
                 A client that has not collected f+1 matching replies re-sends
@@ -369,6 +369,13 @@ menu "TinyBFT Configuration"
                 This is what lets a request survive a lost message or a view
                 change. Replicas never execute a request twice: one that has
                 already run is answered from the reply cache.
+
+                Keep it clearly above the slowest request of every
+                configuration you compare, otherwise a request that is merely
+                slow is re-sent and counted as a loss. Measured on the boards
+                (5-minute runs): 1.6-3.8 s for the configurations of the
+                comparison, up to 6.2 s with 50 ms every 200 ms, so 6 s: 57 % above the slowest and still two re-sends inside the 20 s reply timeout. Use
+                the same value for every configuration.
 
                 Keep it above the normal request latency, otherwise a healthy
                 run carries extra traffic. 0 disables retransmission.

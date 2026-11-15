@@ -31,6 +31,20 @@
 
 static constexpr char TAG[] = "tbft_replica";
 
+/* A Data message carries a whole block, and a New_key carries one slot per
+ * other replica: both must fit in one message (review R7). */
+static_assert(sizeof(tbft_data_rep_t) + TBFT_BLOCK_SIZE <= TBFT_MAX_MESSAGE_SIZE,
+              "TBFT_BLOCK_SIZE too large for TBFT_MAX_MESSAGE_SIZE");
+static_assert(sizeof(tbft_new_key_rep_t)
+              + (size_t)(TBFT_MAX_NUM_REPLICAS - 1) * sizeof(tbft_new_key_slot_t)
+              + TBFT_SIG_SIZE <= TBFT_MAX_MESSAGE_SIZE,
+              "TBFT_MAX_MESSAGE_SIZE too small for New_key with this many replicas");
+
+#if CONFIG_ESP_TASK_WDT_EN
+/* Set once the replica task has subscribed to the task watchdog. */
+static bool s_wdt_subscribed;
+#endif
+
 /* Low #8 FIX: Named constants for magic numbers */
 static constexpr int TBFT_YIELD_THRESHOLD     = 16;  /* message loop iterations before cooperative yield */
 static constexpr int TBFT_VC_BACKOFF_MAX_MULT = 60;  /* max multiplier for view-change timeout backoff */
@@ -1098,6 +1112,8 @@ void tbft_replica_run(tbft_replica_t *r)
     esp_err_t err = esp_task_wdt_add(nullptr);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "failed to subscribe to task WDT: %d", err);
+    } else {
+        s_wdt_subscribed = true;
     }
 #endif
 
@@ -1109,7 +1125,9 @@ void tbft_replica_run(tbft_replica_t *r)
 
     while (r->running) {
 #if CONFIG_ESP_TASK_WDT_EN
-        esp_task_wdt_reset();
+        /* Only feed a watchdog this task is subscribed to: resetting from an
+         * unsubscribed task logs an error on every loop iteration. */
+        if (s_wdt_subscribed) esp_task_wdt_reset();
 #endif
 
         /* Periodic yield counter: after processing a burst of messages,
@@ -1310,9 +1328,16 @@ void tbft_replica_handle_request(tbft_replica_t *r, const void *msg, int len)
              req->cid, (unsigned long long)req->rid, req->command_size,
              tbft_replica_is_primary(r) ? 1 : 0);
 
-    if (req->command_size < 0 ||
-        (size_t)req->command_size > TBFT_MAX_MESSAGE_SIZE - sizeof(*req) - sizeof(tbft_sig_t)) {
-        ESP_LOGW(TAG, "request: invalid command_size %d", req->command_size);
+    /* The command must also fit in the Pre-prepare the primary will build
+     * around it: rep + request + signature, and the non-deterministic choices
+     * (bounded by TBFT_NDET_BUF_SIZE).  A request that passes here but does
+     * not fit would be dropped silently by the primary while the backups arm
+     * their view-change timer (review R3). */
+    const size_t cmd_max = TBFT_MAX_MESSAGE_SIZE - sizeof(tbft_pre_prepare_rep_t)
+                         - sizeof(*req) - sizeof(tbft_sig_t) - TBFT_NDET_BUF_SIZE;
+    if (req->command_size < 0 || (size_t)req->command_size > cmd_max) {
+        ESP_LOGW(TAG, "request: invalid command_size %d (max %zu for a Pre-prepare)",
+                 req->command_size, cmd_max);
         return;
     }
     int idx = client_index(r, req->cid);

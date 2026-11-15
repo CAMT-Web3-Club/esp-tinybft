@@ -58,7 +58,10 @@ typedef struct {
     /* Fetch state */
     bool              in_fetch;
     tbft_seqno_t      fetch_seqno;
-    tbft_fetch_req_t  fetch_queue[TBFT_MAX_STATE_BLOCKS];
+    /* One root Meta_data request plus one Data request per block: the root
+     * takes a slot too, so the queue needs one more than there are blocks
+     * (review R6). */
+    tbft_fetch_req_t  fetch_queue[TBFT_MAX_STATE_BLOCKS + 1];
     int               fetch_queue_len;
     int               n_data_pending; /* number of leaf requests dispatched but not fulfilled */
     int64_t           fetch_timeout_us;

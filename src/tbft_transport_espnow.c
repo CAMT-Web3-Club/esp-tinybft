@@ -196,17 +196,18 @@ static constexpr wifi_interface_t TBFT_ESPNOW_IFIDX = WIFI_IF_STA;
 #endif
 
 /* "AP MAC" = the on-air address of the interface ESP-NOW uses.  For the
- * softAP interface it is the base (eFuse) MAC + 1; for the station
- * interface it is the base MAC itself. */
+ * softAP interface it is the base (eFuse) MAC with its LAST byte + 1; for the
+ * station interface it is the base MAC itself.
+ *
+ * Only the last byte, with no carry into the others: that is what ESP-IDF
+ * does (components/esp_hw_support/mac_addr.c: "mac[5] += 1"), so a carry here
+ * would look the peer up under an address it never uses (review R10). */
 static void get_ap_mac(const uint8_t *base_mac, uint8_t *ap_mac) {
     memcpy(ap_mac, base_mac, 6);
 #if !CONFIG_TBFT_ESPNOW_IF_AP
     return;
 #endif
-    for (int i = 5; i >= 0; i--) {
-        ap_mac[i]++;
-        if (ap_mac[i] != 0) break; /* หากไม่เกิด Overflow (255 -> 0) ให้หยุดคำนวณทดบิต */
-    }
+    ap_mac[5]++;
 }
 
 static void get_base_mac(const uint8_t *ap_mac, uint8_t *base_mac) {
@@ -214,11 +215,7 @@ static void get_base_mac(const uint8_t *ap_mac, uint8_t *base_mac) {
 #if !CONFIG_TBFT_ESPNOW_IF_AP
     return;
 #endif
-    for (int i = 5; i >= 0; i--) {
-        uint8_t val = base_mac[i];
-        base_mac[i]--;
-        if (val != 0) break; /* หากไม่เกิด Underflow (0 -> 255) ให้หยุดคำนวณทดบิต */
-    }
+    base_mac[5]--;
 }
 
 /* --------------------------------------------------------------------------

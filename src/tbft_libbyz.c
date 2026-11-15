@@ -315,6 +315,15 @@ static int parse_config(const char *path, tbft_config_t *cfg)
                  TBFT_MAX_NUM_REPLICAS);
         goto fail;
     }
+    /* Quorums are 2f+1 and f+1 whatever n is.  With n >= 4f+2 two quorums no
+     * longer have to intersect (two correct replicas could commit different
+     * requests at one seqno), so refuse such a configuration. */
+    if (cfg->num_replicas >= 4 * cfg->f + 2) {
+        ESP_LOGE(TAG, "num_replicas=%d with f=%d: quorums of 2f+1 do not intersect"
+                 " (need num_replicas <= 3f+1 = %d)", cfg->num_replicas, cfg->f,
+                 3 * cfg->f + 1);
+        goto fail;
+    }
 
     if (!next_int(&rd, &cfg->vc_timeout_ms))       goto fail;
     if (!next_int(&rd, &cfg->status_timeout_ms))   goto fail;
@@ -594,7 +603,12 @@ static tbft_view_t   s_reply_view = -1;
 static constexpr int      TBFT_RID_COUNTER_BITS = 24;
 static constexpr uint64_t TBFT_RID_COUNTER_MASK = (1ULL << TBFT_RID_COUNTER_BITS) - 1;
 
-static uint32_t client_boot_epoch(int client_id)
+/* The client's boot epoch, from NVS.  @return false when NVS is unusable:
+ * without a growing epoch the request ids of a rebooted client start below
+ * the ones the replicas already executed, so they ignore it - and its reply
+ * cache (matched by rid alone) could hand it a stale reply.  Initialisation
+ * fails in that case instead of starting with epoch 0. */
+static bool client_boot_epoch(int client_id, uint32_t *epoch_out)
 {
     char key[NVS_KEY_NAME_MAX_SIZE];
     snprintf(key, sizeof(key), "cl_epoch%d", client_id);
@@ -602,25 +616,30 @@ static uint32_t client_boot_epoch(int client_id)
     nvs_handle_t h;
     esp_err_t err = nvs_open("tbft", NVS_READWRITE, &h);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "client: NVS not available (%s): request ids restart at every boot,"
-                 " so after a reboot the replicas ignore this client until its ids pass"
-                 " the last one they executed. Call nvs_flash_init() first.",
+        ESP_LOGE(TAG, "client: NVS not available (%s): request ids would restart at every"
+                 " boot, so the replicas would ignore this client and a stale reply could"
+                 " match. Call nvs_flash_init() before Byz_init_client().",
                  esp_err_to_name(err));
-        return 0;
+        return false;
     }
     uint32_t epoch = 0;
     err = nvs_get_u32(h, key, &epoch);
     if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
-        ESP_LOGW(TAG, "client: reading the boot epoch failed (%s)", esp_err_to_name(err));
+        ESP_LOGE(TAG, "client: reading the boot epoch failed (%s)", esp_err_to_name(err));
+        nvs_close(h);
+        return false;
     }
     epoch++;
     err = nvs_set_u32(h, key, epoch);
     if (err == ESP_OK) err = nvs_commit(h);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "client: storing the boot epoch failed (%s)", esp_err_to_name(err));
+        nvs_close(h);
+        return false;
     }
     nvs_close(h);
-    return epoch;
+    *epoch_out = epoch;
+    return true;
 }
 
 int Byz_init_client(const char *config_file, const char *priv_config,
@@ -673,7 +692,10 @@ int Byz_init_client(const char *config_file, const char *priv_config,
     s_req_rid = 0;
     s_app_req_in_use = false;
 
-    uint32_t epoch = client_boot_epoch(local_id);
+    uint32_t epoch = 0;
+    if (!client_boot_epoch(local_id, &epoch)) {
+        return -1;
+    }
     s_client->rid_counter = (uint64_t)epoch << TBFT_RID_COUNTER_BITS;
 
     ESP_LOGI(TAG, "client %d initialised (boot epoch %lu)", local_id, (unsigned long)epoch);
@@ -714,8 +736,12 @@ int Byz_send_request(Byz_req *req, bool read_only)
     s_req_len = 0;
     if ((s_client->rid_counter & TBFT_RID_COUNTER_MASK) == TBFT_RID_COUNTER_MASK) {
         /* request counter used up: continue in a new epoch */
-        s_client->rid_counter =
-            (uint64_t)client_boot_epoch(s_client->node_id) << TBFT_RID_COUNTER_BITS;
+        uint32_t next_epoch = 0;
+        if (client_boot_epoch(s_client->node_id, &next_epoch)) {
+            s_client->rid_counter = (uint64_t)next_epoch << TBFT_RID_COUNTER_BITS;
+        } else {
+            ESP_LOGE(TAG, "client: cannot advance the boot epoch, request id stays put");
+        }
     }
     tbft_request_rep_t *rep = (tbft_request_rep_t *)out;
     rep->hdr.tag      = TBFT_MSG_REQUEST;
@@ -811,7 +837,9 @@ int Byz_recv_reply(Byz_rep *rep)
         if (n < (int)sizeof(tbft_reply_rep_t)) {
             tbft_node_wait(s_client, 100);   /* woken at once by an arriving reply */
 #if CONFIG_ESP_TASK_WDT_EN
-            esp_task_wdt_reset();
+            /* The client's task is subscribed by the application; feeding a
+             * watchdog from a task that is not subscribed only logs errors. */
+            if (esp_task_wdt_status(nullptr) == ESP_OK) esp_task_wdt_reset();
 #endif
             continue;
         }
@@ -986,6 +1014,12 @@ void Byz_free_reply(Byz_rep *rep)
 
 void Byz_reset_client(void)
 {
+    /* s_cm is shared by the client and the replica; clearing it from a
+     * replica would wipe the replica's own state (~14 KB). */
+    if (!s_client) {
+        ESP_LOGW(TAG, "Byz_reset_client: this process is not a client, ignored");
+        return;
+    }
     memset(s_cm->replies, 0, sizeof(s_cm->replies));
     s_reply_count = 0;
 }
@@ -1006,7 +1040,8 @@ static int exec_adapter(const void *req, int req_len,
 {
     if (!s_exec_cb) return -1;
     Byz_req in  = { .contents = (char *)req, .size = req_len };
-    Byz_rep out = { .contents = (char *)rep, .size = 0 };
+    Byz_rep out = { .contents = (char *)rep, .size = 0,
+                    .capacity = TBFT_MAX_REPLY_SIZE };
     Byz_buffer nd = { .contents = (char *)ndet, .size = ndet_len };
     int r = s_exec_cb(&in, &out, &nd, cid, ro);
     if (r == 0 && rep_len) *rep_len = out.size;
@@ -1025,7 +1060,7 @@ static void comp_ndet_adapter(tbft_seqno_t seqno,
 static void recv_reply_adapter(const void *rep, int rep_len, int cid)
 {
     if (!s_recv_reply_cb) return;
-    Byz_rep r = { .contents = (char *)rep, .size = rep_len };
+    Byz_rep r = { .contents = (char *)rep, .size = rep_len, .capacity = rep_len };
     s_recv_reply_cb(&r, cid);
 }
 

@@ -141,7 +141,7 @@ VI_EST=$(align8 $(( 32 + MAX_NUM_REPLICAS + 8 * MAX_NUM_REPLICAS )))
 RID_ARRAYS=$(( 4 * (MAX_NUM_REPLICAS + MAX_NUM_CLIENTS) * 8 ))
 # per-replica view-change and Status tracking, per-client reply times
 PEER_ARRAYS=$(align8 $(( 6 * 8 * MAX_NUM_REPLICAS + MAX_NUM_REPLICAS + 8 * MAX_NUM_CLIENTS )))
-FIXED=264    # sequence numbers, timers, event group, callbacks, statistics
+FIXED=280    # sequence numbers, timers, event group, callbacks, statistics
 
 REPLICA_SIZE=$(( NODE_SIZE + RQUEUE_BOTH + AR_SIZE + CR_SIZE + SR_SIZE
     + STATE_SIZE + VI_EST + NDET_BUF_SIZE + MAX_MESSAGE_SIZE + SYS_STATE_SIZE

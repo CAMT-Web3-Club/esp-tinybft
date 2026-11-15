@@ -95,7 +95,13 @@ typedef struct {
 /** Reply buffer (filled by Byz_recv_reply) */
 typedef struct {
     char *contents; /**< Reply payload */
-    int   size;     /**< Size of reply payload in bytes */
+    int   size;     /**< Size of reply payload in bytes (set by the callback) */
+    /** Bytes available at contents.  The library sets it before calling the
+     *  exec callback (TBFT_MAX_REPLY_SIZE) and the reply callback (the actual
+     *  length), so a callback can bound what it writes instead of trusting
+     *  that it fits.  Callbacks that do not set @c size still produce an
+     *  empty reply, as before. */
+    int   capacity;
 } Byz_rep;
 
 /** Generic byte buffer passed as non-deterministic choices */

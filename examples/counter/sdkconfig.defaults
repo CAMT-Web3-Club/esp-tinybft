@@ -49,7 +49,7 @@ CONFIG_TBFT_RECOVERY_TIMEOUT_US=10000000
 # CLIENT_STATS shows for the slowest configuration (tools/analyze.py warns),
 # otherwise a slow request is re-sent although nothing was lost.
 CONFIG_TBFT_CLIENT_REPLY_TIMEOUT_MS=20000
-CONFIG_TBFT_CLIENT_RETRANSMIT_MS=5000
+CONFIG_TBFT_CLIENT_RETRANSMIT_MS=6000
 
 # Enable IP fragmentation and reassembly for large UDP messages (e.g., New_key)
 CONFIG_LWIP_IP4_FRAG=y
