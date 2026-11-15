@@ -38,8 +38,12 @@ menu "Counter Example Configuration"
         range 1 13
         depends on TBFT_TRANSPORT_ESPNOW
         help
-            Channel all boards use for ESP-NOW. Use the same channel as the
-            router in the UDP runs so both transports share the RF environment.
+            Channel all boards use for ESP-NOW. Use a channel that is free,
+            not the access point's channel: measured on 8 boards, ESP-NOW on
+            the AP's channel lost 27 % of its MAC ACKs at 1 Mbps and the
+            receive power-saving modes stopped working altogether, while a
+            free channel lost none. The UDP runs are on the AP's channel by
+            nature; report the two channels in the results.
 
     menu "Wi-Fi station (UDP)"
         depends on TBFT_TRANSPORT_UDP
