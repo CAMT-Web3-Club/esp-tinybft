@@ -67,6 +67,8 @@ menu "TinyBFT Configuration"
 
             config TBFT_ESPNOW_RATE_IDF_DEFAULT
                 bool "1 Mbps (ESP-IDF default, rate not set)"
+            config TBFT_ESPNOW_RATE_11M
+                bool "11 Mbps (802.11b)"
             config TBFT_ESPNOW_RATE_6M
                 bool "6 Mbps (802.11g)"
             config TBFT_ESPNOW_RATE_MCS0
@@ -81,6 +83,7 @@ menu "TinyBFT Configuration"
 
         config TBFT_ESPNOW_PHY_RATE
             int
+            default 3 if TBFT_ESPNOW_RATE_11M
             default 11 if TBFT_ESPNOW_RATE_6M
             default 16 if TBFT_ESPNOW_RATE_MCS0
             default 9 if TBFT_ESPNOW_RATE_24M

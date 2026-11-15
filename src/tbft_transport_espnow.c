@@ -622,10 +622,20 @@ static void espnow_send_task(void *pvParameters) {
             xSemaphoreGive(enow->lock);
 
 #if CONFIG_TBFT_ESPNOW_BROADCAST
-            if (espnow_do_send_mac(enow, k_bcast_mac, this_msg_id, entry.buf, (size_t)entry.len) <= 0) {
-                enow->stats.tx_fail++;
+            /* A message that needs more than one frame cannot be broadcast
+             * safely: a broadcast frame is sent once and never acknowledged,
+             * so one lost fragment loses the whole message, and the receiver
+             * holds a reassembly slot for 5 s meanwhile.  New_key (1848 B) is
+             * the only such message; send it unicast, where the MAC ACK and
+             * the retries apply.  Measured with all eight boards: broadcast
+             * New_key fragments were lost often enough that keys never
+             * completed (verify_mac_in failures, a view change). */
+            if ((size_t)entry.len <= FRAG_MAX_PAYLOAD) {
+                if (espnow_do_send_mac(enow, k_bcast_mac, this_msg_id, entry.buf, (size_t)entry.len) <= 0) {
+                    enow->stats.tx_fail++;
+                }
+                continue;
             }
-            continue;
 #endif
             for (int i = 0; i < limit; i++) {
                 if (i == enow->local_id) continue;
