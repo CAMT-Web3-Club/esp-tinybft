@@ -531,7 +531,8 @@ static bool espnow_tx_frame(tbft_espnow_t *enow, const uint8_t *mac,
 - build ESP-IDF 6.1 ผ่านตามหัวข้อ 1.1
 - บนบอร์ดจริง (8 บอร์ด, ESP-NOW ค่าเริ่มต้น, run 8 นาที): ผ่าน 48/48 request ไม่มี view change ไม่มี reboot ดูตัวเลขเทียบก่อน/หลังแก้ X8 ในหัวข้อ "ผลบนบอร์ด" ท้ายหัวข้อนี้
 - fault บนบอร์ดจริง: reset primary กลาง run (view change ไป view 1 ตามที่ควร) และ reset backup (ตามทันโดยไม่เกิด view change) exactly-once และ state agreement ยังถูกต้อง
-- **ยังไม่ได้ทดสอบบนบอร์ดจริง:** config อื่น (54 Mbps, power saving, broadcast, UDP) และ L1/L2/L4/L7 ภายใต้ loss จริง simulator ไม่มีวิทยุ ไม่มี RSA จริง และจังหวะเวลาไม่ใช่ของ ESP32-C3
+- ทดสอบครบทุก configuration ของ README บนบอร์ดจริงแล้ว (ตารางในหัวข้อ "ผลทดสอบครบทุก configuration") ยกเว้น broadcast ที่ยังใช้ไม่ได้
+- **ยังไม่ได้ทดสอบ:** L1/L2/L4/L7 ภายใต้ loss จริง (simulator ไม่ได้รัน) และ broadcast ที่ยังค้างที่ seqno 2
 
 **ผลบนบอร์ด (2026-11-15, 8 บอร์ด ESP32-C3 SuperMini ต่อตรงกับพอร์ต USB บนเมนบอร์ด)**
 
@@ -564,6 +565,46 @@ static bool espnow_tx_frame(tbft_espnow_t *enow, const uint8_t *mac,
 สรุป: exactly-once และ state agreement ยังถูกต้องบนบอร์ดจริงเมื่อ primary ถูก reset กลาง run และเมื่อ replica ถูก reset
 
 หมายเหตุ: บอร์ดสามตัวเคยต่อผ่าน hub ที่มีปัญหา USB ทำให้ enumeration ล้มเหลว (`error -110/-71`) และ flash ไม่ได้ หลังย้ายมาต่อตรงกับเมนบอร์ดแล้ว run ทั้ง 8 บอร์ดผ่านตลอด
+
+**ผลทดสอบครบทุก configuration (2026-11-15, 8 บอร์ด, 5 นาทีต่อ config, client ส่งทุก 10 s, request แรกหลัง boot ไม่นับใน latency)**
+
+ESP-NOW รันบน channel 1 (ช่องว่าง) เพราะ channel 10 (ช่องของ AP) ทำให้ ACK หาย ดูข้อ 2 ด้านล่าง
+
+| config | สำเร็จ | latency เฉลี่ย/สูงสุด (ms) | heap_min | หมายเหตุ |
+|---|---|---|---|---|
+| en1 (1 Mbps) | 29/29 | 2366 / 2661 | 44.2 KB | |
+| en1_w50i100 | 29/29 | 2946 / 3808 | 44.6 KB | PS เพิ่ม latency ~0.6 s |
+| en1_w110i200 | 29/29 | 2790 / 3458 | 44.9 KB | |
+| en1_w50i200 | 27/28 | 4322 / 6224 | 44.0 KB | ช้าสุดในกลุ่ม PS, มี tx_fail 25 |
+| en1_t8 (8 attempts) | 29/29 | 2411 / 2696 | 44.2 KB | ไม่ต่างจาก 3 attempts |
+| en65 (MCS7, 65 Mbps) | 30/30 | **1598 / 1627** | 44.8 KB | เร็วสุด |
+| en6 (6 Mbps) | 0/10 | - | 44.7 KB | ACK หาย 100 % (829/830) |
+| en6_5 (MCS0) | 0/10 | - | 44.8 KB | ACK หาย 100 % |
+| en24 | 0/10 | - | 44.8 KB | ACK หาย 90 % |
+| en54 | 0/10 | - | 44.8 KB | ACK หาย 100 % บน ch1 (90 % บน ch10) |
+| en1_bcast | 0/10 | - | 45.0 KB | ค้างที่ seqno 2 แล้วเกิด view change (ดูข้อ 3) |
+
+UDP รันบน channel 10 (AP) ผ่าน DHCP reservation
+
+| config | สำเร็จ | latency เฉลี่ย/สูงสุด (ms) | heap_min |
+|---|---|---|---|
+| udp_none | 29/29 | **1644 / 1710** | 53.7 KB |
+| udp_min | 29/29 | 2162 / 2397 | 58.5 KB |
+| udp_max3 | 29/29 | 2299 / 2496 | 61.1 KB |
+| udp_max10 | 29/29 | 4170 / 4738 | 54.4 KB |
+| udp_min_a20 | 28/28 | 2093 / 2545 | 54.3 KB |
+| udp_max3_a20 | 29/29 | 2314 / 2588 | 55.3 KB |
+| udp_none_mcast | 29/29 | 1895 / 2336 | 64.3 KB |
+| udp_min_mcast | 27/27 | 2285 / 11110 | 64.3 KB |
+
+**ข้อค้นพบจากการทดสอบครบทุก config**
+
+1. **PHY rate: เฉพาะ 1 Mbps และ MCS7 (65 Mbps) ที่ใช้งานได้** 6 / 6.5 / 11 / 24 / 54 Mbps ทำให้ MAC ACK หาย 73–100 % (6 และ 54 วัดซ้ำสองรอบ สองช่องสัญญาณ ได้ผลเดิม) ความล้มเหลวกระจายเท่ากันทุก peer (57–58 ครั้งต่อ peer) จึงไม่ใช่การลงทะเบียน peer ผิด และไม่ใช่ช่องสัญญาณ — ต้องสอบถาม Espressif หรือลอง IDF 6.0.1 เทียบ (Docker ของโปรเจกต์ใช้ 6.0.1) ก่อนสรุปว่าเป็นข้อจำกัดของฮาร์ดแวร์ **ผลต่อการทดลอง: มิติ rate เหลือ 1 Mbps กับ MCS7 เท่านั้น** เพิ่มตัวเลือก 11 Mbps (11b) ใน Kconfig แล้วเพื่อทดสอบข้อนี้
+2. **ช่องสัญญาณของ ESP-NOW ต้องไม่ทับกับ AP** บน channel 10 (ช่อง AP) ที่ 1 Mbps มี ACK หาย 257/955 (27 %) และโหมดประหยัดพลังงานล้มทั้งกลุ่ม (`en1_w110i200` ได้ 0/10 บน ch10 แต่ 29/29 บน ch1) บน channel 1 ไม่มี ACK หายเลยใน run ปกติ → ควรตั้ง `ESP-NOW Wi-Fi channel` เป็นช่องว่าง ไม่ใช่ช่อง router (ขัดกับคำแนะนำเดิมใน README ที่ให้ใช้ช่อง router)
+3. **Broadcast ยังใช้ไม่ได้** `en1_bcast` ได้ 0/10: cluster execute ถึง seqno 1 แล้วค้างที่ seqno 2 เกิด view change และ client ไม่เคยได้ f+1 reply ที่ตรงกัน พบข้อบกพร่องหนึ่งข้อและแก้แล้ว (ข้อความที่ต้องแยก fragment คือ New_key ถูกส่ง broadcast ซึ่งไม่มี ACK/retry ทำให้ fragment หายและ key ไม่ครบ — ตอนนี้ส่ง unicast แม้เปิด broadcast) แต่ยังไม่พอ ต้องแก้ต่อก่อนใช้ในงานวิจัย
+4. **โหมดประหยัดพลังงานของ ESP-NOW ทำงานได้** แต่เพิ่ม latency: 2.37 s (ปิด) → 2.79–2.95 s (50/100, 110/200) → 4.32 s (50/200)
+5. **UDP ผ่านทุกโหมด** รวม PS max, listen interval 10, multicast และ min active 20; `udp_max10` ช้าที่สุด (4.17 s) ตามคาบตื่น และ `udp_min_mcast` มี request หนึ่งใช้ 11.1 s (เกินคาบ re-send 5 s → ตรงกับข้อ X1 ที่ต้องเพิ่ม *Client request retransmission interval*)
+6. heap ต่ำสุดของ ESP-NOW ~44 KB และ UDP ~54–64 KB ตลอดทุก run ไม่มี reboot
 
 ## 7. ระเบียบวิธีการวัด
 

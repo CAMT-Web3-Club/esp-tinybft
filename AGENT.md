@@ -178,6 +178,8 @@ ESP-NOW v2.0 limits each packet to 1470 bytes. Messages exceeding this are autom
 
 The send task has one frame in flight at a time: after `esp_now_send()` it waits for that frame's send callback (the MAC-layer ACK result) before a retry or the next frame, as the ESP-NOW guide recommends and `examples/wifi/espnow` does. The 2 s timeout is only a safety net (the slowest callback measured on the boards was 908 ms). The earlier 100 ms timeout re-sent frames the driver still held when the channel was busy (8 boards at 1 Mbps exchanging 1848-byte New_keys at boot): every copy held a Wi-Fi TX buffer from the heap (free heap fell to about 4 KB), the copies congested the channel further, and a late callback was taken as the next frame's result. `TBFT_STATS` reports the outcomes (`cb_fail`, `cb_timeout`, `send_err`, `cb_slow`, `cb_max_ms`).
 
+With `TBFT_ESPNOW_BROADCAST` a message that needs more than one frame is still sent unicast, peer by peer: a broadcast frame is sent once and never acknowledged, so one lost fragment loses the whole message (New_key, 1848 B) and the receiver holds a reassembly slot for 5 s meanwhile. Measured with 8 boards, broadcast New_key lost fragments often enough that the keys never completed. Broadcast as a mode still stalls at a sequence number on the boards and is not usable yet.
+
 The receiver drops an exact repeat of the last frame from the same sender (`rx_dup`): a frame whose MAC ACK was lost is sent again with the same `msg_id`, fragment and length. The ESP-NOW guide leaves this to the application. Without it a repeated New_key was delivered twice and a repeated Status looked like a peer that was still behind, which made the receiver re-send messages nobody needed.
 
 `espnow_recv_cb` runs in the **WiFi task context** (not an ISR); standard task-context FreeRTOS APIs (`xSemaphoreTake`, `xQueueSend`) are used throughout.
@@ -203,7 +205,7 @@ When using ESP-NOW, the host application must:
 1. Initialize WiFi (`esp_wifi_init`, `esp_wifi_set_mode`, `esp_wifi_start`)
    - The interface is chosen by `CONFIG_TBFT_ESPNOW_IF_STA` (default) or `CONFIG_TBFT_ESPNOW_IF_AP`; **every board must use the same one**. STA: `esp_wifi_set_mode(WIFI_MODE_STA)`, never connect, set the channel after `esp_wifi_start()`. AP (legacy) uses the softAP MAC = base MAC + 1 and keeps the radio on with beacons.
 2. Call `esp_now_init()` before `Byz_init_*()`. The ESP-NOW transport then registers its own `esp_now_recv_cb` and `esp_now_send_cb`
-3. Peer MAC addresses are registered via `esp_now_add_peer` automatically (PHY rate from `TBFT_ESPNOW_RATE_*` via `esp_now_set_peer_rate_config()`)
+3. Peer MAC addresses are registered via `esp_now_add_peer` automatically (PHY rate from `TBFT_ESPNOW_RATE_*` via `esp_now_set_peer_rate_config()`). Measured on 8 boards with ESP-IDF 6.1, only 1 Mbps and 65 Mbps (MCS7) deliver reliably; 6, 6.5, 11, 24 and 54 Mbps lose 73–100 % of the MAC ACKs, uniformly over all peers and on two channels. Check this again (another IDF version, or Espressif) before relying on a rate in between
 4. Receive power saving (`TBFT_ESPNOW_POWER_*`, station only) is applied by the transport right after the callbacks: `esp_wifi_set_ps(WIFI_PS_MIN_MODEM)`, `esp_now_set_wake_window()`, `esp_wifi_connectionless_module_set_wake_interval()`. Retry timing follows from it (`TBFT_ESPNOW_RETRY_DELAY_MS` / `_SPAN_MS` in `tbft_config.h`: half window, interval + 20 ms). With it Off the app may set `WIFI_PS_NONE`
 
 ### TinyBFT static memory model

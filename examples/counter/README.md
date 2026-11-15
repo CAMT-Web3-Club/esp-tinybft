@@ -52,8 +52,8 @@ Two menus at the top level of `idf.py menuconfig` belong to this example.
 | Transport | UDP over Wi-Fi, ESP-NOW (default here) | all boards the same |
 | UDP: send protocol broadcasts as one datagram per replica | on (default here); off = IP multicast | UDP only |
 | ESP-NOW radio > Wi-Fi interface | Station (default), SoftAP | keep Station: no beacons, and power saving needs it |
-| ESP-NOW radio > PHY rate | 1 (ESP-IDF default), 6, 6.5 (MCS0), 24, 54, 65 (MCS7) Mbps | per peer, `esp_now_set_peer_rate_config()` |
-| ESP-NOW radio > Send protocol broadcasts as one broadcast frame | off (default), on | on: no ACK and no retry |
+| ESP-NOW radio > PHY rate | 1 (ESP-IDF default), 11, 6, 6.5 (MCS0), 24, 54, 65 (MCS7) Mbps | per peer, `esp_now_set_peer_rate_config()`. Measured on 8 boards (ESP-IDF 6.1): only **1 Mbps and 65 Mbps (MCS7)** are usable; 6, 6.5, 11, 24 and 54 Mbps lose 73–100 % of the MAC ACKs (`docs/FIX_PLAN_COUNTER_ENERGY_FAIRNESS.md` §6) |
+| ESP-NOW radio > Send protocol broadcasts as one broadcast frame | off (default), on | on: no ACK and no retry. A message that needs more than one frame (New_key) is sent unicast even then. Measured: broadcast still stalls at a seqno, so it is not usable yet |
 | ESP-NOW radio > Receive power saving | Off (default), 50 ms every 100 ms, 110 ms every 200 ms, 50 ms every 200 ms, Custom | [below](#esp-now-receive-power-saving) |
 | ESP-NOW radio > Wake window / Wake interval | only shown for Custom | ms |
 | ESP-NOW radio > Attempts per frame | 3 | minimum number of attempts |
@@ -66,7 +66,7 @@ Two menus at the top level of `idf.py menuconfig` belong to this example.
 |---|---|---|
 | Role of this board | Automatic (default), Replica, Client | Automatic: from the node list |
 | Client: request period (ms) | 10000 | the same for every configuration you compare |
-| ESP-NOW Wi-Fi channel | 1 | use the router's channel |
+| ESP-NOW Wi-Fi channel | 1 | use a channel **away** from the AP: on the AP's channel 1 Mbps lost 27 % of its ACKs and the receive power-saving modes stopped working |
 | Wi-Fi station (UDP) > Wi-Fi SSID, Wi-Fi password | | stored in `sdkconfig` |
 | Wi-Fi station (UDP) > Power saving | None (default), Minimum, Maximum | `esp_wifi_set_ps()` |
 | Wi-Fi station (UDP) > Listen interval | 3 | Maximum only |
@@ -265,9 +265,9 @@ Procedure:
 4. Optional baseline: the same image with the client switched off, saved as
    `runs/<name>-base/`, gives the energy added per request.
 
-Keep fixed for every configuration: channel (set *ESP-NOW Wi-Fi channel* to
-the router's channel), router DTIM and beacon interval, request period, run
-length, board positions. Interleave the configurations over time. The
+Keep fixed for every configuration: channel (an ESP-NOW channel away from the
+AP, see above), router DTIM and beacon interval, request period, run length,
+board positions. Interleave the configurations over time. The
 router's energy is not counted on the UDP side.
 
 What "best" means here: the best configuration among those you ran. The
