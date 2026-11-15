@@ -176,6 +176,10 @@ The transport interface (`tbft_transport.h`) abstracts send/recv/peer-registrati
 
 ESP-NOW v2.0 limits each packet to 1470 bytes. Messages exceeding this are automatically fragmented with a 4-byte header (`msg_id`, `frag_idx`, `frag_total`) and reassembled on the receiving side. Fragmentation works for both unicast and broadcast sends. The reassembly system uses 8 concurrent slots with 5-second timeout per message.
 
+The send task has one frame in flight at a time: after `esp_now_send()` it waits for that frame's send callback (the MAC-layer ACK result) before a retry or the next frame, as the ESP-NOW guide recommends and `examples/wifi/espnow` does. The 2 s timeout is only a safety net (the slowest callback measured on the boards was 908 ms). The earlier 100 ms timeout re-sent frames the driver still held when the channel was busy (8 boards at 1 Mbps exchanging 1848-byte New_keys at boot): every copy held a Wi-Fi TX buffer from the heap (free heap fell to about 4 KB), the copies congested the channel further, and a late callback was taken as the next frame's result. `TBFT_STATS` reports the outcomes (`cb_fail`, `cb_timeout`, `send_err`, `cb_slow`, `cb_max_ms`).
+
+The receiver drops an exact repeat of the last frame from the same sender (`rx_dup`): a frame whose MAC ACK was lost is sent again with the same `msg_id`, fragment and length. The ESP-NOW guide leaves this to the application. Without it a repeated New_key was delivered twice and a repeated Status looked like a peer that was still behind, which made the receiver re-send messages nobody needed.
+
 `espnow_recv_cb` runs in the **WiFi task context** (not an ISR); standard task-context FreeRTOS APIs (`xSemaphoreTake`, `xQueueSend`) are used throughout.
 
 #### Config file formats
@@ -216,7 +220,7 @@ Three region structs inside `tbft_replica_t` hold all in-flight messages:
 
 All three regions live directly inside `tbft_replica_t`. Indexing into `agreement_region` is `(seqno - head) & mask` — the window head advances on each stable checkpoint (`tbft_ar_truncate`).
 
-`tbft_ar_truncate` does not erase the slots that fall out of the window. Each slot is tagged with its sequence number and is emptied only when a sequence number of the new window first uses it (`tbft_ar_slice`). Until then `tbft_ar_peek` still returns its messages, so they can be re-sent to a replica that is a little behind. Always check `tbft_ar_in_range` before `tbft_ar_slice`: calling it for an older seqno would take over a live slot.
+`tbft_ar_truncate` does not erase the slots that fall out of the window. Each slot is tagged with its sequence number and is emptied only when a sequence number of the new window first uses it (`tbft_ar_slice`). Until then `tbft_ar_peek` still returns its messages, so they can be re-sent to a replica that is a little behind. Always check `tbft_ar_in_range` before `tbft_ar_slice`: calling it for an older seqno would take over a live slot. Only writers take a slot over: the queries `tbft_ar_load_pp`, `tbft_ar_prepared` and `tbft_ar_committed` return nothing for a slot that still holds another seqno and leave it as it is.
 
 ### Certificate quorum logic
 
@@ -229,12 +233,12 @@ All three regions live directly inside `tbft_replica_t`. Indexing into `agreemen
 Additional important fields:
 - `tbft_view_info_t vi` — view-change protocol state
 - `EventGroupHandle_t evt_group` — Event group used to decouple timer callbacks (which execute in the system timer task) from heavy operations like RSA cryptography. Callbacks are signal-only — `vtimer_cb` and `stimer_cb` call `xEventGroupSetBits` and return immediately; heavy work runs in the `tbft_replica_run()` loop.
-- Four timers: `vtimer`, `stimer`, `rtimer`, `ntimer` (all `tbft_itimer_t` wrapping `esp_timer_handle_t`). Timers signal the event group rather than executing directly.
+- Two timers: `vtimer` (view change) and `stimer` (Status), both `tbft_itimer_t` wrapping `esp_timer_handle_t` (`rtimer` and `ntimer` are reserved and not created). Timers signal the event group rather than executing directly.
 - Request queues: `rqueue`, `ro_rqueue` (circular FIFOs, `TBFT_RQUEUE_MAX` entries, default 8 via Kconfig)
 - Buffers: `ndet_buf[TBFT_NDET_BUF_SIZE]`, `out_buf[TBFT_MAX_MESSAGE_SIZE]`
 - `sys_state[TBFT_SYS_STATE_SIZE]` — the library's own replicated state: the client table (`tbft_client_entry_t` per client: last executed request id, its seqno and reply). Its blocks follow the application's and are checkpointed and transferred with them.
 - `running` flag, `vtimer_period_us`, `stimer_period_us`
-- Timers are initialised in `tbft_replica_init()` but **not started** — `Byz_init_replica()` sets the correct periods from the config file and starts them
+- The timer periods come from menuconfig (TinyBFT Configuration > Timeouts); the config file's timeout lines are not used. `tbft_replica_init()` creates the timers without starting them; `Byz_init_replica()` starts only the Status timer, as a periodic timer (a Status every period exactly, however late the loop notices each tick). The view-change timer runs only while a request waits for execution (`update_vtimer`), and the run loop ignores an expiry bit that a restart made stale.
 
 ### Message flow
 
@@ -259,6 +263,13 @@ A Pre_prepare whose MAC does not verify (relabelled by a New_view, or the primar
 
 **View change.** A replica sends View_change for the next view when its timer expires, and joins a view change once f+1 other replicas ask for a higher view, so one replica alone moves nobody. After sending View_change it sends no Prepare or Commit until a New_view arrives, but it still executes what the others commit. The timer doubles after each attempt that brought no progress. A replica whose view change has no support (f+1 peers still report normal work) keeps its target instead of moving further away. View_change carries the stable checkpoint (seqno and digest) and, for every seqno above it the replica saw prepared or committed, the view and digest. With 2f+1 of them the new primary sends New_view: the highest stable checkpoint (`min`, `min_digest`) and, for each seqno up to the highest one reported, the request prepared in the highest view, or a null request. `nv_install` (new primary and backups alike) keeps Pre_prepare bodies with the right digest, drops the Prepares and Commits of older views and prepares the re-proposed requests again; a replica behind `min` fetches that checkpoint. The new view starts with empty request queues and no pending request: requests that were not ordered come back with the client's retransmission (so a request whose client went away does not keep the view-change timer running).
 
+**View change under loss and partitions.**
+- *Re-sent View_change.* While its view change is in progress, a replica repeats its stored View_change every Status period until the New_view arrives. With only 2f+1 replicas left every View_change is needed, and one lost message must not cost a whole (doubled) timeout and a view. Receivers skip a byte-identical or older copy before the RSA check.
+- *Cut off.* A replica that heard fewer than 2f peers' Status in the last three Status periods does not ask for a view change, or a further one, when its timer expires: no view could gather 2f+1 View_changes then, and moving its target on would only leave it out of the view the others are in once it hears them again. It keeps its view (or target) and repeats its View_change.
+- *prep_view.* `nv_install` forgets what a slot was prepared as (`prep_view`, `prep_digest`) unless the New_view re-proposes that same request. The New_view, built from 2f+1 View_changes, shows the request did not commit in an earlier view (a replica commits nothing after sending its View_change), and its body is dropped. Reporting it in a later View_change would make that view re-propose a request nobody holds, and execution would stop at that seqno for good.
+
+**Checkpoints.** A replica whose newest checkpoint is still not stable a Status period after it announced it broadcasts its Checkpoint again. With 2f+1 replicas left, one lost Checkpoint per survivor would otherwise stop the window for good.
+
 **Late boot and reboot.** New_key lists which peer keys the sender holds (`have_keys`); a replica whose key is missing there answers with its own New_key, so a replica that boots late or reboots has its keys within about a second instead of waiting for the periodic broadcast. It then gets the current view (New_view), the stable checkpoint (Checkpoint messages, then a state fetch) and the messages of the window through Status.
 
 **Known limits.** View_change entries carry no proof and New_view is not checked against the View_change messages, so a Byzantine replica can lie during a view change (crashes, restarts and message loss are handled). A replica that restarts has lost its protocol state; until it has caught up it counts toward f.
@@ -275,7 +286,7 @@ A Pre_prepare whose MAC does not verify (relabelled by a New_view, or the primar
 
 1. **Staggered boot problem**: ESP32 boards use `esp_timer_get_time()` which starts at 0 on each boot. When boards are flashed sequentially (minutes apart), their timers diverge — a freshly-booted board's timestamps appear "stale" (too far in the past) to boards that have been running longer. A 5-minute slack only helps in one direction; the lagging board's messages are always rejected.
 
-2. **Key rotation as replay protection**: Each `New_key` exchange generates fresh random HMAC session keys (`esp_fill_random`). Once keys rotate, any captured pre-rotation message fails HMAC verification under the new key — the attacker can't replay across key boundaries.
+2. **Fresh keys per boot as replay protection**: A replica generates its random HMAC session keys (`esp_fill_random`) once per boot, the first time it sends New_key; later New_keys (periodic or answering a peer) carry the same keys, and the encrypted slots are cached so they are byte-identical. A message captured before a reboot fails HMAC verification under the new keys, so it cannot be replayed across a reboot. Within one boot the keys do not change.
 
 3. **Sender bitmap as duplicate guard**: Each certificate (`tbft_certificate.c`) tracks per-sender contributions via `tbft_bitmap_t`. A replayed Prepare/Commit from the same sender for the same seqno is rejected as a duplicate sender. Cross-seqno replay fails because the HMAC covers the entire message including `seqno`.
 
@@ -293,13 +304,15 @@ Read by `parse_config()` in `tbft_libbyz.c`. Plain text, line-based:
 <num_nodes>
 <multicast_ip>
 <hostname> <ip> <port> <pubkey_der_path>   # repeated num_nodes times
-<view_change_timeout_ms>
-<status_timeout_ms>
-<recovery_timeout_ms>
+<view_change_timeout_ms>    # not used: write 0
+<status_timeout_ms>         # not used: write 0
+<recovery_timeout_ms>       # not used: write 0
 ```
 Public keys are DER files on SPIFFS. Private key path is passed separately as `priv_config` to `Byz_init_replica` / `Byz_init_client`.
 
-**Note:** In the embedded context, `Byz_init_replica` cannot determine the local node's IP, so it defaults to `local_id = 0` with a warning log. The config parser matches hostnames against the local IP list, but falls back to node 0.
+The three timeout lines stay for the format, but the timeouts come from menuconfig (TinyBFT Configuration > Timeouts), so the build and the BANNER show them; a value other than 0 that differs from menuconfig only logs a warning.
+
+**Local id.** Called with `local_id = -1`, `Byz_init_replica` / `Byz_init_client` find the node themselves: the eFuse base MAC (ESP-NOW) or the station's IP (UDP) is looked up in the node list. If it is not there, initialisation fails; there is no fallback to node 0 (the counter example retries a few times, then reboots with a message).
 
 ## Examples
 
@@ -365,7 +378,9 @@ New_key_bytes = sizeof(tbft_new_key_rep_t)               // 32
 
 With n=7: `32 + 6×260 + 256 = 1848` — `out_buf` (sized to `TBFT_MAX_MESSAGE_SIZE`) must be ≥ this.
 
-**Typical ESP32-C3 budget** (321,296 bytes of DRAM for static data; the rest is heap for ESP-IDF): with 7 replicas keep `WINDOW_SIZE=4` and `MAX_MESSAGE_SIZE=2048`. With the counter example's settings `tbft_replica_t` is 79,072 bytes and the whole ESP-NOW build uses 272,092 bytes of static DRAM (49 KB left as heap for Wi-Fi, lwIP and mbedtls), the UDP build 191,140. Run `memcalc.sh` to estimate (its `tbft_replica_t` total matches `sizeof` for that configuration) and `idf.py size` to check.
+**Typical ESP32-C3 budget** (321,296 bytes of DRAM for static data; the rest is heap for ESP-IDF): with 7 replicas keep `WINDOW_SIZE=4` and `MAX_MESSAGE_SIZE=2048`. With the counter example's settings `tbft_replica_t` is 79,112 bytes and the whole ESP-NOW build uses 272,140 bytes of static DRAM, the UDP build 191,188. Run `memcalc.sh` to estimate (its `tbft_replica_t` total matches `sizeof` for that configuration) and `idf.py size` to check.
+
+That leaves 49,156 bytes by the linker, but the heap the firmware really has is larger: the region `0x3FCCE710-0x3FCDC710` is reserved for the bootloader only while it runs (`components/esp_system/ld/esp32c3/memory.ld.in`, `components/heap/port/esp32c3/memory_layout.c`). On the boards the counter reports about 104 KiB free at boot, plus about 14 KiB once the scheduler starts; with the client's node running, `heap_min` stayed at 44-46 KiB through a 7-minute run (8 boards, ESP-NOW defaults). Take the figure from `heap`/`heap_min` in `TBFT_STATS`, not from the link-time number.
 
 `tbft_config.h` defines all constants from `CONFIG_TBFT_*` Kconfig values and enforces these `_Static_assert` checks:
 
@@ -408,4 +423,6 @@ When a replica detects it has fallen behind, `tbft_state_start_fetch` sets `in_f
 
 State uses a dirty bitmap (`cowb[]` — array of uint64_t, not a single bitmap) to track blocks modified since the last checkpoint. `block_digests[]` holds per-block SHA-256 digests. Checkpoint records (seqno + root digest) are stored in `ckpt_records[]` (max `TBFT_NUM_CKPT_SLOTS`). `last_stable` tracks the highest stable checkpoint seqno.
 
-`tbft_state_checkpoint` also copies every block into `image`. A replica answers Fetch only for the checkpoint its image holds (`tbft_state_can_serve`), and from the image, so the fetcher gets exactly the state that checkpoint's digest covers even while the replier keeps executing. The fetcher knows the certified root digest (from 2f+1 Checkpoint messages or from the New_view) and adopts the fetched state only if its root digest matches (`finish_fetch`); otherwise it fetches again from the next replica. After a timeout it aims at the newest certified checkpoint, or asks another replica.
+`tbft_state_checkpoint` also copies every block into `image`. A replica answers Fetch only for the checkpoint its image holds (`tbft_state_can_serve`), and from the image, so the fetcher gets exactly the state that checkpoint's digest covers even while the replier keeps executing. A fetch aims at the newest checkpoint that at least f+1 replicas vouch for with matching Checkpoint messages (a weak certificate: one of them is correct, so its digest is a correct state), even before that checkpoint is stable, or at the one the New_view fixes. The quorum keeps moving while a replica fetches, and a replica serves only its newest checkpoint, so aiming at a stable one could chase a checkpoint nobody serves any more. With only 2f+1 replicas alive the newer checkpoints cannot become stable without the fetcher's own Checkpoint, so this is what lets it catch up at all. The fetcher asks a replica that sent a Checkpoint for that seqno and digest (it took that checkpoint), adopts the fetched state only if its root digest matches (`finish_fetch`), and otherwise fetches again from the next replica. If the checkpoint is not stable yet it then broadcasts its own Checkpoint for it, the vote it may lack. After a timeout it aims at a newer vouched-for checkpoint, or asks another replica.
+
+A Meta_data whose children are already queued (a duplicate frame, or the previous replier's late answer) queues nothing again, so no block is counted pending twice, and only an accepted Meta_data can complete a fetch. A Fetch whose index is outside its level is rejected.

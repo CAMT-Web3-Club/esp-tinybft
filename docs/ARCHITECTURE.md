@@ -497,7 +497,7 @@ typedef struct {
 } tbft_replica_t;
 ```
 
-With the counter example's configuration (7 replicas, window 4, 2048-byte messages, 8 state blocks) `sizeof(tbft_replica_t)` is 79,072 bytes on the ESP32-C3; `examples/counter/memcalc.sh` prints the breakdown.
+With the counter example's configuration (7 replicas, window 4, 2048-byte messages, 8 state blocks) `sizeof(tbft_replica_t)` is 79,112 bytes on the ESP32-C3; `examples/counter/memcalc.sh` prints the breakdown.
 
 ### Where the memory lives
 
@@ -558,13 +558,13 @@ The `tbft_replica_run()` loop calls `xEventGroupClearBits` each iteration and ha
 | Timer | Callback | Action |
 |---|---|---|
 | `vtimer` | `vtimer_cb` (signal-only) | Sets `TBFT_EVT_VTIMER` bit — run loop calls `handle_vtimer(r)`: a View_change for the next view, unless HMAC keys are still missing or the view change already in progress has no support (see section 14) |
-| `stimer` | `stimer_cb` (signal-only) | Sets `TBFT_EVT_STIMER` bit — run loop broadcasts `tbft_status_rep_t`, restarts stimer, proposes queued requests (primary) and re-checks a checkpoint the quorum certified ahead of this replica |
-| `rtimer` | NULL | Placeholder (not used) |
-| `ntimer` | NULL | Placeholder (not used) |
+| `stimer` | `stimer_cb` (signal-only), periodic | Sets `TBFT_EVT_STIMER` bit — run loop broadcasts `tbft_status_rep_t`, repeats its View_change during a view change and its newest Checkpoint if that is still not stable a period after it was announced, proposes queued requests (primary) and re-checks a checkpoint the quorum certified ahead of this replica |
+| `rtimer` | — | Reserved, not created |
+| `ntimer` | — | Reserved, not created |
 
 Timer callbacks **do not** execute protocol logic directly. They call `xEventGroupSetBits()` only, and the `tbft_replica_run()` event loop handles the heavy work. This avoids running RSA or other heavy operations from the `esp_timer` task context.
 
-Default periods: `vtimer = 5000000 us` (5 s), `stimer = 1000000 us` (1 s). Overridden by config file values. Timers are initialised in `tbft_replica_init()` but **not started** — `Byz_init_replica()` sets the correct periods from the config file and then starts them.
+Periods: `TBFT_VIEW_CHANGE_TIMEOUT_US` and `TBFT_STATUS_TIMEOUT_US` from menuconfig (Kconfig defaults 5 s and 1 s; the counter example sets 30 s and 5 s). The config file's timeout lines are not used. `tbft_replica_init()` creates the timers without starting them; `Byz_init_replica()` starts only `stimer`, as a periodic timer. `vtimer` runs only while a request waits for execution (`update_vtimer`), and the run loop ignores a `TBFT_EVT_VTIMER` bit while the timer is running again (a restart made that expiry stale).
 
 ### Handler Summary
 
@@ -986,7 +986,7 @@ sequenceDiagram
 
 ### 11.2 Checkpoint
 
-After executing every `TBFT_CHECKPOINT_INTERVAL` requests (default 128):
+After executing every `TBFT_CHECKPOINT_INTERVAL` requests (default 8; the counter example uses 2):
 
 ```mermaid
 sequenceDiagram
@@ -1225,7 +1225,7 @@ View_change entries carry no proof (no prepared certificate) and a New_view is n
 | Option | Type | Default | Range | Description |
 |---|---|---|---|---|
 | `TBFT_MAX_MESSAGE_SIZE` | int | 1440 | -- | Max UDP/message size (bytes) |
-| `TBFT_MAX_REPLY_SIZE` | int | 1240 | -- | Max reply payload (must be < MAX_MESSAGE_SIZE) |
+| `TBFT_MAX_REPLY_SIZE` | int | 1136 | -- | Max reply payload (must be < MAX_MESSAGE_SIZE) |
 | `TBFT_BLOCK_SIZE` | int | 1024 | power of 2 | State block/page size |
 | `TBFT_MAX_NUM_REPLICAS` | int | 4 | 4-32 | Replica count (n = 3f+1) |
 | `TBFT_WINDOW_SIZE` | int | 16 | power of 2 | Sequence number window |
@@ -1280,12 +1280,12 @@ static_assert(TBFT_VC_MSG_MAX_SIZE <= TBFT_MAX_MESSAGE_SIZE &&
 <hostname> <ip> <port> <pubkey_path>        # UDP format (one line per node)
 <hostname> <mac_address> <pubkey_path>       # ESP-NOW format (MAC: xx:xx:xx:xx:xx:xx)
 ...
-<view_change_timeout_ms>
-<status_timeout_ms>
-<recovery_timeout_ms>
+<view_change_timeout_ms>    # not used: write 0
+<status_timeout_ms>         # not used: write 0
+<recovery_timeout_ms>       # not used: write 0
 ```
 
-The parser auto-detects UDP vs ESP-NOW format per line by checking for `:` in the second field. Key files (`.der` format) are loaded from paths specified in the config file.
+The parser auto-detects UDP vs ESP-NOW format per line by checking for `:` in the second field. Key files (`.der` format) are loaded from paths specified in the config file. The three timeout lines are parsed (they may be 0) but not used: the timeouts come from menuconfig, and a non-zero value that differs from it logs a warning.
 
 ### tbft_config_t Internal Struct
 
@@ -1346,12 +1346,12 @@ typedef void (*Byz_recv_reply_cb)(Byz_rep *reply, int cid);
 
 | Function | Description |
 |---|---|
-| `Byz_init_replica(config_file, priv_config, mem, mem_size, exec_cb, comp_ndet_cb, ndet_max_len, recv_reply_cb, port)` | Parse config, create replica, init all subsystems |
+| `Byz_init_replica(config_file, priv_config, local_id, mem, mem_size, exec_cb, comp_ndet_cb, ndet_max_len, recv_reply_cb, port)` | Parse config, create replica, init all subsystems. `local_id = -1` finds the node in the list by its base MAC (ESP-NOW) or IP (UDP) and fails if it is not there |
 | `Byz_modify(mem, size)` | CoW: mark blocks in range for snapshot before write |
 | `Byz_modify1(mem)` | CoW: mark single block for snapshot |
 | `Byz_replica_run()` | Blocking event loop; processes messages and executes committed requests |
 | `Byz_reset_stats()` | Placeholder: log "stats reset" |
-| `Byz_print_stats()` | Log current view, last_stable, last_executed, last_prepared |
+| `Byz_print_stats()` | Log one `TBFT_STATS` line: replica protocol counters (view, last executed and stable seqno, re-sent messages, view changes, fetches, the `run_*` counters from the first executed request) or the client's (highest reply view, re-sent requests), transport counters and free heap |
 
 ### Module-Level Singletons (tbft_libbyz.c)
 
@@ -1416,7 +1416,7 @@ int exec_cb(Byz_req *in, Byz_rep *out, Byz_buffer *ndet, int cid, bool ro) {
     return 0;
 }
 
-Byz_init_replica("config.txt", "priv.der",
+Byz_init_replica("config.txt", "priv.der", -1,   // -1: find this node in the list
                  app_state, sizeof(app_state),
                  exec_cb, NULL, 0, NULL, 0);
 Byz_replica_run();  // blocks -- run in FreeRTOS task

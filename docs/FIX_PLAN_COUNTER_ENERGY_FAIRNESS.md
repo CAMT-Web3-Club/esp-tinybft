@@ -30,7 +30,7 @@
 
 **การตั้งค่าย้ายไป `idf.py menuconfig` ทั้งหมด (2026-11-13 ตามที่เจ้าของงานวิจัยขอ):** ทุกค่าของการทดลองเลือกได้ในเมนู TinyBFT Configuration (transport, PHY rate, broadcast, receive power saving ของ ESP-NOW พร้อม preset, multicast ของ UDP) และ Counter Example Configuration (role, คาบ request, channel, Wi-Fi และ power saving ของ UDP) ตรวจรูปแบบ Kconfig ด้วย `kconfcheck` ของ Espressif และทดสอบพฤติกรรม (preset เปลี่ยนค่า window/interval ตามเมื่อยังไม่ได้ตั้งเอง, ค่าที่ซ่อนคำนวณจาก choice, `select`) ด้วย `esp_kconfiglib` 3.12 ตัวเดียวกับที่ `idf.py menuconfig` ใช้ role ค่าเริ่มต้นเป็น *Automatic* คือ image เดียวใช้ได้ทุกบอร์ด บอร์ดหา role ของตัวเองจาก node list ตอนบูต (`Byz_node_is_replica()`) ลบ overlay `sdkconfig.variant.*`, `sdkconfig.role.*`, `sdkconfig.measure`, `sdkconfig.mcast`, `sdkconfig.static_ip`, `sdkconfig.wifi.local.example`, `build_variant.sh`, `tools/sweep.py`, `tools/flash.py` แล้ว แทนด้วย `flash_all.fish` (flash image เดียวกันทุกพอร์ตแบบขนานด้วยคำสั่ง esptool ที่ `idf.py build` พิมพ์) ส่วน `tools/analyze.py` ยังอยู่เป็นตัวช่วยสรุปผล (ไม่บังคับ) และอ่านค่าการตั้งค่าจากบรรทัด `BANNER`
 
-Build ผ่านล่าสุด (2026-11-15 หลังงาน C ในหัวข้อ 6, ESP-IDF 6.1, build dir ใหม่ทั้งหมด, ตั้งค่าแบบเดียวกับ menuconfig): ESP-NOW ค่าเริ่มต้น, ESP-NOW 54 Mbps + 110/200, ESP-NOW custom 30/300 + broadcast + role Replica, UDP `PS_MAX` listen 10 + multicast + role Client และ `simple_wallet` ทุก build ได้ target esp32c3 ไม่มี warning ของ compiler และรายงาน Kconfig เป็น "Finished successfully" `kconfcheck` ผ่านทั้งสามไฟล์ Kconfig ค่า custom ที่ window ไม่สั้นกว่า interval ถูก static assert หยุด build ตามที่ออกแบบ `tools/analyze.py` และ `flash_all.fish` ทดสอบด้วยข้อมูลจำลองและ esptool จำลอง **ยังไม่ได้ทดสอบบนบอร์ดจริง** เกณฑ์ตรวจรับที่ต้องใช้บอร์ดยังเป็นของคนทดสอบ
+Build ผ่านล่าสุด (2026-11-15 หลังงาน C ในหัวข้อ 6, ESP-IDF 6.1, build dir ใหม่ทั้งหมด, ตั้งค่าแบบเดียวกับ menuconfig): ESP-NOW ค่าเริ่มต้น, ESP-NOW 54 Mbps + 110/200, ESP-NOW broadcast + role Replica (ปิด power saving เพราะ X6 บังคับ), UDP `PS_MAX` + multicast + role Client และ `simple_wallet` ทุก build ได้ target esp32c3 ไม่มี warning ของ compiler และรายงาน Kconfig เป็น "Finished successfully" `kconfcheck` ผ่านทั้งสามไฟล์ Kconfig ค่า custom ที่ window ไม่สั้นกว่า interval ถูก static assert หยุด build ตามที่ออกแบบ `tools/analyze.py` และ `flash_all.fish` ทดสอบด้วยข้อมูลจำลองและ esptool จำลอง บนบอร์ดจริงทดสอบแล้วบางส่วน (2026-11-15, 8 บอร์ด, ESP-NOW ค่าเริ่มต้น): build และ `flash_all` ใช้งานได้ และ run ปกติ 8 นาทีผ่าน (ดู "ผลบนบอร์ด" ท้ายหัวข้อ 6) ยังไม่ได้ทดสอบ config อื่นบนบอร์ด
 
 | งาน | สถานะ | หมายเหตุ |
 |---|---|---|
@@ -491,6 +491,28 @@ static bool espnow_tx_frame(tbft_espnow_t *enow, const uint8_t *mac,
 | C10 | replica ที่ boot ช้าหรือ reboot รอ New_key ของตัวอื่นได้ถึง 60 s | New_key บอกว่าผู้ส่งมี key ของใครแล้ว (`have_keys`) replica ที่ key ของตัวเองหายจากรายการจะตอบทันที ใน simulator replica ที่ reboot ได้ key ครบ 2f ใน 1 s (เดิม 30 s) |
 | C11 | digest ของ Pre-prepare ไม่คลุม non-deterministic choices; `tbft_cr_winning_digest` คืน digest ของ checkpoint อื่นที่ map ลงช่องเดียวกันได้ | digest คลุมทั้ง request และ non-det; ตรวจ seqno ของช่องก่อนคืนค่า |
 
+**แก้ตาม review หลายมุม (2026-11-15, รายละเอียดของแต่ละข้ออยู่ใน `docs/REVIEW_2026-11-15.md`)**
+
+| ID | ปัญหา | แก้อย่างไร |
+|---|---|---|
+| X2 | timeout ใน menuconfig ไม่มีผล ค่าจริงมาจาก config file | timeout มาจาก menuconfig อย่างเดียว (counter 30/5/10 s, `simple_wallet` 60/5/10 s ใน `sdkconfig.defaults`) บรรทัด timeout ใน config file เขียนเป็น 0 ถ้าไม่ใช่ 0 และต่างจาก menuconfig จะมี warning; `BANNER` พิมพ์ `vc_ms status_ms recovery_ms retx_ms reply_ms` |
+| X3 | `analyze.py` คัด run ที่มี fault ไม่ได้ถ้ามีแค่ log ของ client | client รายงาน `view` ของ reply ที่รับไว้ใน `TBFT_STATS`; `analyze.py` ตัด run ที่มี view change, บอร์ด reboot, replica เข้าร่วมช้า หรือมี fetch และเตือนเมื่อไม่มี log ของ replica |
+| X4 | ตัวนับไม่ตรงกับหน้าต่างวัด | ตัวนับ `run_*` ของ replica นับตั้งแต่ request แรกที่ execute (`first_exec`) ฝั่ง client ใช้ผลต่างระหว่างต้นกับท้ายหน้าต่าง `analyze.py` เตือนเมื่อช่วงเวลาใน `energy.csv` ไม่ตรงกับช่วงของ request |
+| X5 | ตัวนับ re-send และ drop ไม่ครบ | `resent` นับทุกข้อความที่ส่งซ้ำ ESP-NOW นับ fragment ที่ถูกปฏิเสธและข้อความที่ประกอบไม่ครบใน `rx_frag_drop` `analyze.py` แสดง drops/run และ max latency |
+| X6 | ESP-NOW broadcast ร่วมกับ receive power saving ทำ broadcast หาย | broadcast เลือกได้เฉพาะเมื่อปิด power saving (`depends on !TBFT_ESPNOW_POWER_SAVE`) |
+| X7 | คาบ Status จริง 5.0–5.5 s ขึ้นกับ traffic | stimer เป็น periodic esp_timer |
+| X8 | send callback ที่มาช้ากว่า 100 ms ทำให้ส่งเฟรมเดิมซ้ำขณะที่ driver ยังถือเฟรมแรกอยู่ ผิดข้อควรระวังของ B1 (มีเฟรมค้างส่งได้ทีละหนึ่งเฟรม) | รอ callback ของทุกเฟรมก่อนส่งเฟรมถัดไปหรือ retry ตามคำแนะนำของ ESP-NOW และ `examples/wifi/espnow` timeout 1 s เป็นแค่ตาข่ายกันพลาด และนับผลของแต่ละเฟรม (`cb_fail cb_timeout send_err cb_slow cb_max_ms`) ผลบนบอร์ดอยู่ในหัวข้อการทดสอบด้านล่าง |
+| L1 | View_change ส่งครั้งเดียว ไม่ส่งซ้ำ | ระหว่าง view change ส่ง View_change ซ้ำทุก Status period จนได้ New_view ผู้รับข้ามฉบับที่ซ้ำหรือเก่ากว่าก่อนตรวจ RSA |
+| L2 | fetch เล็ง checkpoint ที่ไม่มีใครเสิร์ฟ เมื่อเหลือ 2f+1 พอดีค้างถาวร | fetch เล็ง checkpoint ใหม่สุดที่มี Checkpoint ตรงกัน f+1 ฉบับ (weak certificate) และขอจาก replica ที่ส่ง Checkpoint นั้น ถ้าหลัง fetch checkpoint ยังไม่ stable จะ broadcast Checkpoint ของตัวเอง และทุก Status period ส่ง Checkpoint ล่าสุดของตัวเองซ้ำถ้ายังไม่ stable |
+| L3 | `prep_view` ค้างหลัง `nv_install` ทิ้ง body | `nv_install` ล้าง `prep_view`/`prep_digest` ของ slot ที่ New_view ไม่ได้เสนอ request เดิม |
+| L4 | target ของ view change เพิ่มเรื่อยๆ ระหว่างถูกตัดขาด | ถ้าได้ยิน Status จาก peer น้อยกว่า 2f ตัวใน 3 Status period จะไม่ขอ view change ใหม่และไม่เพิ่ม target |
+| L6 | query แบบอ่านอย่างเดียวล้าง slot ที่เก็บไว้ส่งซ้ำ | `tbft_ar_load_pp/prepared/committed` ไม่ยึด slot แล้ว `send_view_change_to` ใช้ `tbft_ar_peek` |
+| L7, R2 | Meta_data ซ้ำหรือมาช้าทำให้ fetch ค้างหรือจบก่อนเวลา | ไม่ enqueue ลูกที่อยู่ในคิวแล้ว และตรวจว่า fetch เสร็จเฉพาะเมื่อรับ Meta_data นั้น |
+| L9 | event bit ของ view-change timer ค้าง | loop ข้าม bit ถ้า timer ถูก start ใหม่แล้ว และ `handle_vtimer` ไม่ทำอะไรเมื่อไม่มี request ค้างและไม่ได้อยู่ใน view change |
+| R1 | `handle_fetch` อ่านนอกขอบเขตเมื่อ `index` ใหญ่ | ปฏิเสธ `index >= tbft_ptree_nodes_at_level(level)` |
+
+ข้อที่ยังไม่แก้ (ให้เจ้าของงานวิจัยกำหนดเวลา): L5, L8, R3–R11 และ X1 ส่วนที่เหลือคือค่า *Client request retransmission interval* ซึ่งต้องวัด `max_ms` ของทุก config บนบอร์ดก่อน
+
 **ข้อจำกัดที่ยังเหลือ (ด้าน security ซึ่งตกลงให้เป็นรอง):** View_change ไม่มี proof (prepared certificate) และ New_view ไม่ถูกตรวจกับ View_change ที่ใช้สร้าง replica ที่เป็น Byzantine จึงรายงานเท็จช่วง view change ได้ ส่วน crash, reboot, boot ช้า และข้อความหาย รับมือได้แล้ว replica ที่ reboot เสีย state ของ protocol ไปและนับเป็นหนึ่งใน f จนกว่าจะตามทัน
 
 **ผลต่อการทดลองพลังงาน**
@@ -507,7 +529,41 @@ static bool espnow_tx_frame(tbft_espnow_t *enow, const uint8_t *mac,
 - ก่อนแก้ (commit `ab0a090`, timeout สั้นของ simulator: view change 3 s): boot race และ boot ช้าไม่มี request สำเร็จเลยใน 3 นาที ข้อความหาย 10% ทำให้ replica สองกลุ่ม execute request คนละตัวที่ seqno เดียวกัน และ replica ที่ reboot ข้าม seqno สองตัว
 - หลังแก้: ผ่านทุก scenario ใน seed 1, 2 และ 4 รวมทั้ง build แบบ sanitizer (address, undefined) และกับ timeout เท่าบอร์ด (view change 30 s, Status 5 s) ก็ผ่านทุก scenario: boot race ไม่มี view change เลย (ก่อนแก้มี 6 ครั้งและ request ล้มเหลว 2 ตัว) boot ช้า 0–30 s ไม่มี view change (ก่อนแก้ 4 ครั้งและล้มเหลว 4 ตัว) request ที่ยังล้มเหลวคือตัวที่ค้างอยู่ตอน primary crash เพราะ client รอ reply 20 s แต่ view change ใช้อย่างน้อย 30 s และตัวแรกของ scenario ที่ client เริ่มก่อน replica ทุกตัว
 - build ESP-IDF 6.1 ผ่านตามหัวข้อ 1.1
-- **ยังไม่ได้ทดสอบบนบอร์ดจริง** simulator ไม่มีวิทยุ ไม่มี RSA จริง และจังหวะเวลาไม่ใช่ของ ESP32-C3
+- บนบอร์ดจริง (8 บอร์ด, ESP-NOW ค่าเริ่มต้น, run 8 นาที): ผ่าน 48/48 request ไม่มี view change ไม่มี reboot ดูตัวเลขเทียบก่อน/หลังแก้ X8 ในหัวข้อ "ผลบนบอร์ด" ท้ายหัวข้อนี้
+- fault บนบอร์ดจริง: reset primary กลาง run (view change ไป view 1 ตามที่ควร) และ reset backup (ตามทันโดยไม่เกิด view change) exactly-once และ state agreement ยังถูกต้อง
+- **ยังไม่ได้ทดสอบบนบอร์ดจริง:** config อื่น (54 Mbps, power saving, broadcast, UDP) และ L1/L2/L4/L7 ภายใต้ loss จริง simulator ไม่มีวิทยุ ไม่มี RSA จริง และจังหวะเวลาไม่ใช่ของ ESP32-C3
+
+**ผลบนบอร์ด (2026-11-15, 8 บอร์ด ESP32-C3 SuperMini ต่อตรงกับพอร์ต USB บนเมนบอร์ด)**
+
+เงื่อนไข: ESP-NOW ค่าเริ่มต้น (1 Mbps, receive power saving Off), channel 1, client ส่งทุก 10 s, run 8 นาที, ทุกบอร์ด boot พร้อมกัน (กรณีเลวที่สุดของ boot burst เพราะ New_key ของ 8 บอร์ดออกพร้อมกัน)
+
+| | ก่อนแก้ X8 (timeout 100 ms) | หลังแก้ X8 (รอ callback, timeout 2 s) |
+|---|---|---|
+| request สำเร็จ | 43 จาก 44 | 48 จาก 48 |
+| latency steady state (ไม่นับ request แรกหลัง boot) | เฉลี่ย 4858 ms, สูงสุด 10650 ms | เฉลี่ย 2016 ms, สูงสุด 2381 ms |
+| heap ต่ำสุดของ replica | 4.4–40 KB | 44–46 KB ทุกตัว |
+| การส่งล้มเหลว (`tx_fail`) | 15–630 ครั้งต่อบอร์ด | 0 ทุกบอร์ด |
+| ส่งซ้ำ / ทิ้ง ต่อ run (`analyze.py`) | 328 / 706 | 28 / 17 |
+| view change, reboot | ไม่มี | ไม่มี |
+
+หลักฐานว่าสาเหตุคือ X8: ทุก replica มี send callback ที่ช้ากว่า 100 ms ระหว่าง 17–148 ครั้ง และครั้งที่ช้าที่สุด 908 ms ซึ่งอยู่ในช่วง boot burst ทั้งสิ้น โค้ดเดิมจึงส่งเฟรมซ้ำขณะที่ driver ยังถือเฟรมแรกอยู่ ตรงกับข้อควรระวังของ B1
+
+หลังแก้ยังเหลือ reassembly timeout 1–8 ครั้งต่อบอร์ดใน run 8 นาที (fragment 1/2) สาเหตุคือ MAC ACK ของ fragment แรกหาย ผู้ส่งจึงส่งซ้ำและผู้รับได้สำเนาสองชุด (คู่มือ ESP-NOW ให้แอปทิ้งข้อมูลซ้ำเอง) แก้ด้วยการทิ้งเฟรมที่ซ้ำกับเฟรมล่าสุดของผู้ส่งรายเดียวกัน (`rx_dup`) ซึ่งตัดสาเหตุที่ทำให้ Status ที่ซ้ำถูกตีความว่า peer ยังตามไม่ทันด้วย
+
+หลังแก้ X8 และเพิ่มการทิ้งเฟรมซ้ำ (run 8 นาที, 8 บอร์ด): reassembly timeout เหลือ 0 ครั้ง (จาก 19 ครั้ง) `cb_timeout` เหลือ 0 ครั้ง (จาก 4) และ `rx_dup` นับได้ 17–60 เฟรมต่อบอร์ดที่ถูกทิ้งอย่างถูกต้อง ซึ่งเป็นเฟรมที่ MAC ACK หาย
+
+**ทดสอบ fault บนบอร์ด (run 330 s, reset ผ่านพอร์ต USB Serial/JTAG)**
+
+| เวลา | เหตุการณ์ | ผล |
+|---|---|---|
+| 0 s | ทุกบอร์ด boot พร้อมกัน | client 48/48 ใน run ปกติ |
+| 120 s | reset node0 (primary ของ view 0) | node0 boot ใหม่และ fetch state ถึง seqno 10 ภายใน 10.4 s; อีก 6 ตัว timer หมดที่ 30 s แล้วทั้ง 7 ตัว (รวม node0) ส่ง View_change สำหรับ view 1; New_view ติดตั้งที่ 158.1 s (`min=10 max=11`, primary=1); client ล้มเหลว 1 request (ตัวที่ค้างตอน primary ตาย) แล้วสำเร็จต่อเนื่อง |
+| 240 s | reset node3 (backup) | boot ใหม่, ติดตั้ง view 1, fetch state ถึง seqno 20 ภายใน 11.6 s; ไม่เกิด view change (เหลือ 6 replica ≥ 2f+1); client ไม่ล้มเหลวเพิ่ม |
+| จบ | — | ทุก replica `view=1 last_exec=27 last_stable=26` ตรงกันทุกบรรทัดสถิติ; client สำเร็จ 27 request ณ เวลานั้น; ไม่มีบรรทัด skip seqno; `heap_min` ต่ำสุด 44 KB; "not acknowledged" ทั้ง run 10 ครั้ง (ช่วง reset) |
+
+สรุป: exactly-once และ state agreement ยังถูกต้องบนบอร์ดจริงเมื่อ primary ถูก reset กลาง run และเมื่อ replica ถูก reset
+
+หมายเหตุ: บอร์ดสามตัวเคยต่อผ่าน hub ที่มีปัญหา USB ทำให้ enumeration ล้มเหลว (`error -110/-71`) และ flash ไม่ได้ หลังย้ายมาต่อตรงกับเมนบอร์ดแล้ว run ทั้ง 8 บอร์ดผ่านตลอด
 
 ## 7. ระเบียบวิธีการวัด
 
@@ -552,19 +608,21 @@ static bool espnow_tx_frame(tbft_espnow_t *enow, const uint8_t *mac,
 | Checkpoint | 256 |
 | Status | 56 |
 | Reply | 312 |
-| New_key | 1840 (2 fragment ทั้งสอง transport) |
+| New_key | 1848 (2 fragment ทั้งสอง transport) |
 
 **จำนวนข้อความที่คาดหมายต่อ 1 request เมื่อไม่มี loss (view 0, primary คือ node0)**
 
 | บทบาท | ส่ง | รับ |
 |---|---|---|
-| backup | 14 (forward 1, Prepare 6, Commit 6, Reply 1) | 14 (Request 1, Pre-prepare 1, Prepare 6, Commit 6) |
-| primary | 19 (Pre-prepare 6, Prepare 6, Commit 6, Reply 1) | 19 (Request 1, forward 6, Prepare 6, Commit 6) |
+| backup | 14 (forward 1, Prepare 6, Commit 6, Reply 1) | 13 (Request 1, Pre-prepare 1, Prepare 5, Commit 6) |
+| primary | 13 (Pre-prepare 6, Commit 6, Reply 1) | 19 (Request 1, forward 6, Prepare 6, Commit 6) |
 | client | 7 | 7 |
+
+ตารางนี้เป็นของหลัง C7 (primary ไม่ส่ง Prepare แล้ว backup จึงรับ Prepare จาก backup อีก 5 ตัวเท่านั้น) ตารางเดิมก่อน C7 เขียนว่า primary ส่ง 19 และ backup รับ 14
 
 - ทุก 2 request แต่ละ replica ส่งและรับ Checkpoint เพิ่มอย่างละ 6
 - ทุก 5 s แต่ละ replica ส่งและรับ Status อย่างละ 6
-- ทุก 60 s เมื่อมี key ของ peer อย่างน้อย 4 ตัว แต่ละ replica ส่งและรับ New_key อย่างละ 6 (ถ้ายังไม่ถึงเกณฑ์จะส่งทุก 5 s, `src/tbft_replica.c:370-371`)
+- New_key (`tbft_replica_run()` ใน `src/tbft_replica.c`): ทุก 60 s เมื่อมี key ของ peer ครบทั้ง 6 ตัว ถ้ามีอย่างน้อย 2f = 4 ตัวแต่ยังไม่ครบ ส่งทุก 5 s แล้วเพิ่มเป็นสองเท่าจนถึง 60 s ถ้าน้อยกว่า 4 ตัวส่งทุก 5 s แต่ละครั้ง replica ส่งและรับ New_key อย่างละ 6
 
 **เวลาส่งของ ESP-NOW ในโค้ดก่อนแก้ B1 (อนุมานจาก delay ในโค้ด)**
 
