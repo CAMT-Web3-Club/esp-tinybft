@@ -76,6 +76,7 @@ EVENT_PATTERNS = collections.OrderedDict([
     ("nv_sent", "sent new-view"),
     ("vc_joined", "ask for a view change: joining"),
     ("vc_waits", "replicas still work in view"),
+    ("vc_cut_off", "peers heard: waiting"),
     ("nv_installed", "installed view"),
     ("nv_resent", "re-sent new-view"),
     ("view_sync", "sync view to"),
@@ -87,7 +88,7 @@ EVENT_PATTERNS = collections.OrderedDict([
     ("fetch_start", "start_fetch"),
     ("fetch_done", "state transfer complete"),
     ("fetch_timeout", "fetch timeout"),
-    ("fetch_retarget", "fetching stable checkpoint"),
+    ("fetch_retarget", "timed out - fetching checkpoint"),
     ("fetch_mismatch", "does not match its certified digest"),
     ("ckpt_mismatch", "local state differs from the quorum"),
     ("req_resent", "re-sending the request"),
@@ -142,7 +143,7 @@ class Cluster:
         for i in range(N_REPLICAS + 1):
             host = f"node{i}" if i < N_REPLICAS else f"client{i}"
             lines.append(f"{host} 127.0.0.{IP_BASE + i} {self.port_base + i} pub{i}.key")
-        lines += [str(a.vc_timeout_ms), str(a.status_timeout_ms), str(a.recovery_timeout_ms)]
+        lines += ["0", "0", "0"]   # timeout lines: not used, the build sets them
         (self.dir / "config.txt").write_text("\n".join(lines) + "\n")
         for i in range(N_REPLICAS + 1):
             key = f"tinybft-sim-key node{i}\n"
@@ -872,9 +873,22 @@ def print_table(results: list[dict]):
 # Main
 # --------------------------------------------------------------------------
 
+# The timeouts are build settings, as in menuconfig on the boards; values other
+# than these defaults (shim/sdkconfig.h) get a build directory of their own.
+DEFAULT_TIMEOUTS_MS = (3000, 500, 1000)
+DEFAULT_CLIENT_TIMEOUT_MS = 20000
+
+
+def custom_timeouts(args) -> bool:
+    return (args.vc_timeout_ms, args.status_timeout_ms,
+            args.recovery_timeout_ms) != DEFAULT_TIMEOUTS_MS
+
+
 def build_dir_name(args) -> str:
     name = "build-san" if args.san else "build"
-    if args.client_timeout_ms != 20000:
+    if custom_timeouts(args):
+        name += f"-vc{args.vc_timeout_ms}-st{args.status_timeout_ms}-rc{args.recovery_timeout_ms}"
+    if args.client_timeout_ms != DEFAULT_CLIENT_TIMEOUT_MS:
         name += f"-ct{args.client_timeout_ms}"
     return name
 
@@ -884,8 +898,15 @@ def build(args):
            f"BUILD={build_dir_name(args)}"]
     if args.san:
         cmd.append(f"SAN={args.san}")
-    if args.client_timeout_ms != 20000:
-        cmd.append(f"EXTRA_CFLAGS=-DCONFIG_TBFT_CLIENT_REPLY_TIMEOUT_MS={args.client_timeout_ms}")
+    defs = []
+    if custom_timeouts(args):
+        defs += [f"-DCONFIG_TBFT_VIEW_CHANGE_TIMEOUT_US={args.vc_timeout_ms * 1000}",
+                 f"-DCONFIG_TBFT_STATUS_TIMEOUT_US={args.status_timeout_ms * 1000}",
+                 f"-DCONFIG_TBFT_RECOVERY_TIMEOUT_US={args.recovery_timeout_ms * 1000}"]
+    if args.client_timeout_ms != DEFAULT_CLIENT_TIMEOUT_MS:
+        defs.append(f"-DCONFIG_TBFT_CLIENT_REPLY_TIMEOUT_MS={args.client_timeout_ms}")
+    if defs:
+        cmd.append("EXTRA_CFLAGS=" + " ".join(defs))
     print("building:", " ".join(cmd), flush=True)
     res = subprocess.run(cmd, capture_output=True, text=True)
     sys.stdout.write("".join(l + "\n" for l in res.stdout.splitlines() if "warning" in l or "error" in l))
@@ -912,8 +933,8 @@ def main():
     ap.add_argument("--status-timeout-ms", type=int, default=500)
     ap.add_argument("--recovery-timeout-ms", type=int, default=1000)
     ap.add_argument("--hw-timeouts", action="store_true",
-                    help="use gen_configs.sh's timeouts: view change 30000, status 5000, "
-                         "recovery 10000 ms (slow)")
+                    help="use the counter example's timeouts (sdkconfig.defaults): view "
+                         "change 30000, status 5000, recovery 10000 ms (slow)")
     ap.add_argument("--client-timeout-ms", type=int, default=20000,
                     help="CONFIG_TBFT_CLIENT_REPLY_TIMEOUT_MS (compile time; a value other "
                          "than 20000 builds into build-ct<N>/)")

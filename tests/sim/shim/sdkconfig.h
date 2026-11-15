@@ -59,15 +59,19 @@
 #define CONFIG_TBFT_P_LEVELS              2
 #endif
 
-/* ---- TinyBFT: timeouts (config-file values override the first three) --- */
+/* ---- TinyBFT: timeouts ------------------------------------------------
+ * As on the boards they are build settings (the config file's timeout lines
+ * are not used).  These are the simulator's defaults, 10x shorter than the
+ * counter example's 30/5/10 s; run.py builds a separate directory for other
+ * values (--vc-timeout-ms ..., --hw-timeouts). */
 #ifndef CONFIG_TBFT_VIEW_CHANGE_TIMEOUT_US
-#define CONFIG_TBFT_VIEW_CHANGE_TIMEOUT_US 15000000
+#define CONFIG_TBFT_VIEW_CHANGE_TIMEOUT_US 3000000
 #endif
 #ifndef CONFIG_TBFT_STATUS_TIMEOUT_US
-#define CONFIG_TBFT_STATUS_TIMEOUT_US     1000000
+#define CONFIG_TBFT_STATUS_TIMEOUT_US     500000
 #endif
 #ifndef CONFIG_TBFT_RECOVERY_TIMEOUT_US
-#define CONFIG_TBFT_RECOVERY_TIMEOUT_US   2500000
+#define CONFIG_TBFT_RECOVERY_TIMEOUT_US   1000000
 #endif
 #ifndef CONFIG_TBFT_CLIENT_REPLY_TIMEOUT_MS
 #define CONFIG_TBFT_CLIENT_REPLY_TIMEOUT_MS 20000

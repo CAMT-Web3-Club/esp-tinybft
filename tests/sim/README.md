@@ -36,7 +36,7 @@ Useful options of `run.py`:
 | `--repeat N` | run each scenario N times with seeds seed..seed+N-1 |
 | `--log LEVELS` | `SIM_LOG` for every node, e.g. `INFO` or `WARN,tbft_replica=INFO` |
 | `--auth strict\|lax` | stub verification mode (see below), default strict |
-| `--vc-timeout-ms`, `--status-timeout-ms`, `--recovery-timeout-ms` | config-file timeouts (default 3000/500/1000; hardware uses 30000/5000/10000) |
+| `--vc-timeout-ms`, `--status-timeout-ms`, `--recovery-timeout-ms` | protocol timeouts (default 3000/500/1000; the counter example uses 30000/5000/10000, `--hw-timeouts`). They are build settings as in menuconfig, so other values get their own build directory |
 | `--client-boot-delay-ms` | client delay before `Byz_init_client` (default 5000, as the example) |
 | `--quiesce-s` | wait after the client finished, before the final check (default 10) |
 | `--env NAME=VALUE` | extra environment for every node (e.g. `SIM_LOSS=0.02`) |
@@ -168,13 +168,13 @@ the snapshot is never taken half-way through a message handler.
 
 - **Timing is not the ESP32-C3's.** Crypto takes microseconds (unless the
   `SIM_*_MS` knobs are used), the loopback delivers in microseconds and never
-  reorders, and the scenarios use 10x shorter config-file timeouts than
-  `gen_configs.sh` (3 s view change instead of 30 s) while the compile-time
-  client timeout stays 20 s and the key-exchange periods in `tbft_replica.c`
-  (300 ms stagger, 3 s barrier re-broadcast, 60 s barrier timeout, 5 s / 60 s
-  re-broadcast) are hard-coded. Ratios between timeouts therefore differ from
-  hardware; use `--vc-timeout-ms 30000 --status-timeout-ms 5000
-  --recovery-timeout-ms 10000` for the hardware values (slow).
+  reorders, and the scenarios use 10x shorter protocol timeouts than the
+  counter example (3 s view change instead of 30 s, `shim/sdkconfig.h`)
+  while the client timeout stays 20 s and the key-exchange periods in
+  `tbft_replica.c` (300 ms stagger, 3 s barrier re-broadcast, 60 s barrier
+  timeout, 5 s / 60 s re-broadcast) are hard-coded. Ratios between timeouts
+  therefore differ from hardware; use `--hw-timeouts` for the counter
+  example's values (slow).
 - **Network model.** Loss only (random, sender side). No reordering,
   duplication, delay, partitions, IP fragmentation or Wi-Fi contention; the
   kernel socket buffer is much larger than lwIP's 16-entry UDP mailbox
