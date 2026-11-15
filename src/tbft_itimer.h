@@ -22,6 +22,7 @@ typedef struct {
     tbft_timer_cb_t     cb;
     void               *arg;
     volatile bool       running;
+    bool                periodic;
 } tbft_itimer_t;
 
 /**
@@ -41,6 +42,13 @@ esp_err_t tbft_itimer_init(tbft_itimer_t *t, tbft_timer_cb_t cb,
  * @param timeout_us  Timeout in microseconds
  */
 void tbft_itimer_start(tbft_itimer_t *t, int64_t timeout_us);
+
+/**
+ * Start (or restart) the timer as a periodic timer: it fires every
+ * @p period_us until stopped, independent of when the callback's work is
+ * done.
+ */
+void tbft_itimer_start_periodic(tbft_itimer_t *t, int64_t period_us);
 
 /**
  * Stop the timer if it is running.

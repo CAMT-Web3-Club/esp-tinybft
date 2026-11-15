@@ -113,6 +113,7 @@ typedef struct {
     tbft_seqno_t  stable_wait_seqno;
     int64_t       stable_wait_us;
     int64_t       last_nk_reply_us;                 /* last New_key sent on request */
+    int64_t       own_ckpt_us;                      /* last time we announced our newest checkpoint */
     int64_t       reply_sent_us[TBFT_MAX_NUM_CLIENTS]; /* last reply sent to each client */
 
     /* Request queues */
@@ -166,6 +167,18 @@ typedef struct {
     uint32_t stat_view_change_sent;
     uint32_t stat_new_view;
     uint32_t stat_fetch_started;
+    uint32_t stat_resent;   /* every message sent again: retransmissions to a
+                               peer, cached replies, repeated View_change,
+                               Checkpoint, New_view and New_key */
+
+    /* The counters when this replica executed its first client request
+     * (seqno first_exec, 0 = none yet).  TBFT_STATS also reports the
+     * difference (run_*): the events of the measured run, without the boot
+     * phase's (key exchange, a view change away from a primary that is off). */
+    tbft_seqno_t first_exec;
+    struct {
+        uint32_t vc, nv, fetch, resent, tx_fail, drop;
+    } run_base;
 
     /* Event group for decoupling timer callbacks from heavy processing */
     EventGroupHandle_t evt_group;

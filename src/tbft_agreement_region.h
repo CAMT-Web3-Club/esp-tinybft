@@ -76,6 +76,9 @@ static inline bool tbft_ar_in_range(const tbft_agreement_region_t *ar,
     return (n >= ar->head) && (n < ar->head + TBFT_WINDOW_SIZE);
 }
 
+/** Forget what seqno @p n was prepared as (prep_view, prep_digest). */
+void tbft_ar_forget_prepared(tbft_agreement_region_t *ar, tbft_seqno_t n);
+
 /** Empty @p sl and give it to sequence number @p n. */
 void tbft_ar_slice_assign(tbft_agreement_slice_t *sl, tbft_seqno_t n);
 

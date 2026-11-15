@@ -127,3 +127,35 @@ void tbft_cr_truncate(tbft_checkpoint_region_t *cr, tbft_seqno_t stable_seqno)
         }
     }
 }
+
+bool tbft_cr_newest_with(const tbft_checkpoint_region_t *cr, int min_count,
+                         tbft_seqno_t above, tbft_seqno_t *seqno_out,
+                         tbft_digest_t *digest_out)
+{
+    bool found = false;
+    for (int i = 0; i < TBFT_NUM_CKPT_SLOTS; i++) {
+        const tbft_ckpt_slot_t *s = &cr->slots[i];
+        if (s->seqno <= above || s->match_count < min_count) continue;
+        if (!found || s->seqno > *seqno_out) {
+            *seqno_out  = s->seqno;
+            *digest_out = s->winning_digest;
+            found = true;
+        }
+    }
+    return found;
+}
+
+int tbft_cr_sender_with(const tbft_checkpoint_region_t *cr, tbft_seqno_t seqno,
+                        const tbft_digest_t *digest, int after, int self)
+{
+    const tbft_ckpt_slot_t *s = &cr->slots[slot_index(seqno)];
+    if (s->seqno != seqno) return -1;
+    int n = cr->num_replicas;
+    for (int k = 1; k <= n; k++) {
+        int id = ((after + k) % n + n) % n;
+        if (id == self || !s->present[id]) continue;
+        const tbft_checkpoint_rep_t *m = (const tbft_checkpoint_rep_t *)s->msgs[id];
+        if (tbft_digest_equal(&m->digest, digest)) return id;
+    }
+    return -1;
+}

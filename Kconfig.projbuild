@@ -93,6 +93,7 @@ menu "TinyBFT Configuration"
 
         config TBFT_ESPNOW_BROADCAST
             bool "Send protocol broadcasts as one broadcast frame (no ACK)"
+            depends on !TBFT_ESPNOW_POWER_SAVE
             default n
             help
                 A message to all replicas goes out as ONE frame to
@@ -100,6 +101,11 @@ menu "TinyBFT Configuration"
                 Broadcast frames get no MAC ACK and no retry (the counterpart
                 of UDP multicast). Direct sends (replies, fetch) stay
                 unicast. All boards should use the same setting.
+
+                Only with "Receive power saving" Off: a receiver hears a frame
+                only inside its wake window, the windows of the boards are not
+                lined up, and a broadcast frame is sent once, so each replica
+                would hear only about window/interval of the broadcasts.
 
         choice TBFT_ESPNOW_POWER
             prompt "Receive power saving"
@@ -316,28 +322,30 @@ menu "TinyBFT Configuration"
             default 5000000
             range 1000000 60000000
             help
-                Default view-change timeout period in microseconds.
-                This is the time to wait before triggering a view change
-                when the primary is suspected faulty. Default: 5s (5000000).
+                How long a replica waits for a pending request to execute
+                before it asks for a view change (doubled after every view
+                change that brought no progress). This value is used; the
+                timeout lines of the config file are not. Default: 5 s.
 
         config TBFT_STATUS_TIMEOUT_US
             int "Status broadcast timeout (microseconds)"
             default 1000000
             range 100000 30000000
             help
-                Default status message broadcast period in microseconds.
-                Status messages help replicas catch up during state transfer.
-                Default: 1s (1000000).
+                Period of the Status message every replica broadcasts. Peers
+                answer a Status with what its sender is missing, so this sets
+                how fast a lost message is recovered. This value is used; the
+                timeout lines of the config file are not. Default: 1 s.
 
         config TBFT_RECOVERY_TIMEOUT_US
             int "Recovery/fetch timeout (microseconds)"
             default 2500000
             range 100000 30000000
             help
-                Timeout period for state fetch/recovery in microseconds.
-                If a state block or metadata request doesn't arrive within this
-                window, the replica restarts fetching from a different peer.
-                Default: 2.5s (2500000).
+                How long a state fetch may go without an answer before the
+                replica aims at a newer checkpoint or asks another replica.
+                This value is used; the timeout lines of the config file are
+                not. Default: 2.5 s.
 
         config TBFT_CLIENT_REPLY_TIMEOUT_MS
             int "Client reply timeout (milliseconds)"

@@ -94,3 +94,22 @@ const tbft_digest_t *tbft_cr_winning_digest(const tbft_checkpoint_region_t *cr,
  * Clear all checkpoint slots with seqno < @p stable_seqno.
  */
 void tbft_cr_truncate(tbft_checkpoint_region_t *cr, tbft_seqno_t stable_seqno);
+
+/**
+ * The newest checkpoint above @p above whose leading digest has at least
+ * @p min_count matching messages.  With f+1 (a weak certificate) at least one
+ * correct replica computed that digest, so its state is a correct state to
+ * fetch, even before the checkpoint is stable.
+ * @return true and the seqno and digest, or false if there is none
+ */
+bool tbft_cr_newest_with(const tbft_checkpoint_region_t *cr, int min_count,
+                         tbft_seqno_t above, tbft_seqno_t *seqno_out,
+                         tbft_digest_t *digest_out);
+
+/**
+ * The next replica after @p after (cyclically, never @p self) that sent a
+ * Checkpoint for @p seqno with @p digest: it took that checkpoint.  -1 if
+ * none.
+ */
+int tbft_cr_sender_with(const tbft_checkpoint_region_t *cr, tbft_seqno_t seqno,
+                        const tbft_digest_t *digest, int after, int self);

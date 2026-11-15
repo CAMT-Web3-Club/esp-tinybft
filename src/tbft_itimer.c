@@ -6,7 +6,7 @@ static constexpr char TAG[] = "tbft_itimer";
 static void timer_dispatch(void *arg)
 {
     tbft_itimer_t *t = (tbft_itimer_t *)arg;
-    t->running = false;
+    if (!t->periodic) t->running = false;
     if (t->cb) {
         t->cb(t->arg);
     }
@@ -15,10 +15,11 @@ static void timer_dispatch(void *arg)
 esp_err_t tbft_itimer_init(tbft_itimer_t *t, tbft_timer_cb_t cb,
                            void *arg, const char *name)
 {
-    t->cb      = cb;
-    t->arg     = arg;
-    t->running = false;
-    t->handle  = nullptr;
+    t->cb       = cb;
+    t->arg      = arg;
+    t->running  = false;
+    t->periodic = false;
+    t->handle   = nullptr;
 
     const esp_timer_create_args_t args = {
         .callback        = timer_dispatch,
@@ -49,13 +50,33 @@ void tbft_itimer_start(tbft_itimer_t *t, int64_t timeout_us)
      * stop and call esp_timer_start_once on an already-active timer, returning
      * ESP_ERR_INVALID_STATE and leaving t->running inconsistent. */
     esp_timer_stop(t->handle);
-    t->running = false;
+    t->running  = false;
+    t->periodic = false;
 
     esp_err_t err = esp_timer_start_once(t->handle, timeout_us);
     if (err == ESP_OK) {
         t->running = true;
     } else {
         ESP_LOGE(TAG, "esp_timer_start_once failed: %s", esp_err_to_name(err));
+    }
+}
+
+void tbft_itimer_start_periodic(tbft_itimer_t *t, int64_t period_us)
+{
+    if (t->handle == nullptr) return;
+    if (period_us <= 0) {
+        ESP_LOGE(TAG, "refusing to start timer with non-positive period %lld", (long long)period_us);
+        return;
+    }
+    esp_timer_stop(t->handle);
+    t->running  = false;
+    t->periodic = true;
+
+    esp_err_t err = esp_timer_start_periodic(t->handle, (uint64_t)period_us);
+    if (err == ESP_OK) {
+        t->running = true;
+    } else {
+        ESP_LOGE(TAG, "esp_timer_start_periodic failed: %s", esp_err_to_name(err));
     }
 }
 

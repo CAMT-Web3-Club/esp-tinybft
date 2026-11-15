@@ -55,6 +55,26 @@ bool tbft_ar_replace_pp(tbft_agreement_region_t *ar, tbft_seqno_t seqno,
     return tbft_prepared_cert_replace_pp(&sl->prepared_cert, pp_buf, pp_len);
 }
 
+/* The slice of in-window seqno @p n if it already belongs to @p n, without
+ * taking the slot over: queries must not empty a slot that still holds the
+ * messages of an older seqno (they are kept for re-sending). */
+static const tbft_agreement_slice_t *held(const tbft_agreement_region_t *ar,
+                                          tbft_seqno_t n)
+{
+    if (!tbft_ar_in_range(ar, n)) return nullptr;
+    const tbft_agreement_slice_t *sl =
+        &ar->slices[(ar->head_idx + (n - ar->head)) & ar->mask];
+    return sl->seqno == n ? sl : nullptr;
+}
+
+void tbft_ar_forget_prepared(tbft_agreement_region_t *ar, tbft_seqno_t n)
+{
+    tbft_agreement_slice_t *sl = (tbft_agreement_slice_t *)held(ar, n);
+    if (!sl) return;
+    sl->prep_view = -1;
+    tbft_digest_zero(&sl->prep_digest);
+}
+
 /* --------------------------------------------------------------------------
  * Pre_prepare
  * -------------------------------------------------------------------------- */
@@ -71,13 +91,11 @@ bool tbft_ar_store_pp(tbft_agreement_region_t *ar,
 const uint8_t *tbft_ar_load_pp(const tbft_agreement_region_t *ar,
                                tbft_seqno_t seqno, int *len_out)
 {
-    if (!tbft_ar_in_range(ar, seqno)) {
+    const tbft_agreement_slice_t *sl = held(ar, seqno);
+    if (!sl) {
         if (len_out) *len_out = 0;
         return nullptr;
     }
-    const tbft_agreement_slice_t *sl =
-        (const tbft_agreement_slice_t *)tbft_ar_slice(
-            (tbft_agreement_region_t *)ar, seqno);
     if (len_out) *len_out = sl->prepared_cert.pp_len;
     return tbft_prepared_cert_pp(&sl->prepared_cert);
 }
@@ -110,10 +128,8 @@ bool tbft_ar_add_my_prepare(tbft_agreement_region_t *ar,
 
 bool tbft_ar_prepared(const tbft_agreement_region_t *ar, tbft_seqno_t seqno)
 {
-    if (!tbft_ar_in_range(ar, seqno)) return false;
-    tbft_agreement_slice_t *sl =
-        tbft_ar_slice((tbft_agreement_region_t *)ar, seqno);
-    return tbft_prepared_cert_is_complete(&sl->prepared_cert);
+    const tbft_agreement_slice_t *sl = held(ar, seqno);
+    return sl && tbft_prepared_cert_is_complete(&sl->prepared_cert);
 }
 
 /* --------------------------------------------------------------------------
@@ -142,10 +158,8 @@ bool tbft_ar_add_my_commit(tbft_agreement_region_t *ar,
 
 bool tbft_ar_committed(const tbft_agreement_region_t *ar, tbft_seqno_t seqno)
 {
-    if (!tbft_ar_in_range(ar, seqno)) return false;
-    tbft_agreement_slice_t *sl =
-        tbft_ar_slice((tbft_agreement_region_t *)ar, seqno);
-    return tbft_commit_cert_is_complete(&sl->commit_cert);
+    const tbft_agreement_slice_t *sl = held(ar, seqno);
+    return sl && tbft_commit_cert_is_complete(&sl->commit_cert);
 }
 
 /* --------------------------------------------------------------------------

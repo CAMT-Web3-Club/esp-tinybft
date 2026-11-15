@@ -254,13 +254,13 @@ void tbft_state_start_fetch(tbft_state_t *state, tbft_seqno_t seqno,
              (long long)seqno, replier);
 }
 
-void tbft_state_handle_meta_data(tbft_state_t *state,
+bool tbft_state_handle_meta_data(tbft_state_t *state,
                                  const tbft_meta_data_rep_t *rep,
                                  const tbft_part_info_t *parts,
                                  int n_parts)
 {
-    if (!state->in_fetch) return;
-    if (rep->seqno != state->fetch_seqno) return;
+    if (!state->in_fetch) return false;
+    if (rep->seqno != state->fetch_seqno) return false;
 
     int level = rep->level;
     int index = rep->index;
@@ -273,18 +273,18 @@ void tbft_state_handle_meta_data(tbft_state_t *state,
     if (level < 0 || level >= p_levels - 1) {
         ESP_LOGW(TAG, "meta_data: invalid level %d (p_levels=%d)",
                  level, p_levels);
-        return;
+        return false;
     }
     int nodes_at_level = tbft_ptree_nodes_at_level(level, pchildren);
     if (index < 0 || index >= nodes_at_level) {
         ESP_LOGW(TAG, "meta_data: invalid index %d at level %d (max=%d)",
                  index, level, nodes_at_level);
-        return;
+        return false;
     }
     if (n_parts < 0 || n_parts > pchildren) {
         ESP_LOGW(TAG, "meta_data: invalid n_parts %d (pchildren=%d)",
                  n_parts, pchildren);
-        return;
+        return false;
     }
 
     int child_level = level + 1;
@@ -308,6 +308,19 @@ void tbft_state_handle_meta_data(tbft_state_t *state,
         const tbft_digest_t *local =
             &state->ptree.ptree[child_level][child_idx].digest;
         if (!tbft_digest_equal(local, &parts[i].digest)) {
+            /* A second copy of a Meta_data (a frame re-sent after a lost
+             * ACK, or the previous replier's late answer) must not queue a
+             * child twice: its block would be counted pending twice and the
+             * fetch would never complete. */
+            bool queued = false;
+            for (int q = 0; q < state->fetch_queue_len; q++) {
+                if (state->fetch_queue[q].level == child_level &&
+                    state->fetch_queue[q].index == child_idx) {
+                    queued = true;
+                    break;
+                }
+            }
+            if (queued) continue;
             if (state->fetch_queue_len < TBFT_MAX_STATE_BLOCKS) {
                 tbft_fetch_req_t *req =
                     &state->fetch_queue[state->fetch_queue_len++];
@@ -321,6 +334,7 @@ void tbft_state_handle_meta_data(tbft_state_t *state,
             }
         }
     }
+    return true;
 }
 
 void tbft_state_handle_data(tbft_state_t *state,

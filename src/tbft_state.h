@@ -184,7 +184,7 @@ static inline const uint8_t *tbft_state_image_block(const tbft_state_t *state,
  * Handle an incoming Meta_data message during fetch.
  * Enqueues sub-tree fetches for mismatched children.
  */
-void tbft_state_handle_meta_data(tbft_state_t *state,
+bool tbft_state_handle_meta_data(tbft_state_t *state,
                                  const tbft_meta_data_rep_t *rep,
                                  const tbft_part_info_t *parts,
                                  int n_parts);

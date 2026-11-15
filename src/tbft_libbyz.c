@@ -168,6 +168,10 @@ static bool next_int(cfg_reader_t *rd, int *out)
  *   <view_change_timeout_ms>
  *   <status_timeout_ms>
  *   <recovery_timeout_ms>
+ *
+ * The three timeout lines stay for the format but are not used: the
+ * timeouts come from menuconfig (TinyBFT Configuration > Timeouts), so the
+ * build shows them.  Write 0 there; another value only adds a warning.
  * -------------------------------------------------------------------------- */
 
 typedef struct {
@@ -316,9 +320,9 @@ static int parse_config(const char *path, tbft_config_t *cfg)
     if (!next_int(&rd, &cfg->status_timeout_ms))   goto fail;
     if (!next_int(&rd, &cfg->recovery_timeout_ms)) goto fail;
 
-    if (cfg->auth_timeout_ms <= 0 || cfg->vc_timeout_ms <= 0 ||
-        cfg->status_timeout_ms <= 0 || cfg->recovery_timeout_ms <= 0) {
-        ESP_LOGE(TAG, "timeout values must be positive");
+    if (cfg->auth_timeout_ms < 0 || cfg->vc_timeout_ms < 0 ||
+        cfg->status_timeout_ms < 0 || cfg->recovery_timeout_ms < 0) {
+        ESP_LOGE(TAG, "timeout values must not be negative");
         goto fail;
     }
 
@@ -577,6 +581,9 @@ static int setup_principals(tbft_node_t *node, const tbft_config_t *cfg,
 static int           s_req_len = 0;
 static tbft_req_id_t s_req_rid = 0;
 static uint32_t      s_req_resent = 0;   /* retransmissions, for TBFT_STATS */
+/* Highest view of an accepted reply (-1 = none yet): a view change during the
+ * measured run shows in the client's own log. */
+static tbft_view_t   s_reply_view = -1;
 
 /* Request ids must keep growing across client reboots: every replica
  * remembers the last request it ran for each client and ignores older ones.
@@ -923,6 +930,12 @@ int Byz_recv_reply(Byz_rep *rep)
         }
 
         if (match >= needed) {
+            for (int i = 0; i < num_replicas; i++) {
+                const tbft_reply_rep_t *ri = (const tbft_reply_rep_t *)s_cm->replies[i].buf;
+                if (s_cm->replies[i].valid && ri->rid == r0->rid && ri->view > s_reply_view) {
+                    s_reply_view = ri->view;
+                }
+            }
             if (winning_payload_len < 0 ||
                 (size_t)winning_payload_len > sizeof(s_cm->app_rep)) {
                 return -1;
@@ -1078,15 +1091,20 @@ int Byz_init_replica(const char *config_file, const char *priv_config,
         return -1;
     }
 
-    /* Set timer periods from config */
-    s_replica->vtimer_period_us = (int64_t)cfg.vc_timeout_ms * 1000LL;
-    s_replica->stimer_period_us = (int64_t)cfg.status_timeout_ms * 1000LL;
-    if (s_replica->vtimer_period_us <= 0) s_replica->vtimer_period_us = 5000000LL;
-    if (s_replica->stimer_period_us <= 0) s_replica->stimer_period_us = 1000000LL;
-
-    s_replica->state.fetch_timeout_us = (int64_t)cfg.recovery_timeout_ms * 1000LL;
-    if (s_replica->state.fetch_timeout_us <= 0) {
-        s_replica->state.fetch_timeout_us = TBFT_RECOVERY_TIMEOUT_US;
+    /* The timer periods are the menuconfig values tbft_replica_init set.
+     * Timeouts in the config file are not used (see parse_config). */
+    if ((cfg.vc_timeout_ms != 0 &&
+         (int64_t)cfg.vc_timeout_ms * 1000 != (int64_t)TBFT_VIEW_CHANGE_TIMEOUT_US) ||
+        (cfg.status_timeout_ms != 0 &&
+         (int64_t)cfg.status_timeout_ms * 1000 != (int64_t)TBFT_STATUS_TIMEOUT_US) ||
+        (cfg.recovery_timeout_ms != 0 &&
+         (int64_t)cfg.recovery_timeout_ms * 1000 != (int64_t)TBFT_RECOVERY_TIMEOUT_US)) {
+        ESP_LOGW(TAG, "config file timeouts %d/%d/%d ms are not used: menuconfig sets "
+                 "view change %lld, status %lld, recovery %lld ms",
+                 cfg.vc_timeout_ms, cfg.status_timeout_ms, cfg.recovery_timeout_ms,
+                 (long long)TBFT_VIEW_CHANGE_TIMEOUT_US / 1000,
+                 (long long)TBFT_STATUS_TIMEOUT_US / 1000,
+                 (long long)TBFT_RECOVERY_TIMEOUT_US / 1000);
     }
 
     /* M4 FIX: Setup principals FIRST (including private keys and HMAC session
@@ -1107,7 +1125,9 @@ int Byz_init_replica(const char *config_file, const char *priv_config,
     tbft_itimer_stop(&s_replica->vtimer);
     tbft_itimer_stop(&s_replica->stimer);
     /* Do NOT start vtimer on boot. It will be armed when a client request is received. */
-    tbft_itimer_start(&s_replica->stimer, s_replica->stimer_period_us);
+    /* Periodic: a Status every period exactly, however late the replica
+     * loop notices each tick (it polls the timer bits between messages). */
+    tbft_itimer_start_periodic(&s_replica->stimer, s_replica->stimer_period_us);
 
     s_is_replica = true;
     ESP_LOGI(TAG, "replica %d initialised", local_id);
@@ -1170,13 +1190,18 @@ void Byz_print_stats(void)
     } else if (s_client && s_client->transport) {
         tbft_transport_stats_t t;
         tbft_transport_get_stats(s_client->transport, &t);
-        ESP_LOGW(TAG, "TBFT_STATS id=%d tx=%lu tx_frames=%lu tx_fail=%lu tx_qfull=%lu rx=%lu "
-                 "rx_drop=%lu rx_frag_drop=%lu rx_reply=%lu req_resent=%lu heap=%lu heap_min=%lu",
-                 (int)s_client->node_id, (unsigned long)t.tx_msgs,
+        ESP_LOGW(TAG, "TBFT_STATS id=%d view=%lld tx=%lu tx_frames=%lu tx_fail=%lu tx_qfull=%lu "
+                 "cb_fail=%lu cb_timeout=%lu send_err=%lu cb_slow=%lu cb_max_ms=%lu rx=%lu "
+                 "rx_drop=%lu rx_frag_drop=%lu rx_dup=%lu rx_reply=%lu req_resent=%lu "
+                 "heap=%lu heap_min=%lu",
+                 (int)s_client->node_id, (long long)s_reply_view, (unsigned long)t.tx_msgs,
                  (unsigned long)t.tx_frames,
                  (unsigned long)t.tx_fail, (unsigned long)t.tx_queue_full,
+                 (unsigned long)t.tx_cb_fail, (unsigned long)t.tx_cb_timeout,
+                 (unsigned long)t.tx_send_err, (unsigned long)t.tx_cb_slow,
+                 (unsigned long)t.tx_cb_max_ms,
                  (unsigned long)t.rx_msgs, (unsigned long)t.rx_drop,
-                 (unsigned long)t.rx_frag_drop,
+                 (unsigned long)t.rx_frag_drop, (unsigned long)t.rx_dup,
                  (unsigned long)t.rx_by_tag[TBFT_MSG_REPLY],
                  (unsigned long)s_req_resent,
                  (unsigned long)esp_get_free_heap_size(),
