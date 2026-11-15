@@ -101,9 +101,21 @@ typedef struct {
     uint32_t tx_frames;      /* radio transmissions requested, retries included */
     uint32_t tx_fail;        /* sends given up on (retries exhausted / hard error) */
     uint32_t tx_queue_full;  /* ESP-NOW: send queue full, message dropped */
+    /* ESP-NOW: what happened to each frame handed to esp_now_send() (UDP: 0) */
+    uint32_t tx_cb_fail;     /* send callback: no MAC ACK (driver retries exhausted) */
+    uint32_t tx_cb_timeout;  /* no send callback within the safety timeout */
+    uint32_t tx_send_err;    /* esp_now_send() refused the frame (e.g. no memory) */
+    uint32_t tx_cb_slow;     /* send callbacks that took longer than 100 ms */
+    uint32_t tx_cb_max_ms;   /* longest wait for a send callback */
     uint32_t rx_msgs;        /* complete messages handed to the protocol */
     uint32_t rx_drop;        /* ESP-NOW: complete message dropped (rx queue full) */
-    uint32_t rx_frag_drop;   /* ESP-NOW: fragment dropped (bad header, reasm) */
+    uint32_t rx_frag_drop;   /* ESP-NOW: fragment rejected (bad header or
+                                reassembly) or incomplete message lost
+                                (timed out or evicted).  UDP: 0 (lwIP drops
+                                are not visible) */
+    uint32_t rx_dup;         /* ESP-NOW: exact repeat of the previous frame
+                                from the same sender (its ACK was lost), not
+                                counted in rx_frag_drop.  UDP: 0 */
     uint32_t tx_by_tag[TBFT_STATS_NUM_TAGS];
     uint32_t rx_by_tag[TBFT_STATS_NUM_TAGS];
 } tbft_transport_stats_t;

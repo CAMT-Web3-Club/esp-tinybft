@@ -43,7 +43,12 @@ static constexpr int FRAG_MAX_PARTS   = (TBFT_MAX_MESSAGE_SIZE + FRAG_MAX_PAYLOA
 static constexpr int REASM_MAX_SLOTS  = 8;
 static constexpr int REASM_TIMEOUT_MS = 5'000;
 static constexpr int ESPNOW_TX_MAX_ATTEMPTS  = CONFIG_TBFT_ESPNOW_TX_RETRIES;
-static constexpr int ESPNOW_TX_CB_TIMEOUT_MS = 100;   /* wait for the MAC-layer result */
+/* Safety net only (see espnow_tx_frame()): 2 s, because the slowest send
+ * callback measured on 8 boards at boot (1 Mbps, all New_keys at once) was
+ * 908 ms, and a callback that does arrive must not be cut short. */
+static constexpr int ESPNOW_TX_CB_TIMEOUT_MS = 2'000;
+static constexpr int ESPNOW_TX_CB_SLOW_MS    = 100;   /* a slower callback counts in tx_cb_slow */
+static constexpr int DUP_MAX_SENDERS         = 8;     /* = MAX_NUM_REPLICAS + MAX_NUM_CLIENTS */
 
 static constexpr int MSG_QUEUE_DEPTH      = 16;
 static constexpr int SEND_QUEUE_DEPTH     = 8;
@@ -107,6 +112,18 @@ typedef struct {
     uint16_t  last_frag_len;
 } reasm_slot_t;
 
+/* The last frame received from one sender, to drop an exact repeat of it.
+ * The send task keeps one frame in flight, so a frame a sender sends twice is
+ * always a repeat of that frame (same msg_id, fragment and length). */
+typedef struct {
+    uint8_t  mac[6];
+    uint16_t msg_id;
+    uint8_t  frag_idx;
+    uint8_t  frag_total;
+    int      payload_len;
+    bool     valid;
+} dup_entry_t;
+
 typedef struct tbft_espnow {
     tbft_addr_t  peers[TBFT_MAX_NUM_REPLICAS + TBFT_MAX_NUM_CLIENTS];
     bool         peer_valid[TBFT_MAX_NUM_REPLICAS + TBFT_MAX_NUM_CLIENTS];
@@ -121,12 +138,14 @@ typedef struct tbft_espnow {
     SemaphoreHandle_t task_exit_sem; /* ซิงก์รอให้ task ออกอย่างปลอดภัยตอน shutdown */
 
     reasm_slot_t  reasm[REASM_MAX_SLOTS];
+    dup_entry_t   dup[DUP_MAX_SENDERS];   /* touched only by the Wi-Fi task, like reasm */
     uint16_t next_msg_id;
     SemaphoreHandle_t lock;
     volatile bool shutting_down;
 
-    /* TX completion: only send_task calls esp_now_send(), so at most one
-     * frame is in flight; the send callback reports its MAC-layer result. */
+    /* TX completion: only send_task calls esp_now_send(), and it waits for a
+     * frame's send callback before the next, so at most one frame is in
+     * flight; the callback reports its MAC-layer result. */
     SemaphoreHandle_t tx_done;
     SemaphoreHandle_t rx_sem;   /* given on every delivered message (wait()) */
     volatile esp_now_send_status_t tx_status;
@@ -229,6 +248,7 @@ static reasm_slot_t *reasm_find_or_alloc(tbft_espnow_t *enow, uint16_t msg_id, c
             /* Slot timed out — clear it immediately so the new message
              * starts with a clean buffer. */
             if (s->valid && s->frag_received > 0) {
+                enow->stats.rx_frag_drop++;   /* an incomplete message is lost */
                 ESP_LOGW(TAG, "reasm: slot %d timed out (msg_id=%u, %d/%d frags, "
                          "%ums old) — clearing for new message",
                          i, (unsigned)s->msg_id, s->frag_received,
@@ -253,6 +273,7 @@ static reasm_slot_t *reasm_find_or_alloc(tbft_espnow_t *enow, uint16_t msg_id, c
     /* Log eviction of a partial message so operators can diagnose
      * high fragment loss or undersized REASM_MAX_SLOTS. */
     if (enow->reasm[oldest].valid && enow->reasm[oldest].frag_received > 0) {
+        enow->stats.rx_frag_drop++;   /* an incomplete message is lost */
         ESP_LOGW(TAG, "reasm: evicting slot %d (msg_id=%u, %d/%d frags) — "
                  "all slots full, oldest entry dropped",
                  oldest, (unsigned)enow->reasm[oldest].msg_id,
@@ -266,7 +287,7 @@ static reasm_slot_t *reasm_find_or_alloc(tbft_espnow_t *enow, uint16_t msg_id, c
 
 static bool reasm_feed(tbft_espnow_t *enow, reasm_slot_t *s, const uint8_t *data, int data_len, uint16_t msg_id, uint8_t frag_idx, uint8_t frag_total, const uint8_t *src_mac) {
     if (!s->valid || s->stale) {
-        if (frag_total == 0 || frag_total > 32) return false;
+        if (frag_total == 0 || frag_total > 32) { enow->stats.rx_frag_drop++; return false; }
         s->valid = true;
         s->stale = false;
         s->msg_id = msg_id;
@@ -284,11 +305,13 @@ static bool reasm_feed(tbft_espnow_t *enow, reasm_slot_t *s, const uint8_t *data
                  "(expected %u, frag_total mismatch %d vs %d)",
                  frag_idx, frag_total, (unsigned)msg_id,
                  (unsigned)s->msg_id, frag_total, s->frag_total);
+        enow->stats.rx_frag_drop++;
         return false;
     }
     if (frag_idx >= frag_total || frag_idx >= 32) {
         ESP_LOGW(TAG, "reasm: rejecting frag idx=%d (total=%d) — out of range",
                  frag_idx, frag_total);
+        enow->stats.rx_frag_drop++;
         return false;
     }
     if (s->frag_mask & (1U << frag_idx)) {
@@ -302,6 +325,7 @@ static bool reasm_feed(tbft_espnow_t *enow, reasm_slot_t *s, const uint8_t *data
         ESP_LOGW(TAG, "reasm: rejecting frag idx=%d — would overflow buffer "
                  "(offset=%d + len=%d > %d)",
                  frag_idx, offset, data_len, TBFT_MAX_MESSAGE_SIZE);
+        enow->stats.rx_frag_drop++;
         return false;
     }
 
@@ -338,6 +362,56 @@ static inline void stats_count_tag(uint32_t *arr, int tag) {
     if (tag > 0 && tag < TBFT_STATS_NUM_TAGS) arr[tag]++;
 }
 
+/* True when this frame is an exact repeat of the last frame from the same
+ * sender, i.e. the sender's MAC ACK was lost and it sent the frame again.
+ * The ESP-NOW guide leaves dropping duplicates to the application ("a sequence
+ * number can also be assigned to ESP-NOW data to drop the duplicate data").
+ * Without this a repeated New_key was delivered twice (the reassembly slot is
+ * reused for the same msg_id) and a repeated Status made the receiver think a
+ * peer was still behind, so it re-sent messages nobody needed.  Wi-Fi task
+ * context, no lock (like the reassembly table). */
+static bool is_duplicate_frame(tbft_espnow_t *enow, const uint8_t *src_mac,
+                               const frag_hdr_t *fhdr, int payload_len)
+{
+    for (int i = 0; i < DUP_MAX_SENDERS; i++) {
+        const dup_entry_t *d = &enow->dup[i];
+        if (!d->valid || memcmp(d->mac, src_mac, ESPNOW_MAC_LEN) != 0) continue;
+        return d->msg_id == fhdr->msg_id && d->frag_idx == fhdr->frag_idx &&
+               d->frag_total == fhdr->frag_total && d->payload_len == payload_len;
+    }
+    return false;
+}
+
+/* Remember an accepted frame as the last one from its sender.  Only accepted
+ * frames are remembered: a frame rejected for a passing reason (a reassembly
+ * slot evicted at that moment) must be accepted again when the sender retries
+ * it. */
+static void remember_frame(tbft_espnow_t *enow, const uint8_t *src_mac,
+                           const frag_hdr_t *fhdr, int payload_len)
+{
+    dup_entry_t *empty = nullptr;
+    for (int i = 0; i < DUP_MAX_SENDERS; i++) {
+        dup_entry_t *d = &enow->dup[i];
+        if (!d->valid) {
+            if (!empty) empty = d;
+            continue;
+        }
+        if (memcmp(d->mac, src_mac, ESPNOW_MAC_LEN) != 0) continue;
+        d->msg_id      = fhdr->msg_id;
+        d->frag_idx    = fhdr->frag_idx;
+        d->frag_total  = fhdr->frag_total;
+        d->payload_len = payload_len;
+        return;
+    }
+    if (!empty) return;   /* table full (more senders than nodes): no filtering */
+    memcpy(empty->mac, src_mac, ESPNOW_MAC_LEN);
+    empty->msg_id      = fhdr->msg_id;
+    empty->frag_idx    = fhdr->frag_idx;
+    empty->frag_total  = fhdr->frag_total;
+    empty->payload_len = payload_len;
+    empty->valid       = true;
+}
+
 /* Hand one complete message to the protocol task. Wi-Fi task context. */
 static void espnow_deliver(tbft_espnow_t *enow, recv_entry_t *q_entry) {
     int msg_tag = q_entry->payload[0]; /* low byte of hdr.tag */
@@ -367,6 +441,11 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *
     const uint8_t *payload = data + sizeof(frag_hdr_t);
     int payload_len = data_len - (int)sizeof(frag_hdr_t);
 
+    if (is_duplicate_frame(enow, src_mac, fhdr, payload_len)) {
+        enow->stats.rx_dup++;
+        return;
+    }
+
     /* Fast path: every message except New_key fits one frame. */
     if (fhdr->frag_total == 1) {
         if (fhdr->frag_idx != 0 || payload_len <= 0 || payload_len > TBFT_MAX_MESSAGE_SIZE) {
@@ -376,6 +455,7 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *
         memcpy(q_entry.src_mac, src_mac, ESPNOW_MAC_LEN);
         q_entry.buf_len = payload_len;
         memcpy(q_entry.payload, payload, (size_t)payload_len);
+        remember_frame(enow, src_mac, fhdr, payload_len);
         espnow_deliver(enow, &q_entry);
         return;
     }
@@ -388,6 +468,7 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *
                     fhdr->frag_idx, fhdr->frag_total, src_mac)) {
         return;   /* incomplete (or rejected fragment, logged at WARN inside) */
     }
+    remember_frame(enow, src_mac, fhdr, payload_len);
 
     memcpy(q_entry.src_mac, src_mac, ESPNOW_MAC_LEN);
     q_entry.buf_len = s->buf_len;
@@ -403,6 +484,16 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *
 /* Send one frame and wait for its MAC-layer result (send callback).
  * esp_now_send() returning ESP_OK only means "queued"; the callback tells
  * whether the peer ACKed (ESP-NOW docs, "Send ESP-NOW Data").
+ *
+ * The next frame goes out only after this frame's callback, as those docs
+ * recommend and ESP-IDF's examples/wifi/espnow does (it waits without a
+ * timeout).  The driver calls back for every frame it queued, but on a busy
+ * channel that takes well over 100 ms: 8 boards at 1 Mbps, all sending
+ * New_key at boot.  Sending again before the callback put a second copy of
+ * the frame in the driver.  Every copy holds a Wi-Fi TX buffer from the heap
+ * until it is sent, the copies kept the channel busier still, and a late
+ * callback was taken as the result of the next frame.  So the timeout is only
+ * a safety net.
  *
  * Retries on either kind of failure: at least ESPNOW_TX_MAX_ATTEMPTS times
  * and, with receive power saving, until TBFT_ESPNOW_RETRY_SPAN_MS has passed
@@ -422,12 +513,19 @@ static bool espnow_tx_frame(tbft_espnow_t *enow, const uint8_t *mac,
         esp_err_t err = esp_now_send(mac, pkt, len);
         if (err == ESP_OK) {
             enow->stats.tx_frames++;
+            int64_t sent_us = esp_timer_get_time();
             if (xSemaphoreTake(enow->tx_done,
-                               pdMS_TO_TICKS(ESPNOW_TX_CB_TIMEOUT_MS)) == pdTRUE &&
-                enow->tx_status == ESP_NOW_SEND_SUCCESS) {
-                return true;
+                               pdMS_TO_TICKS(ESPNOW_TX_CB_TIMEOUT_MS)) != pdTRUE) {
+                enow->stats.tx_cb_timeout++;
+            } else {
+                uint32_t waited_ms = (uint32_t)((esp_timer_get_time() - sent_us) / 1000);
+                if (waited_ms > enow->stats.tx_cb_max_ms) enow->stats.tx_cb_max_ms = waited_ms;
+                if (waited_ms > ESPNOW_TX_CB_SLOW_MS) enow->stats.tx_cb_slow++;
+                if (enow->tx_status == ESP_NOW_SEND_SUCCESS) return true;
+                enow->stats.tx_cb_fail++;
             }
         } else {
+            enow->stats.tx_send_err++;
             ESP_LOGD(TAG, "esp_now_send err=0x%x (attempt %d)", err, attempt + 1);
         }
         bool again = (attempt + 1 < ESPNOW_TX_MAX_ATTEMPTS);
