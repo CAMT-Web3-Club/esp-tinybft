@@ -509,9 +509,25 @@ static bool espnow_tx_frame(tbft_espnow_t *enow, const uint8_t *mac,
 | L6 | query แบบอ่านอย่างเดียวล้าง slot ที่เก็บไว้ส่งซ้ำ | `tbft_ar_load_pp/prepared/committed` ไม่ยึด slot แล้ว `send_view_change_to` ใช้ `tbft_ar_peek` |
 | L7, R2 | Meta_data ซ้ำหรือมาช้าทำให้ fetch ค้างหรือจบก่อนเวลา | ไม่ enqueue ลูกที่อยู่ในคิวแล้ว และตรวจว่า fetch เสร็จเฉพาะเมื่อรับ Meta_data นั้น |
 | L9 | event bit ของ view-change timer ค้าง | loop ข้าม bit ถ้า timer ถูก start ใหม่แล้ว และ `handle_vtimer` ไม่ทำอะไรเมื่อไม่มี request ค้างและไม่ได้อยู่ใน view change |
+| L5 | ซ่อมข้อความหายช้า (1–2 Status period ต่อข้อความ) เพราะเทียบกับ snapshot ของ Status รอบก่อน | เมื่อ Status จาก peer บอกว่า peer นำหน้า (executed/prepared สูงกว่าเรา) replica จะส่ง Status แบบ `WANT` ทันที (จำกัด 1 ครั้ง/วินาที) เพื่อให้ peer เทียบกับสถานะปัจจุบันและส่งของที่ขาดให้เลย |
+| L8 | broadcast ช้าเมื่อมี peer ตาย: ส่ง unicast ทีละ peer ลอง 3 ครั้งต่อเฟรม และคิวส่งเต็มแล้วบล็อก replica task | จำนับการส่งที่ล้มเหลวติดกันต่อ peer ถ้าเกิน 3 ครั้งจะลองเพียง 1 ครั้งต่อเฟรมจนกว่าจะได้ยินจาก peer นั้นอีก และรีเซ็ตทุก peer ทุก 10 s (probe) เพื่อให้ peer ที่เพิ่ง boot ไม่ถูกจำกัด retry |
 | R1 | `handle_fetch` อ่านนอกขอบเขตเมื่อ `index` ใหญ่ | ปฏิเสธ `index >= tbft_ptree_nodes_at_level(level)` |
 
-ข้อที่ยังไม่แก้ (ให้เจ้าของงานวิจัยกำหนดเวลา): L5, L8, R3–R11 และ X1 ส่วนที่เหลือคือค่า *Client request retransmission interval* ซึ่งต้องวัด `max_ms` ของทุก config บนบอร์ดก่อน
+ข้อที่ยังไม่แก้ (ให้เจ้าของงานวิจัยกำหนดเวลา): R3–R11 และ X1 ส่วนที่เหลือคือค่า *Client request retransmission interval* ซึ่งต้องวัด `max_ms` ของทุก config บนบอร์ดก่อน (ผลวัดอยู่ท้ายหัวข้อนี้)
+
+**ทดสอบ liveness ใต้ loss บนบอร์ดจริง (2026-11-15)**
+
+link ระหว่างบอร์ดในห้องแล็บไม่ loss อะไรเลย จึงเพิ่ม Kconfig สำหรับทดสอบเท่านั้น `TBFT_TEST_RX_DROP_PCT` (default 0) ซึ่งทิ้งเฟรมที่รับได้ x% **หลัง** MAC ACK ออกไปแล้ว ผู้ส่งจึงคิดว่าถึง ทุก node ทิ้งทั้งขาไปและขากลับ ค่า 15% จึงเท่ากับข้อความหายราว 28%
+
+| การทดสอบ | ผล |
+|---|---|
+| loss 15% อย่างเดียว (5 นาที) | client 23/25, 1 view change, latency 5357/11799 ms |
+| **loss 15% + reset primary 2 ตัว (node0, node1) พร้อมกันที่ t=90 s** | client 23/26, cluster ไป **view 1 ที่ 108 s และ view 2 ที่ 129 s** แล้วให้บริการต่อได้ — scenario เดียวกับ S3b ที่ simulator เคย FAIL 8 จาก 8 รอบก่อนแก้ L1 |
+| ปกติ ไม่มี loss (2 รอบ, 5 นาที) | 27/28 และ 29/29, **ไม่มี view change** ทั้งสองรอบ |
+
+**ข้อบกพร่องที่เจอระหว่างทดสอบ (แก้แล้ว):** การจำกัด retry ของ L8 ทำงานตอน boot ด้วย ทำให้ New_key ส่งได้ 1 ครั้งต่อ peer ที่ยังไม่ตอบ → key ไม่ครบ → เกิด view change ในช่วง boot (2 จาก 2 รอบ) แก้ด้วยการรีเซ็ต streak ทุก 10 วินาที (probe) หลังแก้แล้ว 2 จาก 2 รอบไม่มี view change และการส่งไปยัง peer ที่ตายลดลง (เฟรมรวม 1018 → 908 ใน 5 นาที)
+
+**การนับผลวัดที่ยุติธรรมขึ้น:** `tools/analyze.py` แยกเป็น `success (sent)` = ok/(ok+fail) และ `slots` = ok/(ok+fail+missed) เพราะ `missed` คือช่องที่ client ข้ามเพราะ request ก่อนยังไม่เสร็จ (เป็นเรื่อง latency ไม่ใช่ loss) ก่อนหน้านี้ `missed` ถูกนับเป็นความล้มเหลว ทำให้ config ที่ช้า (เช่น UDP PS) ดู success ต่ำกว่า ESP-NOW ทั้งที่ `fail=0` ทั้งคู่
 
 **ข้อจำกัดที่ยังเหลือ (ด้าน security ซึ่งตกลงให้เป็นรอง):** View_change ไม่มี proof (prepared certificate) และ New_view ไม่ถูกตรวจกับ View_change ที่ใช้สร้าง replica ที่เป็น Byzantine จึงรายงานเท็จช่วง view change ได้ ส่วน crash, reboot, boot ช้า และข้อความหาย รับมือได้แล้ว replica ที่ reboot เสีย state ของ protocol ไปและนับเป็นหนึ่งใน f จนกว่าจะตามทัน
 

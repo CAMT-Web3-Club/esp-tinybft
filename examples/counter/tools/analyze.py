@@ -27,7 +27,14 @@ Requests are counted from the first successful request to the last
 CLIENT_STATS line, so start the meter at the first successful request and stop
 it at the end.  Average and maximum latency are those of the successful
 requests from the second one on: the first request after boot waits for the
-whole cluster to come up and is reported in a note instead.  Measure the SAME boards in every run: efficacy is successful
+whole cluster to come up and is reported in a note instead.
+
+Two success figures are printed, because a slow configuration is not a lossy
+one: "success (sent)" is ok / (ok + fail), the quality of the link and the
+protocol; "slots" is ok / (ok + fail + missed), the share of the client's
+scheduled slots that produced a request.  A slot is "missed" when the
+previous request was still running at the next period, so a higher latency
+lowers "slots" while "success (sent)" stays at 100 %.  Measure the SAME boards in every run: efficacy is successful
 requests per joule summed over the boards listed in energy.csv.
 
 A configuration qualifies only if its mean success rate >= --min-success.
@@ -115,7 +122,13 @@ def load_run(d):
     if first is not None:
         a, b = rows[first], rows[-1]
         r["ok"] = b["ok"] - a["ok"] + 1          # the first success opens the window
-        r["total"] = r["ok"] + (b["fail"] - a["fail"]) + (b.get("missed", 0) - a.get("missed", 0))
+        r["fail"] = b["fail"] - a["fail"]
+        # A "missed" slot is one the client could not send because the previous
+        # request was still running: it measures latency, not loss, so it is
+        # kept apart from the failure count (a slow configuration would
+        # otherwise look less successful than a fast one with the same loss).
+        r["missed"] = b.get("missed", 0) - a.get("missed", 0)
+        r["total"] = r["ok"] + r["fail"] + r["missed"]   # slots in the window
         # Latency of each successful request (last_ms of its own row), not the
         # firmware's running max: that one keeps the first request after boot,
         # which waits for the whole cluster to come up (5-9 s on the boards)
@@ -244,10 +257,15 @@ def main():
         counted = [r for r in rs if r["total"] > 0]
         used = [r for r in counted if a.include_faulty or not r["faulty"]]
         m = {"n": len(used), "of": len(rs), "dropped": len(counted) - len(used),
-             "succ": None, "eff": None, "eff_sd": 0.0, "jpr": None, "inc": None, "lat": None,
-             "max": None, "resent": None, "drops": None}
+             "succ": None, "slot": None, "eff": None, "eff_sd": 0.0, "jpr": None,
+             "inc": None, "lat": None, "max": None, "resent": None, "drops": None}
         if used:
-            m["succ"] = st.mean(r["ok"] / r["total"] for r in used)
+            # Two numbers, because they answer different questions:
+            #   succ = requests that were sent and succeeded (loss and faults)
+            #   slot = scheduled slots that succeeded (latency included)
+            sent = [r for r in used if r["ok"] + r["fail"] > 0]
+            m["succ"] = st.mean(r["ok"] / (r["ok"] + r["fail"]) for r in sent) if sent else None
+            m["slot"] = st.mean(r["ok"] / r["total"] for r in used)
             m["resent"] = st.mean(r["resent"] for r in used)
             m["drops"] = st.mean(r["drops"] for r in used)
             lat = [r["avg_ms"] for r in used if r["avg_ms"]]
@@ -267,14 +285,15 @@ def main():
     def fmt(x, spec):
         return format(x, spec) if x is not None else "-"
 
-    print("\n| point | runs | success | avg latency ms | max latency ms | req/J (±sd) | J/req "
-          "| incr J/req | resent/run | drops/run | excl. faulty |")
-    print("|---|---|---|---|---|---|---|---|---|---|---|")
+    print("\n| point | runs | success (sent) | slots | avg latency ms | max latency ms | req/J (±sd) "
+          "| J/req | incr J/req | resent/run | drops/run | excl. faulty |")
+    print("|---|---|---|---|---|---|---|---|---|---|---|---|")
     for pid, m in sorted(rows.items(), key=lambda kv: -(kv[1]["eff"] or -1)):
         eff = f"{m['eff']:.4f} ±{m['eff_sd']:.4f}" if m["eff"] is not None else "-"
-        print(f"| {pid} | {m['n']}/{m['of']} | {fmt(m['succ'], '.1%')} | {fmt(m['lat'], '.0f')} "
-              f"| {fmt(m['max'], '.0f')} | {eff} | {fmt(m['jpr'], '.2f')} | {fmt(m['inc'], '.2f')} "
-              f"| {fmt(m['resent'], '.1f')} | {fmt(m['drops'], '.1f')} | {m['dropped']} |")
+        print(f"| {pid} | {m['n']}/{m['of']} | {fmt(m['succ'], '.1%')} | {fmt(m['slot'], '.1%')} "
+              f"| {fmt(m['lat'], '.0f')} | {fmt(m['max'], '.0f')} | {eff} | {fmt(m['jpr'], '.2f')} "
+              f"| {fmt(m['inc'], '.2f')} | {fmt(m['resent'], '.1f')} | {fmt(m['drops'], '.1f')} "
+              f"| {m['dropped']} |")
 
     # ESP-NOW rate screen: with an always-on radio the rate barely moves req/J,
     # so choose by success rate, then by speed (shorter airtime).

@@ -180,6 +180,8 @@ The send task has one frame in flight at a time: after `esp_now_send()` it waits
 
 With `TBFT_ESPNOW_BROADCAST` a message that needs more than one frame is still sent unicast, peer by peer: a broadcast frame is sent once and never acknowledged, so one lost fragment loses the whole message (New_key, 1848 B) and the receiver holds a reassembly slot for 5 s meanwhile. Measured with 8 boards, broadcast New_key lost fragments often enough that the keys never completed. Broadcast as a mode still stalls at a sequence number on the boards and is not usable yet.
 
+A peer that fails `TX_FAIL_STREAK_LIMIT` (3) sends in a row gets one attempt per frame until a frame from it arrives again, and every 10 s all peers get the full retries back (a probe), so a peer that has just booted is not left on one attempt. Without the probe the boot-time key exchange ran on one attempt and cost a view change.
+
 The receiver drops an exact repeat of the last frame from the same sender (`rx_dup`): a frame whose MAC ACK was lost is sent again with the same `msg_id`, fragment and length. The ESP-NOW guide leaves this to the application. Without it a repeated New_key was delivered twice and a repeated Status looked like a peer that was still behind, which made the receiver re-send messages nobody needed.
 
 `espnow_recv_cb` runs in the **WiFi task context** (not an ISR); standard task-context FreeRTOS APIs (`xSemaphoreTake`, `xQueueSend`) are used throughout.
@@ -269,6 +271,8 @@ A Pre_prepare whose MAC does not verify (relabelled by a New_view, or the primar
 - *Re-sent View_change.* While its view change is in progress, a replica repeats its stored View_change every Status period until the New_view arrives. With only 2f+1 replicas left every View_change is needed, and one lost message must not cost a whole (doubled) timeout and a view. Receivers skip a byte-identical or older copy before the RSA check.
 - *Cut off.* A replica that heard fewer than 2f peers' Status in the last three Status periods does not ask for a view change, or a further one, when its timer expires: no view could gather 2f+1 View_changes then, and moving its target on would only leave it out of the view the others are in once it hears them again. It keeps its view (or target) and repeats its View_change.
 - *prep_view.* `nv_install` forgets what a slot was prepared as (`prep_view`, `prep_digest`) unless the New_view re-proposes that same request. The New_view, built from 2f+1 View_changes, shows the request did not commit in an earlier view (a replica commits nothing after sending its View_change), and its body is dropped. Reporting it in a later View_change would make that view re-propose a request nobody holds, and execution would stop at that seqno for good.
+
+**Repair speed.** A Status from a peer that is ahead of us (its `last_executed` or `last_prepared` is higher) makes the receiver send its own Status with `TBFT_STATUS_WANT` at once (at most once a second), instead of waiting for that peer to compare against the snapshot of the previous Status; that comparison cost one or two Status periods per missing message and could run into the view-change timeout.
 
 **Checkpoints.** A replica whose newest checkpoint is still not stable a Status period after it announced it broadcasts its Checkpoint again. With 2f+1 replicas left, one lost Checkpoint per survivor would otherwise stop the window for good.
 
