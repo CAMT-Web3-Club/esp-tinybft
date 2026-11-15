@@ -1192,7 +1192,8 @@ void Byz_print_stats(void)
         tbft_transport_get_stats(s_client->transport, &t);
         ESP_LOGW(TAG, "TBFT_STATS id=%d view=%lld tx=%lu tx_frames=%lu tx_fail=%lu tx_qfull=%lu "
                  "cb_fail=%lu cb_timeout=%lu send_err=%lu cb_slow=%lu cb_max_ms=%lu rx=%lu "
-                 "rx_drop=%lu rx_frag_drop=%lu rx_dup=%lu rx_reply=%lu req_resent=%lu "
+                 "rx_drop=%lu rx_frag_drop=%lu rx_dup=%lu rx_test_drop=%lu rx_reply=%lu "
+                 "req_resent=%lu "
                  "heap=%lu heap_min=%lu",
                  (int)s_client->node_id, (long long)s_reply_view, (unsigned long)t.tx_msgs,
                  (unsigned long)t.tx_frames,
@@ -1202,6 +1203,7 @@ void Byz_print_stats(void)
                  (unsigned long)t.tx_cb_max_ms,
                  (unsigned long)t.rx_msgs, (unsigned long)t.rx_drop,
                  (unsigned long)t.rx_frag_drop, (unsigned long)t.rx_dup,
+                 (unsigned long)t.rx_test_drop,
                  (unsigned long)t.rx_by_tag[TBFT_MSG_REPLY],
                  (unsigned long)s_req_resent,
                  (unsigned long)esp_get_free_heap_size(),

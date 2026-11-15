@@ -399,4 +399,18 @@ menu "TinyBFT Configuration"
             Compile in the statistics counters and print a TBFT_STATS line
             every 60 s on replicas and after every request on the client.
 
+    config TBFT_TEST_RX_DROP_PCT
+        int "TEST ONLY: drop this percentage of received frames"
+        default 0
+        range 0 90
+        help
+            Not for measurement runs.  ESP-NOW only: drop this percentage of
+            the frames a node receives, after the MAC ACK was already sent, so
+            the sender believes the frame arrived.  That is the hardest kind
+            of loss, and it lets the liveness fixes (re-sent View_change,
+            fetch target, checkpoint re-announcement, duplicate Meta_data) be
+            exercised on the boards, where the link itself loses nothing.
+            Every node drops, so the effective loss of a message is about
+            twice the value.  0 (the default) disables the code.
+
 endmenu

@@ -1010,7 +1010,7 @@ void tbft_replica_print_stats(const tbft_replica_t *r)
              "run_tx_fail=%lu run_drop=%lu "
              "tx=%lu tx_frames=%lu tx_fail=%lu tx_qfull=%lu "
              "cb_fail=%lu cb_timeout=%lu send_err=%lu cb_slow=%lu cb_max_ms=%lu "
-             "rx=%lu rx_drop=%lu rx_frag_drop=%lu rx_dup=%lu "
+             "rx=%lu rx_drop=%lu rx_frag_drop=%lu rx_dup=%lu rx_test_drop=%lu "
              "tx_pp=%lu tx_prep=%lu tx_commit=%lu rx_pp=%lu rx_prep=%lu rx_commit=%lu "
              "heap=%lu heap_min=%lu",
              r->node.node_id, (long long)r->node.view,
@@ -1033,7 +1033,7 @@ void tbft_replica_print_stats(const tbft_replica_t *r)
              (unsigned long)t.tx_cb_max_ms,
              (unsigned long)t.rx_msgs,
              (unsigned long)t.rx_drop, (unsigned long)t.rx_frag_drop,
-             (unsigned long)t.rx_dup,
+             (unsigned long)t.rx_dup, (unsigned long)t.rx_test_drop,
              (unsigned long)t.tx_by_tag[TBFT_MSG_PRE_PREPARE],
              (unsigned long)t.tx_by_tag[TBFT_MSG_PREPARE],
              (unsigned long)t.tx_by_tag[TBFT_MSG_COMMIT],
@@ -2112,6 +2112,17 @@ static void handle_status(tbft_replica_t *r, const void *msg, int len)
     r->peer_view[p]        = st->view;
     r->peer_in_vc[p]       = (st->hdr.extra & TBFT_STATUS_IN_VC) != 0;
     r->peer_status_us[p]   = now;
+
+    /* A peer is ahead of us: ask for the missing messages now, with the WANT
+     * flag, so that peer compares against what we have at this moment.  The
+     * normal path compares against the snapshot of our previous Status, which
+     * cost one or two Status periods per missing message (review L5) and let
+     * a slow repair run into the view-change timeout.  ask_for_missing() is
+     * rate limited to one Status per second per node. */
+    if (!tbft_state_in_fetch(&r->state) &&
+        (st->last_executed > r->last_executed || st->last_prepared > r->last_prepared)) {
+        ask_for_missing(r);
+    }
 
     if (now - r->retx_us[p] < TBFT_RETX_INTERVAL_US) return;
 

@@ -116,6 +116,9 @@ typedef struct {
     uint32_t rx_dup;         /* ESP-NOW: exact repeat of the previous frame
                                 from the same sender (its ACK was lost), not
                                 counted in rx_frag_drop.  UDP: 0 */
+    uint32_t rx_test_drop;   /* TEST ONLY (CONFIG_TBFT_TEST_RX_DROP_PCT):
+                                frames dropped on purpose after their ACK.
+                                Always 0 in a normal build */
     uint32_t tx_by_tag[TBFT_STATS_NUM_TAGS];
     uint32_t rx_by_tag[TBFT_STATS_NUM_TAGS];
 } tbft_transport_stats_t;

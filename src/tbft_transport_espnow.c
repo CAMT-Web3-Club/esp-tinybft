@@ -13,6 +13,7 @@
 #include "esp_system.h"
 #include "esp_err.h"
 #include "esp_timer.h"
+#include "esp_random.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -49,6 +50,15 @@ static constexpr int ESPNOW_TX_MAX_ATTEMPTS  = CONFIG_TBFT_ESPNOW_TX_RETRIES;
 static constexpr int ESPNOW_TX_CB_TIMEOUT_MS = 2'000;
 static constexpr int ESPNOW_TX_CB_SLOW_MS    = 100;   /* a slower callback counts in tx_cb_slow */
 static constexpr int DUP_MAX_SENDERS         = 8;     /* = MAX_NUM_REPLICAS + MAX_NUM_CLIENTS */
+/* A peer that failed this many sends in a row gets one attempt per frame
+ * until a frame from it arrives again (review L8): a dead or not yet booted
+ * peer must not cost every broadcast ESPNOW_TX_MAX_ATTEMPTS waits. */
+static constexpr int TX_FAIL_STREAK_LIMIT     = 3;
+/* Every this often every peer gets the full retries again, even one that has
+ * been failing: a peer that just booted must not stay on one attempt because
+ * it was still starting when it last failed.  Bounds the cost of a dead peer
+ * to one extra retry chain per period. */
+static constexpr int64_t TX_FAIL_STREAK_RESET_US = 10'000'000;
 
 static constexpr int MSG_QUEUE_DEPTH      = 16;
 static constexpr int SEND_QUEUE_DEPTH     = 8;
@@ -139,6 +149,11 @@ typedef struct tbft_espnow {
 
     reasm_slot_t  reasm[REASM_MAX_SLOTS];
     dup_entry_t   dup[DUP_MAX_SENDERS];   /* touched only by the Wi-Fi task, like reasm */
+    /* Sends that failed in a row per peer: the send task raises it, the Wi-Fi
+     * task clears it when a frame from that peer arrives, and the send task
+     * clears all of them every TX_FAIL_STREAK_RESET_US. */
+    uint8_t       tx_fail_streak[TBFT_MAX_NUM_REPLICAS + TBFT_MAX_NUM_CLIENTS];
+    int64_t       tx_fail_reset_us;
     uint16_t next_msg_id;
     SemaphoreHandle_t lock;
     volatile bool shutting_down;
@@ -437,6 +452,29 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *
     static recv_entry_t q_entry;
 
     const uint8_t *src_mac = recv_info->src_addr;
+
+#if CONFIG_TBFT_TEST_RX_DROP_PCT > 0
+    /* TEST ONLY (Kconfig "TEST ONLY: drop this percentage of received
+     * frames"): the MAC ACK for this frame has already gone out, so the
+     * sender believes it arrived.  This lets the liveness paths be exercised
+     * on the boards, whose link loses nothing. */
+    if ((int)(esp_random() % 100u) < CONFIG_TBFT_TEST_RX_DROP_PCT) {
+        enow->stats.rx_test_drop++;
+        return;
+    }
+#endif
+
+    /* A frame from this peer proves it is alive: give it the full retries
+     * again (see TX_FAIL_STREAK_LIMIT).  peer_ap_mac is written once, when
+     * the peer is registered, before any traffic flows, so reading it here
+     * needs no lock. */
+    for (int i = 0; i < enow->num_nodes; i++) {
+        if (memcmp(enow->peer_ap_mac[i], src_mac, ESPNOW_MAC_LEN) == 0) {
+            enow->tx_fail_streak[i] = 0;
+            break;
+        }
+    }
+
     const frag_hdr_t *fhdr = (const frag_hdr_t *)data;
     const uint8_t *payload = data + sizeof(frag_hdr_t);
     int payload_len = data_len - (int)sizeof(frag_hdr_t);
@@ -495,14 +533,16 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *
  * callback was taken as the result of the next frame.  So the timeout is only
  * a safety net.
  *
- * Retries on either kind of failure: at least ESPNOW_TX_MAX_ATTEMPTS times
- * and, with receive power saving, until TBFT_ESPNOW_RETRY_SPAN_MS has passed
+ * Retries on either kind of failure: at least @p max_attempts times and, with
+ * receive power saving, until TBFT_ESPNOW_RETRY_SPAN_MS has passed
  * (tbft_config.h).  The time bound is for receivers that duty-cycle their
  * radio: as long as the gap between attempts is shorter than their wake
  * window, an attempt lands in a window before the span (> their wake
- * interval) ends, however quickly the driver reports each failure. */
+ * interval) ends, however quickly the driver reports each failure.
+ * @p max_attempts is 1 for a peer that has been failing (see
+ * TX_FAIL_STREAK_LIMIT). */
 static bool espnow_tx_frame(tbft_espnow_t *enow, const uint8_t *mac,
-                            const uint8_t *pkt, size_t len) {
+                            const uint8_t *pkt, size_t len, int max_attempts) {
 #if TBFT_ESPNOW_RETRY_SPAN_MS > 0
     const int64_t give_up_us = esp_timer_get_time()
         + (int64_t)TBFT_ESPNOW_RETRY_SPAN_MS * 1000;
@@ -528,7 +568,7 @@ static bool espnow_tx_frame(tbft_espnow_t *enow, const uint8_t *mac,
             enow->stats.tx_send_err++;
             ESP_LOGD(TAG, "esp_now_send err=0x%x (attempt %d)", err, attempt + 1);
         }
-        bool again = (attempt + 1 < ESPNOW_TX_MAX_ATTEMPTS);
+        bool again = (attempt + 1 < max_attempts);
 #if TBFT_ESPNOW_RETRY_SPAN_MS > 0
         again = again || (esp_timer_get_time() < give_up_us);
 #endif
@@ -537,7 +577,8 @@ static bool espnow_tx_frame(tbft_espnow_t *enow, const uint8_t *mac,
     }
 }
 
-static int espnow_do_send_mac(tbft_espnow_t *enow, const uint8_t *ap_mac, uint16_t msg_id, const uint8_t *buf, size_t len) {
+static int espnow_do_send_mac(tbft_espnow_t *enow, const uint8_t *ap_mac, uint16_t msg_id,
+                              const uint8_t *buf, size_t len, int max_attempts) {
     if (!buf || len == 0) return -1;
 
     /* Stack packet buffer; send_task is the sole caller. */
@@ -554,7 +595,7 @@ static int espnow_do_send_mac(tbft_espnow_t *enow, const uint8_t *ap_mac, uint16
         memcpy(pkt, &fhdr, sizeof(fhdr));
         memcpy(pkt + sizeof(fhdr), src, chunk);
 
-        if (!espnow_tx_frame(enow, ap_mac, pkt, chunk + sizeof(fhdr))) {
+        if (!espnow_tx_frame(enow, ap_mac, pkt, chunk + sizeof(fhdr), max_attempts)) {
             ESP_LOGW(TAG, "tx to " MACSTR " failed: frame %d/%d not acknowledged",
                      MAC2STR(ap_mac), frag_idx + 1, frag_total);
             return -1;   /* remaining frames are useless without this one */
@@ -588,9 +629,21 @@ static void espnow_apply_rate([[maybe_unused]] const uint8_t *mac) {
 #endif
 }
 
-static int espnow_do_send(tbft_espnow_t *enow, tbft_node_id_t dest_id, uint16_t msg_id, const uint8_t *buf, size_t len) {
+/* Send to one peer.  A peer that failed TX_FAIL_STREAK_LIMIT sends in a row
+ * gets one attempt per frame until a frame from it arrives again: without
+ * this a dead peer cost every broadcast the full retry chain (L8). */
+static int espnow_do_send(tbft_espnow_t *enow, tbft_node_id_t dest_id, uint16_t msg_id,
+                          const uint8_t *buf, size_t len) {
     if (dest_id < 0 || dest_id >= enow->num_nodes) return -1;
-    return espnow_do_send_mac(enow, enow->peer_ap_mac[dest_id], msg_id, buf, len);
+    int attempts = enow->tx_fail_streak[dest_id] >= TX_FAIL_STREAK_LIMIT
+                 ? 1 : ESPNOW_TX_MAX_ATTEMPTS;
+    int r = espnow_do_send_mac(enow, enow->peer_ap_mac[dest_id], msg_id, buf, len, attempts);
+    if (r > 0) {
+        enow->tx_fail_streak[dest_id] = 0;
+    } else if (enow->tx_fail_streak[dest_id] < 255) {
+        enow->tx_fail_streak[dest_id]++;
+    }
+    return r;
 }
 
 static void espnow_send_task(void *pvParameters) {
@@ -615,6 +668,15 @@ static void espnow_send_task(void *pvParameters) {
         if (entry.dest == TBFT_ALL_REPLICAS) {
             [[maybe_unused]] int limit = enow->num_replicas > 0 ? enow->num_replicas : enow->num_nodes;
 
+            /* Probe: give every peer the full retries again once per period,
+             * so a peer that has just booted is not left on one attempt. */
+            int64_t now_us = esp_timer_get_time();
+            if (enow->tx_fail_reset_us == 0 ||
+                now_us - enow->tx_fail_reset_us >= TX_FAIL_STREAK_RESET_US) {
+                memset(enow->tx_fail_streak, 0, sizeof(enow->tx_fail_streak));
+                enow->tx_fail_reset_us = now_us;
+            }
+
             /* One msg_id per logical message, not per peer */
             uint16_t this_msg_id;
             xSemaphoreTake(enow->lock, portMAX_DELAY);
@@ -631,7 +693,8 @@ static void espnow_send_task(void *pvParameters) {
              * New_key fragments were lost often enough that keys never
              * completed (verify_mac_in failures, a view change). */
             if ((size_t)entry.len <= FRAG_MAX_PAYLOAD) {
-                if (espnow_do_send_mac(enow, k_bcast_mac, this_msg_id, entry.buf, (size_t)entry.len) <= 0) {
+                if (espnow_do_send_mac(enow, k_bcast_mac, this_msg_id, entry.buf,
+                                       (size_t)entry.len, ESPNOW_TX_MAX_ATTEMPTS) <= 0) {
                     enow->stats.tx_fail++;
                 }
                 continue;
