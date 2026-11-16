@@ -50,7 +50,7 @@ Two menus at the top level of `idf.py menuconfig` belong to this example.
 | Setting | Choices | Notes |
 |---|---|---|
 | Transport | UDP over Wi-Fi, ESP-NOW (default here) | all boards the same |
-| UDP: send protocol broadcasts as one datagram per replica | on (default here); off = IP multicast | UDP only |
+| UDP: send protocol broadcasts as one datagram per replica | **on (default)**; off = IP multicast | UDP only. Unicast is the counterpart of ESP-NOW unicast-per-peer (ACKed, retried); a multicast group frame has no ACK, is sent at a low basic rate and a station in power saving may not hear it. Measured: unicast 29/29 in every power-saving mode, multicast 29/29 and 27/27 (one request at 11.1 s). Use multicast only as a separate "one-to-many" point |
 | ESP-NOW radio > Wi-Fi interface | Station (default), SoftAP | keep Station: no beacons, and power saving needs it |
 | ESP-NOW radio > PHY rate | 1 (ESP-IDF default), 11, 6, 6.5 (MCS0), 24, 54, 65 (MCS7) Mbps | per peer, `esp_now_set_peer_rate_config()`. Measured on 8 boards (ESP-IDF 6.1): only **1 Mbps and 65 Mbps (MCS7)** are usable; 6, 6.5, 11, 24 and 54 Mbps lose 73–100 % of the MAC ACKs (`docs/FIX_PLAN_COUNTER_ENERGY_FAIRNESS.md` §6) |
 | ESP-NOW radio > Send protocol broadcasts as one broadcast frame | off (default), on | on: no ACK and no retry. A message that needs more than one frame (New_key) is sent unicast even then. Measured: broadcast still stalls at a seqno, so it is not usable yet |

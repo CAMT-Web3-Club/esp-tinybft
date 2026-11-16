@@ -206,14 +206,24 @@ menu "TinyBFT Configuration"
     # into a configuration-report notice.
     config TBFT_DISABLE_MULTICAST
         bool "UDP: send protocol broadcasts as one datagram per replica (no multicast)"
-        default n
+        default y
         help
             Only used with the UDP transport.
-            y: a message to all replicas is sent as one unicast datagram per
-            replica. n: one IP multicast datagram to the group in the config
-            file; the access point forwards it as a group frame, which
-            receivers do not acknowledge, and some access points drop
+            y (default): a message to all replicas is sent as one unicast
+            datagram per replica. n: one IP multicast datagram to the group in
+            the config file; the access point forwards it as a group frame,
+            which receivers do not acknowledge, and some access points drop
             multicast traffic.
+
+            Unicast is the default because it is the counterpart of what
+            ESP-NOW can do reliably: unicast per peer, acknowledged and
+            retried. A group frame has no ACK and no retry, is sent at a low
+            basic rate, and a station in Wi-Fi power saving may not hear it,
+            so comparing multicast against ESP-NOW unicast mixes two
+            mechanisms. Measured on 8 boards: unicast 29/29 requests in every
+            power-saving mode; multicast 29/29 and 27/27, the latter with one
+            request at 11.1 s. Use multicast only as a separate
+            "one-to-many" point, never mixed into the unicast comparison.
 
     menu "Protocol sizes"
 
@@ -374,8 +384,9 @@ menu "TinyBFT Configuration"
                 configuration you compare, otherwise a request that is merely
                 slow is re-sent and counted as a loss. Measured on the boards
                 (5-minute runs): 1.6-3.8 s for the configurations of the
-                comparison, up to 6.2 s with 50 ms every 200 ms, so 6 s: 57 % above the slowest and still two re-sends inside the 20 s reply timeout. Use
-                the same value for every configuration.
+                comparison, up to 6.2 s with 50 ms every 200 ms, so 6 s:
+                57 % above the slowest and still two re-sends inside the 20 s
+                reply timeout. Use the same value for every configuration.
 
                 Keep it above the normal request latency, otherwise a healthy
                 run carries extra traffic. 0 disables retransmission.
