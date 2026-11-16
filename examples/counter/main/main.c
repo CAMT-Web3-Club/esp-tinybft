@@ -288,7 +288,7 @@ static void print_banner(bool replica, int local_id) {
     esp_wifi_get_ps(&ps);
     ESP_LOGW(TAG, "BANNER role=%s role_from=%s id=%d transport=udp ps=%s listen_interval=%d "
              "min_active_ms=%d mcast=%d static_ip=%d ch=%d pm=%d hz=%d "
-             "idle_wait_ms=%d req_interval_ms=%d " BANNER_TIMEOUTS_FMT "build=%s "
+             "idle_wait_ms=%d req_interval_ms=%d txp_dbm=%d " BANNER_TIMEOUTS_FMT "build=%s "
              "mac=%02x:%02x:%02x:%02x:%02x:%02x",
              replica ? "replica" : "client", EXAMPLE_ROLE_FROM, local_id,
              ps == WIFI_PS_NONE ? "none" : ps == WIFI_PS_MIN_MODEM ? "min" : "max",
@@ -296,13 +296,14 @@ static void print_banner(bool replica, int local_id) {
              CONFIG_ESP_WIFI_SLP_DEFAULT_MIN_ACTIVE_TIME,
              EXAMPLE_MCAST, EXAMPLE_STATIC_IP_ON, ch,
              EXAMPLE_PM, CONFIG_FREERTOS_HZ, CONFIG_TBFT_IDLE_WAIT_MS,
-             replica ? 0 : EXAMPLE_REQ_INTERVAL_MS, BANNER_TIMEOUTS_ARGS,
+             replica ? 0 : EXAMPLE_REQ_INTERVAL_MS, CONFIG_TBFT_WIFI_TX_POWER_QDBM / 4,
+             BANNER_TIMEOUTS_ARGS,
              __DATE__ " " __TIME__,
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 #else
     ESP_LOGW(TAG, "BANNER role=%s role_from=%s id=%d transport=espnow if=%s rate=%d retries=%d "
              "retry_delay_ms=%d retry_span_ms=%d window_ms=%d interval_ms=%d bcast=%d ch=%d "
-             "pm=%d hz=%d idle_wait_ms=%d req_interval_ms=%d " BANNER_TIMEOUTS_FMT "build=%s "
+             "pm=%d hz=%d idle_wait_ms=%d req_interval_ms=%d txp_dbm=%d " BANNER_TIMEOUTS_FMT "build=%s "
              "mac=%02x:%02x:%02x:%02x:%02x:%02x",
              replica ? "replica" : "client", EXAMPLE_ROLE_FROM, local_id,
 #if CONFIG_TBFT_ESPNOW_IF_STA
@@ -314,9 +315,21 @@ static void print_banner(bool replica, int local_id) {
              TBFT_ESPNOW_RETRY_DELAY_MS, TBFT_ESPNOW_RETRY_SPAN_MS,
              EXAMPLE_EN_WINDOW, EXAMPLE_EN_INTERVAL, EXAMPLE_BCAST, ch,
              EXAMPLE_PM, CONFIG_FREERTOS_HZ, CONFIG_TBFT_IDLE_WAIT_MS,
-             replica ? 0 : EXAMPLE_REQ_INTERVAL_MS, BANNER_TIMEOUTS_ARGS,
+             replica ? 0 : EXAMPLE_REQ_INTERVAL_MS, CONFIG_TBFT_WIFI_TX_POWER_QDBM / 4,
+             BANNER_TIMEOUTS_ARGS,
              __DATE__ " " __TIME__,
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+#endif
+}
+
+/* Kconfig "Wi-Fi TX power": at the driver default (20 dBm) boards that sit
+ * close together desense each other, and ESP-NOW stops getting ACKs.  Applied
+ * to both transports so the comparison keeps one TX power. */
+static void apply_tx_power(void) {
+#if CONFIG_TBFT_WIFI_TX_POWER_QDBM > 0
+    ESP_ERROR_CHECK(esp_wifi_set_max_tx_power(CONFIG_TBFT_WIFI_TX_POWER_QDBM));
+    ESP_LOGW(TAG, "Wi-Fi TX power limited to %d dBm",
+             CONFIG_TBFT_WIFI_TX_POWER_QDBM / 4);
 #endif
 }
 
@@ -346,6 +359,7 @@ static void wifi_init(void) {
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
     ESP_ERROR_CHECK(esp_wifi_start());
+    apply_tx_power();
 #if CONFIG_EXAMPLE_WIFI_PS_NONE
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
     ESP_LOGI(TAG, "WiFi modem-sleep disabled (WIFI_PS_NONE)");
@@ -370,6 +384,7 @@ static void wifi_init(void) {
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
+    apply_tx_power();
     ESP_ERROR_CHECK(esp_wifi_set_channel(CONFIG_EXAMPLE_ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE));
 #else
     ESP_LOGI(TAG, "Starting WiFi AP for ESP-NOW...");
@@ -388,6 +403,7 @@ static void wifi_init(void) {
     };
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_cfg));
     ESP_ERROR_CHECK(esp_wifi_start());
+    apply_tx_power();
 #endif
     ESP_ERROR_CHECK(esp_now_init());
 #if CONFIG_TBFT_ESPNOW_POWER_SAVE

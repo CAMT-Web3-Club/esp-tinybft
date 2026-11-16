@@ -225,6 +225,25 @@ menu "TinyBFT Configuration"
             request at 11.1 s. Use multicast only as a separate
             "one-to-many" point, never mixed into the unicast comparison.
 
+    config TBFT_WIFI_TX_POWER_QDBM
+        int "Wi-Fi TX power (0.25 dBm units, 0 = driver default)"
+        default 0
+        range 0 84
+        help
+            esp_wifi_set_max_tx_power() after the application starts Wi-Fi,
+            for both transports.  The value is in 0.25 dBm units: 80 = 20 dBm
+            (the driver default, CONFIG_ESP_PHY_MAX_WIFI_TX_POWER), 32 = 8 dBm.
+            0 leaves it alone.
+
+            Boards on one desk can be so close that at 20 dBm each one
+            desenses its neighbours: measured on 8 boards 10-20 cm apart,
+            ESP-NOW lost 90-100 % of its MAC ACKs and the cluster never
+            completed its key exchange, while the same boards at 8 dBm lost
+            none.  UDP was unaffected because it goes through the access
+            point, which is far away.  Either space the boards out or lower
+            this value, and keep it the same for every configuration you
+            compare.
+
     menu "Protocol sizes"
 
         config TBFT_MAX_MESSAGE_SIZE
