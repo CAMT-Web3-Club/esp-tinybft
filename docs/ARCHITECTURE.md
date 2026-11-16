@@ -1240,7 +1240,7 @@ View_change entries carry no proof (no prepared certificate) and a New_view is n
 | `TBFT_TRANSPORT_UDP` | bool | -- | -- | UDP over lwIP |
 | `TBFT_TRANSPORT_ESPNOW` | bool | -- | -- | ESP-NOW with fragmentation |
 | `TBFT_PRINT_STATS` | bool | n | -- | Compile in stats |
-| `TBFT_CLIENT_RETRANSMIT_MS` | int | 8000 | 0-120000 | Client re-sends a request without f+1 replies after this time (doubling); 0 = never |
+| `TBFT_CLIENT_RETRANSMIT_MS` | int | 6000 | 0-120000 | Client re-sends a request without f+1 replies after this time (doubling); 0 = never |
 
 ### Derived Constants (src/tbft_config.h)
 

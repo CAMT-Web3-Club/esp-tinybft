@@ -182,6 +182,8 @@ With `TBFT_ESPNOW_BROADCAST` a message that needs more than one frame is still s
 
 A peer that fails `TX_FAIL_STREAK_LIMIT` (3) sends in a row gets one attempt per frame until a frame from it arrives again, and every 10 s all peers get the full retries back (a probe), so a peer that has just booted is not left on one attempt. Without the probe the boot-time key exchange ran on one attempt and cost a view change.
 
+**TX power and board spacing.** `TBFT_WIFI_TX_POWER_QDBM` (0 = driver default 20 dBm) sets `esp_wifi_set_max_tx_power()` for both transports right after the application starts Wi-Fi, and the BANNER prints `txp_dbm`. Boards that sit close together desense each other at 20 dBm: measured with 8 boards 10-20 cm apart on one desk, ESP-NOW lost 90-100 % of its MAC ACKs (`cb_fail`), never completed the key exchange and served no request, while the same boards at 8 dBm lost none and served 30 of 30 requests at 1.7 s. UDP was unaffected at 20 dBm because it goes through the access point. Space the boards out or lower the value, and keep it the same for every configuration compared.
+
 The receiver drops an exact repeat of the last frame from the same sender (`rx_dup`): a frame whose MAC ACK was lost is sent again with the same `msg_id`, fragment and length. The ESP-NOW guide leaves this to the application. Without it a repeated New_key was delivered twice and a repeated Status looked like a peer that was still behind, which made the receiver re-send messages nobody needed.
 
 `espnow_recv_cb` runs in the **WiFi task context** (not an ISR); standard task-context FreeRTOS APIs (`xSemaphoreTake`, `xQueueSend`) are used throughout.

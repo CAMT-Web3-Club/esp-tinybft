@@ -58,7 +58,8 @@ Two menus at the top level of `idf.py menuconfig` belong to this example.
 | ESP-NOW radio > Wake window / Wake interval | only shown for Custom | ms |
 | ESP-NOW radio > Attempts per frame | 3 | minimum number of attempts |
 | ESP-NOW radio > Delay between attempts | 10 ms | only with power saving Off |
-| Protocol sizes, Timeouts | | keep them fixed for the comparison (set in `sdkconfig.defaults`: view change 30 s, Status 5 s, state fetch 10 s, client re-send 5 s, client reply 20 s). The timeout lines at the end of the config files are not used (`gen_configs.sh` writes 0 there) |
+| Protocol sizes, Timeouts | | keep them fixed for the comparison (set in `sdkconfig.defaults`: view change 30 s, Status 5 s, state fetch 10 s, client re-send 6 s, client reply 20 s). The timeout lines at the end of the config files are not used (`gen_configs.sh` writes 0 there) |
+| Wi-Fi TX power | 0 = driver default (20 dBm), or 0.25 dBm units (32 = 8 dBm) | both transports. **Boards on one desk desense each other at 20 dBm**: measured with 8 boards 10–20 cm apart, ESP-NOW lost 90–100 % of its MAC ACKs and never finished the key exchange, while the same boards at 8 dBm lost none. Space the boards out or lower this, and keep it the same for every configuration |
 
 ### Counter Example Configuration (experiment)
 
