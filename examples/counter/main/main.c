@@ -13,6 +13,9 @@
 #include "nvs_flash.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
+#if CONFIG_TBFT_TRANSPORT_UDP && defined(CONFIG_EXAMPLE_PRESET_MIN_ACTIVE_MS)
+#include "esp_private/wifi.h"   /* esp_wifi_set_sleep_min_active_time() */
+#endif
 #include "esp_now.h"
 #include "esp-tinybft.h"
 #include "tbft_config.h"   /* TBFT_ESPNOW_RETRY_* printed in the banner */
@@ -189,6 +192,13 @@ static constexpr char EXAMPLE_ROLE_FROM[] = "list";
 #else
 static constexpr char EXAMPLE_ROLE_FROM[] = "forced";
 #endif
+/* Wi-Fi "Minimum active time" in effect (UDP power saving): the preset's
+ * value, or ESP-IDF's own option with Custom. */
+#ifdef CONFIG_EXAMPLE_PRESET_MIN_ACTIVE_MS
+[[maybe_unused]] static constexpr int EXAMPLE_MIN_ACTIVE_MS = CONFIG_EXAMPLE_PRESET_MIN_ACTIVE_MS;
+#else
+[[maybe_unused]] static constexpr int EXAMPLE_MIN_ACTIVE_MS = CONFIG_ESP_WIFI_SLP_DEFAULT_MIN_ACTIVE_TIME;
+#endif
 #ifdef CONFIG_EXAMPLE_CLIENT_REQUEST_INTERVAL_MS
 static constexpr int EXAMPLE_REQ_INTERVAL_MS = CONFIG_EXAMPLE_CLIENT_REQUEST_INTERVAL_MS;
 #else
@@ -286,14 +296,15 @@ static void print_banner(bool replica, int local_id) {
 #if CONFIG_TBFT_TRANSPORT_UDP
     wifi_ps_type_t ps = WIFI_PS_NONE;
     esp_wifi_get_ps(&ps);
-    ESP_LOGW(TAG, "BANNER role=%s role_from=%s id=%d transport=udp ps=%s listen_interval=%d "
+    ESP_LOGW(TAG, "BANNER preset=%s role=%s role_from=%s id=%d transport=udp ps=%s listen_interval=%d "
              "min_active_ms=%d mcast=%d static_ip=%d ch=%d pm=%d hz=%d "
              "idle_wait_ms=%d req_interval_ms=%d txp_dbm=%d " BANNER_TIMEOUTS_FMT "build=%s "
              "mac=%02x:%02x:%02x:%02x:%02x:%02x",
+             CONFIG_EXAMPLE_PRESET_NAME,
              replica ? "replica" : "client", EXAMPLE_ROLE_FROM, local_id,
              ps == WIFI_PS_NONE ? "none" : ps == WIFI_PS_MIN_MODEM ? "min" : "max",
              EXAMPLE_LISTEN_INTERVAL,
-             CONFIG_ESP_WIFI_SLP_DEFAULT_MIN_ACTIVE_TIME,
+             EXAMPLE_MIN_ACTIVE_MS,
              EXAMPLE_MCAST, EXAMPLE_STATIC_IP_ON, ch,
              EXAMPLE_PM, CONFIG_FREERTOS_HZ, CONFIG_TBFT_IDLE_WAIT_MS,
              replica ? 0 : EXAMPLE_REQ_INTERVAL_MS, CONFIG_TBFT_WIFI_TX_POWER_QDBM / 4,
@@ -301,10 +312,11 @@ static void print_banner(bool replica, int local_id) {
              __DATE__ " " __TIME__,
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 #else
-    ESP_LOGW(TAG, "BANNER role=%s role_from=%s id=%d transport=espnow if=%s rate=%d retries=%d "
+    ESP_LOGW(TAG, "BANNER preset=%s role=%s role_from=%s id=%d transport=espnow if=%s rate=%d retries=%d "
              "retry_delay_ms=%d retry_span_ms=%d window_ms=%d interval_ms=%d bcast=%d ch=%d "
              "pm=%d hz=%d idle_wait_ms=%d req_interval_ms=%d txp_dbm=%d " BANNER_TIMEOUTS_FMT "build=%s "
              "mac=%02x:%02x:%02x:%02x:%02x:%02x",
+             CONFIG_EXAMPLE_PRESET_NAME,
              replica ? "replica" : "client", EXAMPLE_ROLE_FROM, local_id,
 #if CONFIG_TBFT_ESPNOW_IF_STA
              "sta",
@@ -346,6 +358,12 @@ static void wifi_init(void) {
 #endif
     wifi_init_config_t wcfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&wcfg));
+#ifdef CONFIG_EXAMPLE_PRESET_MIN_ACTIVE_MS
+    /* A preset fixes the minimum active time. ESP-IDF applies its own option
+     * only inside esp_wifi_init(), with this call (wifi_init.c), so the same
+     * call right after it replaces that value. */
+    esp_wifi_set_sleep_min_active_time(CONFIG_EXAMPLE_PRESET_MIN_ACTIVE_MS * 1000);
+#endif
     esp_event_handler_instance_t h1, h2;
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
         WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, sta_netif, &h1));

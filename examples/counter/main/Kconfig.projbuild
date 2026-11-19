@@ -1,6 +1,160 @@
 menu "Counter Example Configuration"
 
+    choice EXAMPLE_PRESET
+        prompt "Experiment preset"
+        default EXAMPLE_PRESET_CUSTOM
+        help
+            One choice per configuration of the best-vs-best comparison
+            (README "Best-vs-best: configurations to run"); the name before
+            the colon is the run name, printed as preset= in the BANNER.
+
+            A preset fixes the transport, the ESP-NOW PHY rate, the Wi-Fi
+            interface (station), ESP-NOW receive power saving, broadcast
+            (off), UDP multicast (off: one datagram per replica), and the UDP
+            power saving and listen interval. menuconfig then offers only the
+            preset's option in those menus. Everything that must stay the
+            same across configurations is left to you and is not changed by
+            a preset: role, request period, ESP-NOW channel, Wi-Fi TX power,
+            attempts per frame, timeouts and sizes, and ESP-IDF's own
+            "Minimum active time".
+
+            Only modes that worked on the boards are offered (2026-11-15,
+            8 boards): ESP-NOW at 1 Mbps and 65 Mbps; 6, 6.5, 11, 24 and
+            54 Mbps lost 73-100 % of the MAC ACKs and broadcast stalled.
+            The 65 Mbps presets with receive power saving have not been run
+            on the boards yet.
+
+            Custom: set every option by hand, as before (multicast,
+            broadcast, other rates, custom wake window, 8 attempts, ...).
+            Switching back to Custom keeps the values the last preset left.
+
+        config EXAMPLE_PRESET_CUSTOM
+            bool "Custom: set each option by hand"
+        config EXAMPLE_PRESET_EN1
+            bool "en1: ESP-NOW 1 Mbps, radio always on"
+            select TBFT_PRESET_RADIO
+            select TBFT_PRESET_ESPNOW
+        config EXAMPLE_PRESET_EN65
+            bool "en65: ESP-NOW 65 Mbps (MCS7), radio always on"
+            select TBFT_PRESET_RADIO
+            select TBFT_PRESET_ESPNOW
+            select TBFT_PRESET_RATE_MCS7
+        config EXAMPLE_PRESET_EN1_W50I100
+            bool "en1_w50i100: ESP-NOW 1 Mbps, listen 50 ms every 100 ms"
+            select TBFT_PRESET_RADIO
+            select TBFT_PRESET_ESPNOW
+            select TBFT_PRESET_PS_W50_I100
+        config EXAMPLE_PRESET_EN1_W110I200
+            bool "en1_w110i200: ESP-NOW 1 Mbps, listen 110 ms every 200 ms"
+            select TBFT_PRESET_RADIO
+            select TBFT_PRESET_ESPNOW
+            select TBFT_PRESET_PS_W110_I200
+        config EXAMPLE_PRESET_EN1_W50I200
+            bool "en1_w50i200: ESP-NOW 1 Mbps, listen 50 ms every 200 ms"
+            select TBFT_PRESET_RADIO
+            select TBFT_PRESET_ESPNOW
+            select TBFT_PRESET_PS_W50_I200
+        config EXAMPLE_PRESET_EN1_T8
+            bool "en1_t8: ESP-NOW 1 Mbps, radio always on, 8 attempts per frame"
+            select TBFT_PRESET_RADIO
+            select TBFT_PRESET_ESPNOW
+            select TBFT_PRESET_RETRIES_8
+        config EXAMPLE_PRESET_EN65_W50I100
+            bool "en65_w50i100: ESP-NOW 65 Mbps, listen 50 ms every 100 ms"
+            select TBFT_PRESET_RADIO
+            select TBFT_PRESET_ESPNOW
+            select TBFT_PRESET_RATE_MCS7
+            select TBFT_PRESET_PS_W50_I100
+        config EXAMPLE_PRESET_EN65_W110I200
+            bool "en65_w110i200: ESP-NOW 65 Mbps, listen 110 ms every 200 ms"
+            select TBFT_PRESET_RADIO
+            select TBFT_PRESET_ESPNOW
+            select TBFT_PRESET_RATE_MCS7
+            select TBFT_PRESET_PS_W110_I200
+        config EXAMPLE_PRESET_EN65_W50I200
+            bool "en65_w50i200: ESP-NOW 65 Mbps, listen 50 ms every 200 ms"
+            select TBFT_PRESET_RADIO
+            select TBFT_PRESET_ESPNOW
+            select TBFT_PRESET_RATE_MCS7
+            select TBFT_PRESET_PS_W50_I200
+        config EXAMPLE_PRESET_UDP_NONE
+            bool "udp_none: UDP, power saving None"
+            select TBFT_PRESET_RADIO
+        config EXAMPLE_PRESET_UDP_MIN
+            bool "udp_min: UDP, power saving Minimum"
+            select TBFT_PRESET_RADIO
+        config EXAMPLE_PRESET_UDP_MAX3
+            bool "udp_max3: UDP, power saving Maximum, listen interval 3"
+            select TBFT_PRESET_RADIO
+        config EXAMPLE_PRESET_UDP_MAX10
+            bool "udp_max10: UDP, power saving Maximum, listen interval 10"
+            select TBFT_PRESET_RADIO
+        config EXAMPLE_PRESET_UDP_MIN_A20
+            bool "udp_min_a20: UDP, power saving Minimum, minimum active time 20 ms"
+            select TBFT_PRESET_RADIO
+        config EXAMPLE_PRESET_UDP_MAX3_A20
+            bool "udp_max3_a20: UDP, power saving Maximum, listen interval 3, minimum active time 20 ms"
+            select TBFT_PRESET_RADIO
+        config EXAMPLE_PRESET_UDP_NONE_MCAST
+            bool "udp_none_mcast: UDP, power saving None, IP multicast"
+            select TBFT_PRESET_RADIO
+            select TBFT_PRESET_MCAST
+        config EXAMPLE_PRESET_UDP_MIN_MCAST
+            bool "udp_min_mcast: UDP, power saving Minimum, IP multicast"
+            select TBFT_PRESET_RADIO
+            select TBFT_PRESET_MCAST
+    endchoice
+
     comment "Transport, ESP-NOW rate and power saving: TinyBFT Configuration menu"
+    depends on EXAMPLE_PRESET_CUSTOM
+
+    config EXAMPLE_PRESET_NAME
+        string
+        default "en1" if EXAMPLE_PRESET_EN1
+        default "en65" if EXAMPLE_PRESET_EN65
+        default "en1_t8" if EXAMPLE_PRESET_EN1_T8
+        default "en1_w50i100" if EXAMPLE_PRESET_EN1_W50I100
+        default "en1_w110i200" if EXAMPLE_PRESET_EN1_W110I200
+        default "en1_w50i200" if EXAMPLE_PRESET_EN1_W50I200
+        default "en65_w50i100" if EXAMPLE_PRESET_EN65_W50I100
+        default "en65_w110i200" if EXAMPLE_PRESET_EN65_W110I200
+        default "en65_w50i200" if EXAMPLE_PRESET_EN65_W50I200
+        default "udp_none" if EXAMPLE_PRESET_UDP_NONE
+        default "udp_min" if EXAMPLE_PRESET_UDP_MIN
+        default "udp_max3" if EXAMPLE_PRESET_UDP_MAX3
+        default "udp_max10" if EXAMPLE_PRESET_UDP_MAX10
+        default "udp_min_a20" if EXAMPLE_PRESET_UDP_MIN_A20
+        default "udp_max3_a20" if EXAMPLE_PRESET_UDP_MAX3_A20
+        default "udp_none_mcast" if EXAMPLE_PRESET_UDP_NONE_MCAST
+        default "udp_min_mcast" if EXAMPLE_PRESET_UDP_MIN_MCAST
+        default "custom"
+        help
+            Run name of the preset, printed as preset= in the BANNER.
+
+    # Which UDP power-saving option the preset leaves visible.
+    config EXAMPLE_PRESET_PS_NONE
+        bool
+        default y if EXAMPLE_PRESET_UDP_NONE || EXAMPLE_PRESET_UDP_NONE_MCAST
+    config EXAMPLE_PRESET_PS_MIN
+        bool
+        default y if EXAMPLE_PRESET_UDP_MIN || EXAMPLE_PRESET_UDP_MIN_A20
+        default y if EXAMPLE_PRESET_UDP_MIN_MCAST
+    config EXAMPLE_PRESET_PS_MAX
+        bool
+        default y if EXAMPLE_PRESET_UDP_MAX3 || EXAMPLE_PRESET_UDP_MAX10
+        default y if EXAMPLE_PRESET_UDP_MAX3_A20
+
+    config EXAMPLE_PRESET_MIN_ACTIVE_MS
+        int
+        depends on TBFT_PRESET_RADIO && TBFT_TRANSPORT_UDP
+        default 20 if EXAMPLE_PRESET_UDP_MIN_A20 || EXAMPLE_PRESET_UDP_MAX3_A20
+        default 50
+        help
+            Minimum active time a UDP preset sets, in ms (ESP-IDF's default
+            is 50). ESP-IDF applies its own "Minimum active time" option
+            only inside esp_wifi_init(), so the example calls the same
+            function, esp_wifi_set_sleep_min_active_time(), right after it.
+            Not set with Custom: ESP-IDF's option applies then.
 
     choice EXAMPLE_NODE_ROLE
         prompt "Role of this board"
@@ -73,17 +227,21 @@ menu "Counter Example Configuration"
 
             config EXAMPLE_WIFI_PS_NONE
                 bool "None (WIFI_PS_NONE)"
+                depends on EXAMPLE_PRESET_CUSTOM || EXAMPLE_PRESET_PS_NONE
             config EXAMPLE_WIFI_PS_MIN_MODEM
                 bool "Minimum (WIFI_PS_MIN_MODEM)"
+                depends on EXAMPLE_PRESET_CUSTOM || EXAMPLE_PRESET_PS_MIN
             config EXAMPLE_WIFI_PS_MAX_MODEM
                 bool "Maximum (WIFI_PS_MAX_MODEM)"
+                depends on EXAMPLE_PRESET_CUSTOM || EXAMPLE_PRESET_PS_MAX
         endchoice
 
         comment "Minimum active time: Component config > Wi-Fi > Minimum active time"
-        depends on !EXAMPLE_WIFI_PS_NONE
+        depends on !EXAMPLE_WIFI_PS_NONE && EXAMPLE_PRESET_CUSTOM
 
         config EXAMPLE_WIFI_LISTEN_INTERVAL
-            int "Listen interval (beacon intervals)"
+            int "Listen interval (beacon intervals)" if EXAMPLE_PRESET_CUSTOM
+            default 10 if EXAMPLE_PRESET_UDP_MAX10
             default 3
             range 1 10
             depends on EXAMPLE_WIFI_PS_MAX_MODEM

@@ -41,6 +41,62 @@ idf.py build
 In menuconfig, `?` shows the help of the selected option, `f` toggles a help
 panel, `/` searches and `r` restores an option's default.
 
+### Experiment preset (the easy way)
+
+*Counter Example Configuration > Experiment preset* sets a whole
+configuration of the [best-vs-best comparison](#best-vs-best-configurations-to-run)
+in one choice. The name before the colon is the run name, and the BANNER
+prints it as `preset=`.
+
+Every mode that worked on the boards has a preset:
+
+| Preset | Transport | Radio setting | Measured (2026-11-15) |
+|---|---|---|---|
+| `en1` | ESP-NOW | 1 Mbps, receive power saving Off | 29/29, 2.37 s |
+| `en65` | ESP-NOW | 65 Mbps (MCS7), Off | 30/30, 1.60 s |
+| `en1_t8` | ESP-NOW | 1 Mbps, Off, 8 attempts per frame | 29/29, 2.41 s |
+| `en1_w50i100` | ESP-NOW | 1 Mbps, listen 50 ms every 100 ms | 29/29, 2.95 s |
+| `en1_w110i200` | ESP-NOW | 1 Mbps, listen 110 ms every 200 ms | 29/29, 2.79 s |
+| `en1_w50i200` | ESP-NOW | 1 Mbps, listen 50 ms every 200 ms | 27/28, 4.32 s |
+| `en65_w50i100`, `en65_w110i200`, `en65_w50i200` | ESP-NOW | 65 Mbps with the same three windows | not run yet |
+| `udp_none` | UDP | power saving None | 29/29, 1.64 s |
+| `udp_min` | UDP | Minimum | 29/29, 2.16 s |
+| `udp_max3` | UDP | Maximum, listen interval 3 | 29/29, 2.30 s |
+| `udp_max10` | UDP | Maximum, listen interval 10 | 29/29, 4.17 s |
+| `udp_min_a20` | UDP | Minimum, minimum active time 20 ms | 28/28, 2.09 s |
+| `udp_max3_a20` | UDP | Maximum, listen interval 3, minimum active time 20 ms | 29/29, 2.31 s |
+| `udp_none_mcast` | UDP | None, IP multicast | 29/29, 1.90 s |
+| `udp_min_mcast` | UDP | Minimum, IP multicast | 27/27, 2.29 s (one request 11.1 s) |
+| Custom (default) | set by hand | | |
+
+What a preset fixes, besides the column above: Wi-Fi interface = Station,
+ESP-NOW broadcast = off, attempts per frame = 3 (8 for `_t8`), UDP multicast
+= off (on for `_mcast`), and Wi-Fi *Minimum active time* = 50 ms (20 ms for
+`_a20`). In the TinyBFT Configuration menu only the preset's option is then
+offered for Transport, PHY rate, Wi-Fi interface and Receive power saving.
+
+A preset leaves to you the settings that must stay the **same** in every run:
+role, request period, ESP-NOW channel, Wi-Fi TX power, timeouts and sizes.
+
+Notes:
+
+- *Minimum active time* is an ESP-IDF option that ESP-IDF applies only
+  inside `esp_wifi_init()`. A UDP preset sets its own value with the same
+  call (`esp_wifi_set_sleep_min_active_time()`, from `esp_private/wifi.h`)
+  right after `esp_wifi_init()`, and the BANNER prints the value in effect
+  (`min_active_ms=`). ESP-IDF's option in *Component config > Wi-Fi* then has
+  no effect; with Custom it applies as before. This call has not been run on
+  the boards yet.
+- `_mcast` is a separate "one-to-many" point: a group frame has no ACK and no
+  retry, so do not mix it into the unicast comparison.
+- No preset exists for 6, 6.5, 11, 24 and 54 Mbps or for ESP-NOW broadcast:
+  they did not work on the boards. They stay under *Custom*, and so does a
+  custom wake window.
+- Going back to Custom keeps the values the last preset left.
+
+Changing configuration is then: `idf.py menuconfig` → pick the preset → save →
+`idf.py build` → `./flash_all.fish`.
+
 ## Where each setting lives
 
 Two menus at the top level of `idf.py menuconfig` belong to this example.
@@ -65,6 +121,7 @@ Two menus at the top level of `idf.py menuconfig` belong to this example.
 
 | Setting | Choices | Notes |
 |---|---|---|
+| Experiment preset | Custom (default), `en1`, `en65`, `en1_t8`, `en1_w50i100`, … `udp_min_mcast` | [above](#experiment-preset-the-easy-way); fixes the radio settings of one configuration |
 | Role of this board | Automatic (default), Replica, Client | Automatic: from the node list |
 | Client: request period (ms) | 10000 | the same for every configuration you compare |
 | ESP-NOW Wi-Fi channel | 1 | use a channel **away** from the AP: on the AP's channel 1 Mbps lost 27 % of its ACKs and the receive power-saving modes stopped working |
@@ -227,7 +284,11 @@ modes are compared: no configuration uses CPU light sleep or frequency
 scaling.
 
 Start every configuration from the defaults and change only what the table
-lists. The names are suggestions; keep one name per configuration.
+lists. The names are suggestions; keep one name per configuration. Every
+name in the table has an *Experiment preset* of the same name (one choice in
+menuconfig), except the rates and broadcast that did not work on the boards
+(6, 6.5, 24, 54 Mbps, `_bcast`; 2026-11-15) and `en65_t8`; build those under
+*Custom*.
 
 | Step | Name | TinyBFT Configuration | Counter Example Configuration / ESP-IDF |
 |---|---|---|---|

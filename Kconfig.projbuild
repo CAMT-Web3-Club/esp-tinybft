@@ -1,5 +1,39 @@
 menu "TinyBFT Configuration"
 
+    comment "Transport and ESP-NOW radio are fixed by the application's preset"
+    depends on TBFT_PRESET_RADIO
+
+    # Hooks for an application's experiment preset (counter: "Experiment
+    # preset").  They have no prompt; the application selects them.  While
+    # TBFT_PRESET_RADIO is set, every option of Transport, PHY rate, Wi-Fi
+    # interface and Receive power saving except the preset's one is hidden, so
+    # menuconfig offers only that one and the choice takes it.  Hiding the
+    # options, not the choice, is deliberate: a choice whose prompt is hidden
+    # is switched off altogether (esp_kconfiglib Choice.bool_value), and
+    # "select" has no effect on a choice option.  Attempts per frame (3, or 8
+    # with TBFT_PRESET_RETRIES_8), broadcast (off) and multicast (off, on with
+    # TBFT_PRESET_MCAST) take their defaults.
+    config TBFT_PRESET_RADIO
+        bool
+    config TBFT_PRESET_ESPNOW
+        bool
+    config TBFT_PRESET_RATE_MCS7
+        bool
+    config TBFT_PRESET_PS_W50_I100
+        bool
+    config TBFT_PRESET_PS_W110_I200
+        bool
+    config TBFT_PRESET_PS_W50_I200
+        bool
+    config TBFT_PRESET_RETRIES_8
+        bool
+    config TBFT_PRESET_MCAST
+        bool
+    config TBFT_PRESET_PS_ANY
+        bool
+        default y if TBFT_PRESET_PS_W50_I100 || TBFT_PRESET_PS_W110_I200
+        default y if TBFT_PRESET_PS_W50_I200
+
     choice TBFT_TRANSPORT_TYPE
         prompt "Transport"
         default TBFT_TRANSPORT_UDP
@@ -10,6 +44,7 @@ menu "TinyBFT Configuration"
 
         config TBFT_TRANSPORT_UDP
             bool "UDP over Wi-Fi (through an access point)"
+            depends on !TBFT_PRESET_RADIO || !TBFT_PRESET_ESPNOW
             select LWIP_IP4_REASSEMBLY
             select LWIP_IP4_FRAG
             help
@@ -20,6 +55,7 @@ menu "TinyBFT Configuration"
 
         config TBFT_TRANSPORT_ESPNOW
             bool "ESP-NOW (direct, no access point)"
+            depends on !TBFT_PRESET_RADIO || TBFT_PRESET_ESPNOW
             help
                 ESP-NOW v2.0, up to 1470 bytes per frame; longer messages are
                 fragmented and reassembled. The application calls
@@ -50,6 +86,7 @@ menu "TinyBFT Configuration"
                     connect.
             config TBFT_ESPNOW_IF_AP
                 bool "SoftAP (WIFI_MODE_AP)"
+                depends on !TBFT_PRESET_RADIO
                 help
                     Legacy behaviour. The softAP beacons every ~100 ms and
                     keeps the radio on, which inflates energy measurements.
@@ -67,18 +104,25 @@ menu "TinyBFT Configuration"
 
             config TBFT_ESPNOW_RATE_IDF_DEFAULT
                 bool "1 Mbps (ESP-IDF default, rate not set)"
+                depends on !TBFT_PRESET_RADIO || !TBFT_PRESET_RATE_MCS7
             config TBFT_ESPNOW_RATE_11M
                 bool "11 Mbps (802.11b)"
+                depends on !TBFT_PRESET_RADIO
             config TBFT_ESPNOW_RATE_6M
                 bool "6 Mbps (802.11g)"
+                depends on !TBFT_PRESET_RADIO
             config TBFT_ESPNOW_RATE_MCS0
                 bool "6.5 Mbps (802.11n MCS0, long GI)"
+                depends on !TBFT_PRESET_RADIO
             config TBFT_ESPNOW_RATE_24M
                 bool "24 Mbps (802.11g)"
+                depends on !TBFT_PRESET_RADIO
             config TBFT_ESPNOW_RATE_54M
                 bool "54 Mbps (802.11g)"
+                depends on !TBFT_PRESET_RADIO
             config TBFT_ESPNOW_RATE_MCS7
                 bool "65 Mbps (802.11n MCS7, long GI)"
+                depends on !TBFT_PRESET_RADIO || TBFT_PRESET_RATE_MCS7
         endchoice
 
         config TBFT_ESPNOW_PHY_RATE
@@ -95,7 +139,7 @@ menu "TinyBFT Configuration"
                 rate is left at the ESP-IDF default. Set by the choice only.
 
         config TBFT_ESPNOW_BROADCAST
-            bool "Send protocol broadcasts as one broadcast frame (no ACK)"
+            bool "Send protocol broadcasts as one broadcast frame (no ACK)" if !TBFT_PRESET_RADIO
             depends on !TBFT_ESPNOW_POWER_SAVE
             default n
             help
@@ -137,14 +181,19 @@ menu "TinyBFT Configuration"
 
             config TBFT_ESPNOW_POWER_OFF
                 bool "Off: radio always on"
+                depends on !TBFT_PRESET_RADIO || !TBFT_PRESET_PS_ANY
             config TBFT_ESPNOW_POWER_W50_I100
                 bool "Listen 50 ms every 100 ms (ESP-IDF example)"
+                depends on !TBFT_PRESET_RADIO || TBFT_PRESET_PS_W50_I100
             config TBFT_ESPNOW_POWER_W110_I200
                 bool "Listen 110 ms every 200 ms (Espressif ESP-NOW bridge)"
+                depends on !TBFT_PRESET_RADIO || TBFT_PRESET_PS_W110_I200
             config TBFT_ESPNOW_POWER_W50_I200
                 bool "Listen 50 ms every 200 ms"
+                depends on !TBFT_PRESET_RADIO || TBFT_PRESET_PS_W50_I200
             config TBFT_ESPNOW_POWER_CUSTOM
                 bool "Custom wake window and interval"
+                depends on !TBFT_PRESET_RADIO
         endchoice
 
         config TBFT_ESPNOW_POWER_SAVE
@@ -181,7 +230,8 @@ menu "TinyBFT Configuration"
                 esp_wifi.h recommends multiples of 100 ms.
 
         config TBFT_ESPNOW_TX_RETRIES
-            int "Attempts per frame"
+            int "Attempts per frame" if !TBFT_PRESET_RADIO
+            default 8 if TBFT_PRESET_RETRIES_8
             default 3
             range 1 50
             help
@@ -205,7 +255,8 @@ menu "TinyBFT Configuration"
     # files set it for ESP-NOW builds too, and a dependency would turn that
     # into a configuration-report notice.
     config TBFT_DISABLE_MULTICAST
-        bool "UDP: send protocol broadcasts as one datagram per replica (no multicast)"
+        bool "UDP: send protocol broadcasts as one datagram per replica (no multicast)" if !TBFT_PRESET_RADIO
+        default n if TBFT_PRESET_MCAST
         default y
         help
             Only used with the UDP transport.
