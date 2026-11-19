@@ -95,7 +95,12 @@ Notes:
   custom wake window.
 - Going back to Custom keeps the values the last preset left.
 
-Changing configuration is then: `idf.py menuconfig` → pick the preset → save →
+*Experiment load*, next to it, sets how the client sends for any preset:
+*Back-to-back* (default; the next request as soon as the previous one
+completes) or *One request every 10 s*. Together they give every mode, ESP-NOW
+and UDP, at both loads; the BANNER prints `preset=` and `load=`.
+
+Changing configuration is then: `idf.py menuconfig` → pick the preset and the load → save →
 `idf.py build` → `./flash_all.fish`.
 
 ## Where each setting lives
@@ -123,6 +128,7 @@ Two menus at the top level of `idf.py menuconfig` belong to this example.
 | Setting | Choices | Notes |
 |---|---|---|
 | Experiment preset | Custom (default), `en1`, `en65`, `en1_t8`, `en1_w50i100`, … `udp_min_mcast` | [above](#experiment-preset-the-easy-way); fixes the radio settings of one configuration |
+| Experiment load | Back-to-back (default), One request every 10 s | how the client sends; BANNER `load=b2b` / `load=p10` |
 | Role of this board | Automatic (default), Replica, Client | Automatic: from the node list |
 | ESP-NOW Wi-Fi channel | 1 | use a channel **away** from the AP: on the AP's channel 1 Mbps lost 27 % of its ACKs and the receive power-saving modes stopped working |
 | Wi-Fi station (UDP) > Wi-Fi SSID, Wi-Fi password | | stored in `sdkconfig` |
@@ -231,12 +237,13 @@ All three lines are at WARN level, so they appear with the default log level.
   tick rate), plus the protocol timeouts in ms: `vc_ms` (view change),
   `status_ms`, `recovery_ms` (state fetch), `retx_ms` (client re-send) and
   `reply_ms` (client reply).
-- `CLIENT_STATS ok=… fail=… last_ms=… min_ms=… avg_ms=… max_ms=…` after
-  every request. The client sends back-to-back: the next request starts as
-  soon as the previous one has its reply (or failed), one request
-  outstanding, no wait in between. A faster configuration therefore completes
-  more requests in the same time. (Logs of the older fixed-period client also
-  have `missed=` and a `req_interval_ms` in the BANNER.)
+- `CLIENT_STATS ok=… fail=… missed=… last_ms=… min_ms=… avg_ms=… max_ms=…`
+  after every request. With load *Back-to-back* the next request starts as
+  soon as the previous one has its reply (or failed), one request outstanding,
+  and `missed` stays 0. With *One request every 10 s* the client keeps a fixed
+  schedule and `missed` counts slots skipped because the previous request was
+  still running. The BANNER prints `load=b2b` or `load=p10` and
+  `req_interval_ms` (0 for back-to-back).
 - `TBFT_STATS …` every 60 s on replicas and after each request on the client.
   - Both: messages sent (`tx`) and frames handed to the radio (`tx_frames`:
     every ESP-NOW attempt, fragments and retries included; one per UDP
@@ -311,9 +318,10 @@ menuconfig), except the rates and broadcast that did not work on the boards
 
 Procedure:
 
-1. Step 1: choose one or two rates by success rate and latency. The client
-   sends back-to-back, so a lower latency means more requests in the same
-   energy: requests per joule follow the latency closely.
+1. Step 1: choose one or two rates by success rate and latency. With the
+   back-to-back load a lower latency means more requests in the same energy;
+   with one request every 10 s the idle radio dominates and the rate barely
+   changes requests per joule.
 2. Screen steps 2-4 with one short run per configuration, then repeat the two
    best configurations of each transport at least three times.
 3. Save each run as `runs/<name>-r1/` (`-r2`, …) with one serial log per
@@ -329,6 +337,8 @@ Procedure:
      stop the meter and the logs at the same time, and run at least 60 s
      past the first request so every replica has printed `TBFT_STATS`
      (every 60 s).
+   - Run every configuration under both loads (*Experiment load*), as
+     separate points: `<name>` (back-to-back) and `<name>_p10` (10 s).
 4. Optional baseline: the same image with the client switched off, saved as
    `runs/<name>-base/`, gives the energy added per request.
 
@@ -338,9 +348,11 @@ board positions. Interleave the configurations over time. The
 router's energy is not counted on the UDP side.
 
 What "best" means here: the best configuration among those you ran. The
-search is staged, not exhaustive, and it measures the cluster at full load
-(back-to-back requests); a configuration that wins at full load need not win
-at a light load.
+search is staged, not exhaustive, and the load is part of the result: at
+full load (back-to-back) requests per joule show the cost of one consensus
+round and power saving hardly gets to sleep; at one request every 10 s most
+of the energy is idle time, which is what power saving saves. A configuration
+that wins at one load need not win at the other, so report both.
 
 ### Optional: summarising runs
 

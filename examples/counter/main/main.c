@@ -192,6 +192,13 @@ static constexpr char EXAMPLE_ROLE_FROM[] = "list";
 #else
 static constexpr char EXAMPLE_ROLE_FROM[] = "forced";
 #endif
+/* Experiment load, printed in the BANNER. */
+#if CONFIG_EXAMPLE_LOAD_P10
+static constexpr char EXAMPLE_LOAD_NAME[] = "p10";
+#else
+static constexpr char EXAMPLE_LOAD_NAME[] = "b2b";
+#endif
+
 /* Wi-Fi "Minimum active time" in effect (UDP power saving): the preset's
  * value, or ESP-IDF's own option with Custom. */
 #ifdef CONFIG_EXAMPLE_PRESET_MIN_ACTIVE_MS
@@ -291,11 +298,12 @@ static void print_banner(bool replica, int local_id) {
 #if CONFIG_TBFT_TRANSPORT_UDP
     wifi_ps_type_t ps = WIFI_PS_NONE;
     esp_wifi_get_ps(&ps);
-    ESP_LOGW(TAG, "BANNER preset=%s role=%s role_from=%s id=%d transport=udp ps=%s listen_interval=%d "
+    ESP_LOGW(TAG, "BANNER preset=%s load=%s req_interval_ms=%d role=%s role_from=%s id=%d "
+             "transport=udp ps=%s listen_interval=%d "
              "min_active_ms=%d mcast=%d static_ip=%d ch=%d pm=%d hz=%d "
              "idle_wait_ms=%d txp_dbm=%d " BANNER_TIMEOUTS_FMT "build=%s "
              "mac=%02x:%02x:%02x:%02x:%02x:%02x",
-             CONFIG_EXAMPLE_PRESET_NAME,
+             CONFIG_EXAMPLE_PRESET_NAME, EXAMPLE_LOAD_NAME, CONFIG_EXAMPLE_LOAD_PERIOD_MS,
              replica ? "replica" : "client", EXAMPLE_ROLE_FROM, local_id,
              ps == WIFI_PS_NONE ? "none" : ps == WIFI_PS_MIN_MODEM ? "min" : "max",
              EXAMPLE_LISTEN_INTERVAL,
@@ -307,11 +315,12 @@ static void print_banner(bool replica, int local_id) {
              __DATE__ " " __TIME__,
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 #else
-    ESP_LOGW(TAG, "BANNER preset=%s role=%s role_from=%s id=%d transport=espnow if=%s rate=%d retries=%d "
+    ESP_LOGW(TAG, "BANNER preset=%s load=%s req_interval_ms=%d role=%s role_from=%s id=%d "
+             "transport=espnow if=%s rate=%d retries=%d "
              "retry_delay_ms=%d retry_span_ms=%d window_ms=%d interval_ms=%d bcast=%d ch=%d "
              "pm=%d hz=%d idle_wait_ms=%d txp_dbm=%d " BANNER_TIMEOUTS_FMT "build=%s "
              "mac=%02x:%02x:%02x:%02x:%02x:%02x",
-             CONFIG_EXAMPLE_PRESET_NAME,
+             CONFIG_EXAMPLE_PRESET_NAME, EXAMPLE_LOAD_NAME, CONFIG_EXAMPLE_LOAD_PERIOD_MS,
              replica ? "replica" : "client", EXAMPLE_ROLE_FROM, local_id,
 #if CONFIG_TBFT_ESPNOW_IF_STA
              "sta",
@@ -504,9 +513,14 @@ static void client_task(void *arg) {
     esp_task_wdt_add(nullptr);
 #endif
 
-    /* Back-to-back: one request outstanding, the next one starts as soon as
-     * the previous one has its reply (or failed). */
-    uint32_t n_ok = 0, n_fail = 0;
+    /* Experiment load: back-to-back (one request outstanding, the next one
+     * starts as soon as the previous one has its reply or failed), or a
+     * fixed period. */
+#if CONFIG_EXAMPLE_LOAD_P10
+    const TickType_t period = pdMS_TO_TICKS(CONFIG_EXAMPLE_LOAD_PERIOD_MS);
+    TickType_t next = xTaskGetTickCount();
+#endif
+    uint32_t n_ok = 0, n_fail = 0, n_missed = 0;
     int64_t lat_min = INT64_MAX, lat_max = 0, lat_sum = 0;
 
     while (1) {
@@ -545,13 +559,31 @@ static void client_task(void *arg) {
             if (lat_ms < 1000) vTaskDelay(pdMS_TO_TICKS(1000));
         }
         /* machine-parsable summary, WARN so it survives the measure overlay */
-        ESP_LOGW(TAG, "CLIENT_STATS ok=%lu fail=%lu last_ms=%lld "
+        ESP_LOGW(TAG, "CLIENT_STATS ok=%lu fail=%lu missed=%lu last_ms=%lld "
                  "min_ms=%lld avg_ms=%lld max_ms=%lld",
-                 (unsigned long)n_ok, (unsigned long)n_fail, (long long)lat_ms,
+                 (unsigned long)n_ok, (unsigned long)n_fail,
+                 (unsigned long)n_missed, (long long)lat_ms,
                  (long long)(n_ok ? lat_min : 0),
                  (long long)(n_ok ? lat_sum / n_ok : 0), (long long)lat_max);
 #if CONFIG_TBFT_PRINT_STATS
         Byz_print_stats();
+#endif
+#if CONFIG_EXAMPLE_LOAD_P10
+        /* Fixed period: the next slot is absolute, a slow request does not
+         * shift the schedule; slots already past are skipped and counted. */
+        next += period;
+        while ((int32_t)(next - xTaskGetTickCount()) <= 0) {
+            next += period;
+            n_missed++;
+        }
+        while ((int32_t)(next - xTaskGetTickCount()) > 0) {
+            TickType_t left = next - xTaskGetTickCount();
+            TickType_t chunk = left > pdMS_TO_TICKS(1000) ? pdMS_TO_TICKS(1000) : left;
+            vTaskDelay(chunk);
+#if CONFIG_ESP_TASK_WDT_EN
+            esp_task_wdt_reset();
+#endif
+        }
 #endif
     }
 }

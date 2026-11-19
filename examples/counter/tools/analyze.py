@@ -29,14 +29,16 @@ it at the end.  Average and maximum latency are those of the successful
 requests from the second one on: the first request after boot waits for the
 whole cluster to come up and is reported in a note instead.
 
-The client sends back-to-back: the next request starts as soon as the
-previous one completes, so a faster configuration completes more requests in
-the same time.  "success (sent)" is ok / (ok + fail), the quality of the link
-and the protocol.  "slots" is ok / (ok + fail + missed) and only differs for
-logs of the older fixed-period client, where a slot was "missed" when the
-previous request was still running at the next period; for back-to-back logs
-it equals "success (sent)".  Measure the SAME boards in every run: efficacy is
-successful requests per joule summed over the boards listed in energy.csv.
+The client runs one of two loads (BANNER load=): back-to-back (b2b), where
+the next request starts as soon as the previous one completes, or one request
+every 10 s (p10).  Never mix the two in one comparison: name the runs apart
+(<preset> and <preset>_p10).  "success (sent)" is ok / (ok + fail), the
+quality of the link and the protocol.  "slots" is ok / (ok + fail + missed):
+with p10 a slot is "missed" when the previous request was still running at
+the next period, so a higher latency lowers "slots" while "success (sent)"
+stays at 100 %; with b2b nothing is missed and the two are equal.  Measure
+the SAME boards in every run: efficacy is successful requests per joule
+summed over the boards listed in energy.csv.
 
 A configuration qualifies only if its mean success rate >= --min-success.
 Runs with a view change, a state fetch, a board that rebooted or a replica
@@ -186,7 +188,7 @@ def load_run(d):
     f = os.path.join(d, "energy.csv")
     if os.path.exists(f):
         r["energy"], r["nodes"], r["secs"] = energy(f)
-        # Fixed-period logs only (older client): back-to-back has no period.
+        # p10 only: back-to-back has req_interval_ms=0 and no fixed window.
         period = banner_int(r["banner"] or {}, "req_interval_ms")
         if r["secs"] and period and r["total"]:
             window = r["total"] * period / 1000

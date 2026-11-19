@@ -108,6 +108,40 @@ menu "Counter Example Configuration"
     comment "Transport, ESP-NOW rate and power saving: TinyBFT Configuration menu"
     depends on EXAMPLE_PRESET_CUSTOM
 
+    choice EXAMPLE_LOAD
+        prompt "Experiment load"
+        default EXAMPLE_LOAD_B2B
+        help
+            How the client sends, for every preset (and Custom). The BANNER
+            prints it as load= on every board.
+
+            Back-to-back: the next request starts as soon as the previous one
+            has its reply (or failed), one request outstanding, no wait. The
+            cluster works all the time, so requests per joule show the cost
+            of one consensus round; the radio power-saving modes hardly get
+            to sleep.
+
+            One request every 10 s: a fixed schedule (a slow request does
+            not shift it; slots it overruns are counted as missed). Most of
+            the time is idle, as in a lightly loaded deployment, so this is
+            where the power-saving modes show what they save.
+
+            Suggested run names: <preset> for back-to-back, <preset>_p10
+            for 10 s.
+
+        config EXAMPLE_LOAD_B2B
+            bool "Back-to-back (next request as soon as the previous one completes)"
+        config EXAMPLE_LOAD_P10
+            bool "One request every 10 s"
+    endchoice
+
+    config EXAMPLE_LOAD_PERIOD_MS
+        int
+        default 10000 if EXAMPLE_LOAD_P10
+        default 0
+        help
+            Request period of the load in ms; 0 means back-to-back.
+
     config EXAMPLE_PRESET_NAME
         string
         default "en1" if EXAMPLE_PRESET_EN1
@@ -174,9 +208,6 @@ menu "Counter Example Configuration"
         config EXAMPLE_ROLE_CLIENT
             bool "Client"
     endchoice
-
-    comment "Client: back-to-back, the next request starts as soon as the previous one completes"
-    depends on !EXAMPLE_ROLE_REPLICA
 
     config EXAMPLE_ESPNOW_CHANNEL
         int "ESP-NOW Wi-Fi channel"
