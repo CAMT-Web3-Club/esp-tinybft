@@ -48,7 +48,8 @@ configuration of the [best-vs-best comparison](#best-vs-best-configurations-to-r
 in one choice. The name before the colon is the run name, and the BANNER
 prints it as `preset=`.
 
-Every mode that worked on the boards has a preset:
+Every mode that worked on the boards has a preset. The "Measured" column is
+from the older client, one request every 10 s:
 
 | Preset | Transport | Radio setting | Measured (2026-11-15) |
 |---|---|---|---|
@@ -76,7 +77,7 @@ ESP-NOW broadcast = off, attempts per frame = 3 (8 for `_t8`), UDP multicast
 offered for Transport, PHY rate, Wi-Fi interface and Receive power saving.
 
 A preset leaves to you the settings that must stay the **same** in every run:
-role, request period, ESP-NOW channel, Wi-Fi TX power, timeouts and sizes.
+role, ESP-NOW channel, Wi-Fi TX power, timeouts and sizes.
 
 Notes:
 
@@ -123,7 +124,6 @@ Two menus at the top level of `idf.py menuconfig` belong to this example.
 |---|---|---|
 | Experiment preset | Custom (default), `en1`, `en65`, `en1_t8`, `en1_w50i100`, … `udp_min_mcast` | [above](#experiment-preset-the-easy-way); fixes the radio settings of one configuration |
 | Role of this board | Automatic (default), Replica, Client | Automatic: from the node list |
-| Client: request period (ms) | 10000 | the same for every configuration you compare |
 | ESP-NOW Wi-Fi channel | 1 | use a channel **away** from the AP: on the AP's channel 1 Mbps lost 27 % of its ACKs and the receive power-saving modes stopped working |
 | Wi-Fi station (UDP) > Wi-Fi SSID, Wi-Fi password | | stored in `sdkconfig` |
 | Wi-Fi station (UDP) > Power saving | None (default), Minimum, Maximum | `esp_wifi_set_ps()` |
@@ -231,9 +231,12 @@ All three lines are at WARN level, so they appear with the default log level.
   tick rate), plus the protocol timeouts in ms: `vc_ms` (view change),
   `status_ms`, `recovery_ms` (state fetch), `retx_ms` (client re-send) and
   `reply_ms` (client reply).
-- `CLIENT_STATS ok=… fail=… missed=… last_ms=… min_ms=… avg_ms=… max_ms=…`
-  after every request. The client sends on a fixed period; `missed` counts
-  slots skipped because the previous request was still running.
+- `CLIENT_STATS ok=… fail=… last_ms=… min_ms=… avg_ms=… max_ms=…` after
+  every request. The client sends back-to-back: the next request starts as
+  soon as the previous one has its reply (or failed), one request
+  outstanding, no wait in between. A faster configuration therefore completes
+  more requests in the same time. (Logs of the older fixed-period client also
+  have `missed=` and a `req_interval_ms` in the BANNER.)
 - `TBFT_STATS …` every 60 s on replicas and after each request on the client.
   - Both: messages sent (`tx`) and frames handed to the radio (`tx_frames`:
     every ESP-NOW attempt, fragments and retries included; one per UDP
@@ -308,9 +311,9 @@ menuconfig), except the rates and broadcast that did not work on the boards
 
 Procedure:
 
-1. Step 1 needs no power meter. With an always-on radio the idle radio
-   dominates the energy, so the PHY rate barely changes requests per joule.
-   Choose one or two rates by success rate and latency.
+1. Step 1: choose one or two rates by success rate and latency. The client
+   sends back-to-back, so a lower latency means more requests in the same
+   energy: requests per joule follow the latency closely.
 2. Screen steps 2-4 with one short run per configuration, then repeat the two
    best configurations of each transport at least three times.
 3. Save each run as `runs/<name>-r1/` (`-r2`, …) with one serial log per
@@ -322,19 +325,22 @@ Procedure:
      change.
    - Keep the logs of all seven replicas, from boot: only they show a state
      fetch, a reboot (a second `BANNER`) or a replica that joined late.
-   - Keep logging at least 60 s after the last request: replicas print
-     `TBFT_STATS` every 60 s, and the last line must cover the whole run.
+   - The client never stops sending, so the run ends when you stop it:
+     stop the meter and the logs at the same time, and run at least 60 s
+     past the first request so every replica has printed `TBFT_STATS`
+     (every 60 s).
 4. Optional baseline: the same image with the client switched off, saved as
    `runs/<name>-base/`, gives the energy added per request.
 
 Keep fixed for every configuration: channel (an ESP-NOW channel away from the
-AP, see above), router DTIM and beacon interval, request period, run length,
+AP, see above), router DTIM and beacon interval, run length,
 board positions. Interleave the configurations over time. The
 router's energy is not counted on the UDP side.
 
 What "best" means here: the best configuration among those you ran. The
-search is staged, not exhaustive, and the request period is part of the
-result; repeat at a second period if the ranking matters at other loads.
+search is staged, not exhaustive, and it measures the cluster at full load
+(back-to-back requests); a configuration that wins at full load need not win
+at a light load.
 
 ### Optional: summarising runs
 

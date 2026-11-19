@@ -14,7 +14,7 @@ menu "Counter Example Configuration"
             power saving and listen interval. menuconfig then offers only the
             preset's option in those menus. Everything that must stay the
             same across configurations is left to you and is not changed by
-            a preset: role, request period, ESP-NOW channel, Wi-Fi TX power,
+            a preset: role, ESP-NOW channel, Wi-Fi TX power,
             attempts per frame, timeouts and sizes, and ESP-IDF's own
             "Minimum active time".
 
@@ -175,16 +175,8 @@ menu "Counter Example Configuration"
             bool "Client"
     endchoice
 
-    config EXAMPLE_CLIENT_REQUEST_INTERVAL_MS
-        int "Client: request period (ms)"
-        default 10000
-        range 100 3600000
-        depends on !EXAMPLE_ROLE_REPLICA
-        help
-            The client starts one request every this many ms on a fixed
-            schedule: a slow request does not shift the schedule, and slots
-            it overruns are counted as "missed". Keep it the same for every
-            configuration you compare.
+    comment "Client: back-to-back, the next request starts as soon as the previous one completes"
+    depends on !EXAMPLE_ROLE_REPLICA
 
     config EXAMPLE_ESPNOW_CHANNEL
         int "ESP-NOW Wi-Fi channel"
