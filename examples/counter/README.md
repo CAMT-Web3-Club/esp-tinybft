@@ -6,7 +6,9 @@ and execute them and reply. This example is also the test bed for the
 ESP-NOW vs UDP energy comparison.
 
 Every setting of an experiment is chosen in `idf.py menuconfig`. No script is
-needed to configure, build or flash.
+needed to configure, build or flash. Why the experiment is set up this way
+(presets, loads, and what was wrong with the earlier `devlope/v0.2.9` runs) is
+in [docs/EXPERIMENT_DESIGN.md](../../docs/EXPERIMENT_DESIGN.md) (Thai).
 
 ## Quick start
 
