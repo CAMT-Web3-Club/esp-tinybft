@@ -159,20 +159,36 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
                                int32_t id, void *data)
 {
     static int s_retry = 0;
-#if CONFIG_EXAMPLE_STATIC_IP
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_CONNECTED) {
+        /* Association done (DHCP or the static IP follows): where and how
+         * strong, to tell a weak link from an AP that does not answer. */
+        const wifi_event_sta_connected_t *c = data;
+        int rssi = 0;
+        if (esp_wifi_sta_get_rssi(&rssi) != ESP_OK) rssi = 0;
+        ESP_LOGW(TAG, "WiFi associated ch=%u rssi=%d bssid=" MACSTR " after %d retries",
+                 c->channel, rssi, MAC2STR(c->bssid), s_retry);
+#if CONFIG_EXAMPLE_STATIC_IP
         apply_static_ip((esp_netif_t *)arg);
+#endif
         return;
     }
-#endif
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        /* reason: wifi_err_reason_t (esp_wifi_types_generic.h), e.g.
+         * 2 auth expired, 15 4-way handshake, 200 beacon lost, 201 no AP
+         * found, 202 auth, 203 assoc, 204 handshake, 205 connection.
+         * The wording avoids "failed"/"timed out": the client logger takes
+         * a line with those words for a request timeout. */
+        const wifi_event_sta_disconnected_t *d = data;
         s_retry++;
-        ESP_LOGW(TAG, "WiFi disconnected (attempt %d), reconnecting...", s_retry);
+        ESP_LOGW(TAG, "WiFi disconnected (attempt %d) reason=%u rssi=%d t_ms=%lld, reconnecting...",
+                 s_retry, d->reason, d->rssi, (long long)(esp_timer_get_time() / 1000));
         /* bounded backoff: 100 ms .. 2 s, avoids hammering a missing AP */
         int back_ms = s_retry * 100;
         vTaskDelay(pdMS_TO_TICKS(back_ms > 2000 ? 2000 : back_ms));
         esp_wifi_connect();
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        ESP_LOGW(TAG, "WiFi got IP t_ms=%lld after %d retries",
+                 (long long)(esp_timer_get_time() / 1000), s_retry);
         s_retry = 0;
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     }
