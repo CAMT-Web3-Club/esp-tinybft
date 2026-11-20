@@ -143,7 +143,7 @@ TX power 8 dBm, view-change / Status / fetch / client re-send / reply timeout = 
 
 | สิ่งที่วัด | เดิม | ใหม่ | เครื่องมือ (commit) |
 |---|---|---|---|
-| พลังงาน | INA219 แปลงแบบ one-shot **9-bit ครั้งละ 84 µs** ทุกประมาณ 50–100 ms | INA219 แปลงต่อเนื่อง **เฉลี่ย 128 sample ช่วงละ 68.1 ms** ทุก 68.6 ms | Commander-Logger (`48a2f4b`, branch `dev`) |
+| พลังงาน | INA219 แปลงแบบ one-shot **9-bit ครั้งละ 84 µs** ทุกประมาณ 50–100 ms | INA219 แปลงต่อเนื่อง **เฉลี่ย 128 sample ช่วงละ 68.1 ms** ทุก 68.6 ms | Commander-Logger (`48a2f4b`, `faaa49e`, branch `dev`) |
 | สำเร็จ / ล้มเหลว / latency | logger บน PC จับเวลาจากบรรทัด log INFO (`Client sending increment…` ถึง `Client reply…`) | บอร์ดจับเวลาเองแล้วพิมพ์ `CLIENT_STATS` (ระดับ WARN) และ logger อ่านบรรทัดนั้น | firmware counter + client logger (`a8a19ea`) |
 | ภาระงาน | รอ 2/10/40 s **หลัง** reply | back-to-back หรือ**ตารางเวลาสัมบูรณ์**ทุก 10 s | Experiment load (หัวข้อ 6.2) |
 | ยืนยัน config ของ run | ไม่มี | BANNER พิมพ์ `preset=` และ `load=` ทุกบอร์ด | firmware counter |
@@ -162,6 +162,7 @@ TX power 8 dBm, view-change / Status / fetch / client re-send / reply timeout = 
 
 - **อ่านแต่ละค่าครั้งเดียวพอดี:** Commander อ่านทุก 20 ms และใช้ bit CNVR ตรวจว่ามีค่าใหม่หรือยัง ค่าที่ถูกเขียนทับก่อนอ่านทันจะถูกนับใน `missed[]` และขึ้น log เตือน **run ที่มี `missed` ควรตัดทิ้ง** เพราะการรวมพลังงานจะมีช่วงที่ขาดหายไป
 - **การรวมพลังงาน:** E = Σ P × Δt โดยให้ Δt เป็นช่วงห่างของ timestamp ระหว่างค่าที่ติดกัน (ประมาณ 68.6 ms) ห้ามใช้ช่วงคงที่แบบเดิม
+- **ไม่ใช้ค่าที่อ่านคร่อมสองรอบการแปลง:** register ทั้งสี่อ่านแยกกันสี่ครั้ง ถ้ารอบการแปลงถัดไปเสร็จระหว่างอ่าน BUS_V กับ POWER ค่าที่ได้จะปนกันสองรอบ Commander (`faaa49e`) จึงทิ้งค่าที่ช่วงจากการอ่าน BUS_V ครั้งก่อนถึงการอ่าน POWER ครั้งนี้เกิน 60.2 ms (90 % ของคาบ ลบเวลาแปลง bus 12-bit และ margin 1 ms) และนับไว้ใน `straddled[]` ถ้ามีค่าถูกทิ้งบ่อยแปลว่า Commander อ่านช้าเกินไป
 - **ข้อจำกัด:** ค่า shunt และ bus ในค่าเดียวกันวัดห่างกันได้ถึง 68 ms (datasheet §8.3.1.1) ไม่มีผลเมื่อแรงดันไฟเลี้ยงคงที่ วิธีนี้**ยังไม่ได้ทดสอบกับฮาร์ดแวร์จริง** ต้องดู log ก่อนว่าแต่ละช่องได้ค่าใหม่ประมาณ 14.6 ครั้งต่อวินาที และไม่มี `overwritten unread`
 
 ### 7.2 สำเร็จ ล้มเหลว และ latency: บอร์ดนับเอง
@@ -185,34 +186,78 @@ TX power 8 dBm, view-change / Status / fetch / client re-send / reply timeout = 
 
 ## 8. ผลตรวจบนบอร์ด
 
-**โหลด back-to-back** (2026-11-19, 8 บอร์ด, ประมาณ 75 s ต่อ preset):
+### 8.1 รอบล่าสุด (2026-11-20 หลังเปลี่ยนบอร์ด)
 
-ทุก preset ได้ fail = 0 และไม่มี view change สองตัวที่ replica ไม่ครบ:
+บอร์ดทั้ง 8 ตัวมี MAC ตรงกับ `config_espnow.txt` image ทั้ง 34 ตัว (17 preset × 2 โหลด) build จาก commit `fefc1b1` ขึ้นไป ทุก run ได้ fail = 0 ไม่มี view change และ **replica ครบ 7 ตัวทุก run** (`last_exec` ของทุก replica ห่างกันไม่เกิน 1–2)
 
-| กลุ่ม | ผล |
-|---|---|
-| ESP-NOW 1 Mbps (5 preset) | 26–34 request, latency เฉลี่ย 1.72–2.23 s, replica ครบ 7 ตัว, ACK หาย 0–84 ครั้ง |
-| ESP-NOW 65 Mbps (`en65`, `en65_w50i100`) | 37–39 request, 1.60–1.75 s, replica ครบ แต่ ACK หาย 1,041–3,893 ครั้ง |
-| ESP-NOW 65 Mbps (`en65_w110i200`, `en65_w50i200`) | **node2 ไม่ได้ execute เลย** cluster ตอบได้ครบเพราะเหลือ 6 replica |
-| UDP unicast (6 preset) | 20–39 request, 1.56–3.00 s, replica ครบ |
-| UDP multicast (2 preset) | 31–33 request, 1.89–1.96 s, replica ครบ |
+**โหลด back-to-back** (ประมาณ 72–77 s ต่อ preset, latency เฉลี่ยนับตั้งแต่ request ที่ 2):
 
-**โหลดทุก 10 s** (2026-11-20, 8 บอร์ด, ทุก preset รันจนได้ 10 request ประมาณ 100 s):
+| Preset | request สำเร็จ | latency เฉลี่ย (ms) | ACK หาย (`cb_fail` รวม) |
+|---|---|---|---|
+| `en1` | 35 | 1746 | 0 |
+| `en65` | 39 | 1554 | 750 |
+| `en1_t8` | 34 | 1734 | 0 |
+| `en1_w50i100` | 31 | 1885 | 12 |
+| `en1_w110i200` | 31 | 1900 | 15 |
+| `en1_w50i200` | 25 | 2254 | 105 |
+| `en65_w50i100` | 37 | 1665 | 3,056 |
+| `en65_w110i200` | 32 | 1924 | 2,614 |
+| `en65_w50i200` | 29 | 2049 | 6,411 |
+| `udp_none` | 38 | 1592 | – |
+| `udp_min` | 36 | 1682 | – |
+| `udp_max3` | 32 | 1911 | – |
+| `udp_max10` | 21 | 2897 | – |
+| `udp_min_a20` | 37 | 1651 | – |
+| `udp_max3_a20` | 26 | 1989 | – |
+| `udp_none_mcast` | 32 | 1838 | – |
+| `udp_min_mcast` | 32 | 1873 | – |
 
-| กลุ่ม | ผล |
-|---|---|
-| ESP-NOW 1 Mbps (5 preset) | 10/10, latency เฉลี่ย 1.72–2.28 s, replica ครบ 7 ตัว, ACK หาย 1–52 ครั้ง |
-| ESP-NOW 65 Mbps (4 preset) | 10/10, 1.54–2.15 s, ACK หาย 316–2,594 ครั้ง; **`en65` node2 ไม่ได้ execute**, อีก 3 ตัว replica ครบ |
-| UDP unicast (6 preset) | 10/10, 1.56–3.61 s (`udp_max10` ช้าที่สุด), replica ครบ, ไม่มี ACK หาย |
-| UDP multicast (2 preset) | 10/10, 1.84–2.00 s, replica ครบ |
+**โหลดทุก 10 s** (รันจนได้ 10 request ประมาณ 100–130 s, ทุก preset ได้ 10/10):
 
-ทั้งสองโหลดได้ fail = 0 ทุก preset ลิงก์ของ node2 ที่ 65 Mbps หลุดในบาง run และไม่หลุดในบาง run สลับกันไปมาระหว่าง preset และโหลด แสดงว่าปัญหาอยู่ที่สัญญาณ ไม่ใช่ที่ preset ใด preset หนึ่ง
+| Preset | latency เฉลี่ย (ms) | ACK หาย |
+|---|---|---|
+| `en1` | 1723 | 0 |
+| `en65` | 1530 | 314 |
+| `en1_t8` | 1733 | 0 |
+| `en1_w50i100` | 1865 | 11 |
+| `en1_w110i200` | 1894 | 12 |
+| `en1_w50i200` | 2300 | 74 |
+| `en65_w50i100` | 1601 | 981 |
+| `en65_w110i200` | 1724 | 951 |
+| `en65_w50i200` | 1813 | 1,899 |
+| `udp_none` | 1649 | – |
+| `udp_min` | 1667 | – |
+| `udp_max3` | 2137 | – |
+| `udp_max10` | 3258 | – |
+| `udp_min_a20` | 1675 | – |
+| `udp_max3_a20` | 2154 | – |
+| `udp_none_mcast` | 1856 | – |
+| `udp_min_mcast` | 2044 | – |
 
-ผลข้างบนเป็นการตรวจว่าแต่ละ config ใช้งานได้ ยังไม่ใช่การวัดพลังงาน log อยู่ที่ `esp-tinybft-work/hw/runs/p10-<preset>/` (back-to-back) และ `p10p10-<preset>/` (10 s)
+**ข้อสังเกต:**
+
+- **Wi-Fi ของ UDP ไม่นิ่งในช่วงที่รันโหลด 10 s:** รอบแรก client ของ `udp_min_a20` และ `udp_max3_a20` ต่อ AP ไม่ได้เลย (หลุด 17–19 ครั้งใน 150 s) จึงไม่ได้ส่ง request และ `udp_max10` ได้ 9/10 ส่วน UDP preset อื่นต่อ AP ได้ช้า 15–33 s (ปกติ 3–5 s) และ replica หลุดบ้าง image ของสองโหลดใช้โค้ด Wi-Fi เดียวกัน จึงน่าจะเป็นที่ AP หรือสัญญาณในช่วงนั้น รันสาม preset นี้ใหม่แล้วได้ 10/10 (ตัวเลขในตารางเป็นรอบที่รันใหม่) ก่อนวัดพลังงานด้วย UDP ให้ตรวจว่าทุกบอร์ดต่อ AP ได้ภายในไม่กี่วินาที (ไม่มี `WiFi disconnected` ใน log)
+- **node2 ที่ 65 Mbps ไม่หลุดแล้ว** ในรอบก่อน (8.2) node2 ไม่ได้ execute ใน 3 run ของ 65 Mbps รอบนี้ execute ครบทุก run แต่ 65 Mbps ยังมี ACK หายเป็นหลักร้อยถึงหลักพัน (มากขึ้นเมื่อเปิด receive power saving) ส่วน 1 Mbps แทบไม่มี
+- **ลำดับความเร็วคงเดิมกับรอบก่อน:** เร็วที่สุดคือ `en65` และ `udp_none` ช้าที่สุดคือ `udp_max10`, `en1_w50i200` และ `udp_max3_a20` latency ของ preset เดียวกันต่างจากรอบก่อนไม่เกินประมาณ 0.4 s
+
+### 8.2 รอบก่อน (2026-11-19/20 ก่อนเปลี่ยนบอร์ด)
+
+ทุก preset ได้ fail = 0 และไม่มี view change แต่ replica ไม่ครบในบาง run ของ 65 Mbps:
+
+| โหลด | กลุ่ม | ผล |
+|---|---|---|
+| back-to-back | ESP-NOW 1 Mbps (5 preset) | 26–34 request, latency เฉลี่ย 1.72–2.23 s, ACK หาย 0–84 ครั้ง |
+| back-to-back | ESP-NOW 65 Mbps | 37–44 request, 1.60–2.53 s, ACK หาย 1,041–5,860 ครั้ง; **`en65_w110i200` และ `en65_w50i200` node2 ไม่ได้ execute** |
+| back-to-back | UDP (8 preset) | 20–39 request, 1.56–3.00 s, replica ครบ |
+| 10 s | ESP-NOW 1 Mbps (5 preset) | 10/10, 1.72–2.28 s, ACK หาย 1–52 ครั้ง |
+| 10 s | ESP-NOW 65 Mbps (4 preset) | 10/10, 1.54–2.15 s, ACK หาย 316–2,594 ครั้ง; **`en65` node2 ไม่ได้ execute** |
+| 10 s | UDP (8 preset) | 10/10, 1.56–3.61 s, replica ครบ |
+
+ผลในหัวข้อนี้เป็นการตรวจว่าแต่ละ config ใช้งานได้ ยังไม่ใช่การวัดพลังงาน log อยู่ที่ `esp-tinybft-work/hw/runs/p10-<preset>/` (back-to-back) และ `p10p10-<preset>/` (10 s) สรุปรอบก่อนอยู่ใน `esp-tinybft-work/hw/old_20261120/`
 
 ## 9. ข้อจำกัดที่ยังเหลือ
 
-1. **65 Mbps:** ลิงก์ระหว่าง node2 กับบอร์ดบางตัวส่งไม่ผ่าน ต้องย้ายบอร์ดหรือปรับ TX power (ให้เท่ากันทุก config) ก่อนใช้ผล `en65*`
+1. **65 Mbps:** ACK หายมาก และในรอบก่อนเปลี่ยนบอร์ด node2 หลุดในบาง run (รอบล่าสุดไม่หลุด) ก่อนใช้ผล `en65*` ต้องตรวจว่า replica ครบ 7 ตัวทุก run (หัวข้อ 7.3 ข้อ 3)
 2. **ESP-NOW broadcast ยังใช้ไม่ได้** ค้างที่ seqno 2
 3. **ยังไม่มีการวัดพลังงาน** วิธีวัดใหม่ของ Commander-Logger (หัวข้อ 7.1) ยังไม่ได้ทดสอบกับฮาร์ดแวร์ ต้องวัดทุกบอร์ด รันอย่างน้อย 5 นาทีต่อ run รัน config ที่ดีที่สุดซ้ำ ≥ 3 ครั้ง และบันทึก `energy.csv` ให้ `analyze.py`
 4. **ปัจจัยที่ต่างกันโดยธรรมชาติ** ต้องระบุในรายงาน: ESP-NOW ใช้ช่องที่ว่าง ส่วน UDP ใช้ช่องของ AP, ไม่นับพลังงานของ router และค่าที่วัดเป็นพลังงานของทั้งบอร์ด (รวม regulator และ USB)
