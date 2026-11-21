@@ -328,8 +328,20 @@ Procedure:
    best configurations of each transport at least three times.
 3. Save each run as `runs/<name>-r1/` (`-r2`, …) with one serial log per
    board (`node0.log` … `node6.log`, `client7.log`) and `energy.csv`
-   (`node,joules[,seconds]` or `node,avg_ma,volts,seconds`). Start the meter
-   at the first successful request. Measure the same boards in every run.
+   (`node,joules[,seconds]` or `node,avg_ma,volts,seconds`). Measure the
+   same boards in every run.
+   - A run lasts from power-on until the batteries are empty, and all of it
+     is data: boot, key exchange, the requests that fail while the cluster
+     comes up and the last ones before a board browns out. Do not trim the
+     warm-up. Make the start the same in every run instead: switch all
+     boards on together, or keep one plug-in order and note when each board
+     got power (the Commander CSV shows each channel's bus voltage rise).
+     Measured on 2026-11-21 with the boards plugged in one by one, the client
+     failed 9 requests and got its first reply 3 min 19 s after boot, about
+     1 min after the last replica had power.
+   - `tools/analyze.py` still counts requests and latency from the first
+     success and reads `energy.csv` as a window starting there; it has not
+     been changed for battery-to-empty runs.
    - Joules from INA219 samples (Commander-Logger): the mean of bus
      voltage × current over all samples of the span, times the span's
      duration (first to last timestamp). Every sample is the average of one
