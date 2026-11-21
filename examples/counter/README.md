@@ -330,6 +330,14 @@ Procedure:
    board (`node0.log` … `node6.log`, `client7.log`) and `energy.csv`
    (`node,joules[,seconds]` or `node,avg_ma,volts,seconds`). Start the meter
    at the first successful request. Measure the same boards in every run.
+   - Joules from INA219 samples (Commander-Logger): sum bus voltage ×
+     current × the time to the next sample's timestamp. Do not use a fixed
+     period (the sensors deliver about 15.0 results/s on the boards, 3 %
+     faster than the datasheet's typical 14.57), and do not use the `power`
+     column: the INA219 computes it from the same two registers and stores
+     it in steps of 20 × the current LSB (1.95 mW here, against 0.32 mW for
+     the product at 3.3 V), which is 0.7 % of an always-on board's power
+     but 2.5-3 % of a power-saving one's.
    - The client log is required and must include the boot `BANNER`. It gives
      success, latency and, from the view of the replies it accepted, any view
      change.
