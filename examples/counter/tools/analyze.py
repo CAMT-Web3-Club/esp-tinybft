@@ -23,11 +23,14 @@ state fetches, re-sent messages and transport drops; without them a run with
 a state fetch cannot be excluded (a warning says so).  Keep logging for at
 least 60 s after the last request: the replicas print TBFT_STATS every 60 s.
 
-Requests are counted from the first successful request to the last
-CLIENT_STATS line, so start the meter at the first successful request and stop
-it at the end.  Average and maximum latency are those of the successful
-requests from the second one on: the first request after boot waits for the
-whole cluster to come up and is reported in a note instead.
+A run lasts from power-on until the batteries are empty, and all of it is
+counted: boot, key exchange, the requests that fail while the cluster comes up,
+and the last ones before a board browns out.  Success counts every request the
+client sent since it booted (counters summed over client reboots), latency
+covers every success, the first one after boot included, and energy.csv must
+cover the same span (power-on to the end).  The warm-up is reported, not
+removed: "first OK s" is the client's uptime at its first success and
+"warm-up fails" the requests that failed before it.
 
 The client runs one of two loads (BANNER load=): back-to-back (b2b), where
 the next request starts as soon as the previous one completes, or one request
@@ -41,13 +44,13 @@ the SAME boards in every run: efficacy is successful requests per joule
 summed over the boards listed in energy.csv.
 
 A configuration qualifies only if its mean success rate >= --min-success.
-Runs with a view change, a state fetch, a board that rebooted or a replica
-that joined late are excluded unless --include-faulty.  Replica counters are
-taken from the replica's first executed request on (run_* in TBFT_STATS), so
-the boot phase does not count.  "resent/run" counts every message sent again
+View changes, state fetches and reboots are part of a battery run (a replica
+whose battery empties first forces a view change): they are counted per run
+and shown, and a run is dropped for them only with --exclude-faulty.  A
+replica that joined late (plugged in after the others) is a note.  Replica
+counters are totals since boot.  "resent/run" counts every message sent again
 (client requests and replica re-sends); "drops/run" counts sends given up and
-messages or fragments thrown away.  Both are normally 0; a request slower than
-the client's re-send interval also adds re-sends (a warning says so).
+messages or fragments thrown away.
 "Best" means best among the points you ran, not a proven optimum.
 
   analyze.py runs/ [--min-success 0.95]
@@ -61,6 +64,7 @@ import statistics as st
 
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 KV = re.compile(r"(\w+)=(-?\d+)")
+BOOT_MS = re.compile(r"\b[IWED] \((\d+)\) ")
 BANNER_KV = re.compile(r"(\w+)=(\S+)")
 RATE_MBPS = {0: 1, 11: 6, 16: 6.5, 9: 24, 12: 54, 23: 65}
 
@@ -73,6 +77,8 @@ def parse_log(path):
         if "CLIENT_STATS" in line:
             d = dict((k, int(v)) for k, v in KV.findall(line.split("CLIENT_STATS", 1)[1]))
             if "ok" in d and "fail" in d:
+                m = BOOT_MS.search(line)
+                d["_t"] = int(m.group(1)) if m else None   # ms since the client booted
                 out["client"].append(d)
                 out["events"].append(("client", len(out["client"]) - 1))
         elif "TBFT_STATS" in line:
@@ -97,17 +103,6 @@ def energy(path):
     return tot, frozenset(nodes), secs
 
 
-def stats_after(log, client_idx):
-    """The client's TBFT_STATS line printed right after CLIENT_STATS row i."""
-    seen = False
-    for kind, i in log["events"]:
-        if kind == "client" and i == client_idx:
-            seen = True
-        elif kind == "stats" and seen:
-            return log["stats"][i]
-    return None
-
-
 def load_run(d):
     logs = {os.path.splitext(os.path.basename(p))[0]: parse_log(p)
             for p in glob.glob(os.path.join(d, "*.log"))}
@@ -118,83 +113,79 @@ def load_run(d):
         r["banner"] = client["banner"]
     r["banner"] = r["banner"] or next((v["banner"] for v in logs.values() if v["banner"]), None)
     rows = client["client"] if client else []
-    if client and (len(client["banners"]) > 1 or
-                   any(b["ok"] < a["ok"] for a, b in zip(rows, rows[1:]))):
-        r["faulty"].append("client rebooted")
-    first = next((i for i, x in enumerate(rows) if x["ok"] > 0), None)
-    if first is not None:
-        a, b = rows[first], rows[-1]
-        r["ok"] = b["ok"] - a["ok"] + 1          # the first success opens the window
-        r["fail"] = b["fail"] - a["fail"]
-        # A "missed" slot is one the client could not send because the previous
-        # request was still running: it measures latency, not loss, so it is
-        # kept apart from the failure count (a slow configuration would
-        # otherwise look less successful than a fast one with the same loss).
-        r["missed"] = b.get("missed", 0) - a.get("missed", 0)
-        r["total"] = r["ok"] + r["fail"] + r["missed"]   # slots in the window
-        # Latency of each successful request (last_ms of its own row), not the
-        # firmware's running max: that one keeps the first request after boot,
-        # which waits for the whole cluster to come up (5-9 s on the boards)
-        # and would make every run look slower than the client re-send
-        # interval.  The boot request is reported separately.
-        r["boot_ms"] = rows[first].get("last_ms")
-        lat, prev = [], rows[first]
-        for x in rows[first + 1:]:
-            if x["ok"] > prev["ok"] and x.get("last_ms") is not None:
+    # The counters restart at 0 when the client reboots (a brown-out at the
+    # end of a battery): split the rows into boots and add up their totals.
+    boots = []
+    for x in rows:
+        if not boots or x["ok"] < boots[-1][-1]["ok"] or x["fail"] < boots[-1][-1]["fail"]:
+            boots.append([])
+        boots[-1].append(x)
+    if len(boots) > 1 or (client and len(client["banners"]) > 1):
+        r["faulty"].append(f"client rebooted ({max(len(boots), len(client['banners'])) - 1} times, "
+                           "counters summed)")
+    r["ok"] = sum(bt[-1]["ok"] for bt in boots)
+    r["fail"] = sum(bt[-1]["fail"] for bt in boots)
+    # A "missed" slot is one the client could not send because the previous
+    # request was still running: it measures latency, not loss, so it is kept
+    # apart from the failure count.
+    r["missed"] = sum(bt[-1].get("missed", 0) for bt in boots)
+    r["total"] = r["ok"] + r["fail"] + r["missed"]
+    r["run_s"] = sum((bt[-1].get("_t") or 0) for bt in boots) / 1000 or None
+    # Latency of every successful request (last_ms of its own row, the first
+    # success after boot included), not the firmware's running max.
+    lat, steady = [], []                   # steady: without each boot's first success
+    for bt in boots:
+        prev_ok = 0
+        for x in bt:
+            if x["ok"] > prev_ok and x.get("last_ms") is not None:
                 lat.append(x["last_ms"])
-            prev = x
-        if lat:
-            r["avg_ms"], r["max_ms"] = round(sum(lat) / len(lat)), max(lat)
-        else:
-            r["avg_ms"], r["max_ms"] = r["boot_ms"], r["boot_ms"]
-        if lat and r["boot_ms"] and r["boot_ms"] > max(lat):
-            r["notes"].append(f"the first request after boot took {r['boot_ms']} ms "
-                              f"(excluded from avg/max latency)")
-        sa, sb = stats_after(client, first), (client["stats"][-1] if client["stats"] else None)
-        if sa and sb:
-            if sb.get("view", -1) > sa.get("view", -1):
-                r["faulty"].append(f"view change (client saw view {sa.get('view')} -> {sb.get('view')})")
-            r["resent"] += sb.get("req_resent", 0) - sa.get("req_resent", 0)
-            r["drops"] += ((sb.get("tx_fail", 0) + sb.get("tx_qfull", 0) + sb.get("rx_drop", 0)
-                            + sb.get("rx_frag_drop", 0))
-                           - (sa.get("tx_fail", 0) + sa.get("tx_qfull", 0) + sa.get("rx_drop", 0)
-                              + sa.get("rx_frag_drop", 0)))
-        elif sb:                                   # firmware without per-request client stats
-            r["resent"] += sb.get("req_resent", 0)
-    elif rows:                                   # client ran but nothing ever succeeded
-        r["total"] = rows[-1]["fail"] + rows[-1].get("missed", 0)
+                if prev_ok > 0:
+                    steady.append(x["last_ms"])
+            prev_ok = x["ok"]
+    if lat:
+        r["avg_ms"], r["max_ms"] = round(sum(lat) / len(lat)), max(lat)
+    # For the re-send check only: the first success after a boot waits for
+    # the cluster to come up, so it says nothing about the re-send interval.
+    r["steady_max_ms"] = max(steady) if steady else None
+    # Warm-up of the first boot: when the first success came, and how many
+    # requests failed before it.
+    first = next((x for x in boots[0] if x["ok"] > 0), None) if boots else None
+    r["first_ok_s"] = first["_t"] / 1000 if first and first.get("_t") is not None else None
+    r["warm_fail"] = first["fail"] if first else (boots[0][-1]["fail"] if boots else None)
+    sb = client["stats"][-1] if client and client["stats"] else None
+    r["vc"] = max(sb.get("view", 0), 0) if sb else 0   # views moved through, as the client saw
+    if r["vc"]:
+        r["faulty"].append(f"view change (client saw view {sb.get('view')})")
+    if sb:
+        r["resent"] += sb.get("req_resent", 0)
+        r["drops"] += (sb.get("tx_fail", 0) + sb.get("tx_qfull", 0) + sb.get("rx_drop", 0)
+                       + sb.get("rx_frag_drop", 0))
 
     replicas = {n: v for n, v in logs.items() if v is not client and v["stats"]}
+    r["fetch"] = 0
     if not replicas:
         r["notes"].append("no replica TBFT_STATS: a state fetch cannot be detected")
     for name, v in sorted(replicas.items()):
-        s = v["stats"][-1]
+        s = v["stats"][-1]                         # totals since this replica's boot
         if len(v["banners"]) > 1:
             r["faulty"].append(f"{name} rebooted")
-        if "run_vc" in s:                          # counted from the first executed request
-            if s.get("first_exec", 0) > 1:
-                r["faulty"].append(f"{name} joined late (first executed seqno {s['first_exec']})")
-            ev = (s.get("run_vc", 0), s.get("run_nv", 0), s.get("run_fetch", 0))
-            r["resent"] += s.get("run_resent", 0)
-            r["drops"] += s.get("run_tx_fail", 0) + s.get("run_drop", 0)
-        else:                                      # older firmware: totals since boot
-            ev = (s.get("vc_sent", 0), s.get("new_view", 0), s.get("fetch", 0))
-            r["resent"] += s.get("commit_resent", 0)
-        if any(ev):
-            r["faulty"].append(f"{name}: view-change/new-view/fetch {ev[0]}/{ev[1]}/{ev[2]}")
-        if rows and s.get("last_exec", 0) < rows[-1]["ok"]:
+        if s.get("first_exec", 0) > 1:
+            r["notes"].append(f"{name} joined late (first executed seqno {s['first_exec']})")
+        r["fetch"] += s.get("fetch", 0)
+        if s.get("fetch", 0):
+            r["faulty"].append(f"{name}: state fetch x{s['fetch']}")
+        r["resent"] += s.get("resent", s.get("commit_resent", 0))
+        r["drops"] += (s.get("tx_fail", 0) + s.get("tx_qfull", 0) + s.get("rx_drop", 0)
+                       + s.get("rx_frag_drop", 0))
+        if rows and s.get("last_exec", 0) < r["ok"]:
             r["notes"].append(f"{name}: last TBFT_STATS printed before the run ended "
-                              f"(last_exec {s.get('last_exec')} < {rows[-1]['ok']} requests)")
+                              f"(last_exec {s.get('last_exec')} < {r['ok']} requests)")
     f = os.path.join(d, "energy.csv")
     if os.path.exists(f):
         r["energy"], r["nodes"], r["secs"] = energy(f)
-        # p10 only: back-to-back has req_interval_ms=0 and no fixed window.
-        period = banner_int(r["banner"] or {}, "req_interval_ms")
-        if r["secs"] and period and r["total"]:
-            window = r["total"] * period / 1000
-            if abs(r["secs"] - window) > max(2 * period / 1000, 0.05 * window):
-                r["notes"].append(f"energy.csv covers {r['secs']:.0f} s but the requests span "
-                                  f"{window:.0f} s: start the meter at the first success")
+        if r["secs"] and r.get("run_s") and abs(r["secs"] - r["run_s"]) > 0.05 * r["run_s"]:
+            r["notes"].append(f"energy.csv covers {r['secs']:.0f} s but the client ran "
+                              f"{r['run_s']:.0f} s from boot: measure from power-on to the end")
     return r
 
 
@@ -217,7 +208,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("runs")
     ap.add_argument("--min-success", type=float, default=0.95)
-    ap.add_argument("--include-faulty", action="store_true")
+    ap.add_argument("--exclude-faulty", action="store_true",
+                    help="drop runs with a view change, state fetch or reboot")
     a = ap.parse_args()
 
     runs, base = {}, {}
@@ -245,12 +237,12 @@ def main():
     for pid, rs in runs.items():
         for r in rs:
             for why in r["faulty"]:
-                print(f"{os.path.basename(r['dir'])}: excluded - {why}"
-                      + (" (kept: --include-faulty)" if a.include_faulty else ""))
+                print(f"{os.path.basename(r['dir'])}: "
+                      + ("excluded" if a.exclude_faulty else "fault (counted)") + f" - {why}")
             for note in r["notes"]:
                 print(f"{os.path.basename(r['dir'])}: note - {note}")
         retx = banner_int(meta[pid], "retx_ms")
-        slow = [r["max_ms"] for r in rs if r["max_ms"]]
+        slow = [r["steady_max_ms"] for r in rs if r.get("steady_max_ms")]
         if retx and slow and max(slow) >= 0.8 * retx:
             print(f"WARNING: {pid}: slowest request {max(slow)} ms is close to the client re-send "
                   f"interval ({retx} ms): re-sends are not only losses; raise "
@@ -259,10 +251,11 @@ def main():
     rows = {}
     for pid, rs in runs.items():
         counted = [r for r in rs if r["total"] > 0]
-        used = [r for r in counted if a.include_faulty or not r["faulty"]]
+        used = [r for r in counted if not (a.exclude_faulty and r["faulty"])]
         m = {"n": len(used), "of": len(rs), "dropped": len(counted) - len(used),
              "succ": None, "slot": None, "eff": None, "eff_sd": 0.0, "jpr": None,
-             "inc": None, "lat": None, "max": None, "resent": None, "drops": None}
+             "inc": None, "lat": None, "max": None, "resent": None, "drops": None,
+             "run_s": None, "first_ok": None, "warm_fail": None, "vc": None, "fetch": None}
         if used:
             # Two numbers, because they answer different questions:
             #   succ = requests that were sent and succeeded (loss and faults)
@@ -272,6 +265,10 @@ def main():
             m["slot"] = st.mean(r["ok"] / r["total"] for r in used)
             m["resent"] = st.mean(r["resent"] for r in used)
             m["drops"] = st.mean(r["drops"] for r in used)
+            for k, rk in (("run_s", "run_s"), ("first_ok", "first_ok_s"), ("warm_fail", "warm_fail"),
+                          ("vc", "vc"), ("fetch", "fetch")):
+                v = [r[rk] for r in used if r.get(rk) is not None]
+                m[k] = st.mean(v) if v else None
             lat = [r["avg_ms"] for r in used if r["avg_ms"]]
             m["lat"] = st.mean(lat) if lat else None
             mx = [r["max_ms"] for r in used if r["max_ms"]]
@@ -289,15 +286,17 @@ def main():
     def fmt(x, spec):
         return format(x, spec) if x is not None else "-"
 
-    print("\n| point | runs | success (sent) | slots | avg latency ms | max latency ms | req/J (±sd) "
-          "| J/req | incr J/req | resent/run | drops/run | excl. faulty |")
-    print("|---|---|---|---|---|---|---|---|---|---|---|---|")
+    print("\n| point | runs | run s | first OK s | warm-up fails | success (sent) | slots "
+          "| avg latency ms | max latency ms | req/J (±sd) | J/req | incr J/req | view changes "
+          "| fetches | resent/run | drops/run | excluded |")
+    print("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     for pid, m in sorted(rows.items(), key=lambda kv: -(kv[1]["eff"] or -1)):
         eff = f"{m['eff']:.4f} ±{m['eff_sd']:.4f}" if m["eff"] is not None else "-"
-        print(f"| {pid} | {m['n']}/{m['of']} | {fmt(m['succ'], '.1%')} | {fmt(m['slot'], '.1%')} "
+        print(f"| {pid} | {m['n']}/{m['of']} | {fmt(m['run_s'], '.0f')} | {fmt(m['first_ok'], '.1f')} "
+              f"| {fmt(m['warm_fail'], '.1f')} | {fmt(m['succ'], '.1%')} | {fmt(m['slot'], '.1%')} "
               f"| {fmt(m['lat'], '.0f')} | {fmt(m['max'], '.0f')} | {eff} | {fmt(m['jpr'], '.2f')} "
-              f"| {fmt(m['inc'], '.2f')} | {fmt(m['resent'], '.1f')} | {fmt(m['drops'], '.1f')} "
-              f"| {m['dropped']} |")
+              f"| {fmt(m['inc'], '.2f')} | {fmt(m['vc'], '.1f')} | {fmt(m['fetch'], '.1f')} "
+              f"| {fmt(m['resent'], '.1f')} | {fmt(m['drops'], '.1f')} | {m['dropped']} |")
 
     # ESP-NOW rate screen: with an always-on radio the rate barely moves req/J,
     # so choose by success rate, then by speed (shorter airtime).

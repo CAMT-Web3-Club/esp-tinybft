@@ -339,9 +339,6 @@ Procedure:
      Measured on 2026-11-21 with the boards plugged in one by one, the client
      failed 9 requests and got its first reply 3 min 19 s after boot, about
      1 min after the last replica had power.
-   - `tools/analyze.py` still counts requests and latency from the first
-     success and reads `energy.csv` as a window starting there; it has not
-     been changed for battery-to-empty runs.
    - Joules from INA219 samples (Commander-Logger): the mean of bus
      voltage × current over all samples of the span, times the span's
      duration (first to last timestamp). Every sample is the average of one
@@ -385,18 +382,23 @@ that wins at one load need not win at the other, so report both.
 
 `python3 tools/analyze.py runs/` reads `CLIENT_STATS`, `TBFT_STATS`, the
 `BANNER` (for the settings of each configuration) and `energy.csv`, and prints
-success rate, average and maximum latency, requests per joule, re-sent
-messages and drops per run, the best configuration per transport and whether
-the difference exceeds one standard deviation. It requires `--min-success`
+per configuration: run length, the warm-up (client uptime at its first
+success, requests failed before it), success rate, average and maximum
+latency, requests per joule, view changes, state fetches, re-sent messages
+and drops, then the best configuration per transport and whether the
+difference exceeds one standard deviation. It requires `--min-success`
 (default 95%) and is not needed for configuring, building or flashing.
 
-It drops a run (`--include-faulty` keeps it) when the client saw a view
-change, a board rebooted, a replica joined late (`first_exec` > 1) or a
-replica's `run_*` counters show a view change or a state fetch. It notes runs
-without replica logs (a state fetch cannot be detected then), replica stats
-printed before the run ended and an `energy.csv` that covers another span
-than the requests, and warns when the slowest request comes close to the
-client re-send interval.
+It counts the whole run, power-on to the end: every request since the client
+booted (counters summed when it reboots), every success's latency, the first
+one after boot included, and replica counters since boot. View changes, state
+fetches and reboots are counted and listed, not dropped: a replica whose
+battery empties first forces a view change, and that is part of the result.
+`--exclude-faulty` drops such runs instead. It notes a replica that joined
+late, runs without replica logs (a state fetch cannot be detected then),
+replica stats printed before the run ended and an `energy.csv` whose span
+differs from the client's run by more than 5 %, and warns when a request
+other than the first after boot comes close to the client re-send interval.
 
 ## CPU power management (not part of the comparison)
 
