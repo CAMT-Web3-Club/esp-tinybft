@@ -239,8 +239,13 @@ All three lines are at WARN level, so they appear with the default log level.
   tick rate), plus the protocol timeouts in ms: `vc_ms` (view change),
   `status_ms`, `recovery_ms` (state fetch), `retx_ms` (client re-send) and
   `reply_ms` (client reply).
-- `CLIENT_STATS ok=… fail=… missed=… last_ms=… min_ms=… avg_ms=… max_ms=…`
-  after every request. With load *Back-to-back* the next request starts as
+- `CLIENT_STATS ok=… fail=… missed=… last_ms=… min_ms=… avg_ms=… max_ms=… value=…`
+  after every request. `value` is the counter in the last accepted reply (-1
+  before the first). The replicas execute a request once 2f+1 of them commit
+  it, whether or not the client then gets f+1 matching replies, so when
+  `value` jumps by more than `ok` the replicas executed requests the client
+  counted as failed; with the replicas on batteries and no serial logs this
+  is the only view of how many requests were agreed on. With load *Back-to-back* the next request starts as
   soon as the previous one has its reply (or failed), one request outstanding,
   and `missed` stays 0. With *One request every 10 s* the client keeps a fixed
   schedule and `missed` counts slots skipped because the previous request was

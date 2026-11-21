@@ -174,7 +174,7 @@ TX power 8 dBm, view-change / Status / fetch / client re-send / reply timeout = 
 - ต้องเปิด log ระดับ INFO ซึ่งกิน CPU และพลังงาน เพราะ console UART รอ FIFO แบบ busy-wait (A6) จึงเป็นภาระที่ทำให้ผลพลังงานไม่ยุติธรรม
 - RTT ที่ได้รวมความหน่วงของ UART และ USB
 
-**วิธีใหม่:** log ระดับ WARN และ client พิมพ์ `CLIENT_STATS ok= fail= missed= last_ms= …` หนึ่งบรรทัดหลังทุก request ตัวนับและ latency มาจากบอร์ดเอง logger อ่านบรรทัดนี้ (ยังอ่าน log แบบเดิมได้) เก็บยอดรวมต่อไปแม้ client reboot และไม่นับ request แรกหลังบูต (ที่ต้องรอ cluster พร้อม) ในค่า RTT เหมือน `tools/analyze.py` อัตราสำเร็จคือ ok / (ok + fail) ส่วน `missed` (เฉพาะโหลด 10 s) คือช่องที่ request ก่อนหน้ายังไม่เสร็จ ซึ่งเป็นผลของ latency ไม่ใช่ข้อความหาย จึงรายงานแยกไว้
+**วิธีใหม่:** log ระดับ WARN และ client พิมพ์ `CLIENT_STATS ok= fail= missed= last_ms= … value=` หนึ่งบรรทัดหลังทุก request (`value` คือค่า counter ใน reply ล่าสุดที่รับ ใช้ดูว่า replica execute ไปกี่ request ทั้งที่ client นับว่าล้มเหลว เพราะตอนใช้แบต replica ไม่มี serial log ให้เก็บ) ตัวนับและ latency มาจากบอร์ดเอง logger อ่านบรรทัดนี้ (ยังอ่าน log แบบเดิมได้) เก็บยอดรวมต่อไปแม้ client reboot และไม่นับ request แรกหลังบูต (ที่ต้องรอ cluster พร้อม) ในค่า RTT เหมือน `tools/analyze.py` อัตราสำเร็จคือ ok / (ok + fail) ส่วน `missed` (เฉพาะโหลด 10 s) คือช่องที่ request ก่อนหน้ายังไม่เสร็จ ซึ่งเป็นผลของ latency ไม่ใช่ข้อความหาย จึงรายงานแยกไว้
 
 ### 7.3 ความถูกต้องของแต่ละ run
 

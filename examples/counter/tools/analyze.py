@@ -32,6 +32,12 @@ cover the same span (power-on to the end).  The warm-up is reported, not
 removed: "first OK s" is the client's uptime at its first success and
 "warm-up fails" the requests that failed before it.
 
+Newer client firmware adds value= to CLIENT_STATS, the counter in the last
+accepted reply.  "executed" is how far it moved from the run's first success
+to its last, and "agreed, no reply" the requests among them that the replicas
+executed but the client counted as failed (no f+1 matching replies).  Requests
+executed before the first success or after the last one are not visible.
+
 The client may instead stay powered between runs while only the replicas run
 on batteries: start its log when the batteries go in.  A client log that
 starts with CLIENT_STATS and no BANNER before it is taken as "already
@@ -175,6 +181,21 @@ def load_run(d):
         r["first_ok_s"] = (first["_t"] - (base.get("_t") or 0)) / 1000
     r["warm_fail"] = ((first["fail"] if first else boots[0][-1]["fail"]) - base["fail"]
                       if boots else None)
+    # Newer firmware prints value= (the counter in the last accepted reply).
+    # The replicas execute a request once 2f+1 commit it, whether or not the
+    # client then gets f+1 matching replies: from the run's first success to
+    # its last, "executed" is how far the counter moved, and "no reply" the
+    # executed requests the client counted as failures.
+    vals = []
+    for bt, st0, i0 in zip(boots, starts, firsts):
+        prev_ok = st0["ok"]
+        for x in bt[i0:]:
+            if x["ok"] > prev_ok and x.get("value", -1) >= 0:
+                vals.append((x["value"], x["ok"]))
+            prev_ok = x["ok"]
+    if vals:
+        r["executed"] = vals[-1][0] - vals[0][0] + 1
+        r["no_reply"] = r["executed"] - len(vals)   # len(vals): successes in that span
     sb = client["stats"][-1] if client and client["stats"] else None
     r["vc"] = max(sb.get("view", 0), 0) if sb else 0   # views moved through, as the client saw
     if r["vc"]:
@@ -286,7 +307,8 @@ def main():
         m = {"n": len(used), "of": len(rs), "dropped": len(counted) - len(used),
              "succ": None, "slot": None, "eff": None, "eff_sd": 0.0, "jpr": None,
              "inc": None, "lat": None, "max": None, "resent": None, "drops": None,
-             "run_s": None, "first_ok": None, "warm_fail": None, "vc": None, "fetch": None}
+             "run_s": None, "first_ok": None, "warm_fail": None, "vc": None, "fetch": None,
+             "executed": None, "no_reply": None}
         if used:
             # Two numbers, because they answer different questions:
             #   succ = requests that were sent and succeeded (loss and faults)
@@ -297,7 +319,8 @@ def main():
             m["resent"] = st.mean(r["resent"] for r in used)
             m["drops"] = st.mean(r["drops"] for r in used)
             for k, rk in (("run_s", "run_s"), ("first_ok", "first_ok_s"), ("warm_fail", "warm_fail"),
-                          ("vc", "vc"), ("fetch", "fetch")):
+                          ("vc", "vc"), ("fetch", "fetch"), ("executed", "executed"),
+                          ("no_reply", "no_reply")):
                 v = [r[rk] for r in used if r.get(rk) is not None]
                 m[k] = st.mean(v) if v else None
             lat = [r["avg_ms"] for r in used if r["avg_ms"]]
@@ -318,15 +341,16 @@ def main():
         return format(x, spec) if x is not None else "-"
 
     print("\n| point | runs | run s | first OK s | warm-up fails | success (sent) | slots "
-          "| avg latency ms | max latency ms | req/J (±sd) | J/req | incr J/req | view changes "
-          "| fetches | resent/run | drops/run | excluded |")
-    print("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+          "| avg latency ms | max latency ms | req/J (±sd) | J/req | incr J/req | executed "
+          "| agreed, no reply | view changes | fetches | resent/run | drops/run | excluded |")
+    print("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     for pid, m in sorted(rows.items(), key=lambda kv: -(kv[1]["eff"] or -1)):
         eff = f"{m['eff']:.4f} ±{m['eff_sd']:.4f}" if m["eff"] is not None else "-"
         print(f"| {pid} | {m['n']}/{m['of']} | {fmt(m['run_s'], '.0f')} | {fmt(m['first_ok'], '.1f')} "
               f"| {fmt(m['warm_fail'], '.1f')} | {fmt(m['succ'], '.1%')} | {fmt(m['slot'], '.1%')} "
               f"| {fmt(m['lat'], '.0f')} | {fmt(m['max'], '.0f')} | {eff} | {fmt(m['jpr'], '.2f')} "
-              f"| {fmt(m['inc'], '.2f')} | {fmt(m['vc'], '.1f')} | {fmt(m['fetch'], '.1f')} "
+              f"| {fmt(m['inc'], '.2f')} | {fmt(m['executed'], '.0f')} | {fmt(m['no_reply'], '.1f')} "
+              f"| {fmt(m['vc'], '.1f')} | {fmt(m['fetch'], '.1f')} "
               f"| {fmt(m['resent'], '.1f')} | {fmt(m['drops'], '.1f')} | {m['dropped']} |")
 
     # ESP-NOW rate screen: with an always-on radio the rate barely moves req/J,

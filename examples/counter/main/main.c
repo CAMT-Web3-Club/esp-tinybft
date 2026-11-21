@@ -538,6 +538,11 @@ static void client_task(void *arg) {
 #endif
     uint32_t n_ok = 0, n_fail = 0, n_missed = 0;
     int64_t lat_min = INT64_MAX, lat_max = 0, lat_sum = 0;
+    /* Counter value of the last accepted reply (-1: none yet).  The replicas
+     * execute a request once 2f+1 of them commit it, whether or not the
+     * client then gets f+1 matching replies, so the jumps in this value
+     * show requests that were agreed on but whose reply did not arrive. */
+    int32_t last_value = -1;
 
     while (1) {
 #if CONFIG_ESP_TASK_WDT_EN
@@ -555,6 +560,7 @@ static void client_task(void *arg) {
                 counter_rep_t *res = (counter_rep_t *)rep.contents;
                 ESP_LOGI(TAG, "Client reply: value=%ld, status=%d",
                          res->value, res->status);
+                if (res->status == 0) last_value = res->value;
                 Byz_free_reply(&rep);
                 ok = true;
             }
@@ -576,11 +582,12 @@ static void client_task(void *arg) {
         }
         /* machine-parsable summary, WARN so it survives the measure overlay */
         ESP_LOGW(TAG, "CLIENT_STATS ok=%lu fail=%lu missed=%lu last_ms=%lld "
-                 "min_ms=%lld avg_ms=%lld max_ms=%lld",
+                 "min_ms=%lld avg_ms=%lld max_ms=%lld value=%ld",
                  (unsigned long)n_ok, (unsigned long)n_fail,
                  (unsigned long)n_missed, (long long)lat_ms,
                  (long long)(n_ok ? lat_min : 0),
-                 (long long)(n_ok ? lat_sum / n_ok : 0), (long long)lat_max);
+                 (long long)(n_ok ? lat_sum / n_ok : 0), (long long)lat_max,
+                 (long)last_value);
 #if CONFIG_TBFT_PRINT_STATS
         Byz_print_stats();
 #endif
