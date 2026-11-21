@@ -32,6 +32,12 @@ cover the same span (power-on to the end).  The warm-up is reported, not
 removed: "first OK s" is the client's uptime at its first success and
 "warm-up fails" the requests that failed before it.
 
+The client may instead stay powered between runs while only the replicas run
+on batteries: start its log when the batteries go in.  A client log that
+starts with CLIENT_STATS and no BANNER before it is taken as "already
+running": its first CLIENT_STATS (and TBFT_STATS) are the baseline, the run is
+counted from there, and "first OK s" is measured from that line.
+
 The client runs one of two loads (BANNER load=): back-to-back (b2b), where
 the next request starts as soon as the previous one completes, or one request
 every 10 s (p10).  Never mix the two in one comparison: name the runs apart
@@ -86,6 +92,7 @@ def parse_log(path):
             out["events"].append(("stats", len(out["stats"]) - 1))
         elif "BANNER" in line:
             out["banners"].append(dict(BANNER_KV.findall(line.split("BANNER", 1)[1])))
+            out["events"].append(("banner", len(out["banners"]) - 1))
     out["banner"] = out["banners"][0] if out["banners"] else None
     return out
 
@@ -123,23 +130,37 @@ def load_run(d):
     if len(boots) > 1 or (client and len(client["banners"]) > 1):
         r["faulty"].append(f"client rebooted ({max(len(boots), len(client['banners'])) - 1} times, "
                            "counters summed)")
-    r["ok"] = sum(bt[-1]["ok"] for bt in boots)
-    r["fail"] = sum(bt[-1]["fail"] for bt in boots)
+    # The client may stay powered between runs while only the replicas run on
+    # batteries.  If its log starts with CLIENT_STATS and no BANNER before it,
+    # the client was already running: that first row (earlier runs' counts)
+    # is the baseline, and the run is counted from the start of the log.
+    kinds = [k for k, _ in client["events"] if k in ("client", "banner")] if client else []
+    zero = {"ok": 0, "fail": 0, "missed": 0, "_t": 0}
+    base = rows[0] if kinds and kinds[0] == "client" else zero
+    if base is not zero:
+        r["notes"].append("client was already running when the log started: counted from the "
+                          f"log's first CLIENT_STATS (ok={base['ok']} fail={base['fail']} before)")
+    starts = [base] + [zero] * (len(boots) - 1)       # each boot counts from its start row
+    firsts = [1 if base is not zero else 0] + [0] * (len(boots) - 1)
+    r["ok"] = sum(bt[-1]["ok"] - st0["ok"] for bt, st0 in zip(boots, starts))
+    r["fail"] = sum(bt[-1]["fail"] - st0["fail"] for bt, st0 in zip(boots, starts))
     # A "missed" slot is one the client could not send because the previous
     # request was still running: it measures latency, not loss, so it is kept
     # apart from the failure count.
-    r["missed"] = sum(bt[-1].get("missed", 0) for bt in boots)
+    r["missed"] = sum(bt[-1].get("missed", 0) - st0.get("missed", 0)
+                      for bt, st0 in zip(boots, starts))
     r["total"] = r["ok"] + r["fail"] + r["missed"]
-    r["run_s"] = sum((bt[-1].get("_t") or 0) for bt in boots) / 1000 or None
+    r["run_s"] = sum(((bt[-1].get("_t") or 0) - (st0.get("_t") or 0))
+                     for bt, st0 in zip(boots, starts)) / 1000 or None
     # Latency of every successful request (last_ms of its own row, the first
     # success after boot included), not the firmware's running max.
     lat, steady = [], []                   # steady: without each boot's first success
-    for bt in boots:
-        prev_ok = 0
-        for x in bt:
+    for bt, st0, i0 in zip(boots, starts, firsts):
+        prev_ok = st0["ok"]
+        for x in bt[i0:]:
             if x["ok"] > prev_ok and x.get("last_ms") is not None:
                 lat.append(x["last_ms"])
-                if prev_ok > 0:
+                if prev_ok > st0["ok"]:
                     steady.append(x["last_ms"])
             prev_ok = x["ok"]
     if lat:
@@ -147,19 +168,29 @@ def load_run(d):
     # For the re-send check only: the first success after a boot waits for
     # the cluster to come up, so it says nothing about the re-send interval.
     r["steady_max_ms"] = max(steady) if steady else None
-    # Warm-up of the first boot: when the first success came, and how many
-    # requests failed before it.
-    first = next((x for x in boots[0] if x["ok"] > 0), None) if boots else None
-    r["first_ok_s"] = first["_t"] / 1000 if first and first.get("_t") is not None else None
-    r["warm_fail"] = first["fail"] if first else (boots[0][-1]["fail"] if boots else None)
+    # Warm-up: when the run's first success came (seconds from the client's
+    # boot, or from the start of the log), and how many requests failed before.
+    first = next((x for x in boots[0] if x["ok"] > base["ok"]), None) if boots else None
+    if first and first.get("_t") is not None:
+        r["first_ok_s"] = (first["_t"] - (base.get("_t") or 0)) / 1000
+    r["warm_fail"] = ((first["fail"] if first else boots[0][-1]["fail"]) - base["fail"]
+                      if boots else None)
     sb = client["stats"][-1] if client and client["stats"] else None
     r["vc"] = max(sb.get("view", 0), 0) if sb else 0   # views moved through, as the client saw
     if r["vc"]:
         r["faulty"].append(f"view change (client saw view {sb.get('view')})")
     if sb:
-        r["resent"] += sb.get("req_resent", 0)
-        r["drops"] += (sb.get("tx_fail", 0) + sb.get("tx_qfull", 0) + sb.get("rx_drop", 0)
-                       + sb.get("rx_frag_drop", 0))
+        def sent_again(x):
+            return x.get("req_resent", 0)
+
+        def dropped(x):
+            return (x.get("tx_fail", 0) + x.get("tx_qfull", 0) + x.get("rx_drop", 0)
+                    + x.get("rx_frag_drop", 0))
+        # Already running at the start of the log: its first TBFT_STATS is the
+        # baseline too (only when the client did not reboot in between).
+        s0 = client["stats"][0] if base is not zero and len(boots) == 1 else {}
+        r["resent"] += sent_again(sb) - sent_again(s0)
+        r["drops"] += dropped(sb) - dropped(s0)
 
     replicas = {n: v for n, v in logs.items() if v is not client and v["stats"]}
     r["fetch"] = 0

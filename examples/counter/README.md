@@ -339,6 +339,11 @@ Procedure:
      Measured on 2026-11-21 with the boards plugged in one by one, the client
      failed 9 requests and got its first reply 3 min 19 s after boot, about
      1 min after the last replica had power.
+   - The client can stay on USB between runs while only the replicas run on
+     batteries. Then start the client's log (or the client logger) when the
+     batteries go in: a log that starts without the client's `BANNER` is
+     counted from its first `CLIENT_STATS`, so the client's earlier runs do
+     not count.
    - Joules from INA219 samples (Commander-Logger): the mean of bus
      voltage × current over all samples of the span, times the span's
      duration (first to last timestamp). Every sample is the average of one
