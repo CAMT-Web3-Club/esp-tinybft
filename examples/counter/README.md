@@ -339,9 +339,10 @@ Procedure:
      15.0 results/s on the boards, 3 % faster than the datasheet's typical
      14.57; its ADC clock is 500 kHz ±30 %), and do not use the `power`
      column: the INA219 computes it from the same two registers and stores
-     it in steps of 20 × the current LSB (1.95 mW here, against 0.32 mW for
-     the product at 3.3 V), which is 0.7 % of an always-on board's power
-     but 2.5-3 % of a power-saving one's.
+     it in steps of 20 × the current LSB, so the product is never worse.
+     Exports made before Commander `deb38ce` (±320 mV range) have 1.95 mW
+     steps, 2.5-3 % of a power-saving board's power; since then (±80 mV)
+     0.49 mW.
    - The client log is required and must include the boot `BANNER`. It gives
      success, latency and, from the view of the replies it accepted, any view
      change.
