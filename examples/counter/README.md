@@ -330,10 +330,14 @@ Procedure:
    board (`node0.log` … `node6.log`, `client7.log`) and `energy.csv`
    (`node,joules[,seconds]` or `node,avg_ma,volts,seconds`). Start the meter
    at the first successful request. Measure the same boards in every run.
-   - Joules from INA219 samples (Commander-Logger): sum bus voltage ×
-     current × the time to the next sample's timestamp. Do not use a fixed
-     period (the sensors deliver about 15.0 results/s on the boards, 3 %
-     faster than the datasheet's typical 14.57), and do not use the `power`
+   - Joules from INA219 samples (Commander-Logger): the mean of bus
+     voltage × current over all samples of the span, times the span's
+     duration (first to last timestamp). Every sample is the average of one
+     conversion period and the periods are equal, so the samples weigh the
+     same; the timestamps are read times and jitter by about 20 ms. Do not
+     multiply the sample count by a fixed period (the sensors deliver about
+     15.0 results/s on the boards, 3 % faster than the datasheet's typical
+     14.57; its ADC clock is 500 kHz ±30 %), and do not use the `power`
      column: the INA219 computes it from the same two registers and stores
      it in steps of 20 × the current LSB (1.95 mW here, against 0.32 mW for
      the product at 3.3 V), which is 0.7 % of an always-on board's power
